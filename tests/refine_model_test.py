@@ -349,7 +349,7 @@ def test_general_search_builds_independent_multistart_sources() -> None:
         [transfer],
     )
     assert stop == ""
-    assert 4 <= len(proposals) <= 32
+    assert 4 <= len(proposals) <= 60
     assert all(
         refine.hard_legal(workload, proposal.knowledge, HARDWARE)
         for proposal in proposals
@@ -693,6 +693,54 @@ def test_campaign_manifest_excludes_exact_fingerprint() -> None:
     )
     assert versioned_count == 187
     assert len(versioned_history) == 187
+    round2_history, round2_count = refine.load_campaign_exclusions(
+        ROOT / "config/general_search_v1_round2_fingerprints.csv",
+        "Ascend910B3",
+        20,
+    )
+    assert round2_count == 145
+    assert len(round2_history) == 145
+
+
+def test_campaign_observations_calibrate_sources_and_transfer() -> None:
+    history, transfers, count = refine.load_campaign_observations(
+        ROOT / "config/general_search_v1_round2_observations.csv",
+        "Ascend910B3",
+        20,
+    )
+    assert count == 44
+    assert len(history) == 44
+    assert len(transfers) == 3
+    corrections = refine.conservative_source_corrections(history)
+    assert 1.09 < corrections["local"] < 1.15
+    assert 1.5 < corrections["global"] < 1.6
+    assert 1.5 < corrections["diverse"] < 1.6
+    assert "transfer" not in corrections
+
+    workload = refine.Workload(
+        "campaign_prior", 1024, 1024, 1024,
+        "fp16", False, False, 20,
+    )
+    knowledge = base_knowledge(workload, 192, 160, 64)
+    state = refine.State(
+        row={
+            "search_candidate_source": "global",
+            "search_model_confidence": "high",
+        },
+        knowledge=knowledge,
+        model_score=1.0,
+        normalized_score=1.0,
+        hbm_bytes=0.0,
+        l2_bytes=0.0,
+        template="BASE",
+    )
+    refine.calibrate_from_history(
+        workload, [state], history, "", corrections
+    )
+    assert state.normalized_score == corrections["global"]
+    assert state.row["search_model_confidence"] == (
+        "campaign_source_calibrated"
+    )
 
 
 def test_unstable_comparison_cannot_claim_improvement() -> None:
@@ -2423,6 +2471,7 @@ def main() -> None:
     test_profile_resume_drives_search_history_and_transfer()
     test_unstable_profile_is_excluded_without_calibration()
     test_campaign_manifest_excludes_exact_fingerprint()
+    test_campaign_observations_calibrate_sources_and_transfer()
     test_unstable_comparison_cannot_claim_improvement()
     test_unpaired_exact_profile_is_excluded_without_calibration()
     test_history_calibration_is_source_specific()

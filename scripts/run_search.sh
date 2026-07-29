@@ -28,15 +28,27 @@ PROFILE_HISTORY_ARGS=()
 if [[ -n "${PROFILE_HISTORY_CSV}" && -f "${PROFILE_HISTORY_CSV}" ]]; then
     PROFILE_HISTORY_ARGS=(--profile-history "${PROFILE_HISTORY_CSV}")
 fi
-CAMPAIGN_EXCLUSIONS_CSV="${SEARCH_CAMPAIGN_EXCLUSIONS:-config/general_search_v1_round1_fingerprints.csv}"
 CAMPAIGN_EXCLUSION_ARGS=()
-if [[
-    "${SEARCH_SCOPE}" == "general_search_v1"
-    && -f "${CAMPAIGN_EXCLUSIONS_CSV}"
-]]; then
-    CAMPAIGN_EXCLUSION_ARGS=(
-        --campaign-exclusions "${CAMPAIGN_EXCLUSIONS_CSV}"
-    )
+CAMPAIGN_OBSERVATION_ARGS=()
+if [[ "${SEARCH_SCOPE}" == "general_search_v1" ]]; then
+    CAMPAIGN_EXCLUSIONS_SPEC="${SEARCH_CAMPAIGN_EXCLUSIONS:-config/general_search_v1_round1_fingerprints.csv:config/general_search_v1_round2_fingerprints.csv}"
+    IFS=: read -r -a CAMPAIGN_EXCLUSIONS <<<"${CAMPAIGN_EXCLUSIONS_SPEC}"
+    for campaign_path in "${CAMPAIGN_EXCLUSIONS[@]}"; do
+        if [[ -f "${campaign_path}" ]]; then
+            CAMPAIGN_EXCLUSION_ARGS+=(
+                --campaign-exclusions "${campaign_path}"
+            )
+        fi
+    done
+    CAMPAIGN_OBSERVATIONS_SPEC="${SEARCH_CAMPAIGN_OBSERVATIONS:-config/general_search_v1_round2_observations.csv}"
+    IFS=: read -r -a CAMPAIGN_OBSERVATIONS <<<"${CAMPAIGN_OBSERVATIONS_SPEC}"
+    for campaign_path in "${CAMPAIGN_OBSERVATIONS[@]}"; do
+        if [[ -f "${campaign_path}" ]]; then
+            CAMPAIGN_OBSERVATION_ARGS+=(
+                --campaign-observations "${campaign_path}"
+            )
+        fi
+    done
 fi
 
 if [[ "${SEARCH_SCOPE}" == "all_templates_validation" ]]; then
@@ -103,6 +115,7 @@ python3 tools/refine_matmul_v3_candidates.py \
     "${HISTORY_ARGS[@]}" \
     "${PROFILE_HISTORY_ARGS[@]}" \
     "${CAMPAIGN_EXCLUSION_ARGS[@]}" \
+    "${CAMPAIGN_OBSERVATION_ARGS[@]}" \
     --top-k "${TOP_K}" \
     --beam-width "${BEAM_WIDTH}" \
     --tabu-iters "${TABU_ITERS}" \

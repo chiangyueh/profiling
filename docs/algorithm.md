@@ -1,14 +1,13 @@
 # MatMulV3 Tiling 搜尋算法
 
-> Current scope (2026-07-29): a complete 49-workload 910B3 run established a
-> K=16384 skinny-N family on five independent shapes and an aligned
-> deterministic split-K positive range for K=16384..49152. A subsequent
-> 43-candidate broad L2 campaign produced no new winner. The active
-> `bottleneck_guided_v1` search has also rejected the odd-tail/transposed
-> bank-seed traversal ablations. N=33 plus three unseen N=40/47/48 holdouts
-> established the baseN=48 family; the next campaign emits only three
-> baseN=64 N=49/56/64 holdouts. The all-template
-> construction remains a contract/reference implementation.
+> Current scope (2026-07-30): `general_search_v1` is the default full run. It
+> constructs legal candidates from local, global, structurally diverse and
+> measured-transfer starts without workload-name rules. Two completed NPU
+> rounds contain 332 unique candidate measurements. Their exact fingerprints
+> and stable source-best feedback are versioned so a clean clone advances the
+> active-search frontier instead of replaying prior work. The older
+> `bottleneck_guided_v1` implementation remains available as historical
+> reference, but is not the default research method.
 
 ## 1. 問題定義
 
@@ -298,6 +297,28 @@ DETERMINISTIC_SPLIT_K 只在 M/N/K 對齊時切換來源直接讀取的
 `singleCoreN > stepN*baseN` 時啟用來源的 inner-N path。full-load family
 沒有可證明不破壞 operand residency 的自由轉換時直接停止，不製造候選。
 
+### 5.1 預設 general search
+
+`general_search_v1` 不使用上述 shape 名稱或人工 N/K 區間。每個 workload
+由四個起點來源建立完整合法 schedule：
+
+```text
+local     官方 RuntimeKb seed 的耦合鄰域
+global    Cube 對齊、L0/L1 容量與 output partition 推導出的離散格點
+diverse   與官方 seed 結構距離較遠、但代理模型未判為災難的合法點
+transfer  從其他強實測點轉移 partition count，再重建目標 L1/L2 欄位
+```
+
+Host 候選上限分別為 12/16/16/12，去重後每 workload 最多 60 筆並全部經過
+官方 callback。這是供模型選擇的較深前沿，不是 NPU 預算；每輪 NPU 最多
+量 16 筆，且先保留每個仍有未測候選的來源 leader。
+
+完成一輪後，完整 23-field fingerprint 進入版本化 manifest。下一輪仍會
+構造相同受約束空間，但 exact fingerprint 被 active frontier 排除，因而會
+向每個來源的下一層移動。穩定的 source-best 同輪
+`candidate/bank/official` 結果另作模型殘差；目前採各來源 upper-quartile
+的保守倍率，只修正模型低估，不把歷史好結果當成所有未測點都會加速。
+
 ## 6. Constraint-Aware Beam Search
 
 完整 state 按依賴分成五層 prefix：
@@ -318,9 +339,9 @@ DETERMINISTIC_SPLIT_K 只在 M/N/K 對齊時切換來源直接讀取的
 先以執行單元、transaction 與 memory capacity 限定 shape，再做搜索，而不是
 對完整整數空間盲抽樣。
 
-在 active scope 中，Beam 只排序上述完整轉折候選，不自行生成新欄位組合。
-所以 Beam width 不會把候選數擴張為 `width^layers`；目前 45 個支援
-workload 只輸出 33 筆 searched schedule，其中 22 筆由封裝歷史精確命中。
+在 general scope 中，Beam 只排序上述完整合法候選，不自行生成新欄位組合。
+`general_source_frontier` 先保留各起點來源，再依真機校正後分數與結構距離
+填滿固定預算。因此 Beam width 不會把候選數擴張為 `width^layers`。
 
 ## 7. Tabu 與 Large Neighborhood Search
 
@@ -381,20 +402,20 @@ HBM/L2 bandwidth 分母也使用 active core，不會讓空閒 core 虛構額外
 8.9%。後續雖已補入成功 full run 的 baseline/control 與部分完整候選，
 這個結果仍說明廣域代理模型不足以證明最佳值。
 
-所以目前策略是：
+所以目前 general search 策略是：
 
-1. 先以硬體轉折點把候選限制在每 workload 0–8 筆。
-2. 每種瓶頸 action 最多保留一個 leader。
-3. 同 run 有 bank control 的歷史資料使用
-   `candidate_ms/bank_control_ms` 校準，exact fingerprint 直接重用。
-4. 新候選超過 `MODEL_RATIO_LIMIT` 時淘汰；唯一例外是至少三個獨立真機
-   anchor 都改善超過 10% 時，保留預先註冊、可證偽的因果動作。低 K
-   skinny-N 因此保留 L2-only 與 L2+L1 兩筆，不讓失準 proxy 把實驗問題
-   本身刪掉。
+1. 先由 kernel/template 與硬體容量建立每 workload 最多 60 筆合法前沿。
+2. 同 run 有 bank control 的穩定歷史使用
+   `candidate_ms/bank_control_ms` 校準，exact fingerprint 不再量測。
+3. 跨 clone 的穩定 source-best 殘差對模型低估加保守懲罰；每個來源仍保留
+   leader，避免模型偏差完全關閉全域或遠距探索。
+4. 每輪每 workload 最多量 16 筆，candidate、bank、official 必須同輪且
+   coefficient of variation 不高於 5% 才進入模型回饋。
 5. 最終只相信 correctness 後的 NPU latency。
 
-當累積足夠 exact fingerprint 資料後，才適合加入 AutoTVM/Ansor 類 learned
-cost model 或 TPE/SMAC 來選下一批真機候選。
+目前 44 筆 source-best 只足以做低維保守校正，還不足以訓練聲稱可泛化的
+Bayesian/TPE/神經 cost model。後續每輪保留完整候選量測後，才評估以
+template、dtype/layout 與硬體衍生特徵訓練 residual model。
 
 `bottleneck_guided_v1` 將 `TABU_ITERS=LNS_ROUNDS=0`，不進入本節流程。這是
 對先前廣域模型失準的修正；Tabu/LNS 程式只供全模板 reference scope 使用。

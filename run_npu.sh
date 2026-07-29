@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260730-general-active-resume-v2"
+RUN_NPU_VERSION="20260730-general-feedback-frontier-v3"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -297,10 +297,10 @@ case "${MODE}" in
         DEFAULT_BEAM_WIDTH=32
         DEFAULT_TABU_ITERS=0
         DEFAULT_LNS_ROUNDS=0
-        DEFAULT_TOP_K=12
+        DEFAULT_TOP_K=16
         DEFAULT_MAX_CORE_ROUNDS=0
         DEFAULT_MODEL_RATIO_LIMIT=3.0
-        DEFAULT_RANK_LIMIT=12
+        DEFAULT_RANK_LIMIT=16
         DEFAULT_WARMUP=3
         DEFAULT_REPEAT=10
         DEFAULT_SAMPLES=5

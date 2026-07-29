@@ -227,6 +227,8 @@ class MeasurementEvidence:
     ratio_vs_bank: float | None
     record_id: str
     exact_profile: bool = False
+    candidate_source: str = ""
+    model_ratio: float | None = None
 
 
 @dataclass(frozen=True)
@@ -3504,11 +3506,14 @@ def general_search_candidate_proposals(
         general_base_geometry_space(workload, seed, hardware)
     )
 
+    # Keep a deeper host-side frontier than the NPU measurement budget.  This
+    # lets later active-learning rounds move past exhausted candidates without
+    # turning the callback or NPU phase into an unbounded Cartesian search.
     local = select_global_candidates(
-        workload, seed, hardware, local_candidates, 8
+        workload, seed, hardware, local_candidates, 12
     )
     global_best = select_global_candidates(
-        workload, seed, hardware, global_pool, 8
+        workload, seed, hardware, global_pool, 16
     )
     global_signatures = {
         knowledge_signature(candidate) for candidate in global_best
@@ -3522,12 +3527,12 @@ def general_search_candidate_proposals(
             for candidate in global_pool
             if knowledge_signature(candidate) not in global_signatures
         ],
-        8,
+        16,
         farthest=True,
     )
     transferred = general_transfer_geometry_space(
         workload, seed, hardware, transfer_geometries
-    )[:8]
+    )[:12]
 
     proposals: list[CandidateProposal] = []
     for index, candidate in enumerate(local, 1):
@@ -3590,7 +3595,7 @@ def general_search_candidate_proposals(
         seen.add(signature)
         unique.append(proposal)
     stop = "" if unique else "no_callback_contract_candidate_generated"
-    return unique[:32], stop
+    return unique[:60], stop
 
 
 def bottleneck_guided_candidate_proposals(
@@ -4492,6 +4497,12 @@ def load_profile_measurement_history(
         control_ms = (
             float(control_row["median_ms"]) if paired_stable else None
         )
+        try:
+            model_ratio = float(
+                row.get("search_model_raw_ratio_vs_bank_seed") or ""
+            )
+        except ValueError:
+            model_ratio = None
         history.setdefault(
             state_history_key(workload, knowledge), []
         ).append(
@@ -4512,6 +4523,12 @@ def load_profile_measurement_history(
                     f"{row.get('rank', '')}"
                 ),
                 exact_profile=True,
+                candidate_source=row.get("search_candidate_source", ""),
+                model_ratio=(
+                    model_ratio
+                    if model_ratio is not None and model_ratio > 0
+                    else None
+                ),
             )
         )
     return history
@@ -4567,6 +4584,106 @@ def load_campaign_exclusions(
         )
         accepted += 1
     return history, accepted
+
+
+def load_campaign_observations(
+    path: Path | None,
+    soc: str,
+    aic_cores: int,
+) -> tuple[
+    dict[tuple[str, ...], list[MeasurementEvidence]],
+    list[TransferGeometry],
+    int,
+]:
+    """Load stable, versioned NPU feedback exported from a completed round."""
+    if path is None or not path.is_file():
+        return {}, [], 0
+    _, rows = read_csv(path)
+    history: dict[
+        tuple[str, ...], list[MeasurementEvidence]
+    ] = {}
+    transfers: list[TransferGeometry] = []
+    accepted = 0
+    for row in rows:
+        try:
+            if row.get("soc") != soc or int(row.get("aic") or 0) != aic_cores:
+                continue
+            ratio_vs_official = float(row["ratio_vs_official"])
+            ratio_vs_bank = float(row["ratio_vs_bank"])
+            model_ratio = float(row["model_ratio"])
+            knowledge = profile_row_knowledge(row)
+            if knowledge is None:
+                continue
+            workload = Workload(
+                workload_id=row["workload_id"],
+                m=int(row["m"]),
+                n=int(row["n"]),
+                k=int(row["k"]),
+                dtype=row["dtype"].lower(),
+                trans_a=truthy(row.get("trans_a")),
+                trans_b=truthy(row.get("trans_b")),
+                max_cores=aic_cores,
+            )
+        except (KeyError, ValueError):
+            continue
+        if (
+            ratio_vs_official <= 0
+            or ratio_vs_bank <= 0
+            or model_ratio <= 0
+            or row.get("status_vs_official") == "unstable_measurement"
+            or row.get("status_vs_bank") == "unstable_measurement"
+        ):
+            continue
+        source = row.get("candidate_source", "")
+        history.setdefault(
+            state_history_key(workload, knowledge), []
+        ).append(
+            MeasurementEvidence(
+                ratio_vs_official=ratio_vs_official,
+                ratio_vs_bank=ratio_vs_bank,
+                record_id=(
+                    f"campaign_observation:"
+                    f"{row.get('campaign', 'unknown')}:"
+                    f"{workload.workload_id}:{source}"
+                ),
+                exact_profile=True,
+                candidate_source=source,
+                model_ratio=model_ratio,
+            )
+        )
+        accepted += 1
+        if (
+            template_name(knowledge) == "BASE"
+            and ratio_vs_official <= 1.0 / 1.03
+            and ratio_vs_bank <= 1.0 / 1.03
+        ):
+            transfers.append(
+                TransferGeometry(
+                    workload_id=workload.workload_id,
+                    m=workload.m,
+                    n=workload.n,
+                    k=workload.k,
+                    dtype=workload.dtype,
+                    trans_a=workload.trans_a,
+                    trans_b=workload.trans_b,
+                    template="BASE",
+                    base_m=knowledge["baseM"],
+                    base_n=knowledge["baseN"],
+                    base_k=knowledge["baseK"],
+                    depth_a1=knowledge["depthA1"],
+                    depth_b1=knowledge["depthB1"],
+                    iterate_order=knowledge["iterateOrder"],
+                    db_l0a=knowledge["dbL0A"],
+                    db_l0b=knowledge["dbL0B"],
+                    db_l0c=knowledge["dbL0C"],
+                    l2_iterate_order=knowledge["l2IterateOrder"],
+                    speedup=min(
+                        1.0 / ratio_vs_official,
+                        1.0 / ratio_vs_bank,
+                    ),
+                )
+            )
+    return history, transfers, accepted
 
 
 def load_profile_transfer_geometries(
@@ -4770,11 +4887,45 @@ def completed_bottleneck_frontier_coverage(
     )
 
 
+def conservative_source_corrections(
+    history: dict[tuple[str, ...], list[MeasurementEvidence]],
+) -> dict[str, float]:
+    """Estimate upper-quartile model optimism from stable NPU feedback."""
+    residuals: dict[str, list[float]] = {}
+    for records in history.values():
+        for record in records:
+            if (
+                not record.candidate_source
+                or record.ratio_vs_bank is None
+                or record.model_ratio is None
+                or record.ratio_vs_bank <= 0
+                or record.model_ratio <= 0
+            ):
+                continue
+            residuals.setdefault(
+                record.candidate_source, []
+            ).append(record.ratio_vs_bank / record.model_ratio)
+    corrections: dict[str, float] = {}
+    for source, values in residuals.items():
+        if len(values) < 3:
+            continue
+        ordered = sorted(values)
+        upper_quartile = ordered[
+            math.ceil(0.75 * len(ordered)) - 1
+        ]
+        # Feedback is used to correct optimistic underestimation, not to grant
+        # an unmeasured source a blanket speedup. Source quotas still retain at
+        # least one exploratory candidate after this conservative penalty.
+        corrections[source] = min(2.0, max(1.0, upper_quartile))
+    return corrections
+
+
 def calibrate_from_history(
     workload: Workload,
     states: list[State],
     history: dict[tuple[str, ...], list[MeasurementEvidence]],
     bank_path_diff: str,
+    source_priors: dict[str, float] | None = None,
 ) -> tuple[float, int]:
     exact: dict[tuple[str, ...], tuple[float, str]] = {}
     measured_exact: dict[tuple[str, ...], str] = {}
@@ -4836,6 +4987,7 @@ def calibrate_from_history(
         for source, values in corrections_by_source.items()
         if len(values) >= 2
     }
+    source_priors = source_priors or {}
 
     for state in states:
         key = state_history_key(workload, state.knowledge)
@@ -4853,12 +5005,14 @@ def calibrate_from_history(
         else:
             source = state.row.get("search_candidate_source", "")
             state_correction = source_corrections.get(
-                source, correction
+                source, source_priors.get(source, correction)
             )
             adjusted = raw_ratio * state_correction
             confidence = (
                 "source_calibrated"
                 if source in source_corrections
+                else "campaign_source_calibrated"
+                if source in source_priors
                 else "historically_calibrated"
                 if len(correction_by_key) >= 2
                 else state.row.get("search_model_confidence", "medium")
@@ -5145,7 +5299,12 @@ def main() -> int:
     parser.add_argument("--all-output", type=Path)
     parser.add_argument("--history", type=Path)
     parser.add_argument("--profile-history", type=Path)
-    parser.add_argument("--campaign-exclusions", type=Path)
+    parser.add_argument(
+        "--campaign-exclusions", type=Path, action="append", default=[]
+    )
+    parser.add_argument(
+        "--campaign-observations", type=Path, action="append", default=[]
+    )
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--beam-width", type=int, default=64)
     parser.add_argument("--tabu-iters", type=int, default=64)
@@ -5228,11 +5387,33 @@ def main() -> int:
     )
     for key, records in profile_history.items():
         history.setdefault(key, []).extend(records)
-    campaign_history, campaign_exclusion_count = load_campaign_exclusions(
-        args.campaign_exclusions, args.soc, hardware.aic_cores
+    campaign_exclusion_count = 0
+    for campaign_path in args.campaign_exclusions:
+        campaign_history, excluded = load_campaign_exclusions(
+            campaign_path, args.soc, hardware.aic_cores
+        )
+        campaign_exclusion_count += excluded
+        for key, records in campaign_history.items():
+            history.setdefault(key, []).extend(records)
+    campaign_observation_count = 0
+    campaign_transfers: list[TransferGeometry] = []
+    for campaign_path in args.campaign_observations:
+        campaign_history, transfers, observed = load_campaign_observations(
+            campaign_path, args.soc, hardware.aic_cores
+        )
+        campaign_observation_count += observed
+        campaign_transfers.extend(transfers)
+        for key, records in campaign_history.items():
+            history.setdefault(key, []).extend(records)
+    source_priors = conservative_source_corrections(history)
+    active_learning_enabled = (
+        args.optimization_scope == "general_search_v1"
+        and any(
+            record.exact_profile
+            for records in history.values()
+            for record in records
+        )
     )
-    for key, records in campaign_history.items():
-        history.setdefault(key, []).extend(records)
     profile_record_count = sum(
         len(records) for records in profile_history.values()
     )
@@ -5246,7 +5427,10 @@ def main() -> int:
         "search_feedback: "
         f"profile_exact={profile_record_count} "
         f"profile_usable={profile_usable_count} "
-        f"campaign_excluded={campaign_exclusion_count}",
+        f"campaign_excluded={campaign_exclusion_count} "
+        f"campaign_observed={campaign_observation_count} "
+        f"source_priors="
+        f"{','.join(f'{source}:{value:.4g}' for source, value in sorted(source_priors.items())) or 'none'}",
         flush=True,
     )
     transfer_geometries = load_transfer_geometries(
@@ -5257,6 +5441,7 @@ def main() -> int:
             args.profile_history, args.soc, hardware.aic_cores
         )
     )
+    transfer_geometries.extend(campaign_transfers)
     completed_frontier = completed_bottleneck_frontier_coverage(
         args.history, args.soc, hardware.aic_cores
     )
@@ -5449,6 +5634,17 @@ def main() -> int:
                     if proposal is not None
                     else "constraint_generated"
                 )
+                exact_records = [
+                    record.record_id
+                    for record in history.get(
+                        state_history_key(workload, knowledge), []
+                    )
+                    if record.exact_profile and record.record_id
+                ]
+                if exact_records:
+                    row["search_history_match"] = "|".join(
+                        sorted(set(exact_records))
+                    )
                 template_states.append(
                     State(
                         row=row,
@@ -5465,7 +5661,10 @@ def main() -> int:
             template_states.sort(key=state_sort_key)
             if args.optimization_scope == "general_search_v1":
                 beam = general_source_frontier(
-                    template_states, args.beam_width, seed
+                    template_states,
+                    args.beam_width,
+                    seed,
+                    active_learning=active_learning_enabled,
                 )
             else:
                 beam = constraint_aware_beam(
@@ -5560,6 +5759,7 @@ def main() -> int:
             accepted,
             history,
             bank_path_diff,
+            source_priors,
         )
         for state in accepted:
             if state_has_history_match(state):
@@ -5601,7 +5801,7 @@ def main() -> int:
                 eligible,
                 args.top_k,
                 seed,
-                active_learning=history_matches > 0,
+                active_learning=active_learning_enabled,
             )
         else:
             template_leaders: list[State] = []

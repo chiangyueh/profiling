@@ -3627,11 +3627,12 @@ def constraint_aware_beam(
         if not active:
             break
         for state in active:
-            if not state.row.get("search_guidance", "").startswith(
+            if not state.guidance.startswith(
                 (
                     "attention_score_",
                     "skinny_n_ablation_",
                     "skinny_n_boundary_",
+                    "skinny_n_transition48_",
                     "skinny_n_low_k_",
                     "official_seed_",
                     "bottleneck_",
@@ -3686,11 +3687,12 @@ def tabu_lns_search(
         if signature in discovered_signatures:
             return
         discovered_signatures.add(signature)
-        if not state.row.get("search_guidance", "").startswith(
+        if not state.guidance.startswith(
             (
                 "attention_score_",
                 "skinny_n_ablation_",
                 "skinny_n_boundary_",
+                "skinny_n_transition48_",
                 "official_seed_",
                 "bottleneck_",
             )
@@ -4077,7 +4079,12 @@ def guided_action_frontier(
     for state in eligible:
         preregistered_new = (
             state.row.get("search_resume_policy") == "allow_new"
-            and state.guidance.startswith("skinny_n_boundary_")
+            and state.guidance.startswith(
+                (
+                    "skinny_n_boundary_",
+                    "skinny_n_transition48_",
+                )
+            )
         )
         if state.normalized_score > model_ratio_limit and not preregistered_new:
             continue
@@ -4149,6 +4156,50 @@ def completed_frontier_candidate_allowed(state: State) -> bool:
     return (
         state_has_history_match(state)
         or state.row.get("search_resume_policy") == "allow_new"
+    )
+
+
+def assert_preregistered_campaign_candidates(
+    workloads: list[Workload],
+    selected_rows: list[dict[str, str]],
+) -> None:
+    """Fail before NPU profiling if the exact N=48 crossover disappeared."""
+    workload_id = "skinny_n_boundary_holdout_m5120_n48"
+    if not any(row.workload_id == workload_id for row in workloads):
+        return
+    expected = {
+        "candidate_role": "searched",
+        "base_m": "256",
+        "base_n": "64",
+        "base_k": "64",
+        "depth_a1": "8",
+        "depth_b1": "32",
+        "search_guidance": (
+            "skinny_n_transition48_k16384_base_n64_one_block_per_aic"
+        ),
+    }
+    matches = [
+        row
+        for row in selected_rows
+        if row.get("workload_id") == workload_id
+        and all(row.get(field) == value for field, value in expected.items())
+    ]
+    if matches:
+        return
+    observed = [
+        (
+            row.get("candidate_role", ""),
+            row.get("base_m", ""),
+            row.get("base_n", ""),
+            row.get("base_k", ""),
+            row.get("search_guidance", ""),
+        )
+        for row in selected_rows
+        if row.get("workload_id") == workload_id
+    ]
+    raise SearchError(
+        "preregistered N=48 baseN64 crossover missing before NPU profiling; "
+        f"observed={observed or 'no rows'}"
     )
 
 
@@ -4600,6 +4651,7 @@ def main() -> int:
             flush=True,
         )
 
+    assert_preregistered_campaign_candidates(workloads, selected_rows)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="", encoding="utf-8") as destination:
         writer = csv.DictWriter(destination, fieldnames=output_fields, extrasaction="ignore")

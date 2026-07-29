@@ -1506,3 +1506,37 @@ toolkit currently reports a 30-core Ascend910B platform and rejects the first
 M=1 workload under a different alignment path. The authoritative callback
 round-trip for this candidate must therefore occur on the remote
 Ascend910B3/CANN 8.1 machine during search stage [3/4].
+
+46. N=48 crossover was generated but removed by the frontier model gate
+
+Run 20260729_232304 completed, but it did not execute the intended N=48
+crossover:
+
+  paired_measurement_workloads=0
+  skinny_n_boundary_holdout: improved=2, no_candidate=1
+
+The schedule generator and hard legality check both produced the baseN=64
+N=48 proposal. The loss happened later in two name-based filters. New
+baseN=49..64 guidance used the accepted "skinny_n_boundary_" prefix, while
+the N=48 proposal used "skinny_n_transition48_". constraint_aware_beam first
+renamed it to a generic constraint action. guided_action_frontier could then
+discard it under model_ratio_limit=1.03 because the explicit allow_new
+identity had been lost.
+
+The frontier exception now covers only these two explicit preregistered
+families:
+
+  skinny_n_boundary_*
+  skinny_n_transition48_*
+
+General candidates remain subject to the model limit. A regression test sends
+the N=48 state through both constraint_aware_beam and guided_action_frontier,
+sets its proxy ratio to 1.4, and verifies that the exact allow_new identity is
+preserved and reaches the final frontier. Once emitted, the paired-measurement
+guard must remove the old N=48 baseline/control assignments and measure
+candidate, bank control, and official baseline together.
+
+The search stage also asserts the exact T=256x64x64, L1=8x32 crossover row
+before writing the NPU candidate CSV. If a later filter or callback removes
+it, step [3/4] now fails with the observed N=48 rows instead of running an
+apparently successful campaign that never tested the stated hypothesis.

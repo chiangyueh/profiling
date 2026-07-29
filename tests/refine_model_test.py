@@ -869,6 +869,89 @@ def test_guided_skinny_n_transition48_uses_adjacent_base_n64() -> None:
     assert refine.hard_legal(workload, proposal.knowledge, HARDWARE)
 
 
+def test_transition48_survives_proxy_model_gate() -> None:
+    workload = refine.Workload(
+        "skinny_n_boundary_holdout_m5120_n48",
+        5120, 48, 16384, "fp16", False, False, 20,
+    )
+    knowledge = base_knowledge(workload, 256, 64, 64)
+    seed = SimpleNamespace(
+        bank=SimpleNamespace(
+            knowledge=base_knowledge(workload, 128, 48, 64)
+        )
+    )
+    state = refine.State(
+        row={
+            "search_resume_policy": "allow_new",
+            "search_model_confidence": "high",
+            "search_transition_gain": "0.1",
+            "search_history_match": "",
+        },
+        knowledge=knowledge,
+        model_score=1.4,
+        normalized_score=1.4,
+        hbm_bytes=0.0,
+        l2_bytes=0.0,
+        template="BASE",
+        guidance=(
+            "skinny_n_transition48_k16384_base_n64_one_block_per_aic"
+        ),
+    )
+    beam = refine.constraint_aware_beam([state], 64)
+    assert beam == [state]
+    assert state.guidance == (
+        "skinny_n_transition48_k16384_base_n64_one_block_per_aic"
+    )
+    frontier = refine.guided_action_frontier(
+        workload, seed, HARDWARE, beam, 1.03, 3
+    )
+    assert frontier == [state]
+    assert state.row["search_model_confidence"] == "preregistered_new"
+    assert state.row["search_stop_reason"] == (
+        "source_guided_allow_new_candidate_despite_proxy_rejection"
+    )
+
+
+def test_transition48_campaign_contract_fails_before_npu_if_missing() -> None:
+    workload = refine.Workload(
+        "skinny_n_boundary_holdout_m5120_n48",
+        5120, 48, 16384, "fp16", False, False, 20,
+    )
+    try:
+        refine.assert_preregistered_campaign_candidates(
+            [workload],
+            [
+                {
+                    "workload_id": workload.workload_id,
+                    "candidate_role": "bank_seed_control",
+                }
+            ],
+        )
+    except refine.SearchError as error:
+        assert "crossover missing before NPU profiling" in str(error)
+    else:
+        raise AssertionError("missing N=48 crossover was not rejected")
+
+    refine.assert_preregistered_campaign_candidates(
+        [workload],
+        [
+            {
+                "workload_id": workload.workload_id,
+                "candidate_role": "searched",
+                "base_m": "256",
+                "base_n": "64",
+                "base_k": "64",
+                "depth_a1": "8",
+                "depth_b1": "32",
+                "search_guidance": (
+                    "skinny_n_transition48_k16384_base_n64_"
+                    "one_block_per_aic"
+                ),
+            }
+        ],
+    )
+
+
 def test_new_search_forces_same_run_controls_only_for_that_workload() -> None:
     candidates = [
         {
@@ -1842,6 +1925,8 @@ def main() -> None:
     test_guided_skinny_n_boundary_uses_measured_schedule()
     test_guided_skinny_n_boundary_holdouts_are_preregistered()
     test_guided_skinny_n_transition48_uses_adjacent_base_n64()
+    test_transition48_survives_proxy_model_gate()
+    test_transition48_campaign_contract_fails_before_npu_if_missing()
     test_new_search_forces_same_run_controls_only_for_that_workload()
     test_guided_skinny_n_boundary64_holdouts_are_preregistered()
     test_attention_score_frontier_is_closed_after_npu_falsification()

@@ -227,6 +227,86 @@ def exact_resume_guard_missing(
     return protected_ids, missing_baselines, missing_candidates
 
 
+def force_paired_measurements_for_new_search(
+    candidates: list[dict[str, str]],
+    history_baselines: dict[str, dict[str, str]],
+    history_assignments: dict[tuple[str, str, str], dict[str, str]],
+) -> tuple[set[str], int, int]:
+    """Remeasure each new search action with controls from the same run.
+
+    Absolute ACL event times can shift across runs. Reusing an old candidate
+    while measuring fresh controls can therefore reverse the reported result.
+    Only workloads with at least one genuinely new searched schedule are
+    affected; completed workloads remain resumable.
+    """
+    allow_new_workloads = {
+        candidate["workload_id"]
+        for candidate in candidates
+        if candidate.get("candidate_role") == "searched"
+        and candidate.get("search_resume_policy") == "allow_new"
+    }
+    controls = {
+        candidate["workload_id"]: (
+            candidate["workload_id"],
+            candidate["candidate_role"],
+            candidate["rank"],
+        )
+        for candidate in candidates
+        if candidate.get("candidate_role") == "bank_seed_control"
+    }
+    new_workloads: set[str] = set()
+    for workload_id in allow_new_workloads:
+        searched_keys = [
+            (
+                candidate["workload_id"],
+                candidate["candidate_role"],
+                candidate["rank"],
+            )
+            for candidate in candidates
+            if candidate["workload_id"] == workload_id
+            and candidate.get("candidate_role") == "searched"
+        ]
+        assigned = [
+            history_assignments[key]
+            for key in searched_keys
+            if key in history_assignments
+        ]
+        if len(assigned) != len(searched_keys):
+            new_workloads.add(workload_id)
+            continue
+        baseline = history_baselines.get(workload_id)
+        control_key = controls.get(workload_id)
+        control = (
+            history_assignments.get(control_key)
+            if control_key is not None
+            else None
+        )
+        records = [*assigned, baseline, control]
+        run_ids = {
+            (record or {}).get("resume_run")
+            or (record or {}).get("run_id")
+            for record in records
+        }
+        if (
+            None in records
+            or "" in run_ids
+            or None in run_ids
+            or len(run_ids) != 1
+        ):
+            new_workloads.add(workload_id)
+    removed_baselines = 0
+    removed_schedules = 0
+    for workload_id in new_workloads:
+        if history_baselines.pop(workload_id, None) is not None:
+            removed_baselines += 1
+        for assignment_key in list(history_assignments):
+            if assignment_key[0] != workload_id:
+                continue
+            del history_assignments[assignment_key]
+            removed_schedules += 1
+    return new_workloads, removed_baselines, removed_schedules
+
+
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as source:
         reader = csv.DictReader(source)
@@ -1630,6 +1710,16 @@ def main() -> int:
             if assignment_key not in history_assignments:
                 history_assignments[assignment_key] = history_record
 
+    (
+        paired_measurement_workloads,
+        paired_baselines_removed,
+        paired_schedules_removed,
+    ) = force_paired_measurements_for_new_search(
+        supported_candidates,
+        history_baselines,
+        history_assignments,
+    )
+
     if args.require_exact_resume_prefix:
         (
             protected_ids,
@@ -1823,7 +1913,10 @@ def main() -> int:
             f"history_candidates_assigned={len(history_assignments)} "
             f"npu_searched_pending={pending_searched} "
             f"npu_controls_pending={pending_controls} "
-            f"npu_official_baselines_pending={pending_baselines}",
+            f"npu_official_baselines_pending={pending_baselines} "
+            f"paired_measurement_workloads={len(paired_measurement_workloads)} "
+            f"paired_baselines_remeasured={paired_baselines_removed} "
+            f"paired_schedules_remeasured={paired_schedules_removed}",
             flush=True,
         )
         for workload_index, workload in enumerate(workloads, 1):

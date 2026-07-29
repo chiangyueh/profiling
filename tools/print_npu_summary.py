@@ -302,9 +302,9 @@ def main() -> None:
         "criterion=all_three_preregistered_k16384_holdouts_must_improve"
     )
     print(
-        "SKINNY_N_BOUNDARY_RESULT n_33_to_48_k_eq_16384 "
+        "SKINNY_N_BOUNDARY_POLICY_RESULT n_33_to_48_k_eq_16384 "
         f"status={campaign['skinny_boundary']} "
-        "criterion=all_three_preregistered_n40_n47_n48_holdouts_must_improve"
+        "criterion=n40_n47_baseN48_and_n48_crossover_must_improve"
     )
     print(
         "SKINNY_N_BOUNDARY64_RESULT n_49_to_64_k_eq_16384 "

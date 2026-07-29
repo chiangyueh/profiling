@@ -2,7 +2,7 @@ Ascend MatMul tiling execution issue record
 Updated: 2026-07-27
 
 Purpose
-=======
+-------
 
 This file records why the earlier NPU runs did not validate the tiling search,
 and the boundary used by the current implementation. It is not a list of
@@ -188,7 +188,7 @@ Unaligned M/N/K are not rejected merely for being tails. The official MatMulV3
 operator owns its ND2NZ/NZ2ND and tail execution templates.
 
 Split-K
-=======
+-------
 
 baseK < K is ordinary per-core K blocking.
 
@@ -1410,7 +1410,8 @@ the RuntimeKb bank control:
 Together with the N=33 anchor at 1.17078x, this supports the exact K=16384,
 N=33..48 rule. All four schedules use one M block per each of the 20 AICs,
 one N block, L1=8x40, DB=2x2x1, and L2=1x1(20x1). The three exact new rows are
-stored in results/npu_full_ocr_measurements.csv and must not be remeasured.
+stored in results/npu_full_ocr_measurements.csv. They may be reused only with
+their same-run official and bank controls.
 
 44. Adjacent baseN=64 boundary campaign
 
@@ -1447,3 +1448,61 @@ The complete CANN 8.1 dry-run reports:
 
 The remote NPU run should therefore execute only three new official baselines,
 three new bank controls, and three new searched schedules.
+
+45. BaseN=64 succeeds; N=48 comparison exposed an unpaired-history bug
+
+The 2026-07-29 boundary64 run measured all three preregistered schedules as
+faster than both same-run controls:
+
+  M=3072 N=49 K=16384:
+    T=160x64x64
+    searched_ms=0.0693124
+    bank_seed_ms=0.100987
+    official_ms=0.098620
+    speedup_vs_official=1.42283
+
+  M=4096 N=56 K=16384:
+    T=208x64x64
+    searched_ms=0.081528
+    bank_seed_ms=0.103818
+    official_ms=0.102700
+    speedup_vs_official=1.25969
+
+  M=5120 N=64 K=16384:
+    T=256x64x64
+    searched_ms=0.085094
+    bank_seed_ms=0.0978336
+    official_ms=0.098008
+    speedup_vs_official=1.15176
+
+This supports the baseN=64 schedule for the measured N=49..64 range.
+
+The same report marked the old N=48 baseN=48 result as regressed. That verdict
+is not a paired measurement:
+
+  reused candidate from run 20260729_172955: 0.0977752 ms
+  same old run official/bank:               0.102746 / 0.103711 ms
+  newly measured official/bank:             0.0894544 / 0.090830 ms
+
+The profiler compared the old absolute candidate time with the new controls,
+even though the platform timing level shifted by about 13 percent. This cannot
+establish that the tiling itself regressed.
+
+The next experiment is one exact crossover action, not a parameter sweep:
+
+  M=5120 N=48 K=16384
+  T=256x64x64
+  L1=8x32
+  DB=2x2x1
+  L2=1x1(20x1)
+
+Because N=49, N=56, and N=64 all support this packet, N=48 is the adjacent
+boundary test. Any workload with a new schedule now discards reused absolute
+times for that workload and measures searched, bank, and official paths in the
+same run. Completed unrelated workloads remain history-only.
+
+Local callback validation is not evidence for this remote contract. The local
+toolkit currently reports a 30-core Ascend910B platform and rejects the first
+M=1 workload under a different alignment path. The authoritative callback
+round-trip for this candidate must therefore occur on the remote
+Ascend910B3/CANN 8.1 machine during search stage [3/4].

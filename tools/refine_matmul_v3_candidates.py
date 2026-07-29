@@ -1075,12 +1075,12 @@ def skinny_n_boundary_k16384_applicable(
     seed: Seed,
     hardware: Hardware,
 ) -> bool:
-    """Select the N=33..48 boundary anchored by the N=33 NPU run.
+    """Select the N=33..47 boundary anchored by the N=33 NPU run.
 
     This is intentionally narrower than the broad BASE transition frontier.
     It covers the adjacent one-N-block geometry where the official seed keeps
     a smaller M tile and extra L2 rounds, while the measured anchor assigns
-    exactly one M block per AIC. Three unseen shapes test the range.
+    exactly one M block per AIC.
     """
     core_limit = min(workload.max_cores, hardware.aic_cores)
     balanced_m = align_up(ceil_div(workload.m, core_limit), 16)
@@ -1090,7 +1090,27 @@ def skinny_n_boundary_k16384_applicable(
         and not workload.trans_b
         and template_name(seed.bank.knowledge) == "BASE"
         and workload.k == 16384
-        and 32 < workload.n <= 48
+        and 32 < workload.n < 48
+        and 128 < balanced_m <= 256
+        and ceil_div(workload.m, balanced_m) == core_limit
+    )
+
+
+def skinny_n_transition48_k16384_applicable(
+    workload: Workload,
+    seed: Seed,
+    hardware: Hardware,
+) -> bool:
+    """Select the exact N=48 crossover for a baseN=64 confirmation run."""
+    core_limit = min(workload.max_cores, hardware.aic_cores)
+    balanced_m = align_up(ceil_div(workload.m, core_limit), 16)
+    return (
+        workload.dtype == "fp16"
+        and not workload.trans_a
+        and not workload.trans_b
+        and template_name(seed.bank.knowledge) == "BASE"
+        and workload.k == 16384
+        and workload.n == 48
         and 128 < balanced_m <= 256
         and ceil_div(workload.m, balanced_m) == core_limit
     )
@@ -1312,8 +1332,8 @@ def learned_skinny_n_boundary_k16384_schedule(
     """Apply the measured one-block-per-AIC boundary schedule.
 
     Evidence: skinny_n_boundary_n33 measured 1.17x faster than official and
-    1.18x faster than the bank seed. The active campaign limits transfer to
-    three preregistered N=40/47/48 one-N-block holdouts.
+    1.18x faster than the bank seed. N=40 and N=47 independently preserve the
+    baseN=48 schedule.
     """
     if not skinny_n_boundary_k16384_applicable(
         workload, seed, hardware
@@ -1321,6 +1341,27 @@ def learned_skinny_n_boundary_k16384_schedule(
         return []
     return one_block_per_aic_boundary_schedule(
         workload, seed, hardware, base_n=48, depth_b=40
+    )
+
+
+def learned_skinny_n_transition48_k16384_schedule(
+    workload: Workload,
+    seed: Seed,
+    hardware: Hardware,
+) -> list[dict[str, int]]:
+    """Test N=48 with the baseN=64 packet used successfully at N=49..64.
+
+    The previous baseN=48 latency came from a different profiling run than its
+    latest controls, so its apparent regression is not a valid paired result.
+    This one-candidate crossover test is the adjacent successful schedule, not
+    a new parameter sweep.
+    """
+    if not skinny_n_transition48_k16384_applicable(
+        workload, seed, hardware
+    ):
+        return []
+    return one_block_per_aic_boundary_schedule(
+        workload, seed, hardware, base_n=64, depth_b=32
     )
 
 
@@ -3142,6 +3183,9 @@ def bottleneck_guided_candidate_proposals(
         boundary = learned_skinny_n_boundary_k16384_schedule(
             workload, seed, hardware
         )
+        transition48 = learned_skinny_n_transition48_k16384_schedule(
+            workload, seed, hardware
+        )
         boundary64 = learned_skinny_n_boundary64_k16384_schedule(
             workload, seed, hardware
         )
@@ -3154,7 +3198,13 @@ def bottleneck_guided_candidate_proposals(
                 "skinny_n_boundary64_holdout_",
             )
         )
-        focused = established or boundary or boundary64 or low_k_causal
+        focused = (
+            established
+            or boundary
+            or transition48
+            or boundary64
+            or low_k_causal
+        )
         for index, knowledge in enumerate(focused):
             if established:
                 guidance = focused_candidate_guidance(knowledge)
@@ -3162,14 +3212,27 @@ def bottleneck_guided_candidate_proposals(
                     "apply the K=16384 one-block-per-AIC schedule selected "
                     "by five independent NPU shapes"
                 )
-            elif boundary or boundary64:
-                guidance = (
-                    "skinny_n_boundary_k16384_base_n64_one_block_per_aic"
-                    if boundary64
-                    else "skinny_n_boundary_k16384_one_block_per_aic"
-                )
-                n_range = "49..64" if boundary64 else "33..48"
-                l1_split = "8x32" if boundary64 else "8x40"
+            elif boundary or transition48 or boundary64:
+                if transition48:
+                    guidance = (
+                        "skinny_n_transition48_k16384_base_n64_"
+                        "one_block_per_aic"
+                    )
+                    n_range = "48 crossover"
+                    l1_split = "8x32"
+                elif boundary64:
+                    guidance = (
+                        "skinny_n_boundary_k16384_base_n64_"
+                        "one_block_per_aic"
+                    )
+                    n_range = "49..64"
+                    l1_split = "8x32"
+                else:
+                    guidance = (
+                        "skinny_n_boundary_k16384_one_block_per_aic"
+                    )
+                    n_range = "33..47"
+                    l1_split = "8x40"
                 rationale = (
                     f"apply the N={n_range} boundary schedule: one M block "
                     f"per AIC, one N block, and the L1 {l1_split} split"

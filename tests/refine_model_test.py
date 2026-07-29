@@ -362,6 +362,16 @@ def test_skinny_n_generalization_and_evidence_groups() -> None:
     assert refine.skinny_n_boundary64_k16384_applicable(
         boundary64, seed, HARDWARE
     )
+    transition48 = refine.Workload(
+        "skinny_n_boundary_holdout_m5120_n48",
+        5120, 48, 16384, "fp16", False, False, 20,
+    )
+    assert not refine.skinny_n_boundary_k16384_applicable(
+        transition48, seed, HARDWARE
+    )
+    assert refine.skinny_n_transition48_k16384_applicable(
+        transition48, seed, HARDWARE
+    )
     for workload in (
         refine.Workload(
             "skinny_n_holdout_m3072_k8192",
@@ -794,13 +804,6 @@ def test_guided_skinny_n_boundary_holdouts_are_preregistered() -> None:
             ),
             208,
         ),
-        (
-            refine.Workload(
-                "skinny_n_boundary_holdout_m5120_n48",
-                5120, 48, 16384, "fp16", False, False, 20,
-            ),
-            256,
-        ),
     ):
         knowledge = base_knowledge(workload, 128, 48, 64)
         knowledge.update(
@@ -832,6 +835,122 @@ def test_guided_skinny_n_boundary_holdouts_are_preregistered() -> None:
         assert refine.hard_legal(
             workload, proposal.knowledge, HARDWARE
         )
+
+
+def test_guided_skinny_n_transition48_uses_adjacent_base_n64() -> None:
+    workload = refine.Workload(
+        "skinny_n_boundary_holdout_m5120_n48",
+        5120, 48, 16384, "fp16", False, False, 20,
+    )
+    knowledge = base_knowledge(workload, 128, 48, 64)
+    seed = SimpleNamespace(bank=SimpleNamespace(knowledge=knowledge))
+    estimate = refine.analytical_score(workload, knowledge, HARDWARE)
+    bottleneck = refine.diagnose_bottleneck(
+        workload, knowledge, estimate, HARDWARE
+    )
+    proposals, stop = refine.bottleneck_guided_candidate_proposals(
+        workload, seed, HARDWARE, estimate, bottleneck
+    )
+    assert stop == ""
+    assert len(proposals) == 1
+    proposal = proposals[0]
+    assert proposal.resume_policy == "allow_new"
+    assert proposal.guidance == (
+        "skinny_n_transition48_k16384_base_n64_one_block_per_aic"
+    )
+    assert proposal.knowledge["baseM"] == 256
+    assert proposal.knowledge["baseN"] == 64
+    assert proposal.knowledge["depthA1"] == 8
+    assert proposal.knowledge["depthB1"] == 32
+    assert proposal.knowledge["stepKa"] == 4
+    assert proposal.knowledge["stepKb"] == 16
+    assert proposal.knowledge["usedCoreNum"] == 20
+    assert proposal.knowledge["l2MTileBlock"] == 20
+    assert refine.hard_legal(workload, proposal.knowledge, HARDWARE)
+
+
+def test_new_search_forces_same_run_controls_only_for_that_workload() -> None:
+    candidates = [
+        {
+            "workload_id": "new_shape",
+            "candidate_role": "searched",
+            "rank": "1",
+            "search_resume_policy": "allow_new",
+        },
+        {
+            "workload_id": "new_shape",
+            "candidate_role": "bank_seed_control",
+            "rank": "0",
+            "search_resume_policy": "require_existing",
+        },
+        {
+            "workload_id": "completed_shape",
+            "candidate_role": "searched",
+            "rank": "1",
+            "search_resume_policy": "require_existing",
+        },
+        {
+            "workload_id": "paired_shape",
+            "candidate_role": "searched",
+            "rank": "1",
+            "search_resume_policy": "allow_new",
+        },
+        {
+            "workload_id": "paired_shape",
+            "candidate_role": "bank_seed_control",
+            "rank": "0",
+            "search_resume_policy": "require_existing",
+        },
+        {
+            "workload_id": "unpaired_shape",
+            "candidate_role": "searched",
+            "rank": "1",
+            "search_resume_policy": "allow_new",
+        },
+        {
+            "workload_id": "unpaired_shape",
+            "candidate_role": "bank_seed_control",
+            "rank": "0",
+            "search_resume_policy": "require_existing",
+        },
+    ]
+    baselines = {
+        "new_shape": {"median_ms": "2"},
+        "completed_shape": {"median_ms": "3"},
+        "paired_shape": {"median_ms": "4", "run_id": "same"},
+        "unpaired_shape": {
+            "median_ms": "5", "run_id": "candidate_run",
+        },
+    }
+    assignments = {
+        ("new_shape", "bank_seed_control", "0"): {"median_ms": "2.1"},
+        ("completed_shape", "searched", "1"): {"median_ms": "2.5"},
+        ("paired_shape", "searched", "1"): {
+            "median_ms": "3.5", "run_id": "same",
+        },
+        ("paired_shape", "bank_seed_control", "0"): {
+            "median_ms": "4.1", "run_id": "same",
+        },
+        ("unpaired_shape", "searched", "1"): {
+            "median_ms": "4.5", "run_id": "candidate_run",
+        },
+    }
+    workloads, removed_baselines, removed_schedules = (
+        profile_tilings.force_paired_measurements_for_new_search(
+            candidates, baselines, assignments
+        )
+    )
+    assert workloads == {"new_shape", "unpaired_shape"}
+    assert removed_baselines == 2
+    assert removed_schedules == 2
+    assert "new_shape" not in baselines
+    assert baselines["completed_shape"]["median_ms"] == "3"
+    assert (
+        "completed_shape", "searched", "1"
+    ) in assignments
+    assert baselines["paired_shape"]["median_ms"] == "4"
+    assert ("paired_shape", "searched", "1") in assignments
+    assert ("paired_shape", "bank_seed_control", "0") in assignments
 
 
 def test_guided_skinny_n_boundary64_holdouts_are_preregistered() -> None:
@@ -1722,6 +1841,8 @@ def main() -> None:
     test_guided_skinny_n_uses_the_measured_family_schedule()
     test_guided_skinny_n_boundary_uses_measured_schedule()
     test_guided_skinny_n_boundary_holdouts_are_preregistered()
+    test_guided_skinny_n_transition48_uses_adjacent_base_n64()
+    test_new_search_forces_same_run_controls_only_for_that_workload()
     test_guided_skinny_n_boundary64_holdouts_are_preregistered()
     test_attention_score_frontier_is_closed_after_npu_falsification()
     test_bank_advantage_order_is_closed_after_npu_falsification()

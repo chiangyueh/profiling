@@ -133,13 +133,13 @@ NPU。
 
 既有完整 run 證明 K=16384 skinny-N 在
 3072x17、4096x17、4096x24、4608x31、5120x29 五個獨立窄 N shape 上
-改善 `1.24121x` 到 `1.59785x`；N=33..48 的四個 boundary shape 改善
-`1.05084x` 到 `1.31797x`。
+改善 `1.24121x` 到 `1.59785x`；baseN=48 在 N=33/40/47 改善，
+baseN=64 在 N=49/56/64 改善 `1.15176x` 到 `1.42283x`。
 因此搜索器只有在至少三個獨立 anchor 同時勝過各自 bank control 10% 以上
 時，才允許失準 proxy 之外的預先註冊因果動作。
 
 舊 K=8192/12288 與 bank-seed iterateOrder 候選已實測證偽並關閉。下一輪
-只量 N=49/56/64 的 baseN=64 one-block-per-AIC boundary holdout。
+只量 N=48 的 baseN=64 crossover，且 searched、bank、official 必須同輪。
 128x128 deterministic split-K order 在 K=16384/32768/49152 改善，但
 K=65536 退化到 `0.867283x`，所以不再向更大 K 無條件外推。
 

@@ -29,7 +29,8 @@ aligned 128x128 deterministic split-K traversal
 這推翻「所有 `K >= 8192` skinny-N 都受益」以及「所有對齊
 deterministic split-K 都能翻轉 traversal」兩個廣域假設。低 K、broad
 L2、attention 與 bank-seed traversal 外推都已由真機否定並關閉。
-下一輪只定位相鄰的 `baseN=64` 邊界：N=49/56/64 各一筆、共三筆新候選。
+`baseN=64` 已在 N=49/56/64 全部改善。下一輪只重新定位 N=48
+交界點，測一筆相鄰成功的 `baseN=64` 候選。
 
 證據分組為：
 
@@ -37,8 +38,8 @@ L2、attention 與 bank-seed traversal 外推都已由真機否定並關閉。
 known_anchor                已知可改善的 4096x17x16384
 skinny_n_initial_holdout     已量完的 K=8192/12288/16384 初始 holdout
 skinny_n_k16384_holdout      3 個新的 K=16384 holdout
-skinny_n_boundary_holdout    N=40/47/48，三筆均改善
-skinny_n_boundary64_holdout  N=49/56/64，下一輪預註冊候選
+skinny_n_boundary_holdout    N=40/47 的 baseN=48 證據；N=48 待同輪重測
+skinny_n_boundary64_holdout  N=49/56/64，三筆均改善
 det_split_k_positive_range   K=16384/32768/49152，三筆均改善
 alignment_negative_control   已量完的 127x127x32769 負向對照
 prior_regression             先前曾明顯退化的 workload
@@ -133,7 +134,8 @@ workload       52 組；51 組 MatMulV3 支援，1 組 INT8 負向對照
 control        51 個官方 RuntimeKb bank seed
 候選           15 個 callback-valid searched schedules
 候選上限       每個 workload 目前最多 1 個；hard cap 8
-新舊分流       12 個既有 schedule 重用；本輪新增 3 個 N=49..64 holdout
+新舊分流       遠端最新 resume 可重用 14 個；只新增 1 個 N=48 crossover
+同輪比較       新候選的 searched/bank/official 三條路徑一律同輪量測
 warmup         10
 repeat         50
 samples        15
@@ -226,8 +228,9 @@ schedule 或單一控制變量實驗：
 
 ```text
 skinny-N, K=16384        一個 output M block/AIC 的實測 family schedule
-skinny-N, N=33..48       四個 shape 支持的 baseN=48 family schedule
-skinny-N, N=49..64       三個預先註冊的 baseN=64 boundary holdout
+skinny-N, N=33..47       N=33/40/47 支持的 baseN=48 schedule
+skinny-N, N=48           只測相鄰成功的 baseN=64 crossover
+skinny-N, N=49..64       N=49/56/64 支持的 baseN=64 schedule
 deterministic split-K    對齊 M=N=128 時只切換 iterateOrder
 ```
 

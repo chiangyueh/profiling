@@ -265,20 +265,18 @@ attention-score 的 L2 frontier 同樣未勝官方，亦已關閉。
 `odd_tail_2` 的 BASE `iterateOrder=1` 實測退化到 `0.132863x`，
 `trans_ab_case` 也沒有勝過 bank control，因此該方向已關閉。
 
-`skinny_n_boundary_n33` 與三個 unseen shape 已全部改善：
+`skinny_n_boundary_n33`、N=40 與 N=47 已確認 baseN=48 改善：
 
 ```text
 3072x40x16384  T=160x48x64
 4096x47x16384  T=208x48x64
-5120x48x16384  T=256x48x64
 ```
 
-三者都固定 `L1=8x40, DB=2x2x1, L2=1x1(20x1)`；差異只由 M 尺寸
-推導出恰好 20 個 M blocks。三者均勝過官方與 bank control，因此
-N=33..48 family 已成立。
+它們固定 `L1=8x40, DB=2x2x1, L2=1x1(20x1)`；差異只由 M 尺寸
+推導出恰好 20 個 M blocks。
 
-下一個 16-column 邊界由 CANN 8.1 callback 的 `baseN=64` seed 定義。只
-預註冊三個 unseen shape：
+下一個 16-column 邊界由 CANN 8.1 callback 的 `baseN=64` seed 定義。
+三個預註冊 shape 已全部改善：
 
 ```text
 3072x49x16384  T=160x64x64
@@ -286,8 +284,14 @@ N=33..48 family 已成立。
 5120x64x16384  T=256x64x64
 ```
 
-三者固定 `L1=8x32, DB=2x2x1, L2=1x1(20x1)`，均通過 hard-legal 與
-完整 23 欄 callback round-trip。只有三者都改善，才建立 N=49..64 family。
+三者固定 `L1=8x32, DB=2x2x1, L2=1x1(20x1)`，改善分別為
+`1.42283x`、`1.25969x`、`1.15176x`，因此 N=49..64 的實測範圍成立。
+
+N=48 的舊候選為 `0.0977752 ms`，但最新報告將它與另一輪新量到的
+`0.0894544 ms` 官方基準比較；舊候選所在輪的官方基準其實是
+`0.102746 ms`。這是跨輪 absolute latency 混用，不能判定 tiling
+退化。下一輪只測 `5120x48x16384, T=256x64x64, L1=8x32` 一筆交界
+候選，並強制 searched、bank、official 同輪量測。
 
 DETERMINISTIC_SPLIT_K 只在 M/N/K 對齊時切換來源直接讀取的
 `iterateOrder`。SINGLE_CORE_SPLIT_K 只在
@@ -458,17 +462,18 @@ supported bank controls         51
 selected candidates             66
 searched candidates             15
 callback/RuntimeKb validation   all found
-measured searched schedules     12
-new boundary holdouts            3
+measured searched schedules     14
+new crossover schedules          1
 max candidates/workload          1 in active scope
 template contract               95 rows / 12 suffixes / 7 families
 exact-resume                    fingerprint + explicit resume policy
 ```
 
 這只證明候選符合 callback 與 RuntimeKb 注入契約。既有 NPU 結果證實
-K=16384 skinny-N 在五個獨立窄 N shape 上泛化，N=33..48 family 也成立；
-同時 K=65536 否定 deterministic split-K traversal 的無界外推。active
-search 現在只送出三個尚未量測的 baseN=64 boundary fingerprint。
+K=16384 skinny-N 在五個獨立窄 N shape 上泛化，baseN=48 在
+N=33/40/47 改善，baseN=64 在 N=49/56/64 改善；同時 K=65536 否定
+deterministic split-K traversal 的無界外推。active search 現在只送出
+一個尚未量測的 N=48 baseN=64 crossover fingerprint。
 
 ## 12. 研究依據
 

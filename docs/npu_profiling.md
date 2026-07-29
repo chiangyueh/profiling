@@ -112,24 +112,17 @@ warmup=2 repeat=5 samples=3
 Full：
 
 ```text
-52 組 workload
-51 個 bank-path controls（INT8 為 unsupported 負向對照）
-15 個 callback-valid searched candidates
-每 workload 目前最多 1 個候選，hard cap 8
-既有 baseline/control/require_existing 由 exact-resume 保護
-本輪 NPU 新工作只有三個 N=49/56/64 boundary holdout，各 1 個候選
-allow_new 只量未出現在歷史資料中的完整 fingerprint
-warmup=10 repeat=50 samples=15
+16 組 workload（14 個未見 shape + 2 個正向控制）
+每 workload 最多 12 個 local/global/transfer/diverse 候選
+目前 host callback 驗證後共 187 個 searched candidates
+searched/bank/official 對新 workload 同輪量測
+warmup=3 repeat=10 samples=5
 ```
 
-Full 預設使用 `config/workloads.csv`。歷史量測以 SoC、AIC 數、shape、
-dtype、transpose、模板、完整 23 欄 tiling signature 與 callback SHA-256
-匹配。舊 schema 可由 identity-complete baseline，或具有完整 schedule 與
-`grid9_v1` preflight 的唯一候選遷移；遷移後輸出會補上現行 callback SHA
-並寫入新版 exact resume。預設 full 的既有 baseline、control 或
-`require_existing` searched fingerprint 在兩種來源都缺失時，會在建立
-RuntimeKb 暫存 bank 和啟動 NPU 前中止。`allow_new` 只有未量過的排程送
-NPU。
+Full 預設使用 `config/workloads_general_search_v1.csv`，結果與 resume
+寫入 `results/npu_full_general_v1_*`，不讀寫舊 boundary-family 的
+`results/npu_full_*`。歷史真機資料仍可供 transfer 起點與 cost model 使用，
+但新 workload 的三條比較路徑必須同輪量測。
 
 既有完整 run 證明 K=16384 skinny-N 在
 3072x17、4096x17、4096x24、4608x31、5120x29 五個獨立窄 N shape 上

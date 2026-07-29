@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260730-general-broad-screen-v1"
+RUN_NPU_VERSION="20260730-full-general-broad-screen-v1"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -192,22 +192,20 @@ usage() {
 Usage:
   ./run_npu.sh --check-server [--verbose]
   ./run_npu.sh --mode smoke [--workloads FILE] [--output-stem STEM]
-  ./run_npu.sh --mode general [--workloads FILE] [--output-stem STEM]
   ./run_npu.sh --mode full  [--workloads FILE] [--output-stem STEM]
 
 Modes:
   smoke  Quick NPU validation: official baseline, bank control, and one
          bottleneck-transition candidate.
-  general Bounded template-aware multi-start search on unseen workloads;
-          new candidates and both controls are measured in the same run.
-  full   Incremental validation of source-supported transition candidates;
-         exact prior measurements are reused.
+  full   Bounded template-aware multi-start search on unseen workloads;
+         new candidates and both controls are measured in the same run.
+  general Compatibility alias for full.
 
 Environment overrides:
   CANN_ROOT optionally selects a toolkit root; official set_env.sh is preferred
   DEVICE_ID, SOC_VERSION
   BEAM_WIDTH, TABU_ITERS, LNS_ROUNDS, TOP_K, MAX_CORE_ROUNDS, MODEL_RATIO_LIMIT
-  SEARCH_SCOPE defaults to bottleneck_guided_v1
+  SEARCH_SCOPE defaults to the selected mode scope
   RANK_LIMIT, WARMUP, REPEAT, SAMPLES
   NUMERIC_PREFLIGHT_MAX_MIB, PROFILE_STALL_TIMEOUT_SEC, PROFILE_PROGRESS_EVERY
   REQUIRE_EXACT_RESUME_PREFIX protects prior full-run workloads from remeasurement
@@ -293,9 +291,9 @@ case "${MODE}" in
         DEFAULT_SEARCH_SCOPE=bottleneck_guided_v1
         DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
         ;;
-    general)
+    general|full)
         WORKLOADS_CSV="${WORKLOADS_CSV:-${WORKLOADS:-config/workloads_general_search_v1.csv}}"
-        RESULT_STEM="${RESULT_STEM:-results/npu_general_v1}"
+        RESULT_STEM="${RESULT_STEM:-results/npu_full_general_v1}"
         DEFAULT_BEAM_WIDTH=32
         DEFAULT_TABU_ITERS=0
         DEFAULT_LNS_ROUNDS=0
@@ -311,25 +309,6 @@ case "${MODE}" in
         DEFAULT_PROFILE_PROGRESS_EVERY=8
         DEFAULT_SEARCH_SCOPE=general_search_v1
         DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
-        ;;
-    full)
-        WORKLOADS_CSV="${WORKLOADS_CSV:-${WORKLOADS:-config/workloads.csv}}"
-        RESULT_STEM="${RESULT_STEM:-results/npu_full}"
-        DEFAULT_BEAM_WIDTH=16
-        DEFAULT_TABU_ITERS=0
-        DEFAULT_LNS_ROUNDS=0
-        DEFAULT_TOP_K=6
-        DEFAULT_MAX_CORE_ROUNDS=0
-        DEFAULT_MODEL_RATIO_LIMIT=1.03
-        DEFAULT_RANK_LIMIT=6
-        DEFAULT_WARMUP=10
-        DEFAULT_REPEAT=50
-        DEFAULT_SAMPLES=15
-        DEFAULT_PROFILE_STALL_TIMEOUT_SEC=60
-        DEFAULT_NUMERIC_PREFLIGHT_MAX_MIB=4
-        DEFAULT_PROFILE_PROGRESS_EVERY=10
-        DEFAULT_SEARCH_SCOPE=bottleneck_guided_v1
-        DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=46
         ;;
     *)
         echo "Invalid --mode: ${MODE}. Expected smoke, general, or full." >&2
@@ -470,13 +449,7 @@ profile_env=(
     "NUMERIC_PREFLIGHT_MAX_MIB=${NUMERIC_PREFLIGHT_MAX_MIB:-${DEFAULT_NUMERIC_PREFLIGHT_MAX_MIB}}"
     "PROFILE_STALL_TIMEOUT_SEC=${PROFILE_STALL_TIMEOUT_SEC:-${DEFAULT_PROFILE_STALL_TIMEOUT_SEC}}"
     "PROFILE_PROGRESS_EVERY=${PROFILE_PROGRESS_EVERY:-${DEFAULT_PROFILE_PROGRESS_EVERY}}"
-    "REQUIRE_EXACT_RESUME_PREFIX=${REQUIRE_EXACT_RESUME_PREFIX:-$(
-        if [[ "${MODE}" == "full" && "${WORKLOADS_CSV}" == "config/workloads.csv" && -s "${RESULT_STEM}_resume.csv" ]]; then
-            printf '%s' "${DEFAULT_REQUIRE_EXACT_RESUME_PREFIX}"
-        else
-            printf '0'
-        fi
-    )}"
+    "REQUIRE_EXACT_RESUME_PREFIX=${REQUIRE_EXACT_RESUME_PREFIX:-${DEFAULT_REQUIRE_EXACT_RESUME_PREFIX}}"
     "PLATFORM_AIC_CORES=${PLATFORM_AIC_CORES}"
     "PLATFORM_L0A_BYTES=${PLATFORM_L0A_BYTES}"
     "PLATFORM_L0B_BYTES=${PLATFORM_L0B_BYTES}"

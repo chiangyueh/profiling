@@ -72,42 +72,22 @@ results/npu_smoke_resume.csv
 ./run_npu.sh --mode full
 ```
 
-Full 預設讀取 `config/workloads.csv` 的 52 組 workload。51 組支援
-MatMulV3；INT8 是明確 unsupported 的負向對照。active scope 共有 15 個
-searched schedules，其中 12 個已有量測，3 個是 N=49/56/64 boundary
-holdout。每個 workload 目前最多一筆 searched schedule。
+Full 預設讀取 `config/workloads_general_search_v1.csv`：14 個未見
+workload 與 2 個正向控制，每個 workload 最多 12 個候選。候選由
+local、global、transfer、diverse 四種起點產生，經 hard legality、官方
+RuntimeKb callback 與結構去重後，本輪共 187 筆 searched schedule。
 
-既有 49 組已由 2026-07-29 full run 完整量測。預設 full 先讀 exact resume，
-再由封裝歷史遷移 identity-complete baseline 與完整、preflight-valid
-schedule。兩種來源都無法可信匹配時，才在任何 NPU 工作前停止：
-
-```text
-resume_guard: prior workloads use trusted history; only three new holdouts
-need official baseline, bank control, and searched measurements
-missing=0 action=no_prior_npu_remeasurement
-```
-
-遠端完成 run 已記錄在 `results/npu_full_ocr_measurements.csv` 與
-`results/npu_full_resume.csv`。低 K skinny-N 與兩個 bank-seed traversal
-ablation 都已被實測證偽；default full 不再量這些排程。實際待量測數量仍以
-`profile_plan` 的
-`npu_searched_pending` 為準；若是 0，代表目前只在重建 summary，不該重跑
-既有 NPU 候選。
-
-程式會讀取 `results/npu_full_ocr_measurements.csv`，以 SoC、shape、dtype、
-模板及完整排程指紋逐筆重用已完成量測。最後會分別輸出：
+這是廣域初篩，使用 `warmup=3 repeat=10 samples=5`；searched、bank
+control、official baseline 對每個新 workload 強制同輪量測。約 1% 的差距
+不能直接作為最終結論，明顯候選需再做高精度確認。結果寫入：
 
 ```text
-GENERALIZATION_RESULT skinny_n_initial ...
-REFINED_SKINNY_N_RESULT k_eq_16384 ...
-DETERMINISTIC_SPLIT_K_RESULT aligned_mn_k_16k_to_49k ...
-PRIOR_FAILURE_RESULT ...
-BROAD_VALIDATION_RESULT ...
-MATMUL_WIDE_RESULT ...
+results/npu_full_general_v1_summary.csv
+results/npu_full_general_v1_candidates.csv
+results/npu_full_general_v1_resume.csv
 ```
 
-程式也會自動讀取同一 output stem 的
-`results/npu_full_candidates.csv` 與 `results/npu_full_resume.csv`。
+程式會自動讀取同一 output stem 的 resume。
 `resume.csv` 在每批已完成結果後原子更新，因此中途失敗或 `Ctrl-C` 後再次
 執行，不會重測完整 fingerprint 相同的成功項目。exact 匹配包含 SoC、
 AIC、shape、dtype、transpose、模板、完整 23 欄 tiling 與 callback
@@ -126,10 +106,8 @@ npu_searched_pending=...
 已量結果顯示 K=16384 skinny-N 在 anchor 加三個 preregistered holdout 上
 改善 `1.24121x` 到 `1.59785x`；低 K=8192/12288 外推不成立。
 aligned deterministic split-K 在 K=16384/32768/49152 改善，但 K=65536
-退化，所以只保留 bounded positive range。generic BASE 的 L2/order/DB/core
-grid broad 搜尋在 LLM、vision、attention、tail、BF16/FP32 workload 上沒有
-泛化；default optimizer 不再送這些候選到 NPU。INT8 負向對照單列為
-`unsupported_control`。
+退化。這些歷史結果只作為 transfer/cost-model 證據；default full 仍同時
+抽樣 local、global 與 diverse 結構，不把候選限制在已知成功 family 附近。
 
 第一次可縮小 NPU 測量量：
 

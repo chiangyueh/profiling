@@ -94,19 +94,16 @@ core/L1/DB/L2 因果消融。
   -> 與空 bank 的官方自動 tiling、bank seed control 比較
 ```
 
-搜尋不是「先產生大量錯誤 tiling 再碰運氣」。每個 workload 的動作前沿
-硬限制為 8 筆，每個機制最多 1 筆；目前 45 個支援 workload 實際選出
-33 筆 searched schedule，其中 22 筆由封裝歷史精確命中。已測 fingerprint
-使用同 run 的
-`candidate_ms/bank_control_ms` 排名並直接重用。代理模型全部拒絕時，只有
-至少三個獨立真機 anchor 支持的 family 才保留預先註冊的可證偽 holdout。
+搜尋不是「先產生大量錯誤 tiling 再碰運氣」。通用 full 初篩對每個
+workload 最多保留 12 筆 hard-legal、callback-valid 且結構去重的候選；
+候選由 local、global、transfer、diverse 四個起點輪詢選出，避免單一
+cost-model 排名或歷史成功區域佔滿預算。
 
 ## 執行
 
 ```bash
 cd ascend_matmul
 ./run_npu.sh --mode smoke
-./run_npu.sh --mode general
 ./run_npu.sh --mode full
 ```
 
@@ -126,43 +123,20 @@ repeat         5
 samples        3
 ```
 
-### General
+### Full
 
-General 是通用搜索的廣域初篩：14 個未用於人工規則的新 shape，加 2 個
+Full 是通用搜索的廣域初篩：14 個未用於人工規則的新 shape，加 2 個
 已知控制；每個 workload 最多 12 個候選，共最多 192 筆。使用
 `warmup=3, repeat=10, samples=5` 擴大 shape 與候選覆蓋；明顯改善者要在
 後續高精度輪次確認。只要出現新候選，searched、bank control 與 official
-baseline 就強制同輪量測。結果獨立寫入 `results/npu_general_v1_*`，
-不覆蓋既有 full 證據。terminal 每個 workload 只額外輸出一行
+baseline 就強制同輪量測。結果獨立寫入
+`results/npu_full_general_v1_*`，不覆蓋既有 boundary-family 證據。
+terminal 每個 workload 只額外輸出一行
 `SOURCE_RESULT`，比較 local/global/transfer/diverse 各來源最佳點；所有
 候選的完整量測仍以 candidates CSV 為準。
 
-### Full
-
-Full 是增量的來源導向驗證，不會只執行已知成功案例：
-
-```text
-workload       52 組；51 組 MatMulV3 支援，1 組 INT8 負向對照
-control        51 個官方 RuntimeKb bank seed
-候選           15 個 callback-valid searched schedules
-候選上限       每個 workload 目前最多 1 個；hard cap 8
-新舊分流       遠端最新 resume 可重用 14 個；只新增 1 個 N=48 crossover
-同輪比較       新候選的 searched/bank/official 三條路徑一律同輪量測
-warmup         10
-repeat         50
-samples        15
-```
-
-預設輸入是 `config/workloads.csv`。程式優先讀取
-`results/npu_full_resume.csv`；若它是舊 schema 或只有 header，會再從封裝內
-`npu_full_ocr_measurements.csv` 遷移 identity-complete baseline，以及具有
-完整 T/S/C/G/L2/I/L1/DB/L2O、`grid9_v1` preflight 的 control/candidate。
-既有 baseline、control 與標記為 `require_existing` 的候選若仍有缺口，
-才會在 RuntimeKb/NPU 前停止。`allow_new` 只有未命中的 fingerprint 送 NPU。
-`net_log1.txt` 的完整 run 已在遠端 `results/npu_full_resume.csv` 保存 137
-筆 exact row；更新程式時必須保留該檔。終端簡略輸出省略了 2 個舊候選的
-完整時間列，封裝歷史不會猜造它們；若刪除遠端 resume，guard 會停止而不是
-重測。
+`--mode general` 只保留為相容別名，與 `--mode full` 使用相同設定；正常
+工作流只需執行 `full`。
 
 ## 本輪搜索的欄位
 
@@ -252,8 +226,8 @@ ablation 也未改善，預設搜索不再產生它們。每個 state 在進入 
 完整且 hard-legal；active scope 不執行 Tabu/LNS。cycle estimate 只做
 預算控制，不冒充 NPU latency。
 
-`general_search_v1` 是獨立的實驗 scope，不改動上述已發表的 frontier。
-它不看 workload 名稱，從四個獨立起點建立最多 32 個 callback 候選：
+`general_search_v1` 是預設 full scope。它不看 workload 名稱，從四個獨立
+起點建立最多 32 個 callback 候選：
 
 ```text
 local       官方 RuntimeKb seed 周圍的耦合變換
@@ -262,7 +236,7 @@ transfer    從強真機結果轉移 partition/L1/DB 策略並重建目標 L2
 diverse     在代理模型合理性能帶內，距離 seed 最遠的合法結構
 ```
 
-最終以來源輪詢保留 8 筆，不讓單一 cost-model 排名吃掉全部名額。所有
+最終以來源輪詢保留 12 筆，不讓單一 cost-model 排名吃掉全部名額。所有
 候選仍須通過 hard legality、官方 callback roundtrip 與 NPU preflight。
 
 算法與研究依據見 [docs/algorithm.md](docs/algorithm.md)。
@@ -302,9 +276,9 @@ median ms / stddev / speedup / delta / noise / verdict
 results/npu_smoke_summary.csv
 results/npu_smoke_candidates.csv
 results/npu_smoke_resume.csv
-results/npu_full_summary.csv
-results/npu_full_candidates.csv
-results/npu_full_resume.csv
+results/npu_full_general_v1_summary.csv
+results/npu_full_general_v1_candidates.csv
+results/npu_full_general_v1_resume.csv
 ```
 
 `resume.csv` 是持久化續跑帳本。每完成一個官方 baseline、bank control 或
@@ -336,27 +310,18 @@ BUILD_JOBS=1 ASCENDC_SOC_VERSION=Ascend910B3 \
 SOC_VERSION=Ascend910B3 ./scripts/validate_cpu.sh
 ```
 
-目前 `bottleneck_guided_v1`、CANN 8.1.RC1 的完整 workload dry-run：
+目前 `general_search_v1`、CANN 8.1.RC1 的 broad-screen dry-run：
 
 ```text
-workloads:                    52
-supported bank controls:      51
-selected rows:                66
-searched rows:                15
-measured-history rows:        12
-new holdout candidates:        3
-  M=3072, N=49, K=16384:       T=160x64x64
-  M=4096, N=56, K=16384:       T=208x64x64
-  M=5120, N=64, K=16384:       T=256x64x64
-callback/RuntimeKb valid:     all found
-old broad L2 candidates:       0
-old attention candidates:      0
-failed bank-order candidates:  0
+workloads:                    16
+bank controls:                16
+searched schedules:          187
+callback/RuntimeKb rejected:    0
 ```
 
 每個 searched row 都通過官方 callback 的模板、suffix、23 欄位 roundtrip；
-新記錄也通過 RuntimeKb lookup。
-這證明搜索與注入契約完整，不等於已證明 NPU 加速；後者必須執行 full。
+新記錄也通過 RuntimeKb lookup。這證明搜索與注入契約完整，不等於已證明
+NPU 加速；後者必須執行 full。
 
 NPU 計時與錯誤輸出見 [docs/npu_profiling.md](docs/npu_profiling.md)，先前
 環境與執行問題見 [NPU_TILING_EXECUTION_HISTORY.txt](NPU_TILING_EXECUTION_HISTORY.txt)。

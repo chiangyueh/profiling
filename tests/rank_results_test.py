@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 from rank_npu_results import (
+    comparison_metrics,
     is_official_operator_baseline,
     optimization_decision,
 )
@@ -32,6 +33,18 @@ def main() -> None:
     )
     assert result == "control_unavailable"
     assert verdict == "bank_seed_unavailable"
+
+    _, _, _, verdict = comparison_metrics(
+        {"median_ms": "1.0", "stddev_ms": "0.06"},
+        {"median_ms": "0.5", "stddev_ms": "0.001"},
+    )
+    assert verdict == "unstable_measurement"
+    result, reason, verdict = optimization_decision(
+        "improved", "unstable_measurement"
+    )
+    assert result == "inconclusive"
+    assert "variance" in reason
+    assert verdict == "unstable_measurement"
 
     assert is_official_operator_baseline(
         {

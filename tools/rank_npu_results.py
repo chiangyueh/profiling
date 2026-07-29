@@ -9,6 +9,7 @@ from pathlib import Path
 
 SUCCESS_VALUES = {"1", "true", "True"}
 SHAPE_FIELDS = ["m", "n", "k", "dtype", "trans_a", "trans_b"]
+MAX_RELIABLE_MEASUREMENT_CV = 0.05
 
 
 def as_float(row: dict[str, str], key: str, fallback: float = float("inf")) -> float:
@@ -20,6 +21,17 @@ def as_float(row: dict[str, str], key: str, fallback: float = float("inf")) -> f
 
 def is_success(row: dict[str, str]) -> bool:
     return row.get("success") in SUCCESS_VALUES
+
+
+def measurement_is_stable(row: dict[str, str]) -> bool:
+    median_ms = as_float(row, "median_ms")
+    stddev_ms = as_float(row, "stddev_ms")
+    return (
+        math.isfinite(median_ms)
+        and math.isfinite(stddev_ms)
+        and median_ms > 0
+        and 0 <= stddev_ms / median_ms <= MAX_RELIABLE_MEASUREMENT_CV
+    )
 
 
 def is_api_auto_baseline(row: dict[str, str]) -> bool:
@@ -80,7 +92,12 @@ def comparison_metrics(
         * math.sqrt(reference_stddev**2 + candidate_stddev**2)
         / reference_ms,
     )
-    if latency_change_pct < -noise_threshold_pct:
+    if (
+        reference_stddev / reference_ms > MAX_RELIABLE_MEASUREMENT_CV
+        or candidate_stddev / candidate_ms > MAX_RELIABLE_MEASUREMENT_CV
+    ):
+        verdict = "unstable_measurement"
+    elif latency_change_pct < -noise_threshold_pct:
         verdict = "improved"
     elif latency_change_pct > noise_threshold_pct:
         verdict = "regressed"
@@ -93,6 +110,12 @@ def optimization_decision(
     official_verdict: str,
     bank_verdict: str,
 ) -> tuple[str, str, str]:
+    if "unstable_measurement" in {official_verdict, bank_verdict}:
+        return (
+            "inconclusive",
+            "measurement_variance_exceeds_reliability_limit",
+            "unstable_measurement",
+        )
     comparable = {"improved", "within_noise", "regressed"}
     if official_verdict == "improved" and bank_verdict == "improved":
         return (
@@ -264,9 +287,15 @@ def main() -> None:
             else None
         )
         searched_rows = [row for row in custom_success if is_searched(row)]
+        stable_searched_rows = [
+            row for row in searched_rows if measurement_is_stable(row)
+        ]
         best_searched = (
-            min(searched_rows, key=lambda row: as_float(row, "median_ms"))
-            if searched_rows
+            min(
+                stable_searched_rows or searched_rows,
+                key=lambda row: as_float(row, "median_ms"),
+            )
+            if stable_searched_rows or searched_rows
             else None
         )
         official_all = official_grouped.get(workload_id, [])

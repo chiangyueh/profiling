@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260730-full-general-active-round2-v1"
+RUN_NPU_VERSION="20260730-general-active-resume-v2"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -431,6 +431,12 @@ if [[ "${PLATFORM_AIC_CORES}" -le 0 ]]; then
     exit 1
 fi
 echo "  platform: aic=${PLATFORM_AIC_CORES} L0A=${PLATFORM_L0A_BYTES} L0B=${PLATFORM_L0B_BYTES} L0C=${PLATFORM_L0C_BYTES} L1=${PLATFORM_L1_BYTES}"
+SEARCH_FEEDBACK_LINE="$(
+    sed -n '/^search_feedback:/{p;q;}' "${SEARCH_LOG}"
+)"
+if [[ -n "${SEARCH_FEEDBACK_LINE}" ]]; then
+    echo "  ${SEARCH_FEEDBACK_LINE}"
+fi
 
 echo "[4/4] Run NPU ACL Event profiling ..."
 PROFILE_LOG="${ROOT}/results/logs/profile_$(date +%Y%m%d_%H%M%S).log"

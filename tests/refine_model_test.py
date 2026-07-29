@@ -534,18 +534,21 @@ def test_profile_resume_drives_search_history_and_transfer() -> None:
             **common,
             "candidate_role": "official_operator_baseline",
             "median_ms": "1.0",
+            "stddev_ms": "0.001",
         },
         {
             **common,
             "candidate_role": "bank_seed_control",
             "preflight_passed": "1",
             "median_ms": "1.02",
+            "stddev_ms": "0.001",
         },
         {
             **common,
             "candidate_role": "searched",
             "preflight_passed": "1",
             "median_ms": "0.80",
+            "stddev_ms": "0.001",
             "rank": "5",
             "tiling_signature": signature,
             "resume_record_id": "profile_feedback:rank5",
@@ -574,6 +577,130 @@ def test_profile_resume_drives_search_history_and_transfer() -> None:
         assert len(transfers) == 1
         assert transfers[0].base_m == 224
         assert transfers[0].base_n == 144
+
+
+def test_unstable_profile_is_excluded_without_calibration() -> None:
+    workload = refine.Workload(
+        "unstable_profile", 1024, 1024, 1024,
+        "fp16", False, False, 20,
+    )
+    knowledge = base_knowledge(workload, 128, 128, 64)
+    signature = ":".join(
+        str(knowledge[field]) for field in refine.KNOWLEDGE_FIELDS
+    )
+    common = {
+        "resume_soc": "Ascend910B3",
+        "resume_aic": "20",
+        "resume_run": "unstable_run",
+        "success": "1",
+        "workload_id": workload.workload_id,
+        "m": str(workload.m),
+        "n": str(workload.n),
+        "k": str(workload.k),
+        "dtype": workload.dtype,
+        "trans_a": "0",
+        "trans_b": "0",
+    }
+    rows = [
+        {
+            **common,
+            "candidate_role": "official_operator_baseline",
+            "median_ms": "1.0",
+            "stddev_ms": "0.1",
+        },
+        {
+            **common,
+            "candidate_role": "bank_seed_control",
+            "preflight_passed": "1",
+            "median_ms": "1.0",
+            "stddev_ms": "0.001",
+        },
+        {
+            **common,
+            "candidate_role": "searched",
+            "preflight_passed": "1",
+            "median_ms": "0.5",
+            "stddev_ms": "0.001",
+            "rank": "1",
+            "tiling_signature": signature,
+        },
+    ]
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "resume.csv"
+        with path.open("w", newline="", encoding="utf-8") as destination:
+            writer = csv.DictWriter(
+                destination,
+                fieldnames=sorted({field for row in rows for field in row}),
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+        history = refine.load_profile_measurement_history(
+            path, "Ascend910B3", 20
+        )
+        evidence = history[
+            refine.state_history_key(workload, knowledge)
+        ][0]
+        assert evidence.exact_profile
+        assert evidence.ratio_vs_official is None
+        assert evidence.ratio_vs_bank is None
+        assert not refine.load_profile_transfer_geometries(
+            path, "Ascend910B3", 20
+        )
+
+
+def test_campaign_manifest_excludes_exact_fingerprint() -> None:
+    workload = refine.Workload(
+        "campaign_workload", 512, 768, 1024,
+        "fp16", False, False, 20,
+    )
+    knowledge = base_knowledge(workload, 128, 128, 64)
+    signature = ":".join(
+        str(knowledge[field]) for field in refine.KNOWLEDGE_FIELDS
+    )
+    row = {
+        "campaign": "round1",
+        "soc": "Ascend910B3",
+        "aic": "20",
+        "workload_id": workload.workload_id,
+        "m": str(workload.m),
+        "n": str(workload.n),
+        "k": str(workload.k),
+        "dtype": workload.dtype,
+        "trans_a": "0",
+        "trans_b": "0",
+        "tiling_signature": signature,
+    }
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "campaign.csv"
+        with path.open("w", newline="", encoding="utf-8") as destination:
+            writer = csv.DictWriter(destination, fieldnames=list(row))
+            writer.writeheader()
+            writer.writerow(row)
+        history, count = refine.load_campaign_exclusions(
+            path, "Ascend910B3", 20
+        )
+        assert count == 1
+        evidence = history[
+            refine.state_history_key(workload, knowledge)
+        ][0]
+        assert evidence.exact_profile
+        assert evidence.ratio_vs_official is None
+
+    versioned_history, versioned_count = refine.load_campaign_exclusions(
+        ROOT / "config/general_search_v1_round1_fingerprints.csv",
+        "Ascend910B3",
+        20,
+    )
+    assert versioned_count == 187
+    assert len(versioned_history) == 187
+
+
+def test_unstable_comparison_cannot_claim_improvement() -> None:
+    _, _, _, status = profile_tilings.comparison_status(
+        {"median_ms": "1.0", "stddev_ms": "0.06"},
+        {"median_ms": "0.5", "stddev_ms": "0.001"},
+    )
+    assert status == "unstable_measurement"
 
 
 def test_unpaired_exact_profile_is_excluded_without_calibration() -> None:
@@ -2294,6 +2421,9 @@ def main() -> None:
     test_general_frontier_preserves_each_start_source()
     test_general_active_frontier_excludes_measured_fingerprints()
     test_profile_resume_drives_search_history_and_transfer()
+    test_unstable_profile_is_excluded_without_calibration()
+    test_campaign_manifest_excludes_exact_fingerprint()
+    test_unstable_comparison_cannot_claim_improvement()
     test_unpaired_exact_profile_is_excluded_without_calibration()
     test_history_calibration_is_source_specific()
     test_split_k_order_search_requires_aligned_deterministic_template()

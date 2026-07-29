@@ -101,6 +101,12 @@ local/global/transfer/diverse 分別計算 measured/model residual，排除所�
 第二輪。host 驗證結果為 145 個新候選、14 個 workload、與第一輪 187 筆
 零重疊。
 
+第一輪的 187 個 fingerprint 也保存在版本控制中的 campaign manifest，
+所以乾淨 clone 不需要舊的 `results/` 就能排除已完成的第一輪。執行時的
+`search_feedback` 會列出 profile 與 manifest 實際提供的排除數。標準差
+超過 median 5% 的量測不會拿去校準或建立 transfer；若 official 或 bank
+baseline 本身超過門檻，該 workload 的新候選會保留到下一輪再測。
+
 ```text
 resume_exact_baselines_assigned=...
 resume_exact_assigned=...

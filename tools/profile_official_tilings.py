@@ -58,6 +58,7 @@ INFO_KEYS = {
     "reserved_params4", "reserved_params5", "reserved_params6",
     "trans_a_flag", "trans_b_flag",
 }
+MAX_RELIABLE_MEASUREMENT_CV = 0.05
 KNOWLEDGE_KEYS = {
     "usedCoreNum", "singleCoreM", "singleCoreN", "singleCoreK",
     "baseM", "baseN", "baseK", "depthA1", "depthB1", "stepM", "stepN",
@@ -164,13 +165,29 @@ def comparison_status(
         1.0,
         200.0 * math.hypot(baseline_stddev, candidate_stddev) / baseline_ms,
     )
-    if delta_pct < -noise_pct:
+    if (
+        baseline_stddev / baseline_ms > MAX_RELIABLE_MEASUREMENT_CV
+        or candidate_stddev / candidate_ms > MAX_RELIABLE_MEASUREMENT_CV
+    ):
+        status = "unstable_measurement"
+    elif delta_pct < -noise_pct:
         status = "improved"
     elif delta_pct > noise_pct:
         status = "regressed"
     else:
         status = "within_noise"
     return speedup, delta_pct, noise_pct, status
+
+
+def measurement_is_stable(row: dict[str, str]) -> bool:
+    median_ms = as_float(row, "median_ms")
+    stddev_ms = as_float(row, "stddev_ms")
+    return (
+        math.isfinite(median_ms)
+        and math.isfinite(stddev_ms)
+        and median_ms > 0
+        and 0 <= stddev_ms / median_ms <= MAX_RELIABLE_MEASUREMENT_CV
+    )
 
 
 def dual_baseline_optimization_status(
@@ -1861,6 +1878,7 @@ def main() -> int:
         candidate_index = 0
         runtime_rejected = 0
         unsupported = 0
+        measurement_deferred = 0
         workloads_with_search = len(
             {
                 row["workload_id"]
@@ -2137,7 +2155,29 @@ def main() -> int:
                 if row.get("candidate_role") == "searched"
                 and 0 < int(row.get("rank", "0")) <= args.rank_limit
             ]
+            unstable_references = []
+            if not measurement_is_stable(official_baseline):
+                unstable_references.append("official")
+            if (
+                bank_control_profile is not None
+                and not measurement_is_stable(bank_control_profile)
+            ):
+                unstable_references.append("bank")
+            if searched and unstable_references:
+                deferred_count = len(searched)
+                candidate_index += deferred_count
+                measurement_deferred += deferred_count
+                print(
+                    f"WORKLOAD_DEFERRED {workload_id} "
+                    f"reason=unstable_{'+'.join(unstable_references)}_baseline "
+                    f"candidates={deferred_count} "
+                    f"max_cv={100 * MAX_RELIABLE_MEASUREMENT_CV:.6g}% "
+                    "action=retain_unmeasured_candidates_for_next_full_run",
+                    flush=True,
+                )
+                continue
             best_ms = float("inf")
+            best_quality = (2, float("inf"))
             best_rank = ""
             best_bank_status = ""
             best_official_status = ""
@@ -2262,8 +2302,13 @@ def main() -> int:
                     args.custom_samples_output, samples, rank, "searched"
                 )
                 candidate_ms = as_float(profiled, "median_ms")
-                is_new_best = candidate_ms < best_ms
+                candidate_quality = (
+                    0 if measurement_is_stable(profiled) else 1,
+                    candidate_ms,
+                )
+                is_new_best = candidate_quality < best_quality
                 if is_new_best:
+                    best_quality = candidate_quality
                     best_ms = candidate_ms
                     best_rank = rank
                 official_speedup, official_delta, _, official_status = (
@@ -2375,7 +2420,9 @@ def main() -> int:
         print(
             f"official_tiling_profile completed "
             f"baselines={len(workloads) - unsupported} "
-            f"searched={candidate_index} runtime_rejected={runtime_rejected} "
+            f"searched={candidate_index - measurement_deferred} "
+            f"measurement_deferred={measurement_deferred} "
+            f"runtime_rejected={runtime_rejected} "
             f"unsupported={unsupported}",
             flush=True,
         )

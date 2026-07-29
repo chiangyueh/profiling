@@ -62,6 +62,7 @@ DTYPE_NAME = {
 
 INPUT_BYTES = {"fp16": 2, "bf16": 2, "fp32": 4}
 OUTPUT_BYTES = {"fp16": 2, "bf16": 2, "fp32": 4}
+MAX_RELIABLE_MEASUREMENT_CV = 0.05
 
 # These are the complete low-decimal suffixes dispatched by the installed
 # CANN 8.1 MatMulV3 AscendC kernel on DAV C220. The suffix is authoritative:
@@ -4406,6 +4407,20 @@ def valid_profile_history_row(
     )
 
 
+def profile_measurement_is_stable(row: dict[str, str]) -> bool:
+    try:
+        median_ms = float(row.get("median_ms") or 0)
+        stddev_ms = float(row.get("stddev_ms") or "")
+    except ValueError:
+        return False
+    return (
+        math.isfinite(median_ms)
+        and math.isfinite(stddev_ms)
+        and median_ms > 0
+        and 0 <= stddev_ms / median_ms <= MAX_RELIABLE_MEASUREMENT_CV
+    )
+
+
 def load_profile_measurement_history(
     path: Path | None,
     soc: str,
@@ -4419,22 +4434,21 @@ def load_profile_measurement_history(
         row for row in rows
         if valid_profile_history_row(row, soc, aic_cores)
     ]
-    official: dict[tuple[str, str], float] = {}
-    controls: dict[tuple[str, str], float] = {}
+    official: dict[tuple[str, str], dict[str, str]] = {}
+    controls: dict[tuple[str, str], dict[str, str]] = {}
     for row in rows:
         role = row.get("candidate_role", "")
         key = (
             row.get("workload_id", ""),
             row.get("resume_run", ""),
         )
-        median_ms = float(row["median_ms"])
         if role == "official_operator_baseline":
-            official[key] = median_ms
+            official[key] = row
         elif (
             role == "bank_seed_control"
             and truthy(row.get("preflight_passed"))
         ):
-            controls[key] = median_ms
+            controls[key] = row
 
     history: dict[
         tuple[str, ...], list[MeasurementEvidence]
@@ -4463,8 +4477,21 @@ def load_profile_measurement_history(
         except (KeyError, ValueError):
             continue
         run_key = (workload.workload_id, row.get("resume_run", ""))
-        official_ms = official.get(run_key)
-        control_ms = controls.get(run_key)
+        official_row = official.get(run_key)
+        control_row = controls.get(run_key)
+        paired_stable = (
+            profile_measurement_is_stable(row)
+            and official_row is not None
+            and profile_measurement_is_stable(official_row)
+            and control_row is not None
+            and profile_measurement_is_stable(control_row)
+        )
+        official_ms = (
+            float(official_row["median_ms"]) if paired_stable else None
+        )
+        control_ms = (
+            float(control_row["median_ms"]) if paired_stable else None
+        )
         history.setdefault(
             state_history_key(workload, knowledge), []
         ).append(
@@ -4490,6 +4517,58 @@ def load_profile_measurement_history(
     return history
 
 
+def load_campaign_exclusions(
+    path: Path | None,
+    soc: str,
+    aic_cores: int,
+) -> tuple[
+    dict[tuple[str, ...], list[MeasurementEvidence]],
+    int,
+]:
+    """Load versioned exact fingerprints without treating them as timings."""
+    if path is None or not path.is_file():
+        return {}, 0
+    _, rows = read_csv(path)
+    history: dict[
+        tuple[str, ...], list[MeasurementEvidence]
+    ] = {}
+    accepted = 0
+    for row in rows:
+        try:
+            if row.get("soc") != soc or int(row.get("aic") or 0) != aic_cores:
+                continue
+            knowledge = profile_row_knowledge(row)
+            if knowledge is None:
+                continue
+            workload = Workload(
+                workload_id=row["workload_id"],
+                m=int(row["m"]),
+                n=int(row["n"]),
+                k=int(row["k"]),
+                dtype=row["dtype"].lower(),
+                trans_a=truthy(row.get("trans_a")),
+                trans_b=truthy(row.get("trans_b")),
+                max_cores=aic_cores,
+            )
+        except (KeyError, ValueError):
+            continue
+        history.setdefault(
+            state_history_key(workload, knowledge), []
+        ).append(
+            MeasurementEvidence(
+                ratio_vs_official=None,
+                ratio_vs_bank=None,
+                record_id=(
+                    f"campaign:{row.get('campaign', 'unknown')}:"
+                    f"{workload.workload_id}"
+                ),
+                exact_profile=True,
+            )
+        )
+        accepted += 1
+    return history, accepted
+
+
 def load_profile_transfer_geometries(
     path: Path | None,
     soc: str,
@@ -4504,7 +4583,7 @@ def load_profile_transfer_geometries(
         if valid_profile_history_row(row, soc, aic_cores)
     ]
     references: dict[
-        tuple[str, str], dict[str, float]
+        tuple[str, str], dict[str, dict[str, str]]
     ] = {}
     for row in rows:
         role = row.get("candidate_role", "")
@@ -4523,7 +4602,7 @@ def load_profile_transfer_geometries(
                 row.get("resume_run", ""),
             ),
             {},
-        )[role] = float(row["median_ms"])
+        )[role] = row
 
     geometries: list[TransferGeometry] = []
     for row in rows:
@@ -4542,8 +4621,18 @@ def load_profile_transfer_geometries(
             ),
             {},
         )
-        official_ms = reference.get("official_operator_baseline")
-        control_ms = reference.get("bank_seed_control")
+        official_row = reference.get("official_operator_baseline")
+        control_row = reference.get("bank_seed_control")
+        if (
+            not profile_measurement_is_stable(row)
+            or official_row is None
+            or not profile_measurement_is_stable(official_row)
+            or control_row is None
+            or not profile_measurement_is_stable(control_row)
+        ):
+            continue
+        official_ms = float(official_row["median_ms"])
+        control_ms = float(control_row["median_ms"])
         candidate_ms = float(row["median_ms"])
         if (
             official_ms is None
@@ -5056,6 +5145,7 @@ def main() -> int:
     parser.add_argument("--all-output", type=Path)
     parser.add_argument("--history", type=Path)
     parser.add_argument("--profile-history", type=Path)
+    parser.add_argument("--campaign-exclusions", type=Path)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--beam-width", type=int, default=64)
     parser.add_argument("--tabu-iters", type=int, default=64)
@@ -5138,6 +5228,27 @@ def main() -> int:
     )
     for key, records in profile_history.items():
         history.setdefault(key, []).extend(records)
+    campaign_history, campaign_exclusion_count = load_campaign_exclusions(
+        args.campaign_exclusions, args.soc, hardware.aic_cores
+    )
+    for key, records in campaign_history.items():
+        history.setdefault(key, []).extend(records)
+    profile_record_count = sum(
+        len(records) for records in profile_history.values()
+    )
+    profile_usable_count = sum(
+        record.ratio_vs_official is not None
+        and record.ratio_vs_bank is not None
+        for records in profile_history.values()
+        for record in records
+    )
+    print(
+        "search_feedback: "
+        f"profile_exact={profile_record_count} "
+        f"profile_usable={profile_usable_count} "
+        f"campaign_excluded={campaign_exclusion_count}",
+        flush=True,
+    )
     transfer_geometries = load_transfer_geometries(
         args.history, args.soc, hardware.aic_cores
     )

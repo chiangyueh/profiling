@@ -294,6 +294,17 @@ searched candidate 都先寫入本次 profile；正常結束、後續候選失�
 exact resume。終端的 `profile_plan` 會列出
 `resume_exact_*_assigned` 與 `npu_*_pending`。
 
+初次 general broad screen 的 187 個完整 fingerprint 另外保存在
+`config/general_search_v1_round1_fingerprints.csv`。因此即使重新 clone
+而沒有 Git 忽略的本地 resume，full 也不會靜默重跑第一輪。搜尋階段會輸出
+`search_feedback`，分別列出 exact profile、可用於校準的穩定 profile，
+以及 campaign manifest 排除的數量。
+
+量測標準差超過 median 5% 的資料仍保留為 exact history，避免再次浪費
+NPU 時間，但不會用於 cost-model 校準或 transfer seed。若本輪 official
+或 bank baseline 超過此門檻，該 workload 的新候選會延後到下一次 full，
+不在不穩定基準上得出改善結論。
+
 官方 baseline 只在 SoC、AIC、workload、shape、dtype 與 transpose 相同時
 重用。新版 control/searched 必須匹配模板、完整 23 欄 `tiling_signature`
 與 callback SHA-256。legacy 遷移只接受完整 schedule 欄位且曾通過

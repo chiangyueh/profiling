@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260730-n48-frontier-gate-fix"
+RUN_NPU_VERSION="20260730-general-multistart-v1"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -188,11 +188,14 @@ usage() {
 Usage:
   ./run_npu.sh --check-server [--verbose]
   ./run_npu.sh --mode smoke [--workloads FILE] [--output-stem STEM]
+  ./run_npu.sh --mode general [--workloads FILE] [--output-stem STEM]
   ./run_npu.sh --mode full  [--workloads FILE] [--output-stem STEM]
 
 Modes:
   smoke  Quick NPU validation: official baseline, bank control, and one
          bottleneck-transition candidate.
+  general Bounded template-aware multi-start search on unseen workloads;
+          new candidates and both controls are measured in the same run.
   full   Incremental validation of source-supported transition candidates;
          exact prior measurements are reused.
 
@@ -286,6 +289,25 @@ case "${MODE}" in
         DEFAULT_SEARCH_SCOPE=bottleneck_guided_v1
         DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
         ;;
+    general)
+        WORKLOADS_CSV="${WORKLOADS_CSV:-${WORKLOADS:-config/workloads_general_search_v1.csv}}"
+        RESULT_STEM="${RESULT_STEM:-results/npu_general_v1}"
+        DEFAULT_BEAM_WIDTH=32
+        DEFAULT_TABU_ITERS=0
+        DEFAULT_LNS_ROUNDS=0
+        DEFAULT_TOP_K=8
+        DEFAULT_MAX_CORE_ROUNDS=0
+        DEFAULT_MODEL_RATIO_LIMIT=3.0
+        DEFAULT_RANK_LIMIT=8
+        DEFAULT_WARMUP=5
+        DEFAULT_REPEAT=20
+        DEFAULT_SAMPLES=7
+        DEFAULT_PROFILE_STALL_TIMEOUT_SEC=60
+        DEFAULT_NUMERIC_PREFLIGHT_MAX_MIB=4
+        DEFAULT_PROFILE_PROGRESS_EVERY=1
+        DEFAULT_SEARCH_SCOPE=general_search_v1
+        DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
+        ;;
     full)
         WORKLOADS_CSV="${WORKLOADS_CSV:-${WORKLOADS:-config/workloads.csv}}"
         RESULT_STEM="${RESULT_STEM:-results/npu_full}"
@@ -306,7 +328,7 @@ case "${MODE}" in
         DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=46
         ;;
     *)
-        echo "Invalid --mode: ${MODE}. Expected smoke or full." >&2
+        echo "Invalid --mode: ${MODE}. Expected smoke, general, or full." >&2
         usage >&2
         exit 1
         ;;

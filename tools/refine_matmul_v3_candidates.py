@@ -36,6 +36,7 @@ BANK_COLUMNS = {
 EXTRA_COLUMNS = [
     *BANK_COLUMNS.values(),
     "search_template", "search_guidance", "search_model_score",
+    "search_candidate_source",
     "search_bottleneck", "search_rationale", "search_transition_gain",
     "search_resume_policy", "search_stop_reason",
     "search_model_cycles", "search_model_raw_ratio_vs_bank_seed",
@@ -216,6 +217,7 @@ class CandidateProposal:
     rationale: str
     transition_gain: float
     resume_policy: str = "require_existing"
+    source: str = "local"
 
 
 @dataclass(frozen=True)
@@ -223,6 +225,29 @@ class MeasurementEvidence:
     ratio_vs_official: float
     ratio_vs_bank: float | None
     record_id: str
+
+
+@dataclass(frozen=True)
+class TransferGeometry:
+    workload_id: str
+    m: int
+    n: int
+    k: int
+    dtype: str
+    trans_a: bool
+    trans_b: bool
+    template: str
+    base_m: int
+    base_n: int
+    base_k: int
+    depth_a1: int
+    depth_b1: int
+    iterate_order: int
+    db_l0a: int
+    db_l0b: int
+    db_l0c: int
+    l2_iterate_order: int
+    speedup: float
 
 
 @dataclass
@@ -3162,6 +3187,410 @@ def split_template_proposals(
     return []
 
 
+def structural_distance(
+    knowledge: dict[str, int],
+    reference: dict[str, int],
+) -> float:
+    """Measure distance between coupled schedule groups, not raw field count."""
+    groups = (
+        ("usedCoreNum", "singleCoreM", "singleCoreN", "singleCoreK"),
+        ("baseM", "baseN", "baseK"),
+        ("depthA1", "depthB1", "stepKa", "stepKb"),
+        ("l2MTileCnt", "l2NTileCnt", "l2MTileBlock", "l2NTileBlock"),
+    )
+    distance = 0.0
+    for group in groups:
+        group_distance = sum(
+            abs(
+                math.log2(
+                    max(1, knowledge[field])
+                    / max(1, reference[field])
+                )
+            )
+            for field in group
+        ) / len(group)
+        distance += group_distance
+    distance += 0.25 * sum(
+        knowledge[field] != reference[field]
+        for field in (
+            "iterateOrder",
+            "dbL0A",
+            "dbL0B",
+            "dbL0C",
+            "l2IterateOrder",
+            "tilingEnable",
+        )
+    )
+    return distance
+
+
+def hardware_aligned_base_axes(total: int, seed_axis: int) -> list[int]:
+    """Return a bounded Cube-aligned axis set independent of shape families."""
+    maximum = 256 if total <= 256 else 512
+    values = set(range(16, min(256, maximum) + 1, 16))
+    values.update(range(320, maximum + 1, 64))
+    values.update(
+        {
+            align_up(max(1, total), 16),
+            align_up(max(1, ceil_div(total, 20)), 16),
+            align_up(max(1, ceil_div(total, 40)), 16),
+            seed_axis,
+            max(16, align_up(max(1, seed_axis // 2), 16)),
+            align_up(seed_axis * 2, 16),
+        }
+    )
+    return sorted(value for value in values if 16 <= value <= 512)
+
+
+def hardware_aligned_base_k_values(
+    workload: Workload,
+    seed_base_k: int,
+) -> list[int]:
+    alignment = base_k_alignment(workload)
+    values = {
+        alignment * multiplier
+        for multiplier in (1, 2, 4, 8, 16, 32)
+    }
+    values.update(
+        {
+            seed_base_k,
+            max(alignment, seed_base_k // 2),
+            seed_base_k * 2,
+        }
+    )
+    return sorted(
+        value
+        for value in values
+        if value <= max(alignment, align_up(workload.k, alignment))
+        and value <= 512
+        and value % alignment == 0
+    )
+
+
+def general_base_geometry_space(
+    workload: Workload,
+    seed: Seed,
+    hardware: Hardware,
+) -> list[dict[str, int]]:
+    """Construct a legal BASE geometry pool without workload-name rules."""
+    if template_name(seed.bank.knowledge) != "BASE":
+        return []
+    seed_knowledge = seed.bank.knowledge
+    geometries: list[dict[str, int]] = []
+    for base_m in hardware_aligned_base_axes(
+        workload.m, seed_knowledge["baseM"]
+    ):
+        for base_n in hardware_aligned_base_axes(
+            workload.n, seed_knowledge["baseN"]
+        ):
+            for base_k in hardware_aligned_base_k_values(
+                workload, seed_knowledge["baseK"]
+            ):
+                candidate = configure_base_candidate(
+                    workload,
+                    seed,
+                    hardware,
+                    base_m,
+                    base_n,
+                    base_k,
+                )
+                if candidate is not None:
+                    schedules = (
+                        l2_schedules(
+                            workload, candidate, seed, hardware
+                        )
+                        or [candidate]
+                    )
+                    geometries.extend(
+                        scheduled
+                        for scheduled in schedules
+                        if hard_legal(workload, scheduled, hardware)
+                    )
+    return deduplicate_knowledge(geometries)
+
+
+def transfer_geometry_distance(
+    workload: Workload,
+    geometry: TransferGeometry,
+) -> float:
+    return (
+        abs(math.log2(max(1, workload.m) / max(1, geometry.m)))
+        + abs(math.log2(max(1, workload.n) / max(1, geometry.n)))
+        + 0.5
+        * abs(math.log2(max(1, workload.k) / max(1, geometry.k)))
+    )
+
+
+def general_transfer_geometry_space(
+    workload: Workload,
+    seed: Seed,
+    hardware: Hardware,
+    transfer_geometries: list[TransferGeometry],
+) -> list[tuple[dict[str, int], TransferGeometry]]:
+    """Transfer partition counts, then reconstruct all dependent target fields."""
+    if template_name(seed.bank.knowledge) != "BASE":
+        return []
+    eligible = [
+        geometry
+        for geometry in transfer_geometries
+        if geometry.workload_id != workload.workload_id
+        and geometry.dtype == workload.dtype
+        and geometry.trans_a == workload.trans_a
+        and geometry.trans_b == workload.trans_b
+        and geometry.template == "BASE"
+    ]
+    eligible.sort(
+        key=lambda geometry: (
+            transfer_geometry_distance(workload, geometry),
+            -geometry.speedup,
+            geometry.workload_id,
+        )
+    )
+    transferred: list[tuple[dict[str, int], TransferGeometry]] = []
+    seen: set[tuple[int, ...]] = set()
+    for geometry in eligible:
+        source_m_parts = ceil_div(geometry.m, geometry.base_m)
+        source_n_parts = ceil_div(geometry.n, geometry.base_n)
+        base_m = align_up(ceil_div(workload.m, source_m_parts), 16)
+        base_n = align_up(ceil_div(workload.n, source_n_parts), 16)
+        candidate = configure_base_candidate(
+            workload,
+            seed,
+            hardware,
+            base_m,
+            base_n,
+            geometry.base_k,
+        )
+        if candidate is None:
+            continue
+        if (
+            geometry.depth_a1 % geometry.db_l0a
+            or geometry.depth_b1 % geometry.db_l0b
+        ):
+            continue
+        candidate.update(
+            {
+                "depthA1": geometry.depth_a1,
+                "depthB1": geometry.depth_b1,
+                "stepKa": geometry.depth_a1 // geometry.db_l0a,
+                "stepKb": geometry.depth_b1 // geometry.db_l0b,
+                "iterateOrder": geometry.iterate_order,
+                "dbL0A": geometry.db_l0a,
+                "dbL0B": geometry.db_l0b,
+                "dbL0C": geometry.db_l0c,
+            }
+        )
+        reconstructed = []
+        for scheduled in (
+            l2_schedules(workload, candidate, seed, hardware)
+            or [candidate]
+        ):
+            scheduled = dict(scheduled)
+            scheduled["l2IterateOrder"] = geometry.l2_iterate_order
+            if hard_legal(workload, scheduled, hardware):
+                reconstructed.append(scheduled)
+        if not reconstructed:
+            continue
+        candidate = reconstructed[0]
+        signature = knowledge_signature(candidate)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        transferred.append((candidate, geometry))
+        if len(transferred) >= 12:
+            break
+    return transferred
+
+
+def select_global_candidates(
+    workload: Workload,
+    seed: Seed,
+    hardware: Hardware,
+    candidates: list[dict[str, int]],
+    limit: int,
+    farthest: bool = False,
+) -> list[dict[str, int]]:
+    seed_knowledge = seed.bank.knowledge
+    seed_score = analytical_score(
+        workload, seed_knowledge, hardware, seed.bank
+    ).cycles
+    scored = []
+    for candidate in deduplicate_knowledge(candidates):
+        if knowledge_signature(candidate) == knowledge_signature(seed_knowledge):
+            continue
+        ratio = analytical_score(workload, candidate, hardware).cycles / max(
+            1.0, seed_score
+        )
+        distance = structural_distance(candidate, seed_knowledge)
+        scored.append((ratio, distance, candidate))
+    if farthest:
+        # Explore outside the seed basin without spending NPU time on
+        # structures the hardware model already predicts to be catastrophic.
+        # The model is only a broad safety band; distance controls ordering.
+        best_ratio = min((item[0] for item in scored), default=1.0)
+        ratio_ceiling = max(1.35, min(1.75, best_ratio * 1.75))
+        plausible = [
+            item for item in scored if item[0] <= ratio_ceiling
+        ]
+        if not plausible and scored:
+            plausible = sorted(
+                scored,
+                key=lambda item: (
+                    item[0],
+                    -item[1],
+                    knowledge_signature(item[2]),
+                ),
+            )[:1]
+        scored = plausible
+        scored.sort(
+            key=lambda item: (
+                -item[1],
+                item[0],
+                knowledge_signature(item[2]),
+            )
+        )
+    else:
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                -item[1],
+                knowledge_signature(item[2]),
+            )
+        )
+    return [item[2] for item in scored[:limit]]
+
+
+def general_search_candidate_proposals(
+    workload: Workload,
+    seed: Seed,
+    hardware: Hardware,
+    raw_rows: list[dict[str, str]],
+    seed_estimate: ModelEstimate,
+    profile: BottleneckProfile,
+    transfer_geometries: list[TransferGeometry],
+) -> tuple[list[CandidateProposal], str]:
+    """Build a bounded multi-start frontier for unseen workloads."""
+    seed_signature = knowledge_signature(seed.bank.knowledge)
+    local_candidates: list[dict[str, int]] = []
+    local_candidates.extend(
+        official_seed_order_candidate_space(workload, seed, hardware)
+    )
+    local_candidates.extend(
+        base_candidate_space(workload, seed, raw_rows, hardware, 16)
+    )
+    local_candidates.extend(
+        proposal.knowledge
+        for proposal in broad_base_transition_proposals(
+            workload, seed, hardware, seed_estimate, profile
+        )
+    )
+
+    template_spaces = all_template_candidate_spaces(
+        workload,
+        seed,
+        raw_rows,
+        hardware,
+        32,
+        "all_templates_validation",
+    )
+    global_pool = [
+        candidate
+        for candidates in template_spaces.values()
+        for candidate in candidates
+    ]
+    global_pool.extend(
+        general_base_geometry_space(workload, seed, hardware)
+    )
+
+    local = select_global_candidates(
+        workload, seed, hardware, local_candidates, 8
+    )
+    global_best = select_global_candidates(
+        workload, seed, hardware, global_pool, 8
+    )
+    global_signatures = {
+        knowledge_signature(candidate) for candidate in global_best
+    }
+    diverse = select_global_candidates(
+        workload,
+        seed,
+        hardware,
+        [
+            candidate
+            for candidate in global_pool
+            if knowledge_signature(candidate) not in global_signatures
+        ],
+        8,
+        farthest=True,
+    )
+    transferred = general_transfer_geometry_space(
+        workload, seed, hardware, transfer_geometries
+    )[:8]
+
+    proposals: list[CandidateProposal] = []
+    for index, candidate in enumerate(local, 1):
+        proposals.append(
+            CandidateProposal(
+                knowledge=candidate,
+                guidance=f"general_local_{index}",
+                rationale=(
+                    "exploit one coupled transition around the exact official "
+                    "RuntimeKb seed"
+                ),
+                transition_gain=0.0,
+                resume_policy="allow_new",
+                source="local",
+            )
+        )
+    for index, (candidate, geometry) in enumerate(transferred, 1):
+        proposals.append(
+            CandidateProposal(
+                knowledge=candidate,
+                guidance=f"general_transfer_{index}",
+                rationale=(
+                    "transfer output partition counts from strong measured "
+                    f"workload {geometry.workload_id}, then reconstruct target "
+                    "L1/L2 fields"
+                ),
+                transition_gain=max(0.0, geometry.speedup - 1.0),
+                resume_policy="allow_new",
+                source="transfer",
+            )
+        )
+    for source, candidates in (
+        ("global", global_best),
+        ("diverse", diverse),
+    ):
+        for index, candidate in enumerate(candidates, 1):
+            proposals.append(
+                CandidateProposal(
+                    knowledge=candidate,
+                    guidance=f"general_{source}_{index}",
+                    rationale=(
+                        "construct a hardware-aligned legal schedule independent "
+                        "of workload-name families"
+                        if source == "global"
+                        else "retain a legal schedule far from the official and "
+                        "measured seed basin"
+                    ),
+                    transition_gain=0.0,
+                    resume_policy="allow_new",
+                    source=source,
+                )
+            )
+
+    unique: list[CandidateProposal] = []
+    seen: set[tuple[int, ...]] = {seed_signature}
+    for proposal in proposals:
+        signature = knowledge_signature(proposal.knowledge)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(proposal)
+    stop = "" if unique else "no_callback_contract_candidate_generated"
+    return unique[:32], stop
+
+
 def bottleneck_guided_candidate_proposals(
     workload: Workload,
     seed: Seed,
@@ -3944,6 +4373,81 @@ def load_measurement_history(
     return history
 
 
+def load_transfer_geometries(
+    path: Path | None,
+    soc: str,
+    aic_cores: int,
+) -> list[TransferGeometry]:
+    """Load only strong, complete BASE measurements as transfer starts.
+
+    A transferred record contributes output partition geometry, not its full
+    23-field schedule. The dependent L1/L2 fields are reconstructed for the
+    target workload and must pass the normal hard and callback contracts.
+    """
+    if path is None or not path.is_file():
+        return []
+    _, rows = read_csv(path)
+    geometries: list[TransferGeometry] = []
+    for row in rows:
+        try:
+            row_aic = int(row.get("aic") or 0)
+        except ValueError:
+            continue
+        if (
+            row.get("record_type") != "candidate"
+            or row.get("preflight_contract") != "grid9_v1"
+            or row.get("soc") != soc
+            or row_aic != aic_cores
+            or not truthy(row.get("ocr_complete"))
+            or row.get("template") != "BASE"
+        ):
+            continue
+        try:
+            m, n, k = (int(value) for value in row["shape"].split("x"))
+            base_m, base_n, base_k = (
+                int(value) for value in row["T"].split("x")
+            )
+            depth_a1, depth_b1 = (
+                int(value) for value in row["L1"].split("x")
+            )
+            db_l0a, db_l0b, db_l0c = (
+                int(value) for value in row["DB"].split("x")
+            )
+            iterate_order = int(row["I"])
+            l2_iterate_order = int(row["L2O"])
+            speedup = float(row.get("speedup_vs_official") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        # Keep only effects well outside the one-percent noise floor. Marginal
+        # and cross-run rows remain available for exact replay, not transfer.
+        if speedup < 1.03:
+            continue
+        geometries.append(
+            TransferGeometry(
+                workload_id=row.get("workload_id", ""),
+                m=m,
+                n=n,
+                k=k,
+                dtype=row.get("dtype", "").lower(),
+                trans_a=truthy(row.get("trans_a")),
+                trans_b=truthy(row.get("trans_b")),
+                template=row.get("template", ""),
+                base_m=base_m,
+                base_n=base_n,
+                base_k=base_k,
+                depth_a1=depth_a1,
+                depth_b1=depth_b1,
+                iterate_order=iterate_order,
+                db_l0a=db_l0a,
+                db_l0b=db_l0b,
+                db_l0c=db_l0c,
+                l2_iterate_order=l2_iterate_order,
+                speedup=speedup,
+            )
+        )
+    return geometries
+
+
 def completed_bottleneck_frontier_coverage(
     path: Path | None,
     soc: str,
@@ -4151,6 +4655,69 @@ def guided_action_frontier(
     )
 
 
+def general_source_frontier(
+    states: list[State],
+    limit: int,
+    seed: Seed,
+) -> list[State]:
+    """Round-robin independent start sources before filling by model score."""
+    source_order = ("local", "global", "transfer", "diverse")
+    buckets: dict[str, list[State]] = {
+        source: [] for source in source_order
+    }
+    remainder: list[State] = []
+    for state in states:
+        source = state.row.get("search_candidate_source", "")
+        if source in buckets:
+            buckets[source].append(state)
+        else:
+            remainder.append(state)
+    for source, bucket in buckets.items():
+        if source == "diverse":
+            bucket.sort(
+                key=lambda state: (
+                    -structural_distance(
+                        state.knowledge, seed.bank.knowledge
+                    ),
+                    state_sort_key(state),
+                )
+            )
+        else:
+            bucket.sort(key=state_sort_key)
+
+    selected: list[State] = []
+    seen: set[tuple[int, ...]] = set()
+
+    def append(state: State) -> None:
+        signature = knowledge_signature(state.knowledge)
+        if signature in seen or len(selected) >= limit:
+            return
+        seen.add(signature)
+        selected.append(state)
+
+    # Equal turns guarantee that a model-biased source cannot consume the
+    # entire NPU budget before a structurally different source is observed.
+    while len(selected) < limit and any(buckets.values()):
+        for source in source_order:
+            if buckets[source]:
+                append(buckets[source].pop(0))
+            if len(selected) >= limit:
+                break
+
+    for state in sorted(
+        (
+            state
+            for bucket in buckets.values()
+            for state in bucket
+        ),
+        key=state_sort_key,
+    ):
+        append(state)
+    for state in sorted(remainder, key=state_sort_key):
+        append(state)
+    return selected
+
+
 def completed_frontier_candidate_allowed(state: State) -> bool:
     """Keep measured schedules or explicitly preregistered new experiments."""
     return (
@@ -4219,6 +4786,7 @@ def main() -> int:
         "--optimization-scope",
         choices=(
             "bottleneck_guided_v1",
+            "general_search_v1",
             "official_local_v2",
             "skinny_n_large_k_v1",
             "all_templates_validation",
@@ -4284,6 +4852,9 @@ def main() -> int:
             output_fields.append(column)
     workloads = load_workloads(args.workloads)
     history = load_measurement_history(
+        args.history, args.soc, hardware.aic_cores
+    )
+    transfer_geometries = load_transfer_geometries(
         args.history, args.soc, hardware.aic_cores
     )
     completed_frontier = completed_bottleneck_frontier_coverage(
@@ -4362,6 +4933,25 @@ def main() -> int:
                 template_spaces.setdefault(
                     template_name(proposal.knowledge), []
                 ).append(proposal.knowledge)
+        elif args.optimization_scope == "general_search_v1":
+            proposals, stop_reason = general_search_candidate_proposals(
+                workload,
+                seed,
+                hardware,
+                grouped.get(workload.workload_id, []),
+                bank_seed_estimate,
+                bottleneck,
+                transfer_geometries,
+            )
+            proposal_by_signature = {
+                knowledge_signature(proposal.knowledge): proposal
+                for proposal in proposals
+            }
+            template_spaces = {}
+            for proposal in proposals:
+                template_spaces.setdefault(
+                    template_name(proposal.knowledge), []
+                ).append(proposal.knowledge)
         else:
             template_spaces = all_template_candidate_spaces(
                 workload,
@@ -4378,6 +4968,7 @@ def main() -> int:
         control.row["search_rationale"] = bottleneck.summary()
         control.row["search_resume_policy"] = "require_existing"
         control.row["search_stop_reason"] = stop_reason
+        control.row["search_candidate_source"] = "control"
         selected_rows.append(dict(control.row))
         write_all(control.row)
 
@@ -4420,6 +5011,8 @@ def main() -> int:
                     (
                         "cann81_bottleneck_guided_v1"
                         if args.optimization_scope == "bottleneck_guided_v1"
+                        else "cann81_general_search_v1"
+                        if args.optimization_scope == "general_search_v1"
                         else "cann81_skinny_n_v1_beam_tabu_lns"
                         if args.optimization_scope == "skinny_n_large_k_v1"
                         else (
@@ -4451,6 +5044,11 @@ def main() -> int:
                     ),
                     stop_reason=stop_reason,
                 )
+                row["search_candidate_source"] = (
+                    proposal.source
+                    if proposal is not None
+                    else "constraint_generated"
+                )
                 template_states.append(
                     State(
                         row=row,
@@ -4465,11 +5063,17 @@ def main() -> int:
                     )
                 )
             template_states.sort(key=state_sort_key)
-            beam = constraint_aware_beam(
-                template_states, args.beam_width
-            )
+            if args.optimization_scope == "general_search_v1":
+                beam = general_source_frontier(
+                    template_states, args.beam_width, seed
+                )
+            else:
+                beam = constraint_aware_beam(
+                    template_states, args.beam_width
+                )
             if args.optimization_scope in {
                 "bottleneck_guided_v1",
+                "general_search_v1",
                 "official_local_v2",
                 "skinny_n_large_k_v1",
             }:
@@ -4540,6 +5144,10 @@ def main() -> int:
         callback_target = (
             len(states)
             if args.optimization_scope == "bottleneck_guided_v1"
+            else min(
+                len(states), max(args.top_k * 4, args.beam_width)
+            )
+            if args.optimization_scope == "general_search_v1"
             else args.top_k
         )
         for state in remaining:
@@ -4587,6 +5195,10 @@ def main() -> int:
                 eligible,
                 args.model_ratio_limit,
                 skinny_anchor_count,
+            )
+        elif args.optimization_scope == "general_search_v1":
+            ordered_candidates = general_source_frontier(
+                eligible, args.top_k, seed
             )
         else:
             template_leaders: list[State] = []
@@ -4643,6 +5255,8 @@ def main() -> int:
             f"history_matches={history_matches} "
             f"history_correction={history_correction:.4g} "
             f"callback_rejected={failures} "
+            f"sources="
+            f"{','.join(sorted({state.row.get('search_candidate_source', '') for state in chosen})) or 'none'} "
             f"{bottleneck.summary()} "
             f"actions="
             f"{','.join(state.guidance for state in chosen) or 'none'} "

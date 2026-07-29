@@ -282,6 +282,185 @@ def test_official_local_search_changes_one_order_field() -> None:
     }
 
 
+def test_general_search_builds_independent_multistart_sources() -> None:
+    workload = refine.Workload(
+        "unseen_without_family_name",
+        1536,
+        2560,
+        3072,
+        "fp16",
+        False,
+        False,
+        20,
+    )
+    seed_knowledge = base_knowledge(workload, 128, 256, 64)
+    seed_knowledge.update(
+        depthA1=16,
+        depthB1=8,
+        stepKa=8,
+        stepKb=4,
+        l2MTileCnt=1,
+        l2NTileCnt=1,
+        l2MTileBlock=12,
+        l2NTileBlock=10,
+    )
+    callback = SimpleNamespace(
+        knowledge=seed_knowledge,
+        derived={},
+    )
+    seed = SimpleNamespace(
+        knowledge=seed_knowledge,
+        bank=callback,
+    )
+    estimate = refine.analytical_score(
+        workload, seed_knowledge, HARDWARE, callback
+    )
+    bottleneck = refine.diagnose_bottleneck(
+        workload, seed_knowledge, estimate, HARDWARE
+    )
+    transfer = refine.TransferGeometry(
+        workload_id="measured_elsewhere",
+        m=4096,
+        n=17,
+        k=16384,
+        dtype="fp16",
+        trans_a=False,
+        trans_b=False,
+        template="BASE",
+        base_m=208,
+        base_n=32,
+        base_k=64,
+        depth_a1=16,
+        depth_b1=8,
+        iterate_order=0,
+        db_l0a=2,
+        db_l0b=2,
+        db_l0c=1,
+        l2_iterate_order=0,
+        speedup=1.50,
+    )
+    proposals, stop = refine.general_search_candidate_proposals(
+        workload,
+        seed,
+        HARDWARE,
+        [],
+        estimate,
+        bottleneck,
+        [transfer],
+    )
+    assert stop == ""
+    assert 4 <= len(proposals) <= 32
+    assert all(
+        refine.hard_legal(workload, proposal.knowledge, HARDWARE)
+        for proposal in proposals
+    )
+    sources = {proposal.source for proposal in proposals}
+    assert {"local", "global", "diverse"} <= sources
+    assert any(
+        refine.structural_distance(
+            proposal.knowledge, seed_knowledge
+        ) > 1.0
+        for proposal in proposals
+        if proposal.source == "diverse"
+    )
+
+
+def test_general_transfer_reconstructs_target_partition_geometry() -> None:
+    workload = refine.Workload(
+        "unseen_transfer_target",
+        4608,
+        31,
+        16384,
+        "fp16",
+        False,
+        False,
+        20,
+    )
+    seed_knowledge = base_knowledge(workload, 128, 32, 64)
+    seed_knowledge.update(
+        depthA1=16,
+        depthB1=64,
+        stepKa=8,
+        stepKb=32,
+        l2MTileCnt=8,
+        l2NTileCnt=1,
+        l2MTileBlock=5,
+        l2NTileBlock=1,
+    )
+    seed = SimpleNamespace(
+        knowledge=seed_knowledge,
+        bank=SimpleNamespace(
+            knowledge=seed_knowledge,
+            derived={},
+        ),
+    )
+    source = refine.TransferGeometry(
+        workload_id="measured_source",
+        m=4096,
+        n=17,
+        k=16384,
+        dtype="fp16",
+        trans_a=False,
+        trans_b=False,
+        template="BASE",
+        base_m=208,
+        base_n=32,
+        base_k=64,
+        depth_a1=16,
+        depth_b1=8,
+        iterate_order=0,
+        db_l0a=2,
+        db_l0b=2,
+        db_l0c=1,
+        l2_iterate_order=0,
+        speedup=1.50,
+    )
+    transferred = refine.general_transfer_geometry_space(
+        workload, seed, HARDWARE, [source]
+    )
+    assert len(transferred) == 1
+    candidate, geometry = transferred[0]
+    assert geometry.workload_id == "measured_source"
+    assert candidate["baseM"] == 240
+    assert candidate["baseN"] == 32
+    assert candidate["depthA1"] == 16
+    assert candidate["depthB1"] == 8
+    assert candidate["dbL0C"] == 1
+    assert refine.hard_legal(workload, candidate, HARDWARE)
+
+
+def test_general_frontier_preserves_each_start_source() -> None:
+    workload = refine.Workload(
+        "source_quota", 512, 512, 1024,
+        "fp16", False, False, 20,
+    )
+    seed_knowledge = base_knowledge(workload, 128, 128, 64)
+    seed = SimpleNamespace(
+        bank=SimpleNamespace(knowledge=seed_knowledge)
+    )
+    states = []
+    for index, source in enumerate(
+        ("local", "local", "local", "global", "transfer", "diverse")
+    ):
+        knowledge = dict(seed_knowledge)
+        knowledge["baseM"] = 16 * (index + 1)
+        states.append(
+            refine.State(
+                row={"search_candidate_source": source},
+                knowledge=knowledge,
+                model_score=float(index + 1),
+                normalized_score=float(index + 1),
+                hbm_bytes=0.0,
+                l2_bytes=0.0,
+                template="BASE",
+            )
+        )
+    retained = refine.general_source_frontier(states, 4, seed)
+    assert {
+        state.row["search_candidate_source"] for state in retained
+    } == {"local", "global", "transfer", "diverse"}
+
+
 def test_split_k_order_search_requires_aligned_deterministic_template() -> None:
     aligned = refine.Workload(
         "det_aligned", 128, 128, 32768,
@@ -1912,6 +2091,9 @@ def main() -> None:
     test_focused_skinny_n_ablation_space()
     test_skinny_n_l1_rebalance_respects_base_m_256_capacity()
     test_official_local_search_changes_one_order_field()
+    test_general_search_builds_independent_multistart_sources()
+    test_general_transfer_reconstructs_target_partition_geometry()
+    test_general_frontier_preserves_each_start_source()
     test_split_k_order_search_requires_aligned_deterministic_template()
     test_skinny_n_generalization_and_evidence_groups()
     test_known_anchor_cannot_pass_broad_campaign()

@@ -106,6 +106,7 @@ core/L1/DB/L2 因果消融。
 ```bash
 cd ascend_matmul
 ./run_npu.sh --mode smoke
+./run_npu.sh --mode general
 ./run_npu.sh --mode full
 ```
 
@@ -124,6 +125,13 @@ warmup         2
 repeat         5
 samples        3
 ```
+
+### General
+
+General 是通用搜索的首輪校準：6 個未用於人工規則的新 shape，加 2 個
+已知控制；每個 workload 最多 8 個候選。只要出現新候選，searched、
+bank control 與 official baseline 就強制同輪量測。結果獨立寫入
+`results/npu_general_v1_*`，不覆蓋既有 full 證據。
 
 ### Full
 
@@ -239,6 +247,19 @@ deterministic split-K    對齊 M=N=128 時只切換 iterateOrder
 ablation 也未改善，預設搜索不再產生它們。每個 state 在進入 Beam 前已
 完整且 hard-legal；active scope 不執行 Tabu/LNS。cycle estimate 只做
 預算控制，不冒充 NPU latency。
+
+`general_search_v1` 是獨立的實驗 scope，不改動上述已發表的 frontier。
+它不看 workload 名稱，從四個獨立起點建立最多 32 個 callback 候選：
+
+```text
+local       官方 RuntimeKb seed 周圍的耦合變換
+global      由 Cube alignment、容量與模板契約生成的全域結構
+transfer    從強真機結果轉移 partition/L1/DB 策略並重建目標 L2
+diverse     在代理模型合理性能帶內，距離 seed 最遠的合法結構
+```
+
+最終以來源輪詢保留 8 筆，不讓單一 cost-model 排名吃掉全部名額。所有
+候選仍須通過 hard legality、官方 callback roundtrip 與 NPU preflight。
 
 算法與研究依據見 [docs/algorithm.md](docs/algorithm.md)。
 

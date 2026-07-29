@@ -222,7 +222,8 @@ def main() -> None:
             f" L2={l2_count}({l2_block})"
         )
         print(
-            f"  cause={clean(candidate.get('search_bottleneck', ''))}/"
+            f"  start={clean(candidate.get('search_candidate_source', ''))}"
+            f" cause={clean(candidate.get('search_bottleneck', ''))}/"
             f"{clean(candidate.get('search_guidance', ''))}"
             f" model_ratio={compact_number(candidate.get('search_model_ratio_vs_bank_seed', ''))}"
             f" calibration={compact_number(candidate.get('search_model_calibration', ''))}"

@@ -128,10 +128,14 @@ samples        3
 
 ### General
 
-General 是通用搜索的首輪校準：6 個未用於人工規則的新 shape，加 2 個
-已知控制；每個 workload 最多 8 個候選。只要出現新候選，searched、
-bank control 與 official baseline 就強制同輪量測。結果獨立寫入
-`results/npu_general_v1_*`，不覆蓋既有 full 證據。
+General 是通用搜索的廣域初篩：14 個未用於人工規則的新 shape，加 2 個
+已知控制；每個 workload 最多 12 個候選，共最多 192 筆。使用
+`warmup=3, repeat=10, samples=5` 擴大 shape 與候選覆蓋；明顯改善者要在
+後續高精度輪次確認。只要出現新候選，searched、bank control 與 official
+baseline 就強制同輪量測。結果獨立寫入 `results/npu_general_v1_*`，
+不覆蓋既有 full 證據。terminal 每個 workload 只額外輸出一行
+`SOURCE_RESULT`，比較 local/global/transfer/diverse 各來源最佳點；所有
+候選的完整量測仍以 candidates CSV 為準。
 
 ### Full
 

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260730-general-multistart-v1"
+RUN_NPU_VERSION="20260730-general-broad-screen-v1"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -98,6 +98,10 @@ filter_profile_terminal() {
          $0 ~ /optimization_result=improved/ ||
          $0 ~ /status_vs_official=regressed/ ||
          $0 ~ /status_vs_bank=regressed/) {
+            print
+            next
+        }
+        /^SOURCE_RESULT / {
             print
             next
         }
@@ -295,16 +299,16 @@ case "${MODE}" in
         DEFAULT_BEAM_WIDTH=32
         DEFAULT_TABU_ITERS=0
         DEFAULT_LNS_ROUNDS=0
-        DEFAULT_TOP_K=8
+        DEFAULT_TOP_K=12
         DEFAULT_MAX_CORE_ROUNDS=0
         DEFAULT_MODEL_RATIO_LIMIT=3.0
-        DEFAULT_RANK_LIMIT=8
-        DEFAULT_WARMUP=5
-        DEFAULT_REPEAT=20
-        DEFAULT_SAMPLES=7
+        DEFAULT_RANK_LIMIT=12
+        DEFAULT_WARMUP=3
+        DEFAULT_REPEAT=10
+        DEFAULT_SAMPLES=5
         DEFAULT_PROFILE_STALL_TIMEOUT_SEC=60
         DEFAULT_NUMERIC_PREFLIGHT_MAX_MIB=4
-        DEFAULT_PROFILE_PROGRESS_EVERY=1
+        DEFAULT_PROFILE_PROGRESS_EVERY=8
         DEFAULT_SEARCH_SCOPE=general_search_v1
         DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
         ;;

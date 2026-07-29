@@ -2141,6 +2141,9 @@ def main() -> int:
             best_rank = ""
             best_bank_status = ""
             best_official_status = ""
+            source_best: dict[
+                str, tuple[str, float, float, float, str, str]
+            ] = {}
             for candidate in searched:
                 candidate_index += 1
                 rank = candidate["rank"]
@@ -2166,6 +2169,7 @@ def main() -> int:
                     print(
                         f"candidate_start [{candidate_index}/{searched_count}] "
                         f"{workload_id} rank={rank} "
+                        f"start={candidate.get('search_candidate_source', '')} "
                         f"cause={candidate.get('search_bottleneck', '')}/"
                         f"{candidate.get('search_guidance', '')} "
                         f"model={candidate.get('search_model_ratio_vs_bank_seed', '')} "
@@ -2273,20 +2277,41 @@ def main() -> int:
                 speedup, delta_pct, noise_pct, status = comparison_status(
                     optimization_baseline, profiled
                 )
+                bank_speedup = (
+                    as_float(bank_control_profile, "median_ms")
+                    / candidate_ms
+                    if bank_control_profile is not None
+                    else float("nan")
+                )
+                candidate_source = candidate.get(
+                    "search_candidate_source", ""
+                )
+                if candidate_source in {
+                    "local", "global", "transfer", "diverse"
+                }:
+                    previous_source_best = source_best.get(candidate_source)
+                    if (
+                        previous_source_best is None
+                        or candidate_ms < previous_source_best[1]
+                    ):
+                        source_best[candidate_source] = (
+                            rank,
+                            candidate_ms,
+                            official_speedup,
+                            bank_speedup,
+                            official_status,
+                            status,
+                        )
                 if is_new_best:
                     best_bank_status = status
                     best_official_status = official_status
                 if show_progress or is_new_best:
                     marker = "best" if is_new_best else "measured"
-                    bank_speedup = (
-                        as_float(bank_control_profile, "median_ms")
-                        / candidate_ms
-                        if bank_control_profile is not None
-                        else float("nan")
-                    )
                     print(
                         f"candidate_done [{candidate_index}/{searched_count}] "
-                        f"{workload_id} rank={rank} {schedule_text(candidate, knowledge)} "
+                        f"{workload_id} rank={rank} "
+                        f"start={candidate.get('search_candidate_source', '')} "
+                        f"{schedule_text(candidate, knowledge)} "
                         f"ms={compact(candidate_ms)} std={compact(as_float(profiled, 'stddev_ms'))} "
                         f"speedup_vs_official={compact(official_speedup)} "
                         f"speedup_vs_bank={compact(bank_speedup)} "
@@ -2299,6 +2324,34 @@ def main() -> int:
                         f"mark={marker}",
                         flush=True,
                     )
+            if source_best:
+                source_parts = []
+                for source_name in (
+                    "local", "global", "transfer", "diverse"
+                ):
+                    source_result = source_best.get(source_name)
+                    if source_result is None:
+                        continue
+                    (
+                        source_rank,
+                        source_ms,
+                        source_official_speedup,
+                        source_bank_speedup,
+                        source_official_status,
+                        source_bank_status,
+                    ) = source_result
+                    source_parts.append(
+                        f"{source_name}=r{source_rank}:"
+                        f"{compact(source_ms)}ms:"
+                        f"xO{compact(source_official_speedup)}:"
+                        f"xB{compact(source_bank_speedup)}:"
+                        f"{source_official_status}/{source_bank_status}"
+                    )
+                print(
+                    f"SOURCE_RESULT {workload_id} "
+                    + " ".join(source_parts),
+                    flush=True,
+                )
             bank_control_ms = (
                 as_float(bank_control_profile, "median_ms")
                 if bank_control_profile is not None

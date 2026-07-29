@@ -23,6 +23,11 @@ HISTORY_ARGS=()
 if [[ -f "${HISTORY_CSV}" ]]; then
     HISTORY_ARGS=(--history "${HISTORY_CSV}")
 fi
+PROFILE_HISTORY_CSV="${SEARCH_PROFILE_HISTORY:-}"
+PROFILE_HISTORY_ARGS=()
+if [[ -n "${PROFILE_HISTORY_CSV}" && -f "${PROFILE_HISTORY_CSV}" ]]; then
+    PROFILE_HISTORY_ARGS=(--profile-history "${PROFILE_HISTORY_CSV}")
+fi
 
 if [[ "${SEARCH_SCOPE}" == "all_templates_validation" ]]; then
     ./build/matmul_tiling_search \
@@ -86,6 +91,7 @@ python3 tools/refine_matmul_v3_candidates.py \
     --output "${SEARCH_OUTPUT}" \
     --all-output "${SEARCH_ALL_OUTPUT}" \
     "${HISTORY_ARGS[@]}" \
+    "${PROFILE_HISTORY_ARGS[@]}" \
     --top-k "${TOP_K}" \
     --beam-width "${BEAM_WIDTH}" \
     --tabu-iters "${TABU_ITERS}" \

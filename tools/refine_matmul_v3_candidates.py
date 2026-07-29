@@ -222,9 +222,10 @@ class CandidateProposal:
 
 @dataclass(frozen=True)
 class MeasurementEvidence:
-    ratio_vs_official: float
+    ratio_vs_official: float | None
     ratio_vs_bank: float | None
     record_id: str
+    exact_profile: bool = False
 
 
 @dataclass(frozen=True)
@@ -4373,6 +4374,216 @@ def load_measurement_history(
     return history
 
 
+def profile_row_knowledge(
+    row: dict[str, str],
+) -> dict[str, int] | None:
+    try:
+        words = [int(value) for value in row.get(
+            "tiling_signature", ""
+        ).split(":")]
+    except ValueError:
+        return None
+    if len(words) != len(KNOWLEDGE_FIELDS):
+        return None
+    return dict(zip(KNOWLEDGE_FIELDS, words))
+
+
+def valid_profile_history_row(
+    row: dict[str, str],
+    soc: str,
+    aic_cores: int,
+) -> bool:
+    try:
+        row_aic = int(row.get("resume_aic") or 0)
+        median_ms = float(row.get("median_ms") or 0)
+    except ValueError:
+        return False
+    return (
+        row.get("resume_soc") == soc
+        and row_aic == aic_cores
+        and truthy(row.get("success"))
+        and median_ms > 0
+    )
+
+
+def load_profile_measurement_history(
+    path: Path | None,
+    soc: str,
+    aic_cores: int,
+) -> dict[tuple[str, ...], list[MeasurementEvidence]]:
+    """Read exact same-run evidence from the profiler's resume ledger."""
+    if path is None or not path.is_file():
+        return {}
+    _, rows = read_csv(path)
+    rows = [
+        row for row in rows
+        if valid_profile_history_row(row, soc, aic_cores)
+    ]
+    official: dict[tuple[str, str], float] = {}
+    controls: dict[tuple[str, str], float] = {}
+    for row in rows:
+        role = row.get("candidate_role", "")
+        key = (
+            row.get("workload_id", ""),
+            row.get("resume_run", ""),
+        )
+        median_ms = float(row["median_ms"])
+        if role == "official_operator_baseline":
+            official[key] = median_ms
+        elif (
+            role == "bank_seed_control"
+            and truthy(row.get("preflight_passed"))
+        ):
+            controls[key] = median_ms
+
+    history: dict[
+        tuple[str, ...], list[MeasurementEvidence]
+    ] = {}
+    for row in rows:
+        if (
+            row.get("candidate_role") != "searched"
+            or not truthy(row.get("preflight_passed"))
+        ):
+            continue
+        knowledge = profile_row_knowledge(row)
+        if knowledge is None:
+            continue
+        try:
+            workload = Workload(
+                workload_id=row["workload_id"],
+                m=int(row["m"]),
+                n=int(row["n"]),
+                k=int(row["k"]),
+                dtype=row["dtype"].lower(),
+                trans_a=truthy(row.get("trans_a")),
+                trans_b=truthy(row.get("trans_b")),
+                max_cores=aic_cores,
+            )
+            candidate_ms = float(row["median_ms"])
+        except (KeyError, ValueError):
+            continue
+        run_key = (workload.workload_id, row.get("resume_run", ""))
+        official_ms = official.get(run_key)
+        control_ms = controls.get(run_key)
+        history.setdefault(
+            state_history_key(workload, knowledge), []
+        ).append(
+            MeasurementEvidence(
+                ratio_vs_official=(
+                    candidate_ms / official_ms
+                    if official_ms is not None and official_ms > 0
+                    else None
+                ),
+                ratio_vs_bank=(
+                    candidate_ms / control_ms
+                    if control_ms is not None and control_ms > 0
+                    else None
+                ),
+                record_id=(
+                    row.get("resume_record_id")
+                    or f"profile:{workload.workload_id}:"
+                    f"{row.get('rank', '')}"
+                ),
+                exact_profile=True,
+            )
+        )
+    return history
+
+
+def load_profile_transfer_geometries(
+    path: Path | None,
+    soc: str,
+    aic_cores: int,
+) -> list[TransferGeometry]:
+    """Promote only paired, clearly faster BASE rows to transfer starts."""
+    if path is None or not path.is_file():
+        return []
+    _, rows = read_csv(path)
+    rows = [
+        row for row in rows
+        if valid_profile_history_row(row, soc, aic_cores)
+    ]
+    references: dict[
+        tuple[str, str], dict[str, float]
+    ] = {}
+    for row in rows:
+        role = row.get("candidate_role", "")
+        if role not in {
+            "official_operator_baseline", "bank_seed_control"
+        }:
+            continue
+        if (
+            role == "bank_seed_control"
+            and not truthy(row.get("preflight_passed"))
+        ):
+            continue
+        references.setdefault(
+            (
+                row.get("workload_id", ""),
+                row.get("resume_run", ""),
+            ),
+            {},
+        )[role] = float(row["median_ms"])
+
+    geometries: list[TransferGeometry] = []
+    for row in rows:
+        if (
+            row.get("candidate_role") != "searched"
+            or not truthy(row.get("preflight_passed"))
+        ):
+            continue
+        knowledge = profile_row_knowledge(row)
+        if knowledge is None or template_name(knowledge) != "BASE":
+            continue
+        reference = references.get(
+            (
+                row.get("workload_id", ""),
+                row.get("resume_run", ""),
+            ),
+            {},
+        )
+        official_ms = reference.get("official_operator_baseline")
+        control_ms = reference.get("bank_seed_control")
+        candidate_ms = float(row["median_ms"])
+        if (
+            official_ms is None
+            or control_ms is None
+            or official_ms / candidate_ms < 1.03
+            or control_ms / candidate_ms < 1.03
+        ):
+            continue
+        try:
+            geometries.append(
+                TransferGeometry(
+                    workload_id=row["workload_id"],
+                    m=int(row["m"]),
+                    n=int(row["n"]),
+                    k=int(row["k"]),
+                    dtype=row["dtype"].lower(),
+                    trans_a=truthy(row.get("trans_a")),
+                    trans_b=truthy(row.get("trans_b")),
+                    template="BASE",
+                    base_m=knowledge["baseM"],
+                    base_n=knowledge["baseN"],
+                    base_k=knowledge["baseK"],
+                    depth_a1=knowledge["depthA1"],
+                    depth_b1=knowledge["depthB1"],
+                    iterate_order=knowledge["iterateOrder"],
+                    db_l0a=knowledge["dbL0A"],
+                    db_l0b=knowledge["dbL0B"],
+                    db_l0c=knowledge["dbL0C"],
+                    l2_iterate_order=knowledge["l2IterateOrder"],
+                    speedup=min(
+                        official_ms / candidate_ms,
+                        control_ms / candidate_ms,
+                    ),
+                )
+            )
+        except (KeyError, ValueError):
+            continue
+    return geometries
+
+
 def load_transfer_geometries(
     path: Path | None,
     soc: str,
@@ -4477,7 +4688,9 @@ def calibrate_from_history(
     bank_path_diff: str,
 ) -> tuple[float, int]:
     exact: dict[tuple[str, ...], tuple[float, str]] = {}
+    measured_exact: dict[tuple[str, ...], str] = {}
     correction_by_key: dict[tuple[str, ...], float] = {}
+    corrections_by_source: dict[str, list[float]] = {}
     for state in states:
         key = state_history_key(workload, state.knowledge)
         records = history.get(key)
@@ -4487,19 +4700,20 @@ def calibrate_from_history(
         for record in records:
             if record.ratio_vs_bank is not None:
                 usable.append(record.ratio_vs_bank)
-            elif not bank_path_diff:
+            elif (
+                record.ratio_vs_official is not None
+                and not bank_path_diff
+            ):
                 usable.append(record.ratio_vs_official)
-            elif record.ratio_vs_official <= 0.90:
+            elif (
+                record.ratio_vs_official is not None
+                and record.ratio_vs_official <= 0.90
+            ):
                 # A missing same-run bank control must not erase a large,
                 # measured official improvement. The 10% guard is well above
                 # the observed bank/default drift and is not used to infer
                 # marginal wins.
                 usable.append(record.ratio_vs_official)
-        if not usable:
-            continue
-        actual_ratio = statistics.median(
-            usable
-        )
         record_ids = "|".join(
             sorted({
                 record.record_id
@@ -4507,10 +4721,20 @@ def calibrate_from_history(
                 if record.record_id
             })
         )
+        if usable or any(record.exact_profile for record in records):
+            measured_exact[key] = record_ids
+        if not usable:
+            continue
+        actual_ratio = statistics.median(usable)
         exact[key] = (actual_ratio, record_ids)
         correction_by_key[key] = (
             actual_ratio / max(1.0e-12, state.normalized_score)
         )
+        source = state.row.get("search_candidate_source", "")
+        if source:
+            corrections_by_source.setdefault(source, []).append(
+                correction_by_key[key]
+            )
 
     correction = 1.0
     if len(correction_by_key) >= 2:
@@ -4518,6 +4742,11 @@ def calibrate_from_history(
         # Residual calibration corrects local model bias; larger shifts require
         # a new bank control and are not extrapolated to unseen tilings.
         correction = min(1.15, max(0.85, correction))
+    source_corrections = {
+        source: min(2.0, max(0.5, statistics.median(values)))
+        for source, values in corrections_by_source.items()
+        if len(values) >= 2
+    }
 
     for state in states:
         key = state_history_key(workload, state.knowledge)
@@ -4526,10 +4755,22 @@ def calibrate_from_history(
             adjusted, record_ids = exact[key]
             state.row["search_history_match"] = record_ids
             confidence = "measured_history"
+            state_correction = correction
+        elif key in measured_exact:
+            adjusted = raw_ratio
+            state.row["search_history_match"] = measured_exact[key]
+            confidence = "measured_history_unpaired"
+            state_correction = 1.0
         else:
-            adjusted = raw_ratio * correction
+            source = state.row.get("search_candidate_source", "")
+            state_correction = source_corrections.get(
+                source, correction
+            )
+            adjusted = raw_ratio * state_correction
             confidence = (
-                "historically_calibrated"
+                "source_calibrated"
+                if source in source_corrections
+                else "historically_calibrated"
                 if len(correction_by_key) >= 2
                 else state.row.get("search_model_confidence", "medium")
             )
@@ -4539,11 +4780,11 @@ def calibrate_from_history(
                 "search_model_raw_ratio_vs_bank_seed": f"{raw_ratio:.12g}",
                 "search_model_ratio_vs_bank_seed": f"{adjusted:.12g}",
                 "search_model_score": f"{adjusted:.12g}",
-                "search_model_calibration": f"{correction:.12g}",
+                "search_model_calibration": f"{state_correction:.12g}",
                 "search_model_confidence": confidence,
             }
         )
-    return correction, len(exact)
+    return correction, len(measured_exact)
 
 
 def measured_skinny_anchor_count(
@@ -4659,6 +4900,7 @@ def general_source_frontier(
     states: list[State],
     limit: int,
     seed: Seed,
+    active_learning: bool = False,
 ) -> list[State]:
     """Round-robin independent start sources before filling by model score."""
     source_order = ("local", "global", "transfer", "diverse")
@@ -4667,6 +4909,8 @@ def general_source_frontier(
     }
     remainder: list[State] = []
     for state in states:
+        if active_learning and state_has_history_match(state):
+            continue
         source = state.row.get("search_candidate_source", "")
         if source in buckets:
             buckets[source].append(state)
@@ -4694,6 +4938,40 @@ def general_source_frontier(
             return
         seen.add(signature)
         selected.append(state)
+
+    if active_learning:
+        # Preserve one independent probe per source, then spend the remaining
+        # budget on empirically calibrated exploitation. No measured
+        # fingerprint is selected again.
+        source_counts = {source: 0 for source in source_order}
+        for source in source_order:
+            if buckets[source]:
+                append(buckets[source].pop(0))
+                source_counts[source] += 1
+        per_source_cap = max(2, math.ceil(limit / 2))
+        remaining = sorted(
+            (
+                state
+                for bucket in buckets.values()
+                for state in bucket
+            ),
+            key=state_sort_key,
+        )
+        for state in remaining:
+            source = state.row.get("search_candidate_source", "")
+            if source_counts.get(source, 0) >= per_source_cap:
+                continue
+            previous_count = len(selected)
+            append(state)
+            if len(selected) > previous_count:
+                source_counts[source] = source_counts.get(source, 0) + 1
+            if len(selected) >= limit:
+                break
+        for state in [*remaining, *remainder]:
+            append(state)
+            if len(selected) >= limit:
+                break
+        return selected
 
     # Equal turns guarantee that a model-biased source cannot consume the
     # entire NPU budget before a structurally different source is observed.
@@ -4777,6 +5055,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--all-output", type=Path)
     parser.add_argument("--history", type=Path)
+    parser.add_argument("--profile-history", type=Path)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--beam-width", type=int, default=64)
     parser.add_argument("--tabu-iters", type=int, default=64)
@@ -4854,8 +5133,18 @@ def main() -> int:
     history = load_measurement_history(
         args.history, args.soc, hardware.aic_cores
     )
+    profile_history = load_profile_measurement_history(
+        args.profile_history, args.soc, hardware.aic_cores
+    )
+    for key, records in profile_history.items():
+        history.setdefault(key, []).extend(records)
     transfer_geometries = load_transfer_geometries(
         args.history, args.soc, hardware.aic_cores
+    )
+    transfer_geometries.extend(
+        load_profile_transfer_geometries(
+            args.profile_history, args.soc, hardware.aic_cores
+        )
     )
     completed_frontier = completed_bottleneck_frontier_coverage(
         args.history, args.soc, hardware.aic_cores
@@ -5198,7 +5487,10 @@ def main() -> int:
             )
         elif args.optimization_scope == "general_search_v1":
             ordered_candidates = general_source_frontier(
-                eligible, args.top_k, seed
+                eligible,
+                args.top_k,
+                seed,
+                active_learning=history_matches > 0,
             )
         else:
             template_leaders: list[State] = []

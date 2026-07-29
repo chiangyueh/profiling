@@ -461,6 +461,204 @@ def test_general_frontier_preserves_each_start_source() -> None:
     } == {"local", "global", "transfer", "diverse"}
 
 
+def test_general_active_frontier_excludes_measured_fingerprints() -> None:
+    workload = refine.Workload(
+        "active_source_quota", 512, 512, 1024,
+        "fp16", False, False, 20,
+    )
+    seed_knowledge = base_knowledge(workload, 128, 128, 64)
+    seed = SimpleNamespace(
+        bank=SimpleNamespace(knowledge=seed_knowledge)
+    )
+    states = []
+    for source_index, source in enumerate(
+        ("local", "global", "transfer", "diverse")
+    ):
+        for measured in (True, False):
+            knowledge = dict(seed_knowledge)
+            knowledge["baseM"] = 16 * (
+                2 * source_index + int(measured) + 1
+            )
+            states.append(
+                refine.State(
+                    row={
+                        "search_candidate_source": source,
+                        "search_history_match": (
+                            f"measured:{source}" if measured else ""
+                        ),
+                    },
+                    knowledge=knowledge,
+                    model_score=1.0,
+                    normalized_score=1.0,
+                    hbm_bytes=0.0,
+                    l2_bytes=0.0,
+                    template="BASE",
+                )
+            )
+    retained = refine.general_source_frontier(
+        states, 4, seed, active_learning=True
+    )
+    assert len(retained) == 4
+    assert all(
+        not state.row["search_history_match"] for state in retained
+    )
+    assert {
+        state.row["search_candidate_source"] for state in retained
+    } == {"local", "global", "transfer", "diverse"}
+
+
+def test_profile_resume_drives_search_history_and_transfer() -> None:
+    workload = refine.Workload(
+        "profile_feedback", 1537, 2305, 4099,
+        "fp16", False, False, 20,
+    )
+    knowledge = base_knowledge(workload, 224, 144, 64)
+    signature = ":".join(
+        str(knowledge[field]) for field in refine.KNOWLEDGE_FIELDS
+    )
+    common = {
+        "resume_soc": "Ascend910B3",
+        "resume_aic": "20",
+        "resume_run": "paired_run",
+        "success": "1",
+        "workload_id": workload.workload_id,
+        "m": str(workload.m),
+        "n": str(workload.n),
+        "k": str(workload.k),
+        "dtype": workload.dtype,
+        "trans_a": "0",
+        "trans_b": "0",
+    }
+    rows = [
+        {
+            **common,
+            "candidate_role": "official_operator_baseline",
+            "median_ms": "1.0",
+        },
+        {
+            **common,
+            "candidate_role": "bank_seed_control",
+            "preflight_passed": "1",
+            "median_ms": "1.02",
+        },
+        {
+            **common,
+            "candidate_role": "searched",
+            "preflight_passed": "1",
+            "median_ms": "0.80",
+            "rank": "5",
+            "tiling_signature": signature,
+            "resume_record_id": "profile_feedback:rank5",
+        },
+    ]
+    fields = sorted({field for row in rows for field in row})
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "resume.csv"
+        with path.open("w", newline="", encoding="utf-8") as destination:
+            writer = csv.DictWriter(destination, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        history = refine.load_profile_measurement_history(
+            path, "Ascend910B3", 20
+        )
+        evidence = history[
+            refine.state_history_key(workload, knowledge)
+        ][0]
+        assert abs(evidence.ratio_vs_official - 0.80) < 1.0e-12
+        assert evidence.ratio_vs_bank is not None
+        assert abs(evidence.ratio_vs_bank - 0.80 / 1.02) < 1.0e-12
+        assert evidence.exact_profile
+        transfers = refine.load_profile_transfer_geometries(
+            path, "Ascend910B3", 20
+        )
+        assert len(transfers) == 1
+        assert transfers[0].base_m == 224
+        assert transfers[0].base_n == 144
+
+
+def test_unpaired_exact_profile_is_excluded_without_calibration() -> None:
+    workload = refine.Workload(
+        "old_profile_exact", 1024, 1024, 1024,
+        "fp16", False, False, 20,
+    )
+    knowledge = base_knowledge(workload, 128, 128, 64)
+    state = refine.State(
+        row={
+            "search_candidate_source": "global",
+            "search_model_confidence": "high",
+        },
+        knowledge=knowledge,
+        model_score=1.0,
+        normalized_score=1.2,
+        hbm_bytes=0.0,
+        l2_bytes=0.0,
+        template="BASE",
+    )
+    _, matches = refine.calibrate_from_history(
+        workload,
+        [state],
+        {
+            refine.state_history_key(workload, knowledge): [
+                refine.MeasurementEvidence(
+                    ratio_vs_official=None,
+                    ratio_vs_bank=None,
+                    record_id="old_profile_exact:rank1",
+                    exact_profile=True,
+                )
+            ]
+        },
+        "",
+    )
+    assert matches == 1
+    assert state.normalized_score == 1.2
+    assert state.row["search_history_match"] == (
+        "old_profile_exact:rank1"
+    )
+    assert state.row["search_model_confidence"] == (
+        "measured_history_unpaired"
+    )
+
+
+def test_history_calibration_is_source_specific() -> None:
+    workload = refine.Workload(
+        "source_calibration", 1024, 1024, 1024,
+        "fp16", False, False, 20,
+    )
+    states = []
+    history = {}
+    for index in range(3):
+        knowledge = base_knowledge(
+            workload, 128 + 16 * index, 128, 64
+        )
+        state = refine.State(
+            row={
+                "search_candidate_source": "global",
+                "search_model_confidence": "high",
+            },
+            knowledge=knowledge,
+            model_score=1.0,
+            normalized_score=1.0,
+            hbm_bytes=0.0,
+            l2_bytes=0.0,
+            template="BASE",
+        )
+        states.append(state)
+        if index < 2:
+            history[refine.state_history_key(workload, knowledge)] = [
+                refine.MeasurementEvidence(
+                    ratio_vs_official=1.5,
+                    ratio_vs_bank=1.5,
+                    record_id=f"global:{index}",
+                )
+            ]
+    refine.calibrate_from_history(
+        workload, states, history, ""
+    )
+    assert states[2].normalized_score == 1.5
+    assert states[2].row["search_model_calibration"] == "1.5"
+    assert states[2].row["search_model_confidence"] == "source_calibrated"
+
+
 def test_split_k_order_search_requires_aligned_deterministic_template() -> None:
     aligned = refine.Workload(
         "det_aligned", 128, 128, 32768,
@@ -2094,6 +2292,10 @@ def main() -> None:
     test_general_search_builds_independent_multistart_sources()
     test_general_transfer_reconstructs_target_partition_geometry()
     test_general_frontier_preserves_each_start_source()
+    test_general_active_frontier_excludes_measured_fingerprints()
+    test_profile_resume_drives_search_history_and_transfer()
+    test_unpaired_exact_profile_is_excluded_without_calibration()
+    test_history_calibration_is_source_specific()
     test_split_k_order_search_requires_aligned_deterministic_template()
     test_skinny_n_generalization_and_evidence_groups()
     test_known_anchor_cannot_pass_broad_campaign()

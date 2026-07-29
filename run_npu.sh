@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260730-full-general-broad-screen-v1"
+RUN_NPU_VERSION="20260730-full-general-active-round2-v1"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -393,6 +393,7 @@ run_quiet_phase "[3/4] Search tiling candidates" "${SEARCH_LOG}" \
         MAX_CORE_ROUNDS="${MAX_CORE_ROUNDS:-${DEFAULT_MAX_CORE_ROUNDS}}" \
         MODEL_RATIO_LIMIT="${MODEL_RATIO_LIMIT:-${DEFAULT_MODEL_RATIO_LIMIT}}" \
         SEARCH_SCOPE="${SEARCH_SCOPE:-${DEFAULT_SEARCH_SCOPE}}" \
+        SEARCH_PROFILE_HISTORY="${RESULT_STEM}_resume.csv" \
         SEARCH_OUTPUT="${SEARCH_CANDIDATES_CSV}" \
         SEARCH_ALL_OUTPUT="${SEARCH_ALL_CSV}" \
         SEARCH_TILING_DIR="${SEARCH_TILING_DIR}" \

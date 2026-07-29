@@ -95,6 +95,12 @@ SHA-256。legacy 遷移另外要求完整 schedule 與 `grid9_v1`，且只能唯
 現行 callback；只相同的 `T/S/C` 不算同一候選。執行前可從下列欄位確認
 本次實際會送入 NPU 的數量：
 
+第一輪完成後，相同的 full 指令會把 resume 同時交給搜索器。搜索器對
+local/global/transfer/diverse 分別計算 measured/model residual，排除所有
+已量 fingerprint，再以每來源至少一筆加校正後 exploitation 的方式產生
+第二輪。host 驗證結果為 145 個新候選、14 個 workload、與第一輪 187 筆
+零重疊。
+
 ```text
 resume_exact_baselines_assigned=...
 resume_exact_assigned=...

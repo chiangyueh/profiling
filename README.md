@@ -135,6 +135,12 @@ terminal 每個 workload 只額外輸出一行
 `SOURCE_RESULT`，比較 local/global/transfer/diverse 各來源最佳點；所有
 候選的完整量測仍以 candidates CSV 為準。
 
+再次執行相同的 `--mode full` 時，搜索器會先讀取
+`npu_full_general_v1_resume.csv`。已量 fingerprint 只用來校正每個
+candidate source 的模型誤差，不再佔 NPU 候選名額；每個仍有空間的 source
+至少保留一個探索點，其餘預算依真機校正後分數分配。第一輪 187 筆完成後，
+host 契約演練會提出 145 筆不重複的第二輪候選。
+
 `--mode general` 只保留為相容別名，與 `--mode full` 使用相同設定；正常
 工作流只需執行 `full`。
 

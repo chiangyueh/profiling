@@ -1,0 +1,1449 @@
+Ascend MatMul tiling execution issue record
+Updated: 2026-07-27
+
+Purpose
+=======
+
+This file records why the earlier NPU runs did not validate the tiling search,
+and the boundary used by the current implementation. It is not a list of
+candidate performance results.
+
+Sections 14 through 18 describe earlier BASE-only or callback-family-limited
+strategies. They are retained as history, but section 20 supersedes their
+search boundary.
+
+What the earlier failures meant
+===============================
+
+1. aclInit rc=507008
+
+The old AscendC host-stub runner could load a different HAL/runtime dependency
+set from the minimal ACL program. That was a runner linkage problem before any
+MatMul tiling or kernel was executed.
+
+2. RegisterAscendBinary ret=107000 followed by C index=0 coverage failure
+
+The generated host stub failed to register its embedded custom kernel. The stub
+then returned without executing that kernel, so the poisoned output remained
+unchanged. The coverage message was therefore secondary and was not evidence
+that the candidate tiling was invalid.
+
+3. aclrtSynchronizeStream rc=507015
+
+The custom kernel consumed TCubeTiling through a different scheduling/template
+contract from the official MatMulV3 implementation. MultiCoreMatmulTiling
+acceptance does not make an arbitrary custom wrapper compatible with every
+MatMulV3 ND2NZ, tail, transpose, split-K, and output path.
+
+4. Generic SoC used by the search
+
+The detector found Ascend910B3 but wrote:
+
+  SOC_VERSION=Ascend910B
+
+The search therefore queried a generic PlatformAscendC model while the NPU
+operator used the exact B3 compile information. This could generate candidates
+with an AIC count and memory model that did not match the official MatMulV3
+runtime-bank filename and operator context.
+
+5. Build phase reported only "NPU run failed"
+
+Compiler and linker output was redirected to build/host_build.log or
+build/kernel_build.log, while the outer error handler inspected only the phase
+log. The build wrapper now emits the failing step, return code, nested log path,
+and the last compiler/linker diagnostics directly to the terminal.
+
+6. CANN 8.1 linker could not find -loptiling
+
+On the tested CANN 8.1 installation, liboptiling.so is stored under:
+
+  opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64
+
+It is not necessarily exposed through the platform lib64 linker search path.
+The project CMake now resolves that existing file explicitly and links its
+absolute path. No toolkit symlink or global library path is changed.
+
+7. Use the documented RuntimeKb API sequence
+
+The first bank probe called version-specific RuntimeKb::QueryBank overloads.
+The CANN 8.1 public sequence used now is:
+
+  RuntimeKb::InitBank(fe::PlatFormInfos *)
+  RuntimeKb::QueryBank(src, size, opType, tiling)
+
+Every generated record must return rc=0 and a non-null tiling object.
+
+8. CANN 8.1 platform and RuntimeKb ABI details
+
+The platform header is under the experimental include tree:
+
+  include/experiment/platform/platform/platform_info.h
+
+The CMake target adds that include path only to the bank-probe target. RuntimeKb::InitBank
+returns bool: true means success. Treating its value as an integer return code
+incorrectly reported successful initialization as rc=1.
+
+9. MatMulV3 L2 fields must exactly cover the scheduling grid
+
+The old bank writer set l2MTileCnt and l2NTileCnt to zero. The MatMulV3 base
+kernel uses these values as L2 loop bounds and the host source explicitly
+requires them to be legal. A zero count can leave the output poison unchanged,
+which produced:
+
+  official output coverage failed at C index=0
+
+Positive values alone are insufficient. The kernel computes its output-block
+grid from:
+
+  mTotal = ceil(M / singleCoreM)
+  nTotal = ceil(N / singleCoreN)
+
+The L2 count/block fields must cover that grid exactly, including a positive
+tail no larger than one full L2 block. The bank writer now derives all four L2
+fields from this singleCore grid and validates both tails before writing a
+record.
+
+10. Generic MultiCoreMatmulTiling output is not automatically a BASE bank record
+
+The failed record for llm_full_4096_ffn_up used:
+
+  shape       4096 x 11008 x 4096
+  singleCore  208 x 11008 x 4096
+  base        208 x 144 x 64
+  failure     C[0, 11007] remained 0x5a5a
+
+RuntimeKb accepted the schema and hash, but the official MatMulV3 host source
+does not run its normal semantic tiling checks after a bank hit. It copies all
+23 knowledge fields directly. The source-generated tilingEnable=BASE path sets
+singleCoreM=baseM and singleCoreN=baseN. Larger singleCore M/N values are
+produced only together with specialized full-load or split-K template keys.
+
+The search now treats this as a template contract:
+
+  tilingEnable=BASE:
+      singleCoreM == baseM
+      singleCoreN == baseN
+
+Beam, Tabu, and LNS still search baseM/baseN/baseK, traversal, and buffering.
+They do not inject a generic MultiCoreMatmulTiling M/N partition into the wrong
+MatMulV3 template.
+
+11. MULTI_CORE_SPLIT_K is exactly one tile per launched core
+
+The official kernel maps blockIdx directly to one (m, n, k) tile and has no
+multi-round loop or idle-core guard. Therefore:
+
+  ceil(M/singleCoreM) * ceil(N/singleCoreN) * ceil(K/singleCoreK)
+      == usedCoreNum
+
+This equality is enforced while generating candidates, before Beam pruning.
+Allowing fewer logical tiles than launched cores can make extra cores address a
+K tile beyond the logical range.
+
+12. BASE and MULTI_CORE_SPLIT_K have different idle-core rules
+
+MatmulBaseBlock computes realRound=0 for BASE cores that receive no output
+block. Therefore BASE may safely use more cores than its M/N block count. The
+earlier static rule usedCoreNum <= M-blocks*N-blocks incorrectly rejected small
+M or N cases.
+
+MULTI_CORE_SPLIT_K has no equivalent idle-core check after blockIdx is mapped
+to kIndex, so the exact equality in item 11 remains mandatory.
+
+Current execution boundary
+==========================
+
+The project no longer compiles or launches a custom MatMul kernel.
+
+  exact detected SoC
+      -> constraint-aware Beam + Tabu/LNS
+      -> MultiCoreMatmulTiling::GetTiling/GetCoreNum
+      -> static capacity/template validation
+      -> project-local MatMulV3 TUNE_BANK_PATH record
+      -> RuntimeKb::InitBank + QueryBank acceptance
+      -> installed aclnnMatmul / official MatMulV3 kernel
+      -> numerical or coverage preflight
+      -> ACL Event timing
+
+The baseline uses the same installed aclnnMatmul path with an empty project-local
+tuning-bank directory, so only the injected tiling differs.
+
+Runtime-bank checks performed before NPU timing
+===============================================
+
+- Exact SoC and AIC count must match the installed MatMulV3 bank filename.
+- The installed bank input-key and knowledge schemas must match.
+- The packed MatMulV3 input key must be exactly 183 bytes.
+- CANN RuntimeKb::CommonHash must reproduce the ID of an installed bank record.
+- RuntimeKb::InitBank uses the exact SoC platform information.
+- RuntimeKb::QueryBank must return rc=0 and a non-null tiling object.
+- L2 tile counts/blocks must be positive and exactly cover the singleCore M/N
+  scheduling grid.
+- A tilingEnable=BASE record must use singleCoreM/N equal to baseM/N.
+- usedCoreNum must not exceed the exact platform AIC count.
+- MultiCoreMatmulTiling return, GetCoreNum, Cube alignment, L0/L1/DB, M/N rounds,
+  and split-K template constraints must all pass.
+
+Unaligned M/N/K are not rejected merely for being tails. The official MatMulV3
+operator owns its ND2NZ/NZ2ND and tail execution templates.
+
+Split-K
+=======
+
+baseK < K is ordinary per-core K blocking.
+
+singleCoreK < K is cross-core split-K. The current search emits the official
+MULTI_CORE_SPLIT_K tuning mode only for FP32, transA=false, transB=true, and a
+single scheduling round. Other cross-core reduction templates are not claimed.
+
+Project isolation
+=================
+
+TUNE_BANK_PATH, ASCEND_CACHE_PATH, CANN paths, and SoC variables are set only
+for run_npu.sh and its child processes. The project does not modify toolkit
+symlinks, shell profiles, drivers, firmware, or global system settings.
+
+13. Long full run hid a candidate timeout behind a closed subprocess pipe
+
+After 350 successful candidates, a full run stopped with:
+
+  fatal: I/O operation on closed file.
+
+The next candidate had not printed a start line because progress was emitted
+only every ten candidates. The profiler used Popen stdout=PIPE followed by
+communicate(timeout). If the timeout path observes a child that has already
+closed stdout, the cleanup communicate call can operate on the closed pipe and
+replace the real candidate timeout with this ValueError.
+
+Candidate output now goes to a per-runner regular file. The parent uses wait()
+for the timeout, terminates the isolated process group if needed, closes the
+file, and only then reads it. A timeout can therefore report the exact
+workload, rank, T/S/C/G/L2 schedule, and final runner lines.
+
+14. BASE candidates bypassed the intended core-round budget
+
+The BASE candidate keeps singleCoreM/N unset until MultiCoreMatmulTiling is
+called, then the MatMulV3 BASE contract materializes:
+
+  singleCoreM = baseM
+  singleCoreN = baseN
+
+The old HardLegal round check only ran when singleCoreM/N were already set.
+Large shapes therefore entered NPU profiling with hundreds or thousands of
+BASE output blocks, even though SearchOptions.maxCoreRounds was four.
+
+The measured consequence was systematic:
+
+  llm_8192_square       best searched / official speed = 0.896078
+  vision_projection    best searched / official speed = 0.787998
+  llm_full_ffn_down    best searched / official speed = 0.939847
+  skinny_n_large_k     best searched / official speed = 1.49404
+
+All clearly improved transcribed candidates used one or two core rounds. The
+round guard now applies to the concrete BASE grid after baseM/N are present,
+and the default budget is two rounds. Shapes outside that search envelope keep
+the installed official operator.
+
+15. Noise-aware selection and continuation workload
+
+Profiling a candidate does not make it the deployed choice. The result summary
+now selects searched only when its latency improvement exceeds the combined
+measurement-noise threshold. within_noise and regressed results select the
+official operator.
+
+The 2026-07-27 run completed all Top-20 candidates for workloads 1 through 17
+and ranks 1 through 10 for skinny_n_large_k. Its rank 1 already produced the
+clear 1.49404x result. The default full continuation therefore uses
+config/workloads_unmeasured.csv and does not repeat those workloads.
+
+16. Two-round BASE search validation
+
+The corrected host search was rebuilt for Ascend910B3 and checked without NPU
+profiling or CPU simulation:
+
+  platform AIC cores                         20
+  remaining workloads                       10
+  workloads with distinct searched BASE     2
+  searched candidates sent to NPU            40
+  official-fallback-only workloads           8
+
+The retained workloads are large_k_small_mn and odd_tail_1, with 20 candidates
+each. Every retained BASE record has traverse=0 and no more than 40 output
+blocks. The known skinny_n_large_k winner remains proxy rank 1 at
+baseMNK=208x32x64.
+
+BASE traverse values were previously emitted three times even though
+singleCoreM/N=baseM/N leaves only one M and one N tile inside each Matmul call.
+Normal BASE candidates now use only the canonical traverse value. Direct
+split-K keeps its template-specific traverse search.
+
+The local validate-only test passed the CANN 8.1 RuntimeKb lookup for all
+retained BASE and FP32 NT split-K records. It also asserts that high-round
+large, tail, and BF16 BASE grids fall back to the installed official operator.
+Improving those large shapes requires adding and validating the official
+full-load template families; changing the BASE proxy alone cannot reproduce
+their single-core reuse contract.
+
+17. Remaining BASE run and missing MatMulV3 template families
+
+The 2026-07-27 continuation run completed the remaining two workloads that had
+legal two-round BASE candidates:
+
+  large_k_small_mn  128x128x32768 fp16
+    official          0.0327812 ms
+    best BASE          0.0924664 ms
+    official/BASE      0.354520
+    decision           official
+
+  odd_tail_1         257x1009x4097 fp16
+    official          0.0495860 ms
+    best BASE          0.0495156 ms
+    official/BASE      1.001420
+    decision           official (within noise)
+
+The other seven supported continuation workloads had no legal searched BASE
+candidate under the two-round limit. They were official-baseline-only results,
+not measured search regressions. INT8 belongs to a different operator path.
+
+The clear large-K regression has a structural cause. The current search emits
+MatMulV3 tilingEnable=0 (BASE), except for the narrowly supported FP32 NT direct
+atomic mode. The installed CANN 8.1 MatMulV3 implementation also dispatches:
+
+  tilingEnable=2   single-core Split-K
+  tilingEnable=3   deterministic multi-core Split-K
+  tilingEnable=10  AL1 full load
+  tilingEnable=20  BL1 full load
+
+The installed liboptiling implementation and the matching public host source
+use K >= 27392 as a Split-K trigger. For M=N=128, K=32768 on 20 AICs, the
+128-based M/N output grid has one tile, which is below half the available
+cores, and K is large enough for multi-core K partitioning. This shape is in
+the official deterministic Split-K selection domain. Injecting a BASE record
+there removes the template that makes the official path fast; reranking more
+BASE tiles cannot recover it.
+
+Future search must be hierarchical:
+
+  template family
+    -> legal single-core M/N/K partition
+    -> baseM/baseN/baseK and L1/DB choices
+    -> official RuntimeKb acceptance
+    -> isolated NPU preflight
+    -> timing and noise-aware official fallback
+
+No further broad BASE profiling should be requested before tilingEnable=2/3
+generation, workspace accounting, and template-specific static validation are
+implemented. The previously measured skinny_n_large_k 1.49404x result remains
+the only clear searched improvement so far.
+
+18. Full callback contract and current search boundary
+
+The RuntimeKb MatMulV3 record contains 23 tuning fields, but those fields are
+not the complete tiling blob. After a bank hit, the official callback derives
+additional ND-to-NZ and cache fields. In the CANN 8.1 callback used here, the
+full blob is 272 bytes and includes, after TCubeTiling and L2 scheduling:
+
+  l2CacheFlag
+  baseAN
+  baseAD
+  baseBN
+  baseBD
+
+Replaying the official 23 fields through RuntimeKb can therefore differ from
+the empty-bank official path even when baseM/baseN/baseK are identical.
+skinny_n_large_k is a concrete example: the visible 23 fields are the same,
+but baseBD differs. The profiler now measures three distinct paths:
+
+  official baseline      empty project tuning bank
+  bank_seed_control      official 23 fields replayed through RuntimeKb
+  searched               searched 23 fields replayed through RuntimeKb
+
+The control is not an optimization result. A searched candidate must beat the
+official baseline and the bank-path control beyond noise before the program
+reports a proven tiling improvement.
+
+Two static checks were also corrected:
+
+  - stepKa and stepKb themselves must be integral K-step multiples. Requiring
+    the total K iteration count to divide them rejected official legal tails.
+  - Ascend910B3 reports 524032 usable L1 bytes while the official tiler may use
+    the 512-byte-aligned 524288-byte capacity. Static validation now follows
+    the official alignment boundary instead of rejecting the official seed.
+
+The current CANN 8.1 callback selects BASE for 26 supported corpus workloads
+and DETERMINISTIC_SPLIT_K for large_k_small_mn. Candidate generation is
+conditioned on that observed template contract. It no longer approximates a
+Split-K or full-load kernel by injecting a BASE record with unrelated
+singleCore values.
+
+The analytical ranker now models, per critical core:
+
+  Cube block work and pipeline fill/drain
+  GM/L2-to-L1 bytes and transaction starts
+  L1-to-L0 depth and step reuse
+  L0A/L0B/L0C buffering overlap
+  FixPipe 512-byte row packets
+  ND-to-NZ derived work
+  L2 working set, tails, and 20-AIC scheduling rounds
+
+Beam Search keeps separate beams per kernel template. Tabu/LNS mutates only
+legal discrete neighbours. Every selected record is then round-tripped through
+the official MatMulV3 callback and RuntimeKb before NPU execution.
+
+Historical NPU data are reused only for an exact visible schedule fingerprint
+on the same SoC, AIC count, shape, dtype, transpose state, template, base and
+single-core shapes, core count, output grid, and L2 schedule. One historical
+sample is assigned to at most one current candidate. Controls are never
+fabricated from old data.
+
+19. Resource overload and prevention
+
+This host has about 1.9 GiB RAM and no swap. Two development operations caused
+avoidable overload:
+
+  - a broad source-repository search fetched many partial-clone blobs;
+  - the first analytical model materialized every output tile of large shapes.
+
+The model now computes full/tail axis sums and critical-core load in closed
+form, so its memory is O(1) in the matrix dimensions. Repository research is
+restricted to named files fetched individually. Build and validation run with
+BUILD_JOBS=1; no CPU simulation, NPU profiling, or parallel compiler is started
+on this host.
+
+20. Full CANN 8.1 template implementation
+
+The installed DAV C220 mat_mul_v3.cpp dispatches 12 suffixes in seven families:
+
+  0/1          BASE
+  20/21        SINGLE_CORE_SPLIT_K
+  30/31        DETERMINISTIC_SPLIT_K
+  101          AL1_FULL_LOAD
+  200/201      BL1_FULL_LOAD
+  10200/10201  BL1_FULL_LOAD_FIXPIPE
+  20201        BL1_FULL_LOAD_VEC_NZ2ND
+
+The current search constructs and ranks all seven families. It does not contain
+the earlier invented FP32 NT split mode 4 because CANN 8.1 has no matching
+kernel dispatch.
+
+The BASE contract was corrected again after reading the exact installed kernel:
+singleCoreM/N are output partitions and may be larger than baseM/N. The kernel
+uses baseM/N/K inside each single-core partition. Requiring singleCoreM/N to
+equal baseM/N caused the earlier 4096/8192 regressions by creating excessive
+output tiles and fragmented L2 schedules.
+
+usedCoreNum may also exceed the output tile count; unused AICs exit. This is
+legal and is now penalized by the active-core cost model rather than rejected.
+
+Host validation on CANN 8.1.RC1 and Ascend910B3 completed without NPU or CPU
+simulation:
+
+  general RuntimeKb records       45/45 found
+  full-template RuntimeKb records 96/96 found
+  searched full-template records  85
+  kernel suffix coverage          12/12
+  template family coverage        7/7
+
+Every searched record selected for NPU preserved its requested family and all
+23 knowledge fields through the official MatMulV3 callback. The full workload
+corpus now includes shapes for every suffix. NPU latency is still required to
+claim a performance improvement; host contract validation alone is not a
+speedup result.
+
+21. BASE output-coverage failure and corrected execution contract
+
+The 20260727 full NPU run rejected this generated BASE record:
+
+  workload  llm_full_4096_ffn_up
+  shape     M=4096 N=11008 K=4096 fp16
+  base      176x176x64
+  single    832x352x4096
+  L2        count=1x4 block=5x8
+  failure   C row=2048 col=0 remained 0x5a poison
+
+RuntimeKb returned found=1 because QueryBank verifies the hash/schema lookup and
+deserializes the 23 knowledge fields. TranslateAoeTiling copies those fields and
+checks tilingEnable; neither operation proves output coverage.
+
+The generator had incorrectly treated ordinary BASE singleCoreM/N as arbitrary
+multi-base output partitions. CANN 8.1 CalL1Tiling and CalL1TilingV200 set
+singleCoreM/N to baseM/N. The installed ordinary BASE RuntimeKb records follow
+the same contract; their only smaller values are logical tails within one
+alignment unit. Larger single-core shapes belong to separate Split-K or
+full-load templates with their own constraints.
+
+The corrected ordinary BASE hard contract is:
+
+  singleCoreK == K
+  singleCoreM <= baseM <= align16(singleCoreM)
+  singleCoreN <= baseN <= align16(singleCoreN)
+
+The previous runner sampled only five C elements. That was insufficient to
+certify an output schedule. Preflight now checks a 9x9 evenly spaced C grid
+without copying the full output to host. A rejected searched candidate is
+recorded as success=0 and discarded; because every candidate runs in its own
+process, the next candidate can continue safely. A failed baseline or bank
+control still aborts the run.
+
+Old OCR candidate rows do not contain all 23 tuning fields and were measured
+under the old five-point preflight. They remain as evidence but are not reused
+as exact candidates. Official baseline history remains reusable.
+
+22. Broad BASE search falsified; skinny-N optimization isolated
+
+The 20260727 20-core NPU measurements falsified the broad BASE candidate
+strategy. Across the first 18 completed workloads, the geometric mean of each
+workload's best searched candidate was 0.99458 times the official operator
+(about 0.54% slower). Excluding the one skinny-N winner, the geometric mean was
+0.96982 (about 3.0% slower). Important regressions included:
+
+  llm_full_4096_ffn_up  best speedup 0.767003
+  llm_8192_square       best speedup 0.989526; many candidates 0.44-0.57
+  attention_score_1024 best speedup 0.963880
+  skinny_m_large_k      best speedup 0.813481
+
+The cause was not insufficient Beam width. Generic MultiCoreMatmulTiling
+results such as 176x176 were used as anchors for ordinary MatMulV3 BASE.
+MatMulV3 uses the generic result only during initialization, then applies its
+own SetBaseBlockTiling, CalL1Tiling, load-balance, and L2 rules. The generic
+anchors are legal proposals but are not interchangeable with the final
+MatMulV3 BASE policy. The analytical model therefore ranked legal but
+architecturally poor large-matrix schedules.
+
+The only repeatable large gain was:
+
+  workload              skinny_n_large_k
+  shape                 4096x17x16384 fp16 NN
+  official              0.103036 ms
+  bank control          0.104695 ms
+  searched              0.0674828 ms
+  speedup vs official   1.52685
+  speedup vs bank       1.55144
+  base/single           208x32x64 / 208x32x16384
+  cores/grid            20 / 20x1
+  L1 depth/step         16x8 / 8x4
+  DB                    2x2x2
+  L2                    5x1(4x1), order=1
+
+For this shape, align16(ceil(4096/20)) is 208. It reduces the M output blocks
+from 32 to exactly 20 and the four-core L2 waves from 8 to 5. The ratio 20/32
+is 0.625, close to the measured latency ratio 0.0674828/0.103036 = 0.655.
+The candidate also satisfies the reported 910B3 capacities:
+
+  L0A = 208*64*2*2 = 53248 <= 65536
+  L0B =  32*64*2*2 =  8192 <= 65536
+  L0C = 208*32*4*2 = 53248 <= 131072
+
+The default full run is now restricted to four ablations of this hypothesis:
+core balance only, A-heavy L1 allocation, L0C double buffering, and L2 order.
+The previously measured bank control and exact candidates are keyed by
+template, T, S, cores, grid, L2, iterate order, L1, DB, and L2 order, so they
+are reused rather than measured again.
+
+The unrelated "I/O operation on closed file" was a host parser bug: an empty
+runner CSV caused DictReader.fieldnames to be evaluated after the file context
+closed. Header validation now occurs inside the context, and runner parse
+failures retain the return code and runner tail. It was not evidence for or
+against a tiling.
+
+23. Historical candidate run-directory failure
+
+The 20260728 focused run stopped before launching any candidate with:
+
+  No such file or directory:
+  .../candidate/skinny_n_large_k_bank_seed_control_rank0/run
+
+An exact history match intentionally skips RuntimeKb candidate-directory
+creation. The profiling loop nevertheless tried to create the nested run
+directory before checking whether the control or searched candidate would be
+reused from history. Since mkdir did not create missing parents, the run
+failed before NPU execution.
+
+Run directories are now created only for candidates that require a new NPU
+measurement, with parent creation enabled. Historical controls and searched
+candidates require no temporary run directory. The regression test covers
+both paths. The focused RuntimeKb validation remains unchanged:
+
+  bank_records_prepared=2
+  history_records_reused=3
+
+No measurement from the failed run needs to be preserved because it stopped
+before the bank control or either new candidate was launched.
+
+24. Historical official-baseline identity failure
+
+The focused 20260728 NPU run completed its bank control and all four searched
+candidates. Post-processing then rejected official_profile.csv with:
+
+  official baseline identity contract failed
+
+The NPU measurements were valid. The failure was caused by using
+"historical_installed_aclnn_matmul" in the source column when reconstructing
+an official baseline from history. The ranking contract correctly requires
+the implementation identity to remain:
+
+  rank=-1
+  source=installed_aclnn_matmul
+  candidate_role=official_operator_baseline
+
+Historical provenance belongs in the separate measurement_source column. A
+dedicated historical_official_profile constructor now enforces all three
+identity fields while retaining measurement_source=history:...
+
+The newly reported focused core-balance measurement was also added to the
+history CSV with its complete schedule fingerprint:
+
+  T=208x32x64 S=208x32x16384 C=20 G=20x1
+  L2=5x1(4x1) I=1 L1=8x64 DB=2x2x1 L2O=0
+  median=0.0748452 ms, speedup_vs_official=1.37665
+
+The run confirmed the existing best exact candidate:
+
+  median=0.0674828 ms
+  speedup_vs_official=1.52685
+  speedup_vs_bank=1.55143
+
+25. Selection-bias correction and broad official-local campaign
+
+The focused skinny_n_large_k run was useful only as a regression check. It
+could not establish generalization because that workload was selected after
+its gain was already known. The default full run is therefore broad again.
+
+The earlier broad proxy search is not restored: measured 910B3 data already
+showed that generic 176x176-style MultiCoreMatmulTiling anchors can be legal
+yet much slower than the final MatMulV3 policy. Instead, every supported
+workload now receives two controlled candidates around its exact official
+RuntimeKb seed:
+
+  candidate A changes iterateOrder only
+  candidate B changes l2IterateOrder only
+
+Only the strict fp16 NN, 16 < N <= 32, K >= 8192 BASE family receives four
+additional core/L1/DB/L2 candidates. The known 4096x17x16384 result is tagged
+known_anchor. Three shapes not used to derive the rule are tagged
+unseen_skinny_n:
+
+  3072x17x8192
+  4096x24x12288
+  4608x31x16384
+
+N=33 is a boundary control and receives no skinny-N-specific candidates. Six
+previously regressed workloads are explicitly tagged prior_regression:
+
+  llm_full_4096_ffn_up
+  llm_full_4096_ffn_down
+  llm_8192_square
+  attention_score_1024
+  vision_projection
+  skinny_m_large_k
+
+Host validation on CANN 8.1.RC1 / Ascend910B3 produced:
+
+  workloads                    40
+  bank seed controls           39
+  searched candidates          94
+  callback-valid searched      94/94
+  newly queried RuntimeKb      130/130 found
+  exact history records reused 3
+
+No NPU profiling was run locally. These numbers prove only callback and
+RuntimeKb acceptance. The terminal report now separates known anchor, unseen
+holdouts, prior regressions, broad validation, boundary, and unsupported
+control. The known anchor cannot make the campaign pass. All three unseen
+holdouts, all six prior regressions, and all 28 other supported general
+workloads must improve before MATMUL_WIDE_RESULT can be "supported"; otherwise
+it is "not_proven".
+
+26. Exact persistent resume without repeated NPU measurements
+
+The broad campaign previously regenerated temporary profile CSV files and
+deleted them at exit. A later run could therefore measure the same successful
+candidate again even when the complete tiling had not changed.
+
+The profiler now maintains:
+
+  results/npu_<mode>_resume.csv
+
+It atomically merges each completed official baseline, bank seed control, and
+searched candidate before temporary files are removed. The EXIT trap also
+merges rows after a candidate failure or user interruption. Existing
+npu_<mode>_candidates.csv is imported when upgrading from an earlier package.
+
+Official baselines are reused only for the same SoC, AIC count, workload,
+shape, dtype, and transpose flags. A bank control or searched candidate
+additionally requires an exact match of:
+
+  MatMulV3 template
+  all 23 RuntimeKb knowledge words
+  official callback tiling SHA-256
+
+The visible baseMNK or singleCoreMNK fields alone are deliberately
+insufficient. Old OCR rows without the hidden L1/DB/order fields remain
+research evidence and are not presented as an exact resume match.
+
+The terminal profile_plan reports exact assignments and the remaining NPU
+work:
+
+  resume_exact_baselines_assigned
+  resume_exact_assigned
+  npu_official_baselines_pending
+  npu_controls_pending
+  npu_searched_pending
+
+No tiling candidate-generation rule was changed by this resume work.
+
+27. Completed 40-workload run narrowed the optimization hypotheses
+
+The NPU log transcribed in /usr/local/Ascend/net_log.txt completed the full
+20260728-official-local-exact-resume-v3 campaign:
+
+  workloads                  40
+  improved                    3
+  within_noise               28
+  regressed                   8
+  unsupported                 1
+  exact resume rows written 172
+
+The three measured improvements were:
+
+  skinny_n_large_k
+    4096x17x16384, 0.0674828 ms / 0.103036 ms official, 1.52685x
+
+  skinny_n_holdout_m4608_n31
+    4608x31x16384, 0.073756 ms / 0.107518 ms official, 1.45776x
+
+  large_k_small_mn
+    128x128x32768, 0.031082 ms / 0.0327812 ms official, 1.05467x
+
+The initial skinny-N generalization hypothesis was not supported:
+
+  3072x17x8192    0.998967x, within noise
+  4096x24x12288   1.00111x, within noise
+  4608x31x16384   1.45776x, improved
+
+N=33 was also within noise. The evidence therefore does not support a generic
+K>=8192 rule. It supports testing the narrower K=16384, 16<N<=32 class.
+
+The aligned 128x128x32768 deterministic split-K order ablation improved
+1.05467x, while the 127x127x32769 unaligned control regressed to 0.919247x.
+This is evidence for an alignment-conditioned order hypothesis, not for
+flipping traversal on every split-K template.
+
+The live WORKLOAD_RESULT line previously used only the bank-control verdict.
+It could therefore print optimization_result=improved while the candidate was
+still slower than the official operator. The live result now requires both
+status_vs_official=improved and status_vs_bank=improved, matching the final
+ranking logic.
+
+28. Source-guided incremental campaign and no-remeasurement guard
+
+The next search changes only the two hypotheses supported by entry 27.
+Public MatMulV3 source was used to constrain traversal mutations:
+
+  BASE
+    iterateOrder and l2IterateOrder are separate one-field ablations.
+
+  DETERMINISTIC_SPLIT_K
+    iterateOrder is ablated only when M, N, and K are all 128 aligned.
+
+  SINGLE_CORE_SPLIT_K and full-load families
+    traversal is not mutated because the source ties the outer loop to the
+    reduction or resident-operand implementation.
+
+The skinny-N special family now requires K>=16384. Its A-side L1 depth is
+capacity-aware: depthA1=16 is used only when the exact A+B allocation fits
+the detected 524032-byte L1; baseM=256 uses depthA1=8.
+
+Six new holdouts were appended:
+
+  skinny-N K=16384
+    3072x17x16384
+    4096x24x16384
+    5120x29x16384
+
+  aligned deterministic split-K
+    128x128x16384
+    128x128x49152
+    128x128x65536
+
+Host-only CANN 8.1.RC1 validation produced 45 bank controls and 90 searched
+candidates for 46 workloads. All newly generated holdout records were found
+by RuntimeKb. No local NPU profiling or CPU simulator was run.
+
+The default full command protects the first 40 workloads with an exact resume
+guard. It checks official identity plus every active control/candidate's
+23-word signature and callback SHA before creating a RuntimeKb temporary bank
+or launching NPU work. Missing history aborts instead of remeasuring old
+records. With the remote results/npu_full_resume.csv retained, only these new
+records remain:
+
+  6 official baselines
+  6 bank controls
+  21 searched candidates
+  33 total new NPU measurements
+
+29. Legacy resume migration after exact_rows=0
+
+A later packaged run stopped before RuntimeKb/NPU with:
+
+  exact resume guard refused to remeasure prior workloads
+  resume_history: exact_rows=0
+
+The NPU and tiling path had not failed. The retained resume file either used
+an older schema or contained only a header, while the guard accepted only
+rows carrying the new callback SHA. This made previously recorded successful
+measurements unusable and was too strict.
+
+The successful 20260728_015915 terminal log was structurally imported into
+results/npu_full_ocr_measurements.csv:
+
+  supported official baselines  39
+  bank seed controls             39
+  deterministic Split-K result   1
+
+Legacy baseline reuse now requires exact workload id, shape, dtype,
+transpose, SoC and AIC identity. Legacy control/candidate reuse requires the
+full T/S/C/G/L2/I/L1/DB/L2O schedule plus preflight_contract=grid9_v1. A
+missing callback SHA alone may be migrated only when that schedule uniquely
+matches the current callback; missing schedule fields are still rejected.
+
+A fresh-resume host-only reproduction passed:
+
+  resume_guard protected_workloads=40 trusted_baselines=39 missing=0
+  RuntimeKb records             92/92 found
+  historical bank records       44
+  new bank records              48
+  callback rejection             0
+
+No NPU runner or CPU simulator was started for this validation. Entry 28's
+90-candidate campaign description is superseded by the active
+bottleneck_guided_v1 frontier: 47 searched schedules, at most 4 currently
+selected for any workload (hard cap 8).
+
+30. Complete 46-workload result and lower-K causal follow-up
+
+The NPU log copied to /usr/local/Ascend/net_log1.txt completed successfully:
+
+  script                     20260728-bottleneck-frontier-resume-migration
+  workloads                  46
+  improved                    9
+  within_noise               13
+  regressed                   9
+  other / unsupported        15
+  exact resume rows         137
+
+Five independent K=16384, 16<N<=32 skinny-N shapes improved:
+
+  3072x17x16384   1.59785x
+  4096x17x16384   1.52685x
+  4096x24x16384   1.47232x
+  4608x31x16384   1.45775x
+  5120x29x16384   1.24121x
+
+The adjacent 4096x33x16384 boundary also improved 1.17078x. This establishes
+a measured K=16384 family; it does not establish a generic K>=8192 rule.
+
+Aligned 128x128 deterministic split-K iterate-order results were:
+
+  K=16384   1.10457x
+  K=32768   1.05467x
+  K=49152   1.09397x
+  K=65536   0.867283x
+
+K=65536 is a concrete boundary counterexample, so traversal is not extrapolated
+past the measured positive region.
+
+The previous lower-K skinny-N tests were:
+
+  3072x17x8192    0.990495x
+  4096x24x12288   0.962917x
+
+Both changed the core/base grid but retained L2=1x1(20x1). They therefore did
+not test the L2=5x1(4x1) partition used by every positive K=16384 schedule.
+The next campaign changes no broad search rule. Each lower-K workload receives
+exactly two preregistered candidates:
+
+  L2-only       core/base + L2=5x1(4x1), callback-derived L1 retained
+  L2-plus-L1    same schedule, with L1 depth changed to 16x8
+
+This separates the L2 partition effect from the L1 packet/reuse effect. The
+established K=16384 family now emits one learned schedule rather than repeating
+four ablations.
+
+Forty-five terminal-visible rows from net_log1.txt were added structurally to
+results/npu_full_ocr_measurements.csv: 6 baselines, 6 bank controls, and 33
+candidates. Ten concise-mode candidate lines were not visible; their latency
+was not invented. The remote results/npu_full_resume.csv remains authoritative
+for all 137 exact rows and must be retained when updating the package.
+
+Host-only CANN 8.1.RC1 validation after the change:
+
+  unit tests                         passed
+  general callback/RuntimeKb rows    45/45 found
+  template contract rows             84
+  template suffixes                  12
+  template families                   7
+  active searched schedules          33
+  active bank records                78
+  embedded history reused            72
+  new lower-K NPU candidates           4
+
+The host search initially selected zero lower-K candidates despite generating
+two legal rows. Two control-flow bugs were found and corrected: the string
+"0" in search_history_match was treated as true, and Beam relabeling did not
+preserve the new skinny_n_low_k_* guidance. Regression tests cover both
+conditions. No NPU, CPU simulator, driver, toolkit symlink, or system path was
+changed during this analysis.
+
+31. Exact-frontier filtering after the 20260728_063335 guard failure
+
+The next remote run stopped before RuntimeKb or NPU profiling because the
+completed campaign selected two unmeasured generic actions:
+
+  odd_tail_1:searched:2
+  trans_ab_case:searched:2
+
+Both rows were incorrectly relabeled require_existing even though neither had
+an exact history record. The resume guard correctly rejected that
+contradiction. CandidateProposal now defaults to require_existing; the
+established K=16384 family also requires history, and a completed campaign
+retains only exact history matches or explicitly preregistered allow_new
+experiments. The only current allow_new actions are the four lower-K causal
+L2/L1 tests. Nonempty history record IDs are now recognized consistently,
+while the legacy placeholder "0" remains a no-match value.
+
+The resume guard itself was not weakened. Python syntax, model/search tests,
+and result-ranking tests passed without running an NPU or CPU simulator.
+
+32. Compact terminal output for full profiling
+
+The large terminal output after bottleneck_guided_v1 was not evidence of
+remeasurement by itself. In default mode run_npu.sh still streamed every
+candidate_start/candidate_done line from profile_official_tilings.py through
+tee, while also saving the same stream into results/logs/profile_*.log. Exact
+remeasurement is controlled separately by results/npu_full_resume.csv and the
+require-exact resume guard.
+
+Default terminal output is now filtered. The full profiling stream is still
+stored in the phase log, but stdout keeps only schema/plan lines, one WORKLOAD
+line per workload, bank_control_done, WORKLOAD_RESULT, improved candidates,
+runtime rejections, and complete TILING_ERROR/fatal trace sections. Set
+RUN_VERBOSE=1 to restore the full live stream, or PROFILE_SHOW_REUSE=1 to show
+history reuse lines in the compact stream.
+
+This change does not alter the search algorithm, resume identity keys,
+RuntimeKb checks, or measured CSV contents.
+
+33. net_log2 result and second-stage terminal reduction
+
+The latest successful remote run after the exact-frontier fix completed full
+mode. The first block in net_log2.txt is an older guard failure; the successful
+run starts at run_npu_20260728_064346.
+
+The successful run reported:
+
+  workloads                 46
+  searched candidates        26
+  bank seed controls         45
+  history records reused     67
+  NPU searched pending        4
+  NPU controls pending        0
+  NPU baselines pending       0
+
+So the run did not remeasure the old full campaign. It reused previous
+candidate/control data and only measured the four preregistered lower-K
+skinny-N causal tests.
+
+Optimization results:
+
+  improved                    8
+  not_improved               15
+  no_searched_candidate      23
+
+Supported result:
+
+  skinny-N at K=16384 is supported by all three preregistered K=16384 holdouts.
+
+Not supported:
+
+  generic skinny-N extrapolation to lower K
+  deterministic split-K across all aligned K holdouts
+  previous regression repair
+  broad MatMulV3-wide replacement
+
+The terminal output was still about 500 lines because the final compact result
+listed all 46 workloads and live profiling still printed every WORKLOAD_RESULT.
+The next version now prints only analysis-relevant rows by default: improved,
+regressed, and allow_new experiments. Full rows are still in CSV and can be
+printed with PRINT_ALL_RESULTS=1; live per-workload progress can be restored
+with PROFILE_SHOW_WORKLOADS=1.
+
+34. Search rule pruning from net_log2
+
+The output-only reduction is not a reason to rerun. The measured data in
+net_log2 changes the search frontier:
+
+  low-K skinny-N
+    3072x17x8192 with the K=16384 L2/L1 schedule was within noise
+    4096x24x12288 with the same L2 partition regressed
+    result: lower-K extrapolation is closed; no more allow_new probes there
+
+  K=16384 skinny-N
+    all three preregistered K=16384 holdouts improved, in addition to the
+    original anchor
+    result: the one-block-per-AIC, L2=5x1(4x1), N=32 schedule remains the
+    only learned skinny-N positive rule
+
+  deterministic split-K
+    K=16384, K=32768, and K=49152 improved
+    K=65536 regressed
+    result: the iterate-order ablation is bounded to 16384 <= K <= 49152
+    for 128x128 aligned fp16 only
+
+The search generator now encodes those conclusions directly. Low-K skinny-N
+returns stop=low_k_skinny_n_extrapolation_rejected_by_npu_evidence, and
+deterministic split-K outside the positive interval returns
+stop=deterministic_split_k_range_rejected_by_npu_evidence. The net_log2
+low-K rows are also recorded in results/npu_full_ocr_measurements.csv.
+
+35. Default optimizer narrowed to measured positive families
+
+The net_log4 campaign completed without new NPU measurements and reused the
+exact history already recorded in results/npu_full_ocr_measurements.csv. Its
+evidence is not a broad MatMulV3 improvement:
+
+  supported:
+    skinny-N, fp16, no transpose, 16 < N <= 32, K = 16384,
+    exactly one output block per AIC, BASE T=balancedM x 32 x 64,
+    L2=5x1(4x1), with L1 rebalance and the measured baseM=256 exception.
+
+    deterministic split-K, fp16, no transpose, M=N=128,
+    K in {16384, 32768, 49152}, MatMulV3 deterministic split-K
+    iterateOrder ablation, T=128x128x128, S=384x128x384.
+
+  rejected / not generalized:
+    lower-K skinny-N at K=8192 and K=12288,
+    deterministic split-K at K=65536,
+    generic BASE L2/order/DB/core-grid transitions on the broad LLM,
+    vision, attention, tail, BF16 and FP32 workload set.
+
+The default bottleneck_guided_v1 optimizer now emits only the supported
+family rules above. Generic BASE transition constructors remain in source for
+unit-level analysis and future narrower experiments, but the default full run
+does not send those measured-regressive broad guesses back to NPU. The compact
+summary also reports deterministic split-K support against the bounded
+positive range instead of treating the intentionally excluded K=65536 negative
+control as a failed holdout.
+
+36. Restore the measured skinny-N boundary rule
+
+net_log1 contained one more real improvement that net_log4 accidentally
+excluded while pruning broad BASE transitions:
+
+  skinny_n_boundary_n33
+    shape 4096x33x16384 fp16
+    official_ms=0.0939108
+    bank_seed_ms=0.0948196
+    searched_ms=0.080212
+    speedup_vs_official=1.17078
+    speedup_vs_bank=1.18211
+    schedule: BASE T=208x48x64 S=208x48x16384 C=20
+              G=20x1 L2=1x1(20x1) I=0 L1=8x40 DB=2x2x1
+
+This is not treated as a broad MatMulV3 rule. It is a narrow boundary rule
+for fp16, no-transpose, K=16384, 32 < N <= 48, and exactly one M block per
+AIC. The generator now emits it with
+search_guidance=skinny_n_boundary_k16384_one_block_per_aic and
+resume_policy=require_existing, so old measurements are reused and the full
+run does not reopen the previously rejected broad BASE search.
+
+37. Exact resume guard is conditional on exact resume availability
+
+The OCR measurement file records prior timings and is suitable for search
+history and coarse candidate reuse, but it is not an exact runner resume file:
+it does not contain the full tiling signature, callback sha256, and runner
+preflight identity fields. Therefore it must not be force-converted into
+results/npu_full_resume.csv.
+
+run_npu.sh now enables REQUIRE_EXACT_RESUME_PREFIX=46 only when the exact
+resume file already exists. If the machine only has
+results/npu_full_ocr_measurements.csv, profiling can still reuse the measured
+history, but it will not fail immediately with an exact-resume guard error.
+
+38. Targeted attention-score repair candidate
+
+The current regressed attention_score_1024 result is not caused by the
+128x208 core-grid shape alone. The failed net_log1/net_log4 candidate used:
+
+  BASE T=128x208x64 S=128x208x128
+  G=8x5 L2=1x1(8x5) I=0 L1=16x8 DB=2x2x1
+  searched_ms=0.0096124, official_ms=0.0094252, regressed
+
+The earlier successful-looking 20260727_074700 OCR rows used the same shallow
+K/transB region but with explicit M-direction L2 rounds:
+
+  BASE T=128x208x64 S=128x208x128
+  G=8x5 L2=2x1(4x5), speedup_vs_official=1.01046
+
+  BASE T=112x256x64 S=112x256x128
+  G=10x4 L2=3x1(4x4), speedup_vs_official=1.01216
+
+Those old OCR rows do not contain exact L1/DB/signature metadata, so they
+cannot be reused as exact measurements. The generator now emits exactly these
+two source-guided candidates for attention_score_1024 with official L1
+reconstruction and resume_policy=allow_new. This is a focused NPU verification
+target for one currently regressed workload, not a reopened broad BASE sweep.
+
+39. Default search must emit new exploration, not only replay history
+
+net_log4 exposed a real search-design defect:
+
+  npu_searched_pending=0
+
+That means the default optimizer was replaying historical rows and did not
+propose any new NPU measurement. This is not a valid tiling search.
+
+The default bottleneck_guided_v1 generator now adds a bounded official-seed
+L2 frontier for BASE workloads that were slower or under-explored:
+
+  llm_full_4096_ffn_up, llm_full_4096_ffn_down, llm_8192_square,
+  vision_projection, skinny_m_large_k, bf16_llm, fp32_square,
+  odd_tail_2, odd_tail_3, trans_a_case, trans_b_case, trans_ab_case.
+
+The frontier is intentionally small. It keeps the official MatMulV3 baseM,
+baseN, baseK, singleCoreM/N/K, L1 packet depths and DB settings, and only
+changes the source-visible L2 scheduling fields:
+
+  l2MTileCnt, l2NTileCnt, l2MTileBlock, l2NTileBlock, l2IterateOrder
+
+The generated actions are:
+
+  official_l2_reuse_a_row_first
+  official_l2_reuse_b_col_first
+  official_l2_split_m_round
+  official_l2_split_n_round
+  official_l2_merge_m_round
+  official_l2_merge_n_round
+
+Each candidate must pass hard_legal and official callback validation before
+it is written for NPU profiling. This avoids returning to the previous broad
+BASE search that changed base tile and buffering together and produced large
+regressions on full and vision shapes.
+
+The resume protection was also fixed. A completed frontier may block
+accidental remeasurement, but it must not rewrite preregistered
+resume_policy=allow_new candidates back to require_existing. Otherwise new
+candidate rows disappear before profiling and the run again reports
+npu_searched_pending=0.
+
+Local dry-run evidence on 2026-07-28, without NPU profiling:
+
+  command:
+    ASCENDC_SOC_VERSION=Ascend910B3 SEARCH_SCOPE=bottleneck_guided_v1
+    TOP_K=20 BEAM_WIDTH=64 TABU_ITERS=0 LNS_ROUNDS=0
+    bash scripts/run_search.sh config/workloads.csv
+
+  result:
+    selected rows=103
+    searched rows=58
+    allow_new rows=45
+
+  selected allow_new workloads:
+    attention_score_1024=2
+    bf16_llm=3
+    fp32_square=4
+    llm_8192_square=4
+    llm_full_4096_ffn_down=4
+    llm_full_4096_ffn_up=3
+    odd_tail_2=4
+    odd_tail_3=4
+    skinny_m_large_k=4
+    trans_a_case=3
+    trans_ab_case=4
+    trans_b_case=3
+    vision_projection=3
+
+The next real NPU run should therefore show npu_searched_pending greater
+than zero. If the next run again reports zero, the problem is in profiling
+history assignment or terminal filtering, not in candidate generation.
+
+40. First NPU run of the bounded new frontier and timeout-row fix
+
+The 2026-07-29 full run confirmed that section 39 now reaches the NPU:
+
+  searched_candidates=58
+  history_candidates_assigned=60
+  npu_search_pending=43
+  npu_controls_pending=0
+  npu_official_baselines_pending=0
+
+Therefore this run was not only replaying historical measurements. It sent
+43 exact schedules that were not available in the trusted history to the NPU.
+
+The focused attention candidate did not beat the installed official operator:
+
+  attention_score_1024
+    searched_ms=0.009722
+    bank_seed_ms=0.0097192
+    official_ms=0.0094252
+    speedup_vs_official=0.969471
+    optimization_result=not_improved
+
+The run also reconfirmed the previously recorded skinny-N and deterministic
+split-K holdout improvements. Those measurements already exist in
+results/npu_full_ocr_measurements.csv, so they were not duplicated:
+
+  skinny_n_k16384_holdout_m3072_n17  speedup=1.59785
+  skinny_n_k16384_holdout_m4096_n24  speedup=1.47232
+  skinny_n_k16384_holdout_m5120_n29  speedup=1.24122
+  det_split_k_aligned_holdout_k16384 speedup=1.10457
+  det_split_k_aligned_holdout_k49152 speedup=1.09397
+
+fp32_square rank 1 timed out after 60 seconds in the isolated MatMulV3
+preflight and was correctly classified as candidate_timeout. The profiler
+discarded it and continued; this is a rejected tiling result, not a host or
+ACL infrastructure failure.
+
+After all measurements, ranking incorrectly failed with:
+
+  fp32_square: custom/official workload shape mismatch
+
+Root cause: a timeout produces no runner profile CSV. The synthetic failure
+row contained workload_id and error but no m/n/k/dtype/trans fields. Ranking
+then compared the blank failed-row identity with the valid official
+2048x2048x2048 identity and rejected the complete run.
+
+candidate_profile now copies workload_id, m, n, k, dtype, trans_a and trans_b
+from the candidate into every profile row, including timeout and execution
+failure rows. Rejected candidates can therefore remain in the detailed CSV
+without invalidating successful rows. The 147 exact successful measurements
+already written to results/npu_full_resume.csv remain usable by the next run.
+
+41. Completed 148-row run closes the broad L2 frontier
+
+The next 2026-07-29 full run completed profiling and ranking successfully:
+
+  baselines=45
+  searched=58
+  runtime_rejected=0
+  unsupported=1
+  resume_exact_rows=148
+  result_workloads=46
+  improved=8
+  within_noise=8
+  regressed=5
+  no_searched_candidate=25
+
+The eight improved results did not come from the 43 new broad L2 candidates.
+They reconfirmed the two already identified, holdout-backed families:
+
+  skinny-N, K=16384:
+    known anchor                    1.50756x
+    M=4608, N=31 holdout           1.45775x
+    M=3072, N=17 holdout           1.59785x
+    M=4096, N=24 holdout           1.47232x
+    M=5120, N=29 holdout           1.24122x
+
+  deterministic split-K, M=N=128:
+    K=16384                         1.10457x
+    K=32768                         1.05467x
+    K=49152                         1.09397x
+
+The broad official_l2_* frontier found no new workload that beat both the
+official operator and the RuntimeKb bank control beyond noise. Representative
+regressions were fp32_square 0.628585x, llm_8192_square 0.976054x, and
+llm_full_4096_ffn_up 0.989579x. The attention_score_1024 focused frontier also
+failed to beat the official operator. Both frontiers are now closed in the
+default optimizer.
+
+Two bank controls remain useful causal starting points:
+
+  odd_tail_2:
+    bank_seed_ms=0.181318
+    official_ms=0.184911
+    bank_seed_speedup=1.01982x
+
+  trans_ab_case:
+    bank_seed_ms=0.0417304
+    official_ms=0.042384
+    bank_seed_speedup=1.01566x
+
+The next frontier therefore contains exactly one new candidate for each of
+those workloads. It copies all 23 RuntimeKb fields and toggles only the BASE
+kernel iterateOrder bit from 0 to 1. CANN 8.1 MatMulV3 source reads this field
+to select the M/N traversal order, so the experiment changes a real execution
+path while preserving tile shape, L1 packet depth, DB settings, and L2
+partitioning.
+
+Local callback dry-run, without NPU profiling:
+
+  selected_rows=55
+  allow_new=2
+  official_l2_rows=0
+  attention_score_1024_searched_rows=0
+
+  odd_tail_2:
+    guidance=bank_advantage_iterate_order_ablation
+    T=128x256x64
+    iterateOrder=1
+
+  trans_ab_case:
+    guidance=bank_advantage_iterate_order_ablation
+    T=256x128x64
+    iterateOrder=1
+
+Both candidates pass hard_legal and the official callback contract. The next
+NPU run should reuse the 148 exact measurements and report only these two
+previously unmeasured schedules as npu_search_pending.
+
+42. Iterate-order ablation rejected; N=33..48 boundary family preregistered
+
+The 2026-07-29 bank-advantage-order-ablation run completed successfully and
+executed exactly the two schedules requested by section 41:
+
+  searched_candidates=10
+  history_candidates_assigned=53
+  npu_search_pending=2
+  npu_controls_pending=0
+  npu_official_baselines_pending=0
+
+Neither iterate-order change improved its bank seed:
+
+  odd_tail_2:
+    searched_ms=1.39174
+    bank_seed_ms=0.181318
+    official_ms=0.184911
+    speedup_vs_bank=0.130281
+    speedup_vs_official=0.132863
+
+  trans_ab_case:
+    searched_ms=0.042818
+    bank_seed_ms=0.0417304
+    official_ms=0.042384
+    speedup_vs_bank=0.9746
+    speedup_vs_official=0.989864
+
+The odd-tail slowdown is decisive, and the transpose result does not beat
+either reference. Both bank-seed iterate-order hypotheses are rejected and
+removed from the default frontier. Their exact rows are retained in
+results/npu_full_ocr_measurements.csv, so they will not be measured again.
+
+Reviewing the complete history exposed a separate missed positive result:
+
+  skinny_n_boundary_n33:
+    shape=4096x33x16384
+    T=208x48x64
+    L1=8x40
+    DB=2x2x1
+    L2=1x1(20x1)
+    searched_ms=0.080212
+    bank_seed_ms=0.0948196
+    official_ms=0.0939108
+    speedup_vs_official=1.17078
+
+This schedule was omitted because its candidate and bank control came from
+different run IDs. The history calibrator rejected any official-only evidence
+when a bank-path difference existed, even when the measured official
+improvement was 14.59 percent. The rule now accepts cross-run official-only
+evidence only when searched_ms / official_ms is at most 0.90. Marginal wins
+remain rejected.
+
+The N=33 result defines a hardware-relevant boundary: N in 33..48 occupies
+one 48-column tile, while M is divided into exactly 20 output blocks for the
+20 AICs. Three unseen K=16384 holdouts are preregistered:
+
+  skinny_n_boundary_holdout_m3072_n40 T=160x48x64
+  skinny_n_boundary_holdout_m4096_n47 T=208x48x64
+  skinny_n_boundary_holdout_m5120_n48 T=256x48x64
+
+All three use one M block per AIC, one N block, L1=8x40, DB=2x2x1, and
+L2=1x1(20x1). This is one family rule tested on three unseen shapes, not a
+parameter grid.
+
+The local callback dry-run confirms:
+
+  total_workloads=49
+  searched_rows=12
+  allow_new=3
+  odd_tail_2_searched_rows=0
+  trans_ab_case_searched_rows=0
+
+The N=33 anchor is assigned from trusted history. On the remote NPU, the next
+run should report exactly three pending official baselines, three pending bank
+controls, and three pending searched candidates for the new holdouts.
+
+43. N=33..48 boundary family confirmed on three unseen NPU shapes
+
+The 2026-07-29 skinny-n-boundary-holdouts run matched the preregistered plan:
+
+  workloads=49
+  searched_candidates=12
+  history_candidates_assigned=54
+  npu_search_pending=3
+  npu_controls_pending=3
+  npu_official_baselines_pending=3
+
+All three unseen shapes beat both the installed official MatMulV3 operator and
+the RuntimeKb bank control:
+
+  M=3072 N=40 K=16384:
+    T=160x48x64
+    searched_ms=0.069284
+    bank_seed_ms=0.0906788
+    official_ms=0.0913144
+    speedup_vs_official=1.31797
+
+  M=4096 N=47 K=16384:
+    T=208x48x64
+    searched_ms=0.0785904
+    bank_seed_ms=0.0959392
+    official_ms=0.0962516
+    speedup_vs_official=1.22472
+
+  M=5120 N=48 K=16384:
+    T=256x48x64
+    searched_ms=0.0977752
+    bank_seed_ms=0.103711
+    official_ms=0.102746
+    speedup_vs_official=1.05084
+
+Together with the N=33 anchor at 1.17078x, this supports the exact K=16384,
+N=33..48 rule. All four schedules use one M block per each of the 20 AICs,
+one N block, L1=8x40, DB=2x2x1, and L2=1x1(20x1). The three exact new rows are
+stored in results/npu_full_ocr_measurements.csv and must not be remeasured.
+
+44. Adjacent baseN=64 boundary campaign
+
+The N=48 improvement is still positive but has narrowed to 5.08 percent.
+Therefore the next experiment locates the adjacent 16-column hardware boundary
+instead of searching another parameter grid.
+
+CANN 8.1 RuntimeKb returns baseN=64 for N=49, N=56, and N=64. The recovered
+MultiCoreMatmulTiling contract confirms that baseM/baseN are 16-aligned L0
+factors and that depthA1/depthB1 are derived from compatible K steps. The
+proposed L1=8x32 split uses stepKa=4 and stepKb=16 and remains within the
+524032-byte 910B3 L1 capacity.
+
+Three unseen shapes are preregistered:
+
+  skinny_n_boundary64_holdout_m3072_n49 T=160x64x64
+  skinny_n_boundary64_holdout_m4096_n56 T=208x64x64
+  skinny_n_boundary64_holdout_m5120_n64 T=256x64x64
+
+Each schedule has exactly 20x1 output blocks, uses all 20 AICs, and sets
+L2=1x1(20x1), DB=2x2x1, and iterateOrder=0. For all three shapes:
+
+  static hard_legal=passed
+  CANN 8.1 callback=accepted
+  23-field callback round-trip difference=none
+
+The complete CANN 8.1 dry-run reports:
+
+  workloads=52
+  bank_seed_controls=51
+  searched_candidates=15
+  history_matched_searched=12
+  allow_new=3
+
+The remote NPU run should therefore execute only three new official baselines,
+three new bank controls, and three new searched schedules.

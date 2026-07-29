@@ -1,0 +1,11 @@
+id,m,n,k,dtype,trans_a,trans_b,max_cores
+validation_llm,4096,11008,4096,fp16,0,0,24
+validation_large_k,4096,4096,11008,fp16,0,0,24
+validation_skinny,17,4096,16384,fp16,0,0,24
+validation_skinny_n,4096,17,16384,fp16,0,0,24
+validation_tail,1025,4097,3073,fp16,0,0,24
+validation_trans_b,1024,1024,128,fp16,0,1,24
+validation_trans_ab,1024,1536,2048,fp16,1,1,24
+validation_bf16,1024,4096,4096,bf16,0,0,24
+validation_fp32_nt_splitk,16,16,4096,fp32,0,1,24
+validation_int8,2048,4096,8192,int8,0,0,24

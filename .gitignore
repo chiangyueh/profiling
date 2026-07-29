@@ -1,0 +1,8 @@
+build/
+results/*
+!results/npu_full_ocr_measurements.csv
+cceprint/
+npuchk/
+stub_reg.log
+tools/__pycache__/
+*.pyc

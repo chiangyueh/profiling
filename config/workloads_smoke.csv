@@ -1,0 +1,2 @@
+id,m,n,k,dtype,trans_a,trans_b,max_cores
+npu_smoke_fp16,256,256,256,fp16,0,0,24

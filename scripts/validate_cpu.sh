@@ -79,6 +79,7 @@ assert len({
 }) == 10
 assert all(
     row["source"] == "cann81_contract_behavior_v1"
+    and row["search_scope"] == "contract_behavior_v1"
     and row["search_template"] == row["callback_kernel_family"]
     and len(row["callback_tiling_sha256"]) == 64
     for row in searched
@@ -99,6 +100,54 @@ print(
     )
 )
 PY
+
+python3 tools/profile_official_tilings.py \
+    --runner build/official_matmul_runner \
+    --bank-probe build/tiling_bank_probe \
+    --candidates "$CONTRACT_CSV" \
+    --workloads config/contract_callback_validation.csv \
+    --custom-output "$WORK_DIR/contract_custom.csv" \
+    --custom-samples-output "$WORK_DIR/contract_custom_samples.csv" \
+    --official-output "$WORK_DIR/contract_official.csv" \
+    --official-samples-output "$WORK_DIR/contract_official_samples.csv" \
+    --cann-root "$CANN_ROOT" \
+    --soc "$SOC" \
+    --aic-cores "$AIC_CORES" \
+    --l0a-bytes "$L0A_BYTES" \
+    --l0b-bytes "$L0B_BYTES" \
+    --l0c-bytes "$L0C_BYTES" \
+    --l1-bytes "$L1_BYTES" \
+    --rank-limit 8 \
+    --validate-only
+
+CONTRACT_REGRESSION_CSV="$WORK_DIR/contract_regression_candidates.csv"
+SEARCH_SCOPE=contract_behavior_v1 \
+    BEAM_WIDTH=32 TABU_ITERS=0 LNS_ROUNDS=0 TOP_K=32 \
+    SEARCH_OUTPUT="$CONTRACT_REGRESSION_CSV" \
+    SEARCH_ALL_OUTPUT="$WORK_DIR/contract_regression_all.csv" \
+    SEARCH_TILING_DIR="$WORK_DIR/contract_regression_tilings" \
+    ./scripts/run_search.sh \
+    config/contract_profiler_regression.csv \
+    >"$WORK_DIR/contract_regression_search.log"
+
+python3 tools/profile_official_tilings.py \
+    --runner build/official_matmul_runner \
+    --bank-probe build/tiling_bank_probe \
+    --candidates "$CONTRACT_REGRESSION_CSV" \
+    --workloads config/contract_profiler_regression.csv \
+    --custom-output "$WORK_DIR/contract_regression_custom.csv" \
+    --custom-samples-output "$WORK_DIR/contract_regression_custom_samples.csv" \
+    --official-output "$WORK_DIR/contract_regression_official.csv" \
+    --official-samples-output "$WORK_DIR/contract_regression_official_samples.csv" \
+    --cann-root "$CANN_ROOT" \
+    --soc "$SOC" \
+    --aic-cores "$AIC_CORES" \
+    --l0a-bytes "$L0A_BYTES" \
+    --l0b-bytes "$L0B_BYTES" \
+    --l0c-bytes "$L0C_BYTES" \
+    --l1-bytes "$L1_BYTES" \
+    --rank-limit 32 \
+    --validate-only
 
 python3 tools/profile_official_tilings.py \
     --runner build/official_matmul_runner \

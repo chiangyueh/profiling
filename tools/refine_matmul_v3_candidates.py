@@ -75,7 +75,7 @@ BANK_COLUMNS = {
 EXTRA_COLUMNS = [
     *BANK_COLUMNS.values(),
     "search_template", "search_guidance", "search_model_score",
-    "search_candidate_source",
+    "search_scope", "search_candidate_source",
     "search_acquisition", "search_behavior_key", "search_behavior_metrics",
     "search_bottleneck", "search_rationale", "search_transition_gain",
     "search_resume_policy", "search_stop_reason",
@@ -5780,6 +5780,7 @@ def main() -> int:
             output_fields, workload, seed, hardware
         )
         control.row["search_bottleneck"] = bottleneck.dominant
+        control.row["search_scope"] = args.optimization_scope
         control.row["search_rationale"] = bottleneck.summary()
         control.row["search_resume_policy"] = "require_existing"
         control.row["search_stop_reason"] = stop_reason
@@ -5876,6 +5877,7 @@ def main() -> int:
                     if proposal is not None
                     else "constraint_generated"
                 )
+                row["search_scope"] = args.optimization_scope
                 contract_candidate = contract_candidate_by_signature.get(
                     signature
                 )

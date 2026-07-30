@@ -15,6 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import refine_matmul_v3_candidates as matmul_contract
+from tiling_search import (
+    Hardware as ContractHardware,
+    Schedule as ContractSchedule,
+    Workload as ContractWorkload,
+)
+from tiling_search.contracts import (
+    validate_schedule as validate_contract_schedule,
+)
 
 
 PROFILE_COLUMNS = [
@@ -31,7 +39,7 @@ PROFILE_COLUMNS = [
     "proxy_total", "success", "preflight_passed", "preflight_mode", "error",
     "min_ms", "mean_ms", "median_ms", "stddev_ms", "p95_ms", "max_ms", "tflops",
     "warmup", "repeat", "samples", "tiling_signature", "tiling_bin",
-    "search_guidance", "search_candidate_source",
+    "search_guidance", "search_scope", "search_candidate_source",
     "search_bottleneck", "search_rationale",
     "search_transition_gain", "search_resume_policy", "search_stop_reason",
     "search_model_cycles",
@@ -166,6 +174,8 @@ def comparison_status(
         1.0,
         200.0 * math.hypot(baseline_stddev, candidate_stddev) / baseline_ms,
     )
+    # The RuntimeKb control is an authoritative callback record, not output
+    # from our solver. Generator contracts apply only to searched schedules.
     if (
         baseline_stddev / baseline_ms > MAX_RELIABLE_MEASUREMENT_CV
         or candidate_stddev / candidate_ms > MAX_RELIABLE_MEASUREMENT_CV
@@ -1126,9 +1136,48 @@ def validate_candidate(row: dict[str, str], spec: BankSpec) -> None:
         l2_bytes_per_cycle_per_core=1.0,
         hbm_bytes_per_cycle_per_core=1.0,
     )
-    if not matmul_contract.hard_legal(workload, knowledge, hardware):
+    if (
+        row.get("search_scope") == "contract_behavior_v1"
+        and row.get("candidate_role") == "searched"
+    ):
+        contract_report = validate_contract_schedule(
+            ContractWorkload(
+                workload_id=workload.workload_id,
+                m=workload.m,
+                n=workload.n,
+                k=workload.k,
+                dtype=workload.dtype,
+                trans_a=workload.trans_a,
+                trans_b=workload.trans_b,
+                max_cores=workload.max_cores,
+            ),
+            ContractSchedule.from_mapping(knowledge),
+            ContractHardware(
+                aic_cores=hardware.aic_cores,
+                l0a_bytes=hardware.l0a_bytes,
+                l0b_bytes=hardware.l0b_bytes,
+                l0c_bytes=hardware.l0c_bytes,
+                l1_bytes=hardware.l1_bytes,
+                l2_bytes=hardware.l2_bytes,
+                l2_bytes_per_cycle_per_core=(
+                    hardware.l2_bytes_per_cycle_per_core
+                ),
+                hbm_bytes_per_cycle_per_core=(
+                    hardware.hbm_bytes_per_cycle_per_core
+                ),
+            ),
+        )
+        if not contract_report.valid:
+            raise ProfileError(
+                "candidate violates the contract_behavior_v1 template "
+                f"contract: {','.join(contract_report.violations)}"
+            )
+    elif (
+        row.get("search_scope") != "contract_behavior_v1"
+        and not matmul_contract.hard_legal(workload, knowledge, hardware)
+    ):
         raise ProfileError(
-            "candidate violates the exact CANN 8.1 MatMulV3 template contract"
+            "candidate violates the legacy CANN 8.1 MatMulV3 template contract"
         )
 
     family = matmul_contract.template_name(knowledge)
@@ -1420,6 +1469,7 @@ def candidate_profile(
         "tiling_signature": "tiling_signature",
         "tiling_bin": "tiling_bin",
         "search_guidance": "search_guidance",
+        "search_scope": "search_scope",
         "search_candidate_source": "search_candidate_source",
         "search_bottleneck": "search_bottleneck",
         "search_rationale": "search_rationale",

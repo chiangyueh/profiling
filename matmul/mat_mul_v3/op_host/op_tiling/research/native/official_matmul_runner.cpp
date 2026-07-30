@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -182,6 +183,31 @@ int RunAclOnly(int32_t deviceId)
     const aclError finalizeRc = aclFinalize();
     std::cout << "aclFinalize rc=" << finalizeRc << '\n';
     return soc != nullptr && resetRc == ACL_SUCCESS && finalizeRc == ACL_SUCCESS ? 0 : 1;
+}
+
+int RunSocOnly(int32_t deviceId)
+{
+    std::cout << "soc_probe_stage=aclInit" << std::endl;
+    const aclError initRc = aclInit(nullptr);
+    if (initRc != ACL_SUCCESS) {
+        std::cerr << "fatal: aclInit failed, rc=" << initRc << std::endl;
+        return 1;
+    }
+    std::cout << "soc_probe_stage=aclrtSetDevice device=" << deviceId << std::endl;
+    const aclError setRc = aclrtSetDevice(deviceId);
+    if (setRc != ACL_SUCCESS) {
+        std::cerr << "fatal: aclrtSetDevice failed, rc=" << setRc << std::endl;
+        return 1;
+    }
+    std::cout << "soc_probe_stage=aclrtGetSocName" << std::endl;
+    const char *soc = aclrtGetSocName();
+    if (soc == nullptr || soc[0] == '\0') {
+        std::cerr << "fatal: aclrtGetSocName returned an empty value" << std::endl;
+        return 1;
+    }
+    std::cout << "aclrtGetSocName=" << soc << std::endl;
+    std::cout.flush();
+    std::_Exit(0);
 }
 
 std::vector<std::string> SplitCsv(const std::string &line)
@@ -717,7 +743,7 @@ std::unordered_map<std::string, std::string> ParseArgs(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
         if (key == "--help" || key == "-h" || key == "--validate-input" ||
-            key == "--acl-only") {
+            key == "--acl-only" || key == "--soc-only") {
             args[key] = "1";
             continue;
         }
@@ -762,6 +788,7 @@ void PrintUsage()
         << "  --workload-limit N\n"
         << "  --numeric-preflight-max-mib N\n"
         << "  --acl-only            initialize the linked ACL runtime without profiling\n"
+        << "  --soc-only            print the exact device SoC and exit without teardown\n"
         << "  --validate-input       validate input and CSV schema without ACL/NPU\n";
 }
 
@@ -792,6 +819,9 @@ int main(int argc, char **argv)
         }
         if (args.count("--acl-only")) {
             return RunAclOnly(options.deviceId);
+        }
+        if (args.count("--soc-only")) {
+            return RunSocOnly(options.deviceId);
         }
 
         const auto workloads = LoadWorkloads(options.candidatesCsv, options);

@@ -87,7 +87,28 @@ PROBE="${BUILD_DIR}/tiling_bank_probe"
 echo "  ok"
 
 echo "[2/4] Detect NPU and platform ..."
-ACL_OUTPUT="$("${RUNNER}" --acl-only --device "${DEVICE_ID:-0}")"
+DETECT_TIMEOUT_SEC="${DETECT_TIMEOUT_SEC:-30}"
+PLATFORM_TIMEOUT_SEC="${PLATFORM_TIMEOUT_SEC:-60}"
+SOC_PROBE_LOG="${ROOT}/results/logs/soc_probe_${RUN_ID}.log"
+PLATFORM_PROBE_LOG="${ROOT}/results/logs/platform_probe_${RUN_ID}.log"
+
+echo "  detect_stage: ACL SoC probe"
+set +e
+timeout --signal=TERM --kill-after=5 "${DETECT_TIMEOUT_SEC}" \
+    "${RUNNER}" --soc-only --device "${DEVICE_ID:-0}" \
+    2>&1 | tee "${SOC_PROBE_LOG}"
+SOC_PROBE_RC="${PIPESTATUS[0]}"
+set -e
+ACL_OUTPUT="$(cat "${SOC_PROBE_LOG}")"
+if [[ "${SOC_PROBE_RC}" -ne 0 ]]; then
+    if [[ "${SOC_PROBE_RC}" -eq 124 ]]; then
+        echo "fatal: ACL SoC probe timed out after ${DETECT_TIMEOUT_SEC}s" >&2
+    else
+        echo "fatal: ACL SoC probe failed rc=${SOC_PROBE_RC}" >&2
+    fi
+    echo "  probe_log: ${SOC_PROBE_LOG}" >&2
+    exit 1
+fi
 SOC="$(printf '%s\n' "${ACL_OUTPUT}" | sed -n 's/^aclrtGetSocName=//p' | tail -1)"
 if [[ -z "${SOC}" || "${SOC}" == "<null>" ]]; then
     echo "${ACL_OUTPUT}"
@@ -96,8 +117,23 @@ if [[ -z "${SOC}" || "${SOC}" == "<null>" ]]; then
 fi
 export ASCENDC_SOC_VERSION="${SOC}"
 export SOC_VERSION="${SOC}"
-PLATFORM="$("${PROBE}" --platform "${SOC}")"
-echo "  ${PLATFORM}"
+echo "  detect_stage: platform capacities"
+set +e
+timeout --signal=TERM --kill-after=5 "${PLATFORM_TIMEOUT_SEC}" \
+    "${PROBE}" --platform "${SOC}" \
+    2>&1 | tee "${PLATFORM_PROBE_LOG}"
+PLATFORM_PROBE_RC="${PIPESTATUS[0]}"
+set -e
+PLATFORM="$(sed -n '/^soc=/{p;q;}' "${PLATFORM_PROBE_LOG}")"
+if [[ "${PLATFORM_PROBE_RC}" -ne 0 || -z "${PLATFORM}" ]]; then
+    if [[ "${PLATFORM_PROBE_RC}" -eq 124 ]]; then
+        echo "fatal: platform probe timed out after ${PLATFORM_TIMEOUT_SEC}s" >&2
+    else
+        echo "fatal: platform probe failed rc=${PLATFORM_PROBE_RC}" >&2
+    fi
+    echo "  probe_log: ${PLATFORM_PROBE_LOG}" >&2
+    exit 1
+fi
 platform_field() {
     printf '%s\n' "${PLATFORM}" |
         sed -n "s/.*[[:space:]]$1=\\([0-9][0-9.]*\\).*/\\1/p"

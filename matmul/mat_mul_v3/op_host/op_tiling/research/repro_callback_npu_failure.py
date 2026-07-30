@@ -100,7 +100,7 @@ def write_workload_csv(path: Path) -> None:
         writer.writerow(schedule_row())
 
 
-def run_host_callback(output: Path | None = None) -> None:
+def run_host_callback() -> None:
     # CANN initializes the Python RuntimeKb cache on the first callback. The
     # normal profiling path also performs this unmodified control lookup first.
     invoke(WORKLOAD)
@@ -117,11 +117,6 @@ def run_host_callback(output: Path | None = None) -> None:
     print(f"  exact_fields={len(KNOWLEDGE_FIELDS)}")
     print(f"  block_dim={callback.block_dim} tiling_key={callback.key}")
     print(f"  signature={SCHEDULE.signature_text()}")
-    if output is not None:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(callback.blob)
-        print(f"  tiling_blob={output}")
-        print(f"  tiling_bytes={len(callback.blob)}")
 
 
 def run_npu(args: argparse.Namespace) -> None:
@@ -226,7 +221,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--soc")
     parser.add_argument("--aic", type=int)
     parser.add_argument("--results", type=Path)
-    parser.add_argument("--tiling-output", type=Path)
     parser.add_argument("--timeout", type=int, default=30)
     return parser.parse_args()
 
@@ -234,7 +228,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.stage == "host":
-        run_host_callback(args.tiling_output)
+        run_host_callback()
         return
     missing = [
         name

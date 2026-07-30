@@ -3,7 +3,6 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESEARCH="${ROOT}/matmul/mat_mul_v3/op_host/op_tiling/research"
-SIMULATOR_SOURCE="${RESEARCH}/simulator"
 MODE="full"
 
 while [[ $# -gt 0 ]]; do
@@ -28,183 +27,242 @@ if [[ "${MODE}" != "full" && "${MODE}" != "smoke" ]]; then
     exit 2
 fi
 
+filter_ascend_path() {
+    python3 - "$1" <<'PY'
+import sys
+
+blocked = (
+    "/usr/local/Ascend/ascend-toolkit",
+    "/usr/local/Ascend/driver",
+    "/usr/local/Ascend/nnrt",
+)
+items = [item for item in sys.argv[1].split(":") if item]
+print(":".join(item for item in items if not any(token in item for token in blocked)))
+PY
+}
+
+join_existing_dirs() {
+    local result=""
+    local path
+    for path in "$@"; do
+        [[ -d "${path}" ]] || continue
+        if [[ -n "${result}" ]]; then
+            result="${result}:${path}"
+        else
+            result="${path}"
+        fi
+    done
+    printf '%s' "${result}"
+}
+
+find_set_env() {
+    local root="$1"
+    local candidate
+    for candidate in \
+        "${root}/set_env.sh" \
+        "$(dirname "${root}")/set_env.sh" \
+        "/usr/local/Ascend/ascend-toolkit/set_env.sh"; do
+        if [[ -f "${candidate}" ]]; then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 CANN_ROOT="${CANN_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
 if [[ ! -d "${CANN_ROOT}" ]]; then
     echo "fatal: CANN root does not exist: ${CANN_ROOT}" >&2
     exit 1
 fi
-CANN_REAL="$(readlink -f "${CANN_ROOT}")"
-SIM_SOC="${SOC_VERSION:-Ascend910B3}"
-SIMULATOR_LIB="${CANN_REAL}/tools/simulator/${SIM_SOC}/lib"
-MSPROF="$(readlink -f "${CANN_ROOT}/bin/msprof")"
 
-if [[ ! -x "${MSPROF}" ]]; then
-    echo "fatal: msprof is not installed under ${CANN_ROOT}" >&2
-    exit 1
-fi
-if [[ ! -d "${SIMULATOR_LIB}" ]]; then
-    echo "fatal: ${SIM_SOC} simulator is not installed: ${SIMULATOR_LIB}" >&2
-    exit 1
-fi
+# A shell reused across CANN releases can retain toolkit or driver paths from a
+# previous install. Start from non-Ascend paths, then source this install.
+export LD_LIBRARY_PATH="$(filter_ascend_path "${LD_LIBRARY_PATH:-}")"
+export PYTHONPATH="$(filter_ascend_path "${PYTHONPATH:-}")"
+export PATH="$(filter_ascend_path "${PATH:-}")"
+unset ASCEND_HOME_PATH ASCEND_TOOLKIT_HOME ASCEND_AICPU_PATH ASCEND_OPP_PATH
+unset ASCEND_LATEST_INSTALL_PATH TOOLCHAIN_HOME
 
-SET_ENV=""
-for candidate in \
-    "${CANN_ROOT}/$(uname -m)-linux/bin/setenv.bash" \
-    "${CANN_ROOT}/set_env.sh" \
-    "$(dirname "${CANN_ROOT}")/set_env.sh"; do
-    if [[ -f "${candidate}" ]]; then
-        SET_ENV="${candidate}"
-        break
-    fi
-done
-if [[ -n "${SET_ENV}" ]]; then
-    set +e +u
-    source "${SET_ENV}"
-    SET_ENV_RC=$?
-    set -e -u
-    if [[ "${SET_ENV_RC}" -ne 0 ]]; then
-        echo "warning: CANN environment script returned rc=${SET_ENV_RC}; continuing with explicit paths" >&2
-    fi
+SET_ENV_SH="$(find_set_env "${CANN_ROOT}" || true)"
+if [[ -n "${SET_ENV_SH}" ]]; then
+    set +u
+    source "${SET_ENV_SH}"
+    set -u
 fi
 
 export ASCEND_HOME_PATH="${CANN_ROOT}"
 export ASCEND_TOOLKIT_HOME="${CANN_ROOT}"
+export ASCEND_AICPU_PATH="${CANN_ROOT}"
 export ASCEND_OPP_PATH="${CANN_ROOT}/opp"
-export ASCENDC_SOC_VERSION="${SIM_SOC}"
+export ASCEND_LATEST_INSTALL_PATH="$(dirname "$(dirname "${CANN_ROOT}")")"
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="${RESEARCH}:${CANN_ROOT}/python/site-packages:${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe${PYTHONPATH:+:${PYTHONPATH}}"
+
+ARCH="$(uname -m)"
+PLATFORM_ROOT="${CANN_ROOT}/${ARCH}-linux"
+OP_TILING_LIB="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/${ARCH}"
+
+# Real toolkit runtime and driver libraries must resolve before devlib. devlib
+# contains compile/link stubs on CANN installations and is only a final fallback.
+NON_ASCEND_LD="$(filter_ascend_path "${LD_LIBRARY_PATH:-}")"
+RUNTIME_LD="$(join_existing_dirs \
+    "${PLATFORM_ROOT}/lib64" \
+    "${CANN_ROOT}/lib64" \
+    "${CANN_ROOT}/runtime/lib64" \
+    "${CANN_ROOT}/fwkacllib/lib64" \
+    "${CANN_ROOT}/atc/lib64" \
+    "/usr/local/Ascend/driver/lib64" \
+    "/usr/local/Ascend/driver/lib64/common" \
+    "/usr/local/Ascend/driver/lib64/driver" \
+    "${CANN_ROOT}/tools/aml/lib64" \
+    "${CANN_ROOT}/tools/aml/lib64/plugin" \
+    "${OP_TILING_LIB}")"
+DEVLIB_LD="$(join_existing_dirs "${PLATFORM_ROOT}/devlib")"
+export LD_LIBRARY_PATH="${RUNTIME_LD}"
+[[ -z "${NON_ASCEND_LD}" ]] || export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${NON_ASCEND_LD}"
+[[ -z "${DEVLIB_LD}" ]] || export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${DEVLIB_LD}"
+
+NON_ASCEND_PYTHON="$(filter_ascend_path "${PYTHONPATH:-}")"
+CANN_PYTHON="$(join_existing_dirs \
+    "${CANN_ROOT}/python/site-packages" \
+    "${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe")"
+export PYTHONPATH="${RESEARCH}"
+[[ -z "${CANN_PYTHON}" ]] || export PYTHONPATH="${PYTHONPATH}:${CANN_PYTHON}"
+[[ -z "${NON_ASCEND_PYTHON}" ]] || export PYTHONPATH="${PYTHONPATH}:${NON_ASCEND_PYTHON}"
+
+NON_ASCEND_PATH="$(filter_ascend_path "${PATH:-}")"
+CANN_BIN="$(join_existing_dirs \
+    "${CANN_ROOT}/bin" \
+    "${CANN_ROOT}/compiler/ccec_compiler/bin" \
+    "${CANN_ROOT}/tools/ccec_compiler/bin" \
+    "${CANN_ROOT}/tools/bishengir/bin")"
+export PATH="${CANN_BIN}"
+[[ -z "${NON_ASCEND_PATH}" ]] || export PATH="${PATH}:${NON_ASCEND_PATH}"
 
 mkdir -p "${ROOT}/results/logs"
-RUN_ID="$(date +%Y%m%d_%H%M%S)_$$"
-BUILD_DIR="${ROOT}/.build/matmul_v3_msprof_simulator_${RUN_ID}"
-RESULT_DIR="${ROOT}/results/msprof_simulator_proof_${RUN_ID}"
-PROFILE_ROOT="${RESULT_DIR}/profile"
-TILING_BIN="${RESULT_DIR}/tiling.bin"
-OUTPUT_BIN="${RESULT_DIR}/output.bin"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
 RUN_LOG="${ROOT}/results/logs/run_npu_${RUN_ID}.log"
-BUILD_LOG="${RESULT_DIR}/build.log"
-MSPROF_LOG="${RESULT_DIR}/msprof.log"
-mkdir -p "${RESULT_DIR}"
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
-echo
-echo "MatMulV3 msprof simulator proof"
-echo "  script:    run_npu.sh 20260731-msprof-official-base-proof"
-echo "  upstream:  CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  toolkit:   ${CANN_REAL}"
-echo "  simulator: ${SIM_SOC}"
-echo "  shape:     32x32x128 fp16 NN"
-echo "  results:   ${RESULT_DIR}"
-echo "  log:       ${RUN_LOG}"
-echo
-
-echo "[1/4] Emit the exact callback tiling record ..."
-python3 "${RESEARCH}/repro_callback_npu_failure.py" \
-    --stage host \
-    --tiling-output "${TILING_BIN}"
+BUILD_DIR="${ROOT}/.build/matmul_v3_tiling_research"
+REPRO_RESULTS="${ROOT}/results/minimal_callback_npu_failure_${RUN_ID}"
 
 echo
-echo "[2/4] Build the original MatmulBaseKernel simulator entry ..."
-if ! cmake \
-    -S "${SIMULATOR_SOURCE}" \
-    -B "${BUILD_DIR}" \
-    -DRUN_MODE=sim \
-    -DSOC_VERSION="${SIM_SOC}" \
+echo "Minimal MatMulV3 callback/NPU failure repro"
+echo "  script:     run_npu.sh 20260731-minimal-callback-npu-failure"
+echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
+echo "  scope:      one fixed 32x32x128 fp16 BASE record"
+echo "  mode:       ${MODE}"
+echo "  host work:  callback only; no CPU GEMM"
+echo "  results:    ${REPRO_RESULTS}"
+echo "  log:        ${RUN_LOG}"
+echo
+
+echo "[1/4] Build official callback/bank/NPU harness ..."
+cmake -S "${RESEARCH}" -B "${BUILD_DIR}" \
     -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" \
-    -DCMAKE_BUILD_TYPE=Release >"${BUILD_LOG}" 2>&1; then
-    cat "${BUILD_LOG}"
-    exit 1
-fi
-if ! cmake --build "${BUILD_DIR}" --parallel >>"${BUILD_LOG}" 2>&1; then
-    cat "${BUILD_LOG}"
-    exit 1
-fi
-APP="${BUILD_DIR}/matmul_v3_simulator_repro"
-echo "  kernel=mat_mul_v3_base_fixed_0 build=ok"
+    -DCMAKE_BUILD_TYPE=Release >/dev/null
+cmake --build "${BUILD_DIR}" --parallel >/dev/null
+RUNNER="${BUILD_DIR}/official_matmul_runner"
+PROBE="${BUILD_DIR}/tiling_bank_probe"
+echo "  ok"
 
-echo
-echo "[3/4] Execute and profile the kernel with msprof op simulator ..."
-export LD_LIBRARY_PATH="${BUILD_DIR}/lib:${SIMULATOR_LIB}:${CANN_ROOT}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-set +e
-pushd "${RESULT_DIR}" >/dev/null
-"${MSPROF}" op simulator \
-    --soc-version="${SIM_SOC}" \
-    --launch-count=1 \
-    --aic-metrics=PipeUtilization \
-    --output="${PROFILE_ROOT}" \
-    --timeout="${MSPROF_TIMEOUT_MINUTES:-2}" \
-    "${APP}" \
-    "${TILING_BIN}" \
-    "${OUTPUT_BIN}" 2>&1 | tee "${MSPROF_LOG}"
-MSPROF_RC="${PIPESTATUS[0]}"
-popd >/dev/null
-set -e
-if [[ "${MSPROF_RC}" -ne 0 ]]; then
-    echo "fatal: msprof simulator failed rc=${MSPROF_RC}" >&2
-    exit "${MSPROF_RC}"
-fi
-
-echo
-echo "[4/4] Validate simulator output and profiler artifacts ..."
-python3 - "${TILING_BIN}" "${OUTPUT_BIN}" "${PROFILE_ROOT}" "${MSPROF_LOG}" "${RESULT_DIR}/proof.json" <<'PY'
-import json
-import re
-import struct
-import sys
-from pathlib import Path
-
-tiling_path, output_path, profile_root, log_path, proof_path = map(
-    Path, sys.argv[1:]
-)
-tiling = tiling_path.read_bytes()
-output = output_path.read_bytes()
-if len(tiling) != 272:
-    raise SystemExit(f"fatal: expected 272 tiling bytes, got {len(tiling)}")
-if len(output) != 2048:
-    raise SystemExit(f"fatal: expected 2048 output bytes, got {len(output)}")
-values = struct.unpack("<1024H", output)
-if any(value != 0x5800 for value in values):
-    raise SystemExit("fatal: simulator output is not the expected FP16 value 128")
-
-profiles = sorted(profile_root.glob("OPPROF_*"))
-instruction_csv = sorted(profile_root.glob("OPPROF_*/simulator/**/*instr_exe.csv"))
-if len(profiles) != 1 or not instruction_csv:
-    raise SystemExit("fatal: msprof did not emit simulator instruction results")
-
-log = log_path.read_text(encoding="utf-8", errors="replace")
-match = re.search(
-    r"core0\.cubecore0\s+([0-9.]+)\s+([0-9.]+)", log
-)
-proof = {
-    "workload": "32x32x128 fp16 NN",
-    "tiling_bytes": len(tiling),
-    "tiling_signature": "1:16:16:128:16:16:32:2:2:1:1:0:1:1:1:1:1:1:1:1:1:0:0",
-    "kernel": "mat_mul_v3_base_fixed_0",
-    "output_bytes": len(output),
-    "output_elements": len(values),
-    "output_fp16_value": 128.0,
-    "msprof_profile": str(profiles[0]),
-    "instruction_csv": str(instruction_csv[0]),
-    "duration_time_us": float(match.group(1)) if match else None,
-    "running_time_us": float(match.group(2)) if match else None,
+print_acl_loader_diag() {
+    echo "  runtime_loader:"
+    ldd "${RUNNER}" 2>&1 |
+        grep -E 'libascendcl|libruntime|libdrv|libplatform|libnnopbase|libopapi|not found' |
+        sed 's/^/    /' || true
 }
-proof_path.write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
-print("MSPROF_SIMULATOR_PASS")
-print("  callback_exact_fields=23 tiling_bytes=272")
-print("  kernel=mat_mul_v3_base_fixed_0")
-print("  output_elements=1024 output_fp16_value=128")
-if match:
-    print(
-        f"  duration_time_us={match.group(1)} "
-        f"running_time_us={match.group(2)}"
-    )
-print(f"  profile={profiles[0]}")
-print(f"  evidence={proof_path}")
-PY
+
+echo "[2/4] Detect NPU and platform ..."
+DETECT_TIMEOUT_SEC="${DETECT_TIMEOUT_SEC:-30}"
+PLATFORM_TIMEOUT_SEC="${PLATFORM_TIMEOUT_SEC:-60}"
+SOC_PROBE_LOG="${ROOT}/results/logs/soc_probe_${RUN_ID}.log"
+PLATFORM_PROBE_LOG="${ROOT}/results/logs/platform_probe_${RUN_ID}.log"
+
+echo "  detect_stage: ACL SoC probe"
+set +e
+timeout --signal=TERM --kill-after=5 "${DETECT_TIMEOUT_SEC}" \
+    "${RUNNER}" --soc-only --device "${DEVICE_ID:-0}" \
+    2>&1 | tee "${SOC_PROBE_LOG}"
+SOC_PROBE_RC="${PIPESTATUS[0]}"
+set -e
+ACL_OUTPUT="$(cat "${SOC_PROBE_LOG}")"
+if [[ "${SOC_PROBE_RC}" -ne 0 ]]; then
+    if [[ "${SOC_PROBE_RC}" -eq 124 ]]; then
+        echo "fatal: ACL SoC probe timed out after ${DETECT_TIMEOUT_SEC}s" >&2
+    else
+        echo "fatal: ACL SoC probe failed rc=${SOC_PROBE_RC}" >&2
+    fi
+    print_acl_loader_diag >&2
+    echo "  probe_log: ${SOC_PROBE_LOG}" >&2
+    exit 1
+fi
+SOC="$(printf '%s\n' "${ACL_OUTPUT}" | sed -n 's/^aclrtGetSocName=//p' | tail -1)"
+if [[ -z "${SOC}" || "${SOC}" == "<null>" ]]; then
+    echo "${ACL_OUTPUT}"
+    echo "fatal: aclrtGetSocName did not return an NPU SoC" >&2
+    exit 1
+fi
+export ASCENDC_SOC_VERSION="${SOC}"
+export SOC_VERSION="${SOC}"
+echo "  detect_stage: platform capacities"
+set +e
+timeout --signal=TERM --kill-after=5 "${PLATFORM_TIMEOUT_SEC}" \
+    "${PROBE}" --platform "${SOC}" \
+    2>&1 | tee "${PLATFORM_PROBE_LOG}"
+PLATFORM_PROBE_RC="${PIPESTATUS[0]}"
+set -e
+PLATFORM="$(sed -n '/^soc=/{p;q;}' "${PLATFORM_PROBE_LOG}")"
+if [[ "${PLATFORM_PROBE_RC}" -ne 0 || -z "${PLATFORM}" ]]; then
+    if [[ "${PLATFORM_PROBE_RC}" -eq 124 ]]; then
+        echo "fatal: platform probe timed out after ${PLATFORM_TIMEOUT_SEC}s" >&2
+    else
+        echo "fatal: platform probe failed rc=${PLATFORM_PROBE_RC}" >&2
+    fi
+    echo "  probe_log: ${PLATFORM_PROBE_LOG}" >&2
+    exit 1
+fi
+platform_field() {
+    printf '%s\n' "${PLATFORM}" |
+        sed -n "s/.*[[:space:]]$1=\\([0-9][0-9.]*\\).*/\\1/p"
+}
+AIC="$(platform_field aic)"
+L0A="$(platform_field L0A)"
+L0B="$(platform_field L0B)"
+L0C="$(platform_field L0C)"
+L1="$(platform_field L1)"
+L2="$(platform_field L2)"
+L2_BPC="$(platform_field L2_Bpc_per_core)"
+HBM_BPC="$(platform_field HBM_Bpc_per_core)"
+for value in "${AIC}" "${L0A}" "${L0B}" "${L0C}" "${L1}" "${L2}"; do
+    if [[ -z "${value}" ]]; then
+        echo "fatal: incomplete platform capability record: ${PLATFORM}" >&2
+        exit 1
+    fi
+done
+TOOLKIT_VERSION="$(basename "$(readlink -f "${CANN_ROOT}")")"
+echo "  detected_soc=${SOC} aic=${AIC} runtime_toolkit=${TOOLKIT_VERSION}"
+if [[ "${TOOLKIT_VERSION}" != 8.5* ]]; then
+    echo "  compatibility: source baseline is 8.5.0; execution uses installed ${TOOLKIT_VERSION}"
+    echo "  compatibility: exact callback roundtrip and RuntimeKb preflight remain mandatory"
+fi
+
+echo "[3/4] Run official host callback exact roundtrip ..."
+python3 "${RESEARCH}/repro_callback_npu_failure.py" --stage host
+
+echo "[4/4] Run RuntimeKb lookup and one official NPU preflight ..."
+python3 "${RESEARCH}/repro_callback_npu_failure.py" \
+    --stage npu \
+    --runner "${RUNNER}" \
+    --probe "${PROBE}" \
+    --cann-root "${CANN_ROOT}" \
+    --soc "${SOC}" \
+    --aic "${AIC}" \
+    --results "${REPRO_RESULTS}" \
+    --timeout "${PROFILE_TIMEOUT_SEC:-30}"
 
 echo
-echo "msprof simulator proof completed"
-echo "  output:   ${OUTPUT_BIN}"
-echo "  evidence: ${RESULT_DIR}/proof.json"
-echo "  profile:  ${PROFILE_ROOT}"
-echo "  log:      ${RUN_LOG}"
+echo "Minimal repro completed"
+echo "  result: ${REPRO_RESULTS}/repro_result.json"
+echo "  log:    ${RUN_LOG}"

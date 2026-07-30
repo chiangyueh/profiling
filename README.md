@@ -97,7 +97,7 @@ core/L1/DB/L2 因果消融。
 搜尋不是「先產生大量錯誤 tiling 再碰運氣」。通用 full 由獨立的
 template contract solvers 生成候選，每個 workload 最多考慮 12,000 筆
 lazy raw attempts、保留 192 筆 behavior pool、送 96 筆做 callback
-roundtrip，最後選 16 筆進入 NPU。Official RuntimeKb 只作 local anchor
+roundtrip，最後選 32 筆進入 NPU。Official RuntimeKb 只作 local anchor
 與同輪 control，不提供 global solver 的 geometry。
 
 ## 執行
@@ -128,8 +128,8 @@ samples        3
 
 Full 現在是凍結搜索器的外部泛化測試：22 個從未出現在歷史 workload 或
 量測 manifest 的預註冊 shape，涵蓋 dense/K-regime/skinny/layout/BF16/FP32
-與 template 七個硬體相關 strata。每個 workload 最多 16 個候選，共最多
-352 筆。使用
+與 template 七個硬體相關 strata。每個 workload 最多 32 個候選，共最多
+704 筆。使用
 `warmup=3, repeat=10, samples=5` 擴大 shape 與候選覆蓋；明顯改善者要在
 後續高精度輪次確認。只要出現新候選，searched、bank control 與 official
 baseline 就強制同輪量測。結果獨立寫入

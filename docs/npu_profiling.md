@@ -113,7 +113,7 @@ Full（目前的 `contract_behavior_v1`）：
 
 ```text
 22 組預註冊未見 workload
-每 workload 最多 16 個 contract/behavior 候選
+每 workload 最多 32 個 contract/behavior 候選
 exact fingerprint 排除後，由 feedback mutation 與未覆蓋 behavior
 target 產生新的生成空間
 searched/bank/official 對新 workload 同輪量測

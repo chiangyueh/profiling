@@ -48,8 +48,12 @@ contract-legal schedules per workload. It retains 192 schedules by behavior
 coverage, then retains 96 by a second behavior-coverage pass for exact callback
 roundtrip. If a callback rejects a preferred schedule, the remaining
 contract-generated behavior pool refills the callback budget; there is no
-legacy refill. The paired NPU stage receives 16 schedules per workload by
+legacy refill. The paired NPU stage receives 32 schedules per workload by
 default.
+
+The budget scales when `TOP_K` is raised: `TOP_K=48` expands the behavior and
+callback frontiers to at least 288 and 144 schedules respectively before
+selecting 48 for NPU measurement.
 
 Behavior features include kernel family and suffix, active cores and rounds,
 L0/L1 occupancy, K passes, padding efficiency, MTE-to-Cube work ratio, L2

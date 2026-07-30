@@ -5562,10 +5562,10 @@ def main() -> int:
             raw_attempts=12000,
             legal_candidates=5000,
             behavior_candidates=max(
-                192, args.beam_width * 4, args.top_k * 8
+                192, args.beam_width * 4, args.top_k * 6
             ),
             callback_candidates=max(
-                32, args.beam_width * 3, args.top_k * 6
+                48, args.beam_width * 3, args.top_k * 3
             ),
             npu_candidates=args.top_k,
         )

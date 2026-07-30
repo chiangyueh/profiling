@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260730-external-generalization-v2"
+RUN_NPU_VERSION="20260730-contract-behavior-v1"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -294,7 +294,7 @@ case "${MODE}" in
         ;;
     general|full)
         WORKLOADS_CSV="${WORKLOADS_CSV:-${WORKLOADS:-config/workloads_generalization_v2.csv}}"
-        RESULT_STEM="${RESULT_STEM:-results/npu_full_generalization_v2}"
+        RESULT_STEM="${RESULT_STEM:-results/npu_full_contract_behavior_v1}"
         DEFAULT_BEAM_WIDTH=32
         DEFAULT_TABU_ITERS=0
         DEFAULT_LNS_ROUNDS=0
@@ -308,7 +308,7 @@ case "${MODE}" in
         DEFAULT_PROFILE_STALL_TIMEOUT_SEC=60
         DEFAULT_NUMERIC_PREFLIGHT_MAX_MIB=4
         DEFAULT_PROFILE_PROGRESS_EVERY=8
-        DEFAULT_SEARCH_SCOPE=general_search_v1
+        DEFAULT_SEARCH_SCOPE=contract_behavior_v1
         DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
         ;;
     *)

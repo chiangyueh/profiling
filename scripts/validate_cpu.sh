@@ -27,6 +27,7 @@ g++ -std=c++17 -O2 -Wall -Wextra \
     -o "$WORK_DIR/proxy_model_test"
 "$WORK_DIR/proxy_model_test"
 python3 "$ROOT/tests/refine_model_test.py"
+python3 "$ROOT/tests/contract_behavior_test.py"
 python3 "$ROOT/tests/rank_results_test.py"
 
 GENERAL_CSV="$WORK_DIR/candidates.csv"
@@ -49,6 +50,55 @@ L0B_BYTES="$(platform_field L0B)"
 L0C_BYTES="$(platform_field L0C)"
 L1_BYTES="$(platform_field L1)"
 test -n "$AIC_CORES"
+
+CONTRACT_CSV="$WORK_DIR/contract_candidates.csv"
+SEARCH_SCOPE=contract_behavior_v1 \
+    BEAM_WIDTH=8 TABU_ITERS=0 LNS_ROUNDS=0 TOP_K=8 \
+    SEARCH_CAMPAIGN_EXCLUSIONS="$WORK_DIR/no_exclusions.csv" \
+    SEARCH_CAMPAIGN_OBSERVATIONS="$WORK_DIR/no_observations.csv" \
+    SEARCH_OUTPUT="$CONTRACT_CSV" \
+    SEARCH_ALL_OUTPUT="$WORK_DIR/contract_all.csv" \
+    SEARCH_TILING_DIR="$WORK_DIR/contract_tilings" \
+    ./scripts/run_search.sh \
+    config/contract_callback_validation.csv \
+    >"$WORK_DIR/contract_search.log"
+
+python3 - "$CONTRACT_CSV" <<'PY'
+import csv
+import sys
+from collections import Counter
+
+with open(sys.argv[1], newline="", encoding="utf-8") as source:
+    rows = list(csv.DictReader(source))
+searched = [
+    row for row in rows if row.get("candidate_role") == "searched"
+]
+assert len(searched) == 80
+assert len({
+    row["workload_id"] for row in searched
+}) == 10
+assert all(
+    row["source"] == "cann81_contract_behavior_v1"
+    and row["search_template"] == row["callback_kernel_family"]
+    and len(row["callback_tiling_sha256"]) == 64
+    for row in searched
+)
+families = Counter(row["callback_kernel_family"] for row in searched)
+assert families["BASE"] > 0
+assert families["SINGLE_CORE_SPLIT_K"] > 0
+assert families["DETERMINISTIC_SPLIT_K"] > 0
+assert families["AL1_FULL_LOAD"] > 0
+assert families["BL1_FULL_LOAD"] > 0
+assert families["BL1_FULL_LOAD_FIXPIPE"] > 0
+assert families["BL1_FULL_LOAD_VEC_NZ2ND"] > 0
+print(
+    "contract_callback_validation passed "
+    + " ".join(
+        f"{family}={count}"
+        for family, count in sorted(families.items())
+    )
+)
+PY
 
 python3 tools/profile_official_tilings.py \
     --runner build/official_matmul_runner \

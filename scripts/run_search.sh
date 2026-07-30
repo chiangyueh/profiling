@@ -30,7 +30,8 @@ if [[ -n "${PROFILE_HISTORY_CSV}" && -f "${PROFILE_HISTORY_CSV}" ]]; then
 fi
 CAMPAIGN_EXCLUSION_ARGS=()
 CAMPAIGN_OBSERVATION_ARGS=()
-if [[ "${SEARCH_SCOPE}" == "general_search_v1" ]]; then
+if [[ "${SEARCH_SCOPE}" == "general_search_v1" ||
+      "${SEARCH_SCOPE}" == "contract_behavior_v1" ]]; then
     CAMPAIGN_EXCLUSIONS_SPEC="${SEARCH_CAMPAIGN_EXCLUSIONS:-config/general_search_v1_round1_fingerprints.csv:config/general_search_v1_round2_fingerprints.csv:config/general_search_v1_round3_partial_fingerprints.csv:config/general_search_v1_round4_fingerprints.csv}"
     IFS=: read -r -a CAMPAIGN_EXCLUSIONS <<<"${CAMPAIGN_EXCLUSIONS_SPEC}"
     for campaign_path in "${CAMPAIGN_EXCLUSIONS[@]}"; do
@@ -67,9 +68,8 @@ if [[ "${SEARCH_SCOPE}" == "all_templates_validation" ]]; then
         --all-output "${RAW_ALL_OUTPUT}" \
         --tiling-dir "${SEARCH_TILING_DIR}" | tee "${RAW_LOG}"
 else
-    # The active search is constructed from the official RuntimeKb seed.
-    # The C++ host is needed only for authoritative platform capacities; do
-    # not spend time enumerating a generic space that Python will discard.
+    # Python owns candidate construction in these scopes. The C++ host is
+    # retained only as the authoritative source of platform capacities.
     ./build/matmul_tiling_search \
         --platform-only \
         --soc "${ASCENDC_SOC_VERSION:-${SOC_VERSION:-Ascend910B}}" \

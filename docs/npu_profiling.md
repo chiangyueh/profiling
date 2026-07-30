@@ -109,20 +109,21 @@ Smoke：
 warmup=2 repeat=5 samples=3
 ```
 
-Full：
+Full（目前的 `contract_behavior_v1`）：
 
 ```text
-16 組 workload（14 個未見 shape + 2 個正向控制）
-每 workload 最多 16 個 local/global/transfer/diverse 候選
-active frontier 會排除所有已完成 fingerprint，再補入較深的新候選
+22 組預註冊未見 workload
+每 workload 最多 16 個 contract/behavior 候選
+exact fingerprint 排除後，由 feedback mutation 與未覆蓋 behavior
+target 產生新的生成空間
 searched/bank/official 對新 workload 同輪量測
 warmup=3 repeat=10 samples=5
 ```
 
-Full 預設使用 `config/workloads_general_search_v1.csv`，結果與 resume
-寫入 `results/npu_full_general_v1_*`，不讀寫舊 boundary-family 的
-`results/npu_full_*`。歷史真機資料仍可供 transfer 起點與 cost model 使用，
-但新 workload 的三條比較路徑必須同輪量測。
+Full 預設使用 `config/workloads_generalization_v2.csv`，結果與 resume
+寫入 `results/npu_full_contract_behavior_v1_*`，不讀寫舊
+boundary-family 的 `results/npu_full_*`。歷史真機資料只作 feedback
+prior 與 exact fingerprint 排除；新 workload 的三條比較路徑必須同輪量測。
 
 既有完整 run 證明 K=16384 skinny-N 在
 3072x17、4096x17、4096x24、4608x31、5120x29 五個獨立窄 N shape 上

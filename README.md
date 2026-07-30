@@ -94,10 +94,11 @@ core/L1/DB/L2 因果消融。
   -> 與空 bank 的官方自動 tiling、bank seed control 比較
 ```
 
-搜尋不是「先產生大量錯誤 tiling 再碰運氣」。通用 full 初篩對每個
-workload 最多保留 12 筆 hard-legal、callback-valid 且結構去重的候選；
-候選由 local、global、transfer、diverse 四個起點輪詢選出，避免單一
-cost-model 排名或歷史成功區域佔滿預算。
+搜尋不是「先產生大量錯誤 tiling 再碰運氣」。通用 full 由獨立的
+template contract solvers 生成候選，每個 workload 最多考慮 12,000 筆
+lazy raw attempts、保留 192 筆 behavior pool、送 96 筆做 callback
+roundtrip，最後選 16 筆進入 NPU。Official RuntimeKb 只作 local anchor
+與同輪 control，不提供 global solver 的 geometry。
 
 ## 執行
 
@@ -132,20 +133,18 @@ Full 現在是凍結搜索器的外部泛化測試：22 個從未出現在歷史
 `warmup=3, repeat=10, samples=5` 擴大 shape 與候選覆蓋；明顯改善者要在
 後續高精度輪次確認。只要出現新候選，searched、bank control 與 official
 baseline 就強制同輪量測。結果獨立寫入
-`results/npu_full_generalization_v2_*`，不覆蓋既有 general-v1 或
+`results/npu_full_contract_behavior_v1_*`，不覆蓋既有 general-v1 或
 boundary-family 證據。原先 16 個訓練/探索 workload 仍保存在
 `config/workloads_general_search_v1.csv`，但不再由預設 full 重複深挖。
 
-搜索後會先輸出 `SEARCH_FRONTIER` 與每個 workload 一行
-`SEARCH_WORKLOAD`，列出候選數、來源與 template 分布。profiling 再為每個
-workload 輸出一行
-`SOURCE_RESULT`，比較 local/global/transfer/diverse 各來源最佳點；所有
+搜索會輸出每個 workload 的 raw/common/template-legal/emitted 數量、
+behavior/callback frontier 大小、callback 拒絕數與 template 分布；所有
 候選的完整量測仍以 candidates CSV 為準。
 
 再次執行相同的 `--mode full` 時，搜索器會先讀取
-`npu_full_generalization_v2_resume.csv`。已量 fingerprint 只用來校正每個
-candidate source 的模型誤差，不再佔 NPU 候選名額；每個仍有空間的 source
-至少保留一個探索點，其餘預算依真機校正後分數分配。
+`npu_full_contract_behavior_v1_resume.csv`。同 run 的穩定配對量測與可信
+campaign summary 會產生 winner mutation、regression counterfactual 與
+未覆蓋 behavior targets；已量 exact fingerprint 不再佔 NPU 候選名額。
 
 `--mode general` 只保留為相容別名，與 `--mode full` 使用相同設定；正常
 工作流只需執行 `full`。
@@ -238,20 +237,16 @@ ablation 也未改善，預設搜索不再產生它們。每個 state 在進入 
 完整且 hard-legal；active scope 不執行 Tabu/LNS。cycle estimate 只做
 預算控制，不冒充 NPU latency。
 
-`general_search_v1` 是預設 full scope。它不看 workload 名稱，從四個獨立
-起點建立最多 32 個 callback 候選：
+`contract_behavior_v1` 是預設 full scope。BASE、single-core split-K、
+deterministic split-K、AL1 full-load 與 BL1 full-load 各自從 workload、
+硬體容量和 template contract 建立完整 23-field record；behavior coverage
+描述 active cores/rounds、L0/L1 occupancy、K passes、padding、MTE/Cube、
+L2、reduction 與 resident ratio。沒有候選時直接失敗，不會 fallback 到
+舊 family constructor。
 
-```text
-local       官方 RuntimeKb seed 周圍的耦合變換
-global      由 Cube alignment、容量與模板契約生成的全域結構
-transfer    從強真機結果轉移 partition/L1/DB 策略並重建目標 L2
-diverse     在代理模型合理性能帶內，距離 seed 最遠的合法結構
-```
-
-最終以來源輪詢保留 12 筆，不讓單一 cost-model 排名吃掉全部名額。所有
-候選仍須通過 hard legality、官方 callback roundtrip 與 NPU preflight。
-
-算法與研究依據見 [docs/algorithm.md](docs/algorithm.md)。
+新候選層見
+[docs/contract_behavior_search.md](docs/contract_behavior_search.md)；舊算法
+與研究記錄見 [docs/algorithm.md](docs/algorithm.md)。
 
 ## Baseline 與結果定義
 
@@ -288,9 +283,9 @@ median ms / stddev / speedup / delta / noise / verdict
 results/npu_smoke_summary.csv
 results/npu_smoke_candidates.csv
 results/npu_smoke_resume.csv
-results/npu_full_general_v1_summary.csv
-results/npu_full_general_v1_candidates.csv
-results/npu_full_general_v1_resume.csv
+results/npu_full_contract_behavior_v1_summary.csv
+results/npu_full_contract_behavior_v1_candidates.csv
+results/npu_full_contract_behavior_v1_resume.csv
 ```
 
 `resume.csv` 是持久化續跑帳本。每完成一個官方 baseline、bank control 或
@@ -304,8 +299,8 @@ general campaign 已完成的完整 fingerprint 另外保存在
 `config/general_search_v1_round{1,2,3_partial,4}_fingerprints.csv`。因此
 即使重新 clone 而沒有 Git 忽略的本地 resume，也不會靜默重跑前 577 筆。
 搜尋階段會輸出
-`search_feedback`，分別列出 exact profile、可用於校準的穩定 profile，
-以及 campaign manifest 排除的數量。
+`search_feedback`，列出 paired observations 與 campaign manifest 排除
+數量；舊 source calibration 與 transfer constructor 不會進入新 scope。
 
 量測標準差超過 median 5% 時，official/bank reference 會自動重試最多兩次；
 仍不穩定才延後該 workload 的新候選。兩個 reference 即使各自穩定，若

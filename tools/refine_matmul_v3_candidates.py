@@ -12,6 +12,45 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from tiling_search import (
+        CandidateEngine as ContractCandidateEngine,
+        GenerationBudget as ContractGenerationBudget,
+        Hardware as ContractHardware,
+        Schedule as ContractSchedule,
+        SearchConfig as ContractSearchConfig,
+        Workload as ContractWorkload,
+    )
+    from tiling_search.behavior import (
+        select_behavior_coverage as select_contract_behavior_coverage,
+    )
+    from tiling_search.contracts import (
+        validate_schedule as validate_contract_schedule,
+    )
+    from tiling_search.feedback import (
+        load_feedback as load_contract_feedback,
+    )
+except ModuleNotFoundError as exception:
+    if exception.name not in {"tiling_search", "tiling_search.behavior"}:
+        raise
+    from tools.tiling_search import (
+        CandidateEngine as ContractCandidateEngine,
+        GenerationBudget as ContractGenerationBudget,
+        Hardware as ContractHardware,
+        Schedule as ContractSchedule,
+        SearchConfig as ContractSearchConfig,
+        Workload as ContractWorkload,
+    )
+    from tools.tiling_search.behavior import (
+        select_behavior_coverage as select_contract_behavior_coverage,
+    )
+    from tools.tiling_search.contracts import (
+        validate_schedule as validate_contract_schedule,
+    )
+    from tools.tiling_search.feedback import (
+        load_feedback as load_contract_feedback,
+    )
+
 
 warnings.filterwarnings("ignore", category=Warning, module="requests")
 
@@ -37,6 +76,7 @@ EXTRA_COLUMNS = [
     *BANK_COLUMNS.values(),
     "search_template", "search_guidance", "search_model_score",
     "search_candidate_source",
+    "search_acquisition", "search_behavior_key", "search_behavior_metrics",
     "search_bottleneck", "search_rationale", "search_transition_gain",
     "search_resume_policy", "search_stop_reason",
     "search_model_cycles", "search_model_raw_ratio_vs_bank_seed",
@@ -121,6 +161,36 @@ class Hardware:
     l2_bytes: int
     l2_bytes_per_cycle_per_core: float
     hbm_bytes_per_cycle_per_core: float
+
+
+def as_contract_workload(workload: Workload) -> ContractWorkload:
+    return ContractWorkload(
+        workload_id=workload.workload_id,
+        m=workload.m,
+        n=workload.n,
+        k=workload.k,
+        dtype=workload.dtype,
+        trans_a=workload.trans_a,
+        trans_b=workload.trans_b,
+        max_cores=workload.max_cores,
+    )
+
+
+def as_contract_hardware(hardware: Hardware) -> ContractHardware:
+    return ContractHardware(
+        aic_cores=hardware.aic_cores,
+        l0a_bytes=hardware.l0a_bytes,
+        l0b_bytes=hardware.l0b_bytes,
+        l0c_bytes=hardware.l0c_bytes,
+        l1_bytes=hardware.l1_bytes,
+        l2_bytes=hardware.l2_bytes,
+        l2_bytes_per_cycle_per_core=(
+            hardware.l2_bytes_per_cycle_per_core
+        ),
+        hbm_bytes_per_cycle_per_core=(
+            hardware.hbm_bytes_per_cycle_per_core
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -5350,6 +5420,7 @@ def main() -> int:
     parser.add_argument(
         "--optimization-scope",
         choices=(
+            "contract_behavior_v1",
             "bottleneck_guided_v1",
             "general_search_v1",
             "official_local_v2",
@@ -5416,33 +5487,44 @@ def main() -> int:
         if column not in output_fields:
             output_fields.append(column)
     workloads = load_workloads(args.workloads)
-    history = load_measurement_history(
-        args.history, args.soc, hardware.aic_cores
-    )
-    profile_history = load_profile_measurement_history(
-        args.profile_history, args.soc, hardware.aic_cores
-    )
+    if args.optimization_scope == "contract_behavior_v1":
+        history = {}
+        profile_history = {}
+    else:
+        history = load_measurement_history(
+            args.history, args.soc, hardware.aic_cores
+        )
+        profile_history = load_profile_measurement_history(
+            args.profile_history, args.soc, hardware.aic_cores
+        )
     for key, records in profile_history.items():
         history.setdefault(key, []).extend(records)
     campaign_exclusion_count = 0
-    for campaign_path in args.campaign_exclusions:
-        campaign_history, excluded = load_campaign_exclusions(
-            campaign_path, args.soc, hardware.aic_cores
-        )
-        campaign_exclusion_count += excluded
-        for key, records in campaign_history.items():
-            history.setdefault(key, []).extend(records)
     campaign_observation_count = 0
     campaign_transfers: list[TransferGeometry] = []
-    for campaign_path in args.campaign_observations:
-        campaign_history, transfers, observed = load_campaign_observations(
-            campaign_path, args.soc, hardware.aic_cores
-        )
-        campaign_observation_count += observed
-        campaign_transfers.extend(transfers)
-        for key, records in campaign_history.items():
-            history.setdefault(key, []).extend(records)
-    source_priors = conservative_source_corrections(history)
+    if args.optimization_scope != "contract_behavior_v1":
+        for campaign_path in args.campaign_exclusions:
+            campaign_history, excluded = load_campaign_exclusions(
+                campaign_path, args.soc, hardware.aic_cores
+            )
+            campaign_exclusion_count += excluded
+            for key, records in campaign_history.items():
+                history.setdefault(key, []).extend(records)
+        for campaign_path in args.campaign_observations:
+            campaign_history, transfers, observed = (
+                load_campaign_observations(
+                    campaign_path, args.soc, hardware.aic_cores
+                )
+            )
+            campaign_observation_count += observed
+            campaign_transfers.extend(transfers)
+            for key, records in campaign_history.items():
+                history.setdefault(key, []).extend(records)
+    source_priors = (
+        {}
+        if args.optimization_scope == "contract_behavior_v1"
+        else conservative_source_corrections(history)
+    )
     active_learning_enabled = (
         args.optimization_scope == "general_search_v1"
         and any(
@@ -5460,29 +5542,70 @@ def main() -> int:
         for records in profile_history.values()
         for record in records
     )
+    contract_observations = []
+    contract_exclusions = set()
+    contract_engine = None
+    contract_budget = None
+    if args.optimization_scope == "contract_behavior_v1":
+        contract_observations, contract_exclusions = load_contract_feedback(
+            soc=args.soc,
+            aic_cores=hardware.aic_cores,
+            profile_paths=(
+                (args.profile_history,)
+                if args.profile_history is not None
+                else ()
+            ),
+            observation_paths=args.campaign_observations,
+            exclusion_paths=args.campaign_exclusions,
+        )
+        contract_budget = ContractGenerationBudget(
+            raw_attempts=12000,
+            legal_candidates=5000,
+            behavior_candidates=max(
+                192, args.beam_width * 4, args.top_k * 8
+            ),
+            callback_candidates=max(
+                32, args.beam_width * 3, args.top_k * 6
+            ),
+            npu_candidates=args.top_k,
+        )
+        contract_engine = ContractCandidateEngine(
+            config=ContractSearchConfig(contract_budget),
+            observations=contract_observations,
+            exclusions=contract_exclusions,
+        )
+        campaign_exclusion_count = len(contract_exclusions)
+        campaign_observation_count = len(contract_observations)
     print(
         "search_feedback: "
         f"profile_exact={profile_record_count} "
         f"profile_usable={profile_usable_count} "
         f"campaign_excluded={campaign_exclusion_count} "
         f"campaign_observed={campaign_observation_count} "
+        f"contract_observed={len(contract_observations)} "
+        f"contract_excluded={len(contract_exclusions)} "
         f"source_priors="
         f"{','.join(f'{source}:{value:.4g}' for source, value in sorted(source_priors.items())) or 'none'}",
         flush=True,
     )
-    transfer_geometries = load_transfer_geometries(
-        args.history, args.soc, hardware.aic_cores
-    )
-    transfer_geometries.extend(
-        load_profile_transfer_geometries(
-            args.profile_history, args.soc, hardware.aic_cores
+    if args.optimization_scope == "contract_behavior_v1":
+        transfer_geometries = []
+        completed_frontier = set()
+        skinny_anchor_count = 0
+    else:
+        transfer_geometries = load_transfer_geometries(
+            args.history, args.soc, hardware.aic_cores
         )
-    )
-    transfer_geometries.extend(campaign_transfers)
-    completed_frontier = completed_bottleneck_frontier_coverage(
-        args.history, args.soc, hardware.aic_cores
-    )
-    skinny_anchor_count = measured_skinny_anchor_count(history)
+        transfer_geometries.extend(
+            load_profile_transfer_geometries(
+                args.profile_history, args.soc, hardware.aic_cores
+            )
+        )
+        transfer_geometries.extend(campaign_transfers)
+        completed_frontier = completed_bottleneck_frontier_coverage(
+            args.history, args.soc, hardware.aic_cores
+        )
+        skinny_anchor_count = measured_skinny_anchor_count(history)
 
     # Capture both the no-bank default and the exact same 23 fields after the
     # RuntimeKb injection path. MatMulV3 derives ND->NZ fields after the bank
@@ -5537,8 +5660,78 @@ def main() -> int:
         proposal_by_signature: dict[
             tuple[int, ...], CandidateProposal
         ] = {}
+        contract_candidate_by_signature = {}
+        contract_callback_priority = {}
+        contract_workload = as_contract_workload(workload)
+        contract_hardware = as_contract_hardware(hardware)
+        contract_search_result = None
         stop_reason = ""
-        if args.optimization_scope == "bottleneck_guided_v1":
+        if args.optimization_scope == "contract_behavior_v1":
+            if contract_engine is None or contract_budget is None:
+                raise SearchError(
+                    "contract_behavior_v1 engine was not initialized"
+                )
+            contract_search_result = contract_engine.generate(
+                contract_workload,
+                contract_hardware,
+                local_anchor=ContractSchedule.from_mapping(
+                    seed.bank.knowledge
+                ),
+            )
+            if not contract_search_result.candidates:
+                reports = ";".join(
+                    (
+                        f"{report.template.value}:"
+                        f"raw={report.raw_generated},"
+                        f"common={report.common_legal},"
+                        f"template={report.template_legal}"
+                    )
+                    for report in contract_search_result.reports
+                )
+                raise SearchError(
+                    "independent contract solvers generated no candidates "
+                    f"for {workload.workload_id}; {reports}"
+                )
+            proposals = []
+            template_spaces = {}
+            contract_callback_priority = {
+                candidate.schedule.signature(): index
+                for index, candidate in enumerate(
+                    contract_search_result.callback_candidates
+                )
+            }
+            for candidate in contract_search_result.candidates:
+                knowledge = candidate.schedule.as_dict()
+                proposal = CandidateProposal(
+                    knowledge=knowledge,
+                    guidance=f"contract_behavior_{candidate.source}",
+                    rationale=candidate.rationale,
+                    transition_gain=-candidate.acquisition,
+                    resume_policy="allow_new",
+                    source=candidate.source,
+                )
+                signature = candidate.schedule.signature()
+                proposals.append(proposal)
+                proposal_by_signature[signature] = proposal
+                contract_candidate_by_signature[signature] = candidate
+                template_spaces.setdefault(
+                    candidate.template.value, []
+                ).append(knowledge)
+            stop_reason = "independent_contract_behavior_frontier"
+            print(
+                f"contract_generation: {workload.workload_id} "
+                f"behavior_frontier="
+                f"{len(contract_search_result.candidates)} "
+                f"callback_frontier="
+                f"{len(contract_search_result.callback_candidates)} "
+                f"behavior_bins={contract_search_result.behavior_bins} "
+                f"excluded={contract_search_result.excluded_fingerprints} "
+                f"observations={contract_search_result.observation_count} "
+                f"solvers="
+                f"{','.join(f'{report.template.value}:{report.raw_generated}/{report.common_legal}/{report.template_legal}/{report.emitted}' for report in contract_search_result.reports)}",
+                flush=True,
+            )
+        elif args.optimization_scope == "bottleneck_guided_v1":
             proposals, stop_reason = bottleneck_guided_candidate_proposals(
                 workload,
                 seed,
@@ -5601,9 +5794,19 @@ def main() -> int:
         for template, candidates in sorted(template_spaces.items()):
             template_states: list[State] = []
             for knowledge in candidates:
+                signature = knowledge_signature(knowledge)
+                if args.optimization_scope == "contract_behavior_v1":
+                    contract_report = validate_contract_schedule(
+                        contract_workload,
+                        ContractSchedule.from_mapping(knowledge),
+                        contract_hardware,
+                    )
+                    legal = contract_report.valid
+                else:
+                    legal = hard_legal(workload, knowledge, hardware)
                 if (
-                    not hard_legal(workload, knowledge, hardware)
-                    or knowledge_signature(knowledge) == seed_signature
+                    not legal
+                    or signature == seed_signature
                 ):
                     continue
                 estimate = analytical_score(
@@ -5611,7 +5814,7 @@ def main() -> int:
                 )
                 normalized = estimate.cycles / max(seed_score, 1.0)
                 proposal = proposal_by_signature.get(
-                    knowledge_signature(knowledge)
+                    signature
                 )
                 if proposal is not None:
                     guidance = proposal.guidance
@@ -5631,7 +5834,9 @@ def main() -> int:
                     workload,
                     knowledge,
                     (
-                        "cann81_bottleneck_guided_v1"
+                        "cann81_contract_behavior_v1"
+                        if args.optimization_scope == "contract_behavior_v1"
+                        else "cann81_bottleneck_guided_v1"
                         if args.optimization_scope == "bottleneck_guided_v1"
                         else "cann81_general_search_v1"
                         if args.optimization_scope == "general_search_v1"
@@ -5671,6 +5876,22 @@ def main() -> int:
                     if proposal is not None
                     else "constraint_generated"
                 )
+                contract_candidate = contract_candidate_by_signature.get(
+                    signature
+                )
+                if contract_candidate is not None:
+                    row["search_acquisition"] = (
+                        f"{contract_candidate.acquisition:.12g}"
+                    )
+                    row["search_behavior_key"] = json.dumps(
+                        contract_candidate.behavior_key,
+                        separators=(",", ":"),
+                    )
+                    row["search_behavior_metrics"] = json.dumps(
+                        dict(contract_candidate.metrics),
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
                 exact_records = [
                     record.record_id
                     for record in history.get(
@@ -5695,8 +5916,25 @@ def main() -> int:
                         estimate=estimate,
                     )
                 )
-            template_states.sort(key=state_sort_key)
-            if args.optimization_scope == "general_search_v1":
+            if args.optimization_scope == "contract_behavior_v1":
+                template_states.sort(
+                    key=lambda state: (
+                        (
+                            0
+                            if knowledge_signature(state.knowledge)
+                            in contract_callback_priority
+                            else 1
+                        ),
+                        contract_callback_priority.get(
+                            knowledge_signature(state.knowledge),
+                            len(contract_callback_priority),
+                        ),
+                        knowledge_signature(state.knowledge),
+                    )
+                )
+                beam = template_states
+            elif args.optimization_scope == "general_search_v1":
+                template_states.sort(key=state_sort_key)
                 beam = general_source_frontier(
                     template_states,
                     args.beam_width,
@@ -5704,10 +5942,12 @@ def main() -> int:
                     active_learning=active_learning_enabled,
                 )
             else:
+                template_states.sort(key=state_sort_key)
                 beam = constraint_aware_beam(
                     template_states, args.beam_width
                 )
             if args.optimization_scope in {
+                "contract_behavior_v1",
                 "bottleneck_guided_v1",
                 "general_search_v1",
                 "official_local_v2",
@@ -5773,12 +6013,34 @@ def main() -> int:
                 if knowledge_signature(state.knowledge) not in seen
             ),
             key=lambda state: (
-                state.normalized_score,
+                (
+                    (
+                        0
+                        if knowledge_signature(state.knowledge)
+                        in contract_callback_priority
+                        else 1
+                    )
+                    if args.optimization_scope == "contract_behavior_v1"
+                    else 0
+                ),
+                (
+                    contract_callback_priority.get(
+                        knowledge_signature(state.knowledge),
+                        len(contract_callback_priority),
+                    )
+                    if args.optimization_scope == "contract_behavior_v1"
+                    else state.normalized_score
+                ),
                 knowledge_signature(state.knowledge),
             ),
         )
         callback_target = (
-            len(states)
+            min(len(states), contract_budget.callback_candidates)
+            if (
+                args.optimization_scope == "contract_behavior_v1"
+                and contract_budget is not None
+            )
+            else len(states)
             if args.optimization_scope == "bottleneck_guided_v1"
             else min(
                 len(states), max(args.top_k * 4, args.beam_width)
@@ -5791,25 +6053,42 @@ def main() -> int:
             if len(accepted) >= callback_target:
                 break
 
-        history_correction, history_matches = calibrate_from_history(
-            workload,
-            accepted,
-            history,
-            bank_path_diff,
-            source_priors,
-        )
+        if args.optimization_scope == "contract_behavior_v1":
+            history_correction = 1.0
+            history_matches = sum(
+                state_has_history_match(state) for state in accepted
+            )
+        else:
+            history_correction, history_matches = calibrate_from_history(
+                workload,
+                accepted,
+                history,
+                bank_path_diff,
+                source_priors,
+            )
         for state in accepted:
             if state_has_history_match(state):
                 state.row["search_resume_policy"] = "require_existing"
-        accepted.sort(
-            key=state_sort_key
-        )
+        if args.optimization_scope == "contract_behavior_v1":
+            accepted.sort(
+                key=lambda state: (
+                    -float(
+                        state.row.get("search_transition_gain") or 0
+                    ),
+                    knowledge_signature(state.knowledge),
+                )
+            )
+        else:
+            accepted.sort(key=state_sort_key)
         callback_valid = len(accepted)
-        eligible = [
-            state
-            for state in accepted
-            if not dominated_by_bank_seed(state.knowledge, seed)
-        ]
+        if args.optimization_scope == "contract_behavior_v1":
+            eligible = list(accepted)
+        else:
+            eligible = [
+                state
+                for state in accepted
+                if not dominated_by_bank_seed(state.knowledge, seed)
+            ]
         if (
             completed_frontier
             and args.optimization_scope == "bottleneck_guided_v1"
@@ -5821,7 +6100,32 @@ def main() -> int:
             ]
         chosen: list[State] = []
         chosen_signatures: set[tuple[int, ...]] = set()
-        if args.optimization_scope == "bottleneck_guided_v1":
+        if args.optimization_scope == "contract_behavior_v1":
+            accepted_candidates = [
+                contract_candidate_by_signature[
+                    knowledge_signature(state.knowledge)
+                ]
+                for state in eligible
+                if knowledge_signature(state.knowledge)
+                in contract_candidate_by_signature
+            ]
+            contract_frontier = select_contract_behavior_coverage(
+                contract_workload,
+                accepted_candidates,
+                contract_observations,
+                contract_hardware,
+                args.top_k,
+            )
+            state_by_signature = {
+                knowledge_signature(state.knowledge): state
+                for state in eligible
+            }
+            ordered_candidates = [
+                state_by_signature[candidate.schedule.signature()]
+                for candidate in contract_frontier
+                if candidate.schedule.signature() in state_by_signature
+            ]
+        elif args.optimization_scope == "bottleneck_guided_v1":
             # A transition frontier retains at most one representative per
             # diagnosed action. Exact measured regressions are not sent back;
             # preregistered allow_new actions may override the proxy model.
@@ -5905,7 +6209,8 @@ def main() -> int:
             flush=True,
         )
 
-    assert_preregistered_campaign_candidates(workloads, selected_rows)
+    if args.optimization_scope != "contract_behavior_v1":
+        assert_preregistered_campaign_candidates(workloads, selected_rows)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="", encoding="utf-8") as destination:
         writer = csv.DictWriter(destination, fieldnames=output_fields, extrasaction="ignore")

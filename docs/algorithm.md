@@ -1,14 +1,10 @@
 # MatMulV3 Tiling 搜尋算法
 
-> Current scope (2026-07-30): `general_search_v1` is the default full run. It
-> constructs legal candidates from local, global, structurally diverse and
-> measured-transfer starts without workload-name rules. Two completed NPU
-> rounds plus one partial round contain 380 unique candidate
-> measurements. Their exact fingerprints and stable source-best feedback are
-> versioned so a clean clone advances the
-> active-search frontier instead of replaying prior work. The older
-> `bottleneck_guided_v1` implementation remains available as historical
-> reference, but is not the default research method.
+> Current scope (2026-07-30): `contract_behavior_v1` is the default full run.
+> Its candidate layer is documented in
+> [contract_behavior_search.md](contract_behavior_search.md). The
+> `general_search_v1` and `bottleneck_guided_v1` sections below are retained
+> as historical baselines and are not called by the new global path.
 
 ## 1. 問題定義
 

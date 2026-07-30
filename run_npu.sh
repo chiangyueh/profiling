@@ -4,7 +4,6 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESEARCH="${ROOT}/matmul/mat_mul_v3/op_host/op_tiling/research"
 MODE="full"
-WORKLOADS="${RESEARCH}/config/workloads.csv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -12,12 +11,8 @@ while [[ $# -gt 0 ]]; do
             MODE="${2:?missing value for --mode}"
             shift 2
             ;;
-        --workloads)
-            WORKLOADS="$(realpath "${2:?missing workload CSV}")"
-            shift 2
-            ;;
         --help|-h)
-            echo "Usage: ./run_npu.sh --mode full [--workloads FILE]"
+            echo "Usage: ./run_npu.sh --mode full"
             exit 0
             ;;
         *)
@@ -150,26 +145,20 @@ RUN_LOG="${ROOT}/results/logs/run_npu_${RUN_ID}.log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
 BUILD_DIR="${ROOT}/.build/matmul_v3_tiling_research"
-CANDIDATES="${ROOT}/results/npu_full_search_candidates.csv"
-ALL_CANDIDATES="${ROOT}/results/npu_full_search_all.csv"
-SUMMARY="${ROOT}/results/npu_full_summary.csv"
-CANDIDATE_RESULTS="${ROOT}/results/npu_full_candidates.csv"
-RESUME="${ROOT}/results/npu_full_resume.csv"
+REPRO_RESULTS="${ROOT}/results/minimal_callback_npu_failure_${RUN_ID}"
 
 echo
-echo "NPU run"
-echo "  script:     run_npu.sh 20260730-cann-runtime-loader-fix"
+echo "Minimal MatMulV3 callback/NPU failure repro"
+echo "  script:     run_npu.sh 20260731-minimal-callback-npu-failure"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      independent_contract_behavior_search"
+echo "  scope:      one fixed 32x32x128 fp16 BASE record"
 echo "  mode:       ${MODE}"
-echo "  workloads:  ${WORKLOADS}"
-echo "  summary:    ${SUMMARY}"
-echo "  candidates: ${CANDIDATE_RESULTS}"
-echo "  resume:     ${RESUME}"
+echo "  host work:  callback only; no CPU GEMM"
+echo "  results:    ${REPRO_RESULTS}"
 echo "  log:        ${RUN_LOG}"
 echo
 
-echo "[1/4] Build callback/bank/NPU tools ..."
+echo "[1/4] Build official callback/bank/NPU harness ..."
 cmake -S "${RESEARCH}" -B "${BUILD_DIR}" \
     -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" \
     -DCMAKE_BUILD_TYPE=Release >/dev/null
@@ -259,55 +248,21 @@ if [[ "${TOOLKIT_VERSION}" != 8.5* ]]; then
     echo "  compatibility: exact callback roundtrip and RuntimeKb preflight remain mandatory"
 fi
 
-NPU_CANDIDATES="${NPU_CANDIDATES:-40}"
-if [[ "${MODE}" == "smoke" ]]; then
-    NPU_CANDIDATES=4
-fi
+echo "[3/4] Run official host callback exact roundtrip ..."
+python3 "${RESEARCH}/repro_callback_npu_failure.py" --stage host
 
-echo "[3/4] Generate independent hardware-contract candidates ..."
-python3 "${RESEARCH}/generate.py" \
-    --workloads "${WORKLOADS}" \
-    --output "${CANDIDATES}" \
-    --all-output "${ALL_CANDIDATES}" \
-    --source-root "${ROOT}/matmul/mat_mul_v3" \
-    --soc "${SOC}" \
-    --aic-cores "${AIC}" \
-    --l0a-bytes "${L0A}" \
-    --l0b-bytes "${L0B}" \
-    --l0c-bytes "${L0C}" \
-    --l1-bytes "${L1}" \
-    --l2-bytes "${L2}" \
-    --l2-bpc "${L2_BPC:-1}" \
-    --hbm-bpc "${HBM_BPC:-1}" \
-    --observations "${RESEARCH}/config/measured_observations.csv" \
-    --exclusions "${RESEARCH}/config/measured_fingerprints.csv" \
-    --resume-feedback "${RESUME}" \
-    --npu-candidates "${NPU_CANDIDATES}" \
-    --callback-candidates 48 \
-    --behavior-candidates 320
-echo "  ok"
-
-echo "[4/4] Run paired official/bank/candidate NPU profiling ..."
-python3 "${RESEARCH}/profile.py" \
-    --candidates "${CANDIDATES}" \
-    --summary "${SUMMARY}" \
-    --candidate-results "${CANDIDATE_RESULTS}" \
-    --resume "${RESUME}" \
+echo "[4/4] Run RuntimeKb lookup and one official NPU preflight ..."
+python3 "${RESEARCH}/repro_callback_npu_failure.py" \
+    --stage npu \
     --runner "${RUNNER}" \
     --probe "${PROBE}" \
     --cann-root "${CANN_ROOT}" \
     --soc "${SOC}" \
     --aic "${AIC}" \
-    --toolkit "${TOOLKIT_VERSION}" \
-    --timeout "${PROFILE_TIMEOUT_SEC:-120}" \
-    --warmup "${WARMUP:-10}" \
-    --repeat "${REPEAT:-50}" \
-    --samples "${SAMPLES:-15}"
-echo "  ok"
+    --results "${REPRO_RESULTS}" \
+    --timeout "${PROFILE_TIMEOUT_SEC:-30}"
 
 echo
-echo "NPU run completed"
-echo "  Summary:    ${SUMMARY}"
-echo "  Candidates: ${CANDIDATE_RESULTS}"
-echo "  Resume:     ${RESUME}"
-echo "  log:        ${RUN_LOG}"
+echo "Minimal repro completed"
+echo "  result: ${REPRO_RESULTS}/repro_result.json"
+echo "  log:    ${RUN_LOG}"

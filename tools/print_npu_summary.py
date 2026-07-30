@@ -242,7 +242,12 @@ def main() -> None:
             f" speedup_vs_bank={compact_number(summary.get('speedup_vs_bank_seed', ''))}"
             f" delta={compact_number(summary.get('latency_change_pct_vs_official_operator', ''))}%"
         )
-        print(f"  decision={clean(summary.get('selection_reason', ''))}")
+        print(
+            f"  decision={clean(summary.get('selection_reason', ''))}"
+            f" baseline_pair={clean(summary.get('baseline_pair_status', ''))}"
+            " official_bank_gap="
+            f"{compact_number(summary.get('official_bank_relative_gap_pct', ''))}%"
+        )
 
     ordered = ("improved", "within_noise", "regressed")
     totals = " ".join(f"{key}={verdicts.pop(key, 0)}" for key in ordered)

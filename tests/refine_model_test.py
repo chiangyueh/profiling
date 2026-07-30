@@ -31,6 +31,19 @@ HARDWARE = refine.Hardware(
 )
 
 
+def test_reference_pair_coherence_guard() -> None:
+    close_official = {"median_ms": "1.0", "stddev_ms": "0.001"}
+    close_bank = {"median_ms": "1.02", "stddev_ms": "0.001"}
+    drifted_official = {"median_ms": "2.08892", "stddev_ms": "0.00681975"}
+    drifted_bank = {"median_ms": "0.754802", "stddev_ms": "0.00681975"}
+    assert profile_tilings.baseline_pair_is_coherent(
+        close_official, close_bank
+    )
+    assert not profile_tilings.baseline_pair_is_coherent(
+        drifted_official, drifted_bank
+    )
+
+
 def base_knowledge(
     workload: refine.Workload,
     base_m: int,
@@ -700,6 +713,13 @@ def test_campaign_manifest_excludes_exact_fingerprint() -> None:
     )
     assert round2_count == 145
     assert len(round2_history) == 145
+    round3_history, round3_count = refine.load_campaign_exclusions(
+        ROOT / "config/general_search_v1_round3_partial_fingerprints.csv",
+        "Ascend910B3",
+        20,
+    )
+    assert round3_count == 48
+    assert len(round3_history) == 48
 
 
 def test_campaign_observations_calibrate_sources_and_transfer() -> None:
@@ -741,6 +761,27 @@ def test_campaign_observations_calibrate_sources_and_transfer() -> None:
     assert state.row["search_model_confidence"] == (
         "campaign_source_calibrated"
     )
+
+    partial_history, partial_transfers, partial_count = (
+        refine.load_campaign_observations(
+            ROOT / "config/general_search_v1_round3_partial_observations.csv",
+            "Ascend910B3",
+            20,
+        )
+    )
+    assert partial_count == 5
+    assert len(partial_history) == 5
+    assert len(partial_transfers) == 1
+    combined_history = {
+        key: list(records) for key, records in history.items()
+    }
+    for key, records in partial_history.items():
+        combined_history.setdefault(key, []).extend(records)
+    combined_corrections = refine.conservative_source_corrections(
+        combined_history
+    )
+    assert 1.55 < combined_corrections["global"] < 1.60
+    assert 1.55 < combined_corrections["diverse"] < 1.60
 
 
 def test_unstable_comparison_cannot_claim_improvement() -> None:

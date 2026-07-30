@@ -3,8 +3,9 @@
 > Current scope (2026-07-30): `general_search_v1` is the default full run. It
 > constructs legal candidates from local, global, structurally diverse and
 > measured-transfer starts without workload-name rules. Two completed NPU
-> rounds contain 332 unique candidate measurements. Their exact fingerprints
-> and stable source-best feedback are versioned so a clean clone advances the
+> rounds plus one partial round contain 380 unique candidate
+> measurements. Their exact fingerprints and stable source-best feedback are
+> versioned so a clean clone advances the
 > active-search frontier instead of replaying prior work. The older
 > `bottleneck_guided_v1` implementation remains available as historical
 > reference, but is not the default research method.

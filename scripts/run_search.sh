@@ -31,7 +31,7 @@ fi
 CAMPAIGN_EXCLUSION_ARGS=()
 CAMPAIGN_OBSERVATION_ARGS=()
 if [[ "${SEARCH_SCOPE}" == "general_search_v1" ]]; then
-    CAMPAIGN_EXCLUSIONS_SPEC="${SEARCH_CAMPAIGN_EXCLUSIONS:-config/general_search_v1_round1_fingerprints.csv:config/general_search_v1_round2_fingerprints.csv}"
+    CAMPAIGN_EXCLUSIONS_SPEC="${SEARCH_CAMPAIGN_EXCLUSIONS:-config/general_search_v1_round1_fingerprints.csv:config/general_search_v1_round2_fingerprints.csv:config/general_search_v1_round3_partial_fingerprints.csv}"
     IFS=: read -r -a CAMPAIGN_EXCLUSIONS <<<"${CAMPAIGN_EXCLUSIONS_SPEC}"
     for campaign_path in "${CAMPAIGN_EXCLUSIONS[@]}"; do
         if [[ -f "${campaign_path}" ]]; then
@@ -40,7 +40,7 @@ if [[ "${SEARCH_SCOPE}" == "general_search_v1" ]]; then
             )
         fi
     done
-    CAMPAIGN_OBSERVATIONS_SPEC="${SEARCH_CAMPAIGN_OBSERVATIONS:-config/general_search_v1_round2_observations.csv}"
+    CAMPAIGN_OBSERVATIONS_SPEC="${SEARCH_CAMPAIGN_OBSERVATIONS:-config/general_search_v1_round2_observations.csv:config/general_search_v1_round3_partial_observations.csv}"
     IFS=: read -r -a CAMPAIGN_OBSERVATIONS <<<"${CAMPAIGN_OBSERVATIONS_SPEC}"
     for campaign_path in "${CAMPAIGN_OBSERVATIONS[@]}"; do
         if [[ -f "${campaign_path}" ]]; then

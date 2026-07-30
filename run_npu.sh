@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260730-general-feedback-frontier-v3"
+RUN_NPU_VERSION="20260730-general-reference-guard-v4"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -79,7 +79,8 @@ filter_profile_terminal() {
             next
         }
         /^bank_schema:/ || /^bank_records_prepared:/ || /^profile_plan:/ ||
-        /^resume_history:/ || /^workload_skip:/ ||
+        /^reference_guard:/ || /^resume_history:/ || /^workload_skip:/ ||
+        /^WORKLOAD_DEFERRED / || /^REFERENCE_/ ||
         /^official_tiling_profile completed/ ||
         /^profile_npu completed/ {
             print

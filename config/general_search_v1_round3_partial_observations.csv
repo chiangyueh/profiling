@@ -1,0 +1,6 @@
+campaign,soc,aic,workload_id,m,n,k,dtype,trans_a,trans_b,tiling_signature,candidate_source,median_ms,ratio_vs_official,ratio_vs_bank,status_vs_official,status_vs_bank,model_ratio
+general_search_v1_round3_partial,Ascend910B3,20,general_holdout_large,4096,6144,4096,fp16,0,0,20:160:192:4096:160:192:32:20:20:1:1:0:10:10:2:2:1:3:1:10:32:0:0,global,1.40655,0.673338375811,1.86346883024,incoherent_baseline,regressed,0.993649698885
+general_search_v1_round3_partial,Ascend910B3,20,general_holdout_large,4096,6144,4096,fp16,0,0,20:512:64:4096:512:64:16:16:128:1:1:0:8:64:2:2:1:2:2:4:48:0:0,diverse,1.84774,0.884543208931,2.44797973508,incoherent_baseline,regressed,1.36054912001
+general_search_v1_round3_partial,Ascend910B3,20,general_holdout_skinny_m,33,3072,8192,fp16,0,0,20:48:256:8192:48:256:64:40:8:1:1:1:20:4:2:2:1:1:1:1:12:0:0,local,0.034876,1.00011470521,0.995153601958,within_noise,within_noise,1
+general_search_v1_round3_partial,Ascend910B3,20,general_holdout_skinny_m,33,3072,8192,fp16,0,0,20:96:160:8192:96:160:64:12:12:1:1:0:6:6:2:2:1:1:1:1:20:0:0,global,0.034992,1.00344115623,0.998462367953,within_noise,within_noise,0.570495957002
+general_search_v1_round3_partial,Ascend910B3,20,control_skinny_n,4096,17,16384,fp16,0,0,20:208:32:16384:208:32:64:8:32:1:1:0:4:16:2:2:1:5:1:4:1:0:0,transfer,0.077278,0.749035572356,0.739431633337,improved,improved,0.928723019259

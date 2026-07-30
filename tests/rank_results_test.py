@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 from rank_npu_results import (
+    baseline_pair_status,
     comparison_metrics,
     is_official_operator_baseline,
     optimization_decision,
@@ -45,6 +46,21 @@ def main() -> None:
     assert result == "inconclusive"
     assert "variance" in reason
     assert verdict == "unstable_measurement"
+
+    assert baseline_pair_status(
+        {"median_ms": "1.0", "stddev_ms": "0.001"},
+        {"median_ms": "1.02", "stddev_ms": "0.001"},
+    ) == "coherent"
+    assert baseline_pair_status(
+        {"median_ms": "2.08892", "stddev_ms": "0.00681975"},
+        {"median_ms": "0.754802", "stddev_ms": "0.00681975"},
+    ) == "incoherent"
+    result, reason, verdict = optimization_decision(
+        "improved", "regressed", baselines_coherent=False
+    )
+    assert result == "inconclusive"
+    assert reason == "official_and_bank_baselines_diverge"
+    assert verdict == "incoherent_baselines"
 
     assert is_official_operator_baseline(
         {

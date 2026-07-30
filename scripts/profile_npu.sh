@@ -172,6 +172,7 @@ if python3 tools/profile_official_tilings.py \
     --rank-limit "${RANK_LIMIT:-20}" \
     --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-4}" \
     --timeout-sec "${PROFILE_STALL_TIMEOUT_SEC:-60}" \
+    --reference-retries "${REFERENCE_RETRIES:-2}" \
     --progress-every "${PROFILE_PROGRESS_EVERY:-10}"; then
     profile_rc=0
 else

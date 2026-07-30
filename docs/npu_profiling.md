@@ -113,8 +113,8 @@ Full：
 
 ```text
 16 組 workload（14 個未見 shape + 2 個正向控制）
-每 workload 最多 12 個 local/global/transfer/diverse 候選
-目前 host callback 驗證後共 187 個 searched candidates
+每 workload 最多 16 個 local/global/transfer/diverse 候選
+active frontier 會排除所有已完成 fingerprint，再補入較深的新候選
 searched/bank/official 對新 workload 同輪量測
 warmup=3 repeat=10 samples=5
 ```

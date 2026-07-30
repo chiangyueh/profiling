@@ -10,6 +10,7 @@ from pathlib import Path
 SUCCESS_VALUES = {"1", "true", "True"}
 SHAPE_FIELDS = ["m", "n", "k", "dtype", "trans_a", "trans_b"]
 MAX_RELIABLE_MEASUREMENT_CV = 0.05
+MAX_BASELINE_PAIR_RELATIVE_GAP = 0.15
 
 
 def as_float(row: dict[str, str], key: str, fallback: float = float("inf")) -> float:
@@ -32,6 +33,35 @@ def measurement_is_stable(row: dict[str, str]) -> bool:
         and median_ms > 0
         and 0 <= stddev_ms / median_ms <= MAX_RELIABLE_MEASUREMENT_CV
     )
+
+
+def baseline_pair_relative_gap(
+    official: dict[str, str],
+    bank: dict[str, str],
+) -> float:
+    official_ms = as_float(official, "median_ms")
+    bank_ms = as_float(bank, "median_ms")
+    if (
+        not math.isfinite(official_ms)
+        or not math.isfinite(bank_ms)
+        or official_ms <= 0
+        or bank_ms <= 0
+    ):
+        return float("inf")
+    return max(official_ms, bank_ms) / min(official_ms, bank_ms) - 1.0
+
+
+def baseline_pair_status(
+    official: dict[str, str] | None,
+    bank: dict[str, str] | None,
+) -> str:
+    if official is None or bank is None:
+        return "unavailable"
+    if not measurement_is_stable(official) or not measurement_is_stable(bank):
+        return "unstable"
+    if baseline_pair_relative_gap(official, bank) > MAX_BASELINE_PAIR_RELATIVE_GAP:
+        return "incoherent"
+    return "coherent"
 
 
 def is_api_auto_baseline(row: dict[str, str]) -> bool:
@@ -109,12 +139,19 @@ def comparison_metrics(
 def optimization_decision(
     official_verdict: str,
     bank_verdict: str,
+    baselines_coherent: bool = True,
 ) -> tuple[str, str, str]:
     if "unstable_measurement" in {official_verdict, bank_verdict}:
         return (
             "inconclusive",
             "measurement_variance_exceeds_reliability_limit",
             "unstable_measurement",
+        )
+    if not baselines_coherent:
+        return (
+            "inconclusive",
+            "official_and_bank_baselines_diverge",
+            "incoherent_baselines",
         )
     comparable = {"improved", "within_noise", "regressed"}
     if official_verdict == "improved" and bank_verdict == "improved":
@@ -305,6 +342,12 @@ def main() -> None:
             if official_success
             else None
         )
+        pair_status = baseline_pair_status(official_operator, bank_control)
+        pair_gap = (
+            baseline_pair_relative_gap(official_operator, bank_control)
+            if official_operator is not None and bank_control is not None
+            else float("nan")
+        )
 
         if custom_success:
             best_ms = as_float(custom_success[0], "median_ms")
@@ -469,6 +512,10 @@ def main() -> None:
             )
             if official_operator is None
             else "no_searched_candidate",
+            "baseline_pair_status": pair_status,
+            "official_bank_relative_gap_pct": (
+                f"{100 * pair_gap:.12g}" if math.isfinite(pair_gap) else ""
+            ),
             "primary_reference": "",
             "primary_verdict": (
                 "no_successful_searched_candidate"
@@ -532,7 +579,11 @@ def main() -> None:
                 optimization_result,
                 selection_reason,
                 combined_verdict,
-            ) = optimization_decision(official_verdict, bank_verdict)
+            ) = optimization_decision(
+                official_verdict,
+                bank_verdict,
+                pair_status != "incoherent",
+            )
             if optimization_result != "baseline_unavailable":
                 comparison["primary_reference"] = (
                     "official_operator+bank_seed_control"

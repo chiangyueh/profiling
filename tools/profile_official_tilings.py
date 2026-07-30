@@ -59,6 +59,7 @@ INFO_KEYS = {
     "trans_a_flag", "trans_b_flag",
 }
 MAX_RELIABLE_MEASUREMENT_CV = 0.05
+MAX_BASELINE_PAIR_RELATIVE_GAP = 0.15
 KNOWLEDGE_KEYS = {
     "usedCoreNum", "singleCoreM", "singleCoreN", "singleCoreK",
     "baseM", "baseN", "baseK", "depthA1", "depthB1", "stepM", "stepN",
@@ -188,6 +189,88 @@ def measurement_is_stable(row: dict[str, str]) -> bool:
         and median_ms > 0
         and 0 <= stddev_ms / median_ms <= MAX_RELIABLE_MEASUREMENT_CV
     )
+
+
+def baseline_pair_relative_gap(
+    official: dict[str, str],
+    bank: dict[str, str],
+) -> float:
+    official_ms = as_float(official, "median_ms")
+    bank_ms = as_float(bank, "median_ms")
+    if (
+        not math.isfinite(official_ms)
+        or not math.isfinite(bank_ms)
+        or official_ms <= 0
+        or bank_ms <= 0
+    ):
+        return float("inf")
+    return max(official_ms, bank_ms) / min(official_ms, bank_ms) - 1.0
+
+
+def baseline_pair_is_coherent(
+    official: dict[str, str],
+    bank: dict[str, str],
+) -> bool:
+    return (
+        measurement_is_stable(official)
+        and measurement_is_stable(bank)
+        and baseline_pair_relative_gap(official, bank)
+        <= MAX_BASELINE_PAIR_RELATIVE_GAP
+    )
+
+
+def run_stable_reference(
+    runner: Path,
+    workload_source: Path,
+    workload_id: str,
+    output_dir: Path,
+    env: dict[str, str],
+    args: argparse.Namespace,
+    reference: str,
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Retry only noisy references before deciding to defer a workload."""
+    measured: dict[str, str] = {}
+    samples: list[dict[str, str]] = []
+    attempts = args.reference_retries + 1
+    for attempt in range(attempts):
+        attempt_dir = (
+            output_dir
+            if attempt == 0
+            else output_dir / f"stability_retry_{attempt}"
+        )
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        measured, samples = run_official(
+            runner,
+            workload_source,
+            workload_id,
+            attempt_dir,
+            env,
+            args,
+        )
+        if measurement_is_stable(measured):
+            if attempt:
+                print(
+                    f"REFERENCE_RECOVERED {workload_id} "
+                    f"reference={reference} attempt={attempt + 1} "
+                    f"ms={compact(as_float(measured, 'median_ms'))} "
+                    f"cv={compact(as_float(measured, 'stddev_ms') / as_float(measured, 'median_ms'))}",
+                    flush=True,
+                )
+            return measured, samples
+        if attempt + 1 < attempts:
+            print(
+                f"REFERENCE_RETRY {workload_id} "
+                f"reference={reference} attempt={attempt + 1}/{attempts} "
+                f"ms={compact(as_float(measured, 'median_ms'))} "
+                f"cv={compact(as_float(measured, 'stddev_ms') / as_float(measured, 'median_ms'))}",
+                flush=True,
+            )
+    print(
+        f"REFERENCE_RETRY_EXHAUSTED {workload_id} "
+        f"reference={reference} attempts={attempts}",
+        flush=True,
+    )
+    return measured, samples
 
 
 def dual_baseline_optimization_status(
@@ -1580,6 +1663,12 @@ def main() -> int:
     parser.add_argument("--timeout-sec", type=int, default=60)
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument(
+        "--reference-retries",
+        type=int,
+        default=2,
+        help="retry an official or bank reference whose sample CV exceeds 5%%",
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="validate every candidate against CANN RuntimeKb without using the NPU",
@@ -1620,7 +1709,12 @@ def main() -> int:
         ) <= 0
     ):
         raise ProfileError("platform capacities and rank-limit must be positive")
-    if args.repeat <= 0 or args.samples <= 0 or args.warmup < 0:
+    if (
+        args.repeat <= 0
+        or args.samples <= 0
+        or args.warmup < 0
+        or args.reference_retries < 0
+    ):
         raise ProfileError("warmup/repeat/samples values are invalid")
 
     candidates = read_csv(args.candidates)
@@ -1939,6 +2033,14 @@ def main() -> int:
             f"paired_schedules_remeasured={paired_schedules_removed}",
             flush=True,
         )
+        print(
+            "reference_guard: "
+            f"max_cv={100 * MAX_RELIABLE_MEASUREMENT_CV:.6g}% "
+            f"max_official_bank_gap="
+            f"{100 * MAX_BASELINE_PAIR_RELATIVE_GAP:.6g}% "
+            f"retries={args.reference_retries}",
+            flush=True,
+        )
         for workload_index, workload in enumerate(workloads, 1):
             workload_id = workload["workload_id"]
             rows = grouped.get(workload_id, [])
@@ -1976,9 +2078,9 @@ def main() -> int:
                 )
             else:
                 try:
-                    measured, samples = run_official(
+                    measured, samples = run_stable_reference(
                         args.runner, args.workloads, workload_id,
-                        baseline_dir, baseline_env, args,
+                        baseline_dir, baseline_env, args, "official",
                     )
                 except RunnerProfileError as exception:
                     append_row(
@@ -2082,13 +2184,14 @@ def main() -> int:
                             "an unmeasured bank control"
                         )
                     try:
-                        control_measured, control_samples = run_official(
+                        control_measured, control_samples = run_stable_reference(
                             args.runner,
                             args.workloads,
                             workload_id,
                             control_run_dir,
                             control_env,
                             args,
+                            "bank",
                         )
                     except RunnerProfileError as exception:
                         failed = candidate_profile(
@@ -2172,6 +2275,31 @@ def main() -> int:
                     f"reason=unstable_{'+'.join(unstable_references)}_baseline "
                     f"candidates={deferred_count} "
                     f"max_cv={100 * MAX_RELIABLE_MEASUREMENT_CV:.6g}% "
+                    "action=retain_unmeasured_candidates_for_next_full_run",
+                    flush=True,
+                )
+                continue
+            if (
+                searched
+                and bank_control_profile is not None
+                and not baseline_pair_is_coherent(
+                    official_baseline, bank_control_profile
+                )
+            ):
+                deferred_count = len(searched)
+                candidate_index += deferred_count
+                measurement_deferred += deferred_count
+                pair_gap = baseline_pair_relative_gap(
+                    official_baseline, bank_control_profile
+                )
+                print(
+                    f"WORKLOAD_DEFERRED {workload_id} "
+                    "reason=incoherent_official_bank_baselines "
+                    f"official_ms={compact(as_float(official_baseline, 'median_ms'))} "
+                    f"bank_ms={compact(as_float(bank_control_profile, 'median_ms'))} "
+                    f"relative_gap={compact(100 * pair_gap)}% "
+                    f"max_gap={100 * MAX_BASELINE_PAIR_RELATIVE_GAP:.6g}% "
+                    f"candidates={deferred_count} "
                     "action=retain_unmeasured_candidates_for_next_full_run",
                     flush=True,
                 )

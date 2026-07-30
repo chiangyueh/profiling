@@ -32,26 +32,117 @@ if [[ "${MODE}" != "full" && "${MODE}" != "smoke" ]]; then
     exit 2
 fi
 
+filter_ascend_path() {
+    python3 - "$1" <<'PY'
+import sys
+
+blocked = (
+    "/usr/local/Ascend/ascend-toolkit",
+    "/usr/local/Ascend/driver",
+    "/usr/local/Ascend/nnrt",
+)
+items = [item for item in sys.argv[1].split(":") if item]
+print(":".join(item for item in items if not any(token in item for token in blocked)))
+PY
+}
+
+join_existing_dirs() {
+    local result=""
+    local path
+    for path in "$@"; do
+        [[ -d "${path}" ]] || continue
+        if [[ -n "${result}" ]]; then
+            result="${result}:${path}"
+        else
+            result="${path}"
+        fi
+    done
+    printf '%s' "${result}"
+}
+
+find_set_env() {
+    local root="$1"
+    local candidate
+    for candidate in \
+        "${root}/set_env.sh" \
+        "$(dirname "${root}")/set_env.sh" \
+        "/usr/local/Ascend/ascend-toolkit/set_env.sh"; do
+        if [[ -f "${candidate}" ]]; then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 CANN_ROOT="${CANN_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
 if [[ ! -d "${CANN_ROOT}" ]]; then
     echo "fatal: CANN root does not exist: ${CANN_ROOT}" >&2
     exit 1
 fi
-if [[ -f "${CANN_ROOT}/set_env.sh" ]]; then
+
+# A shell reused across CANN releases can retain toolkit or driver paths from a
+# previous install. Start from non-Ascend paths, then source this install.
+export LD_LIBRARY_PATH="$(filter_ascend_path "${LD_LIBRARY_PATH:-}")"
+export PYTHONPATH="$(filter_ascend_path "${PYTHONPATH:-}")"
+export PATH="$(filter_ascend_path "${PATH:-}")"
+unset ASCEND_HOME_PATH ASCEND_TOOLKIT_HOME ASCEND_AICPU_PATH ASCEND_OPP_PATH
+unset ASCEND_LATEST_INSTALL_PATH TOOLCHAIN_HOME
+
+SET_ENV_SH="$(find_set_env "${CANN_ROOT}" || true)"
+if [[ -n "${SET_ENV_SH}" ]]; then
     set +u
-    source "${CANN_ROOT}/set_env.sh"
+    source "${SET_ENV_SH}"
     set -u
 fi
+
 export ASCEND_HOME_PATH="${CANN_ROOT}"
 export ASCEND_TOOLKIT_HOME="${CANN_ROOT}"
+export ASCEND_AICPU_PATH="${CANN_ROOT}"
 export ASCEND_OPP_PATH="${CANN_ROOT}/opp"
+export ASCEND_LATEST_INSTALL_PATH="$(dirname "$(dirname "${CANN_ROOT}")")"
 export PYTHONUNBUFFERED=1
 
 ARCH="$(uname -m)"
 PLATFORM_ROOT="${CANN_ROOT}/${ARCH}-linux"
 OP_TILING_LIB="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/${ARCH}"
-export PYTHONPATH="${RESEARCH}:${PYTHONPATH:-}"
-export LD_LIBRARY_PATH="${PLATFORM_ROOT}/lib64:${PLATFORM_ROOT}/devlib:${CANN_ROOT}/lib64:${OP_TILING_LIB}:${LD_LIBRARY_PATH:-}"
+
+# Real toolkit runtime and driver libraries must resolve before devlib. devlib
+# contains compile/link stubs on CANN installations and is only a final fallback.
+NON_ASCEND_LD="$(filter_ascend_path "${LD_LIBRARY_PATH:-}")"
+RUNTIME_LD="$(join_existing_dirs \
+    "${PLATFORM_ROOT}/lib64" \
+    "${CANN_ROOT}/lib64" \
+    "${CANN_ROOT}/runtime/lib64" \
+    "${CANN_ROOT}/fwkacllib/lib64" \
+    "${CANN_ROOT}/atc/lib64" \
+    "/usr/local/Ascend/driver/lib64" \
+    "/usr/local/Ascend/driver/lib64/common" \
+    "/usr/local/Ascend/driver/lib64/driver" \
+    "${CANN_ROOT}/tools/aml/lib64" \
+    "${CANN_ROOT}/tools/aml/lib64/plugin" \
+    "${OP_TILING_LIB}")"
+DEVLIB_LD="$(join_existing_dirs "${PLATFORM_ROOT}/devlib")"
+export LD_LIBRARY_PATH="${RUNTIME_LD}"
+[[ -z "${NON_ASCEND_LD}" ]] || export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${NON_ASCEND_LD}"
+[[ -z "${DEVLIB_LD}" ]] || export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${DEVLIB_LD}"
+
+NON_ASCEND_PYTHON="$(filter_ascend_path "${PYTHONPATH:-}")"
+CANN_PYTHON="$(join_existing_dirs \
+    "${CANN_ROOT}/python/site-packages" \
+    "${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe")"
+export PYTHONPATH="${RESEARCH}"
+[[ -z "${CANN_PYTHON}" ]] || export PYTHONPATH="${PYTHONPATH}:${CANN_PYTHON}"
+[[ -z "${NON_ASCEND_PYTHON}" ]] || export PYTHONPATH="${PYTHONPATH}:${NON_ASCEND_PYTHON}"
+
+NON_ASCEND_PATH="$(filter_ascend_path "${PATH:-}")"
+CANN_BIN="$(join_existing_dirs \
+    "${CANN_ROOT}/bin" \
+    "${CANN_ROOT}/compiler/ccec_compiler/bin" \
+    "${CANN_ROOT}/tools/ccec_compiler/bin" \
+    "${CANN_ROOT}/tools/bishengir/bin")"
+export PATH="${CANN_BIN}"
+[[ -z "${NON_ASCEND_PATH}" ]] || export PATH="${PATH}:${NON_ASCEND_PATH}"
 
 mkdir -p "${ROOT}/results/logs"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
@@ -67,6 +158,7 @@ RESUME="${ROOT}/results/npu_full_resume.csv"
 
 echo
 echo "NPU run"
+echo "  script:     run_npu.sh 20260730-cann-runtime-loader-fix"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      independent_contract_behavior_search"
 echo "  mode:       ${MODE}"
@@ -85,6 +177,13 @@ cmake --build "${BUILD_DIR}" --parallel >/dev/null
 RUNNER="${BUILD_DIR}/official_matmul_runner"
 PROBE="${BUILD_DIR}/tiling_bank_probe"
 echo "  ok"
+
+print_acl_loader_diag() {
+    echo "  runtime_loader:"
+    ldd "${RUNNER}" 2>&1 |
+        grep -E 'libascendcl|libruntime|libdrv|libplatform|libnnopbase|libopapi|not found' |
+        sed 's/^/    /' || true
+}
 
 echo "[2/4] Detect NPU and platform ..."
 DETECT_TIMEOUT_SEC="${DETECT_TIMEOUT_SEC:-30}"
@@ -106,6 +205,7 @@ if [[ "${SOC_PROBE_RC}" -ne 0 ]]; then
     else
         echo "fatal: ACL SoC probe failed rc=${SOC_PROBE_RC}" >&2
     fi
+    print_acl_loader_diag >&2
     echo "  probe_log: ${SOC_PROBE_LOG}" >&2
     exit 1
 fi

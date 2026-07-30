@@ -64,14 +64,19 @@ They are not Euclidean distance over the raw 23 fields.
 
 Resume measurements enter the feedback model only when the candidate and
 stable official/bank references share the same run identity. Curated campaign
-observation manifests must provide both ratios and non-unstable statuses and
-are treated as trusted paired summaries. Previously measured exact
-fingerprints are excluded.
+observation manifests must provide both ratios and statuses that are neither
+unstable nor baseline-incoherent. Previously measured exact fingerprints are
+excluded.
 Stable winners and regressions change the next generated pool through behavior
 targets; same-workload records also create contract-checked semantic mutations.
 Winner mutations and regression counterfactuals receive a bounded intervention
 bonus so they can reach the callback frontier. Unseen workloads use
 workload-distance plus behavior-distance prediction, not workload names.
+
+An NPU output-coverage rejection is different from a measured regression. Its
+fingerprint and behavior remain negative feedback, but it is never used as a
+legal mutation parent because the failed execution does not provide a valid
+local search direction.
 
 The old `general_search_v1`, `bottleneck_guided_v1`, and manual family
 constructors remain available only as regression baselines for non-full scopes.

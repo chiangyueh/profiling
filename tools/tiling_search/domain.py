@@ -186,6 +186,8 @@ class MeasuredObservation:
     ratio_vs_bank: float
     source: str
     record_id: str
+    status_vs_official: str = ""
+    status_vs_bank: str = ""
 
     @property
     def measured_ratio(self) -> float:
@@ -193,6 +195,11 @@ class MeasuredObservation:
 
     @property
     def is_winner(self) -> bool:
+        if self.status_vs_official or self.status_vs_bank:
+            return (
+                self.status_vs_official == "improved"
+                and self.status_vs_bank == "improved"
+            )
         return (
             self.ratio_vs_official <= 0.99
             and self.ratio_vs_bank <= 0.99
@@ -200,6 +207,11 @@ class MeasuredObservation:
 
     @property
     def is_regression(self) -> bool:
+        if self.status_vs_official or self.status_vs_bank:
+            return (
+                self.status_vs_official == "regressed"
+                or self.status_vs_bank == "regressed"
+            )
         return (
             self.ratio_vs_official >= 1.01
             or self.ratio_vs_bank >= 1.01

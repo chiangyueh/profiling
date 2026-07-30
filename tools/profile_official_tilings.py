@@ -1603,6 +1603,14 @@ def print_tiling_failure(
     )
     print(f"schedule: {schedule_text(candidate, knowledge)}", flush=True)
     print(
+        "identity: "
+        f"tiling_signature={candidate.get('tiling_signature', 'NA')} "
+        f"kernel_suffix={candidate.get('callback_kernel_suffix', 'NA')} "
+        f"iterate_order={knowledge['iterateOrder']} "
+        f"l2_iterate_order={knowledge['l2IterateOrder']}",
+        flush=True,
+    )
+    print(
         "l1: "
         f"depth={knowledge['depthA1']}x{knowledge['depthB1']} "
         f"stepMN={knowledge['stepM']}x{knowledge['stepN']} "

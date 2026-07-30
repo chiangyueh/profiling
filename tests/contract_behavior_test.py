@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import csv
 import inspect
 import sys
 from itertools import islice
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +28,8 @@ from tiling_search.feedback import (
     feedback_mutations,
     feedback_targets,
     fingerprint,
+    load_feedback,
+    semantic_mutations,
 )
 from tiling_search.solvers import (
     Al1FullLoadSolver,
@@ -323,6 +327,111 @@ def test_cross_workload_feedback_changes_generated_frontier() -> None:
     assert baseline_signatures != informed_signatures
 
 
+def test_untrusted_and_runtime_rejected_feedback_are_separated() -> None:
+    workload = Workload(
+        "feedback-status", 257, 1009, 4097, "fp16", False, False, 20
+    )
+    parent = first_valid(BaseSolver(), workload)
+    rejected = semantic_mutations(
+        workload,
+        HARDWARE,
+        parent,
+        source="test",
+        parent=parent.signature(),
+    )[0].schedule
+    fields = (
+        "campaign",
+        "soc",
+        "aic",
+        "workload_id",
+        "m",
+        "n",
+        "k",
+        "dtype",
+        "trans_a",
+        "trans_b",
+        "tiling_signature",
+        "candidate_source",
+        "median_ms",
+        "ratio_vs_official",
+        "ratio_vs_bank",
+        "status_vs_official",
+        "status_vs_bank",
+        "model_ratio",
+    )
+    common = {
+        "campaign": "test",
+        "soc": "Ascend910B3",
+        "aic": "20",
+        "workload_id": workload.workload_id,
+        "m": str(workload.m),
+        "n": str(workload.n),
+        "k": str(workload.k),
+        "dtype": workload.dtype,
+        "trans_a": "0",
+        "trans_b": "0",
+        "median_ms": "0",
+        "model_ratio": "1",
+    }
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "observations.csv"
+        with path.open("w", newline="", encoding="utf-8") as output:
+            writer = csv.DictWriter(output, fieldnames=fields)
+            writer.writeheader()
+            writer.writerow(
+                {
+                    **common,
+                    "tiling_signature": ":".join(
+                        str(value) for value in parent.signature()
+                    ),
+                    "candidate_source": "old_campaign",
+                    "ratio_vs_official": "0.8",
+                    "ratio_vs_bank": "1.8",
+                    "status_vs_official": "incoherent_baseline",
+                    "status_vs_bank": "regressed",
+                }
+            )
+            writer.writerow(
+                {
+                    **common,
+                    "tiling_signature": ":".join(
+                        str(value) for value in rejected.signature()
+                    ),
+                    "candidate_source": "runtime_rejected",
+                    "ratio_vs_official": "3",
+                    "ratio_vs_bank": "3",
+                    "status_vs_official": "runtime_rejected",
+                    "status_vs_bank": "runtime_rejected",
+                }
+            )
+        observations, exclusions = load_feedback(
+            soc="Ascend910B3",
+            aic_cores=20,
+            observation_paths=(path,),
+        )
+    assert len(observations) == 1
+    assert observations[0].source == "runtime_rejected"
+    assert fingerprint(workload, rejected) in exclusions
+    assert feedback_mutations(workload, HARDWARE, observations) == []
+    assert all(
+        target.origin != "counterfactual"
+        for target in feedback_targets(workload, HARDWARE, observations)
+    )
+
+    noisy = MeasuredObservation(
+        workload=workload,
+        schedule=parent,
+        ratio_vs_official=0.96,
+        ratio_vs_bank=0.97,
+        source="measured",
+        record_id="paired-noisy",
+        status_vs_official="within_noise",
+        status_vs_bank="within_noise",
+    )
+    assert not noisy.is_winner
+    assert not noisy.is_regression
+
+
 def test_new_package_has_no_legacy_import() -> None:
     import tiling_search
     from tiling_search import orchestrator
@@ -341,6 +450,7 @@ def main() -> None:
     test_feedback_creates_new_legal_fingerprints()
     test_budget_and_behavior_coverage_are_bounded()
     test_cross_workload_feedback_changes_generated_frontier()
+    test_untrusted_and_runtime_rejected_feedback_are_separated()
     test_new_package_has_no_legacy_import()
     print("contract_behavior_test passed")
 

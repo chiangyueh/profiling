@@ -308,7 +308,10 @@ def score_candidates(
         prior = (
             math.log1p(vector.metrics["analytical_prior"]) - low
         ) / span
-        exploitation = 0.55 * prior + 0.45 * min(3.0, prediction) / 3.0
+        # The analytical model is a weak hardware prior. Paired NPU feedback
+        # must dominate once it exists; otherwise model error repeatedly
+        # outranks measured winners and known execution failures.
+        exploitation = 0.20 * prior + 0.80 * min(3.0, prediction) / 3.0
         intervention_bonus = {
             "feedback_winner_mutation": 0.25,
             "feedback_regression_counterfactual": 0.15,

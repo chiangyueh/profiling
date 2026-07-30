@@ -78,6 +78,51 @@ def _stable(row: dict[str, str]) -> bool:
     )
 
 
+def _comparison_status(
+    baseline: dict[str, str],
+    candidate: dict[str, str],
+) -> str:
+    try:
+        baseline_ms = float(baseline.get("median_ms") or 0)
+        baseline_stddev = max(
+            0.0, float(baseline.get("stddev_ms") or 0)
+        )
+        candidate_ms = float(candidate.get("median_ms") or 0)
+        candidate_stddev = max(
+            0.0, float(candidate.get("stddev_ms") or 0)
+        )
+    except ValueError:
+        return "invalid_measurement"
+    if baseline_ms <= 0 or candidate_ms <= 0:
+        return "invalid_measurement"
+    delta_pct = 100.0 * (candidate_ms - baseline_ms) / baseline_ms
+    noise_pct = max(
+        1.0,
+        200.0
+        * math.hypot(baseline_stddev, candidate_stddev)
+        / baseline_ms,
+    )
+    if delta_pct < -noise_pct:
+        return "improved"
+    if delta_pct > noise_pct:
+        return "regressed"
+    return "within_noise"
+
+
+def _untrusted_observation_status(row: dict[str, str]) -> bool:
+    statuses = " ".join(
+        (
+            row.get("status_vs_official", ""),
+            row.get("status_vs_bank", ""),
+        )
+    ).lower()
+    return "unstable" in statuses or "incoherent" in statuses
+
+
+def _runtime_rejected(observation: MeasuredObservation) -> bool:
+    return observation.source == "runtime_rejected"
+
+
 def load_feedback(
     *,
     soc: str,
@@ -129,8 +174,7 @@ def load_feedback(
                     or not math.isfinite(ratio_bank)
                     or ratio_official <= 0
                     or ratio_bank <= 0
-                    or "unstable" in row.get("status_vs_official", "")
-                    or "unstable" in row.get("status_vs_bank", "")
+                    or _untrusted_observation_status(row)
                 ):
                     continue
                 observations.append(
@@ -144,6 +188,10 @@ def load_feedback(
                             f"{row.get('campaign', path.stem)}:"
                             f"{workload.workload_id}"
                         ),
+                        status_vs_official=row.get(
+                            "status_vs_official", ""
+                        ),
+                        status_vs_bank=row.get("status_vs_bank", ""),
                     )
                 )
                 exclusions.add(fingerprint(workload, schedule))
@@ -224,6 +272,10 @@ def load_feedback(
                     ratio_vs_bank=candidate_ms / bank_ms,
                     source=row.get("search_candidate_source", ""),
                     record_id=row.get("resume_record_id") or path.stem,
+                    status_vs_official=_comparison_status(
+                        official, row
+                    ),
+                    status_vs_bank=_comparison_status(bank, row),
                 )
             )
     unique: dict[
@@ -244,6 +296,11 @@ def feedback_targets(
     del workload
     targets: list[BehaviorTarget] = []
     for observation in observations:
+        # A poisoned or incomplete NPU output proves that this exact schedule
+        # must not run again. It does not identify a legal local direction to
+        # mutate, so retain it for coverage/model feedback only.
+        if _runtime_rejected(observation):
+            continue
         if not (observation.is_winner or observation.is_regression):
             continue
         vector = behavior_vector(
@@ -422,6 +479,8 @@ def feedback_mutations(
     candidates: list[Candidate] = []
     for observation in observations:
         if observation.workload.identity() != workload.identity():
+            continue
+        if _runtime_rejected(observation):
             continue
         if observation.is_winner:
             source = "feedback_winner_mutation"

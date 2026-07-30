@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260730-contract-behavior-v1-profiler-contract"
+RUN_NPU_VERSION="20260730-contract-feedback-round2"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1

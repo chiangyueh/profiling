@@ -23,6 +23,8 @@ DET_SPLIT_K_POSITIVE_RANGE = {
 
 
 def evidence_group(workload_id: str) -> str:
+    if workload_id.startswith("external_v2_"):
+        return "external_holdout_v2"
     if workload_id == "int8_projection":
         return "unsupported_control"
     if workload_id in DET_SPLIT_K_POSITIVE_RANGE:
@@ -46,6 +48,36 @@ def evidence_group(workload_id: str) -> str:
     if workload_id in PRIOR_REGRESSION_WORKLOADS:
         return "prior_regression"
     return "broad_validation"
+
+
+def external_stratum(workload_id: str) -> str:
+    if not workload_id.startswith("external_v2_"):
+        return ""
+    suffix = workload_id.removeprefix("external_v2_")
+    return suffix.split("_", 1)[0]
+
+
+def external_generalization_status(
+    results: Counter[str],
+    improved_strata: set[str],
+    expected_workloads: int = 22,
+) -> tuple[str, str]:
+    total = sum(results.values())
+    if total < expected_workloads:
+        return "insufficient_evidence", "insufficient_evidence"
+    improved = results.get("improved", 0)
+    measured = improved + results.get("not_improved", 0)
+    method_status = (
+        "supported"
+        if measured * 10 >= expected_workloads * 9
+        and improved * 4 >= expected_workloads
+        and len(improved_strata) >= 3
+        else "not_supported"
+    )
+    universal_status = (
+        "supported" if improved == expected_workloads else "not_supported"
+    )
+    return method_status, universal_status
 
 
 def strict_evidence_status(
@@ -159,6 +191,8 @@ def main() -> None:
     width = max(2, len(str(total)))
     optimization_results: Counter[str] = Counter()
     evidence_results: dict[str, Counter[str]] = {}
+    external_results: Counter[str] = Counter()
+    external_improved_strata: set[str] = set()
     printed_workloads = 0
     for index, summary in enumerate(summaries, 1):
         workload_id = summary.get("workload_id", "")
@@ -173,6 +207,10 @@ def main() -> None:
         )
         optimization_results[optimization] += 1
         evidence_results.setdefault(evidence, Counter())[optimization] += 1
+        if evidence == "external_holdout_v2":
+            external_results[optimization] += 1
+            if optimization == "improved":
+                external_improved_strata.add(external_stratum(workload_id))
 
         should_print = (
             args.all_workloads
@@ -272,6 +310,7 @@ def main() -> None:
         f"optimization_other={optimization_other}"
     )
     for evidence in (
+        "external_holdout_v2",
         "known_anchor",
         "skinny_n_initial_holdout",
         "skinny_n_k16384_holdout",
@@ -296,6 +335,29 @@ def main() -> None:
             f"{results.get('no_successful_searched_candidate', 0)} "
             f"other={sum(results.values()) - results.get('improved', 0) - results.get('not_improved', 0) - results.get('no_successful_searched_candidate', 0)}"
         )
+    if external_results:
+        method_status, universal_status = external_generalization_status(
+            external_results, external_improved_strata
+        )
+        external_total = sum(external_results.values())
+        external_improved = external_results.get("improved", 0)
+        external_measured = (
+            external_improved + external_results.get("not_improved", 0)
+        )
+        print(
+            "EXTERNAL_GENERALIZATION_RESULT "
+            f"status={method_status} workloads={external_total} "
+            f"measured={external_measured} improved={external_improved} "
+            f"improved_strata={len(external_improved_strata)} "
+            "criterion=coverage_ge_90pct_and_dual_baseline_improvement_ge_25pct_across_ge_3_strata"
+        )
+        print(
+            "UNIVERSAL_UNSEEN_OPTIMIZATION_RESULT "
+            f"status={universal_status} improved={external_improved}/22 "
+            "criterion=all_22_preregistered_unseen_workloads_must_improve"
+        )
+        print("NPU_RESULT_END")
+        return
     campaign = campaign_statuses(evidence_results)
     print(
         "GENERALIZATION_RESULT skinny_n_initial "

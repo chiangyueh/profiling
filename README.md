@@ -125,21 +125,27 @@ samples        3
 
 ### Full
 
-Full 是通用搜索的廣域初篩：14 個未用於人工規則的新 shape，加 2 個
-已知控制；每個 workload 最多 12 個候選，共最多 192 筆。使用
+Full 現在是凍結搜索器的外部泛化測試：22 個從未出現在歷史 workload 或
+量測 manifest 的預註冊 shape，涵蓋 dense/K-regime/skinny/layout/BF16/FP32
+與 template 七個硬體相關 strata。每個 workload 最多 16 個候選，共最多
+352 筆。使用
 `warmup=3, repeat=10, samples=5` 擴大 shape 與候選覆蓋；明顯改善者要在
 後續高精度輪次確認。只要出現新候選，searched、bank control 與 official
 baseline 就強制同輪量測。結果獨立寫入
-`results/npu_full_general_v1_*`，不覆蓋既有 boundary-family 證據。
-terminal 每個 workload 只額外輸出一行
+`results/npu_full_generalization_v2_*`，不覆蓋既有 general-v1 或
+boundary-family 證據。原先 16 個訓練/探索 workload 仍保存在
+`config/workloads_general_search_v1.csv`，但不再由預設 full 重複深挖。
+
+搜索後會先輸出 `SEARCH_FRONTIER` 與每個 workload 一行
+`SEARCH_WORKLOAD`，列出候選數、來源與 template 分布。profiling 再為每個
+workload 輸出一行
 `SOURCE_RESULT`，比較 local/global/transfer/diverse 各來源最佳點；所有
 候選的完整量測仍以 candidates CSV 為準。
 
 再次執行相同的 `--mode full` 時，搜索器會先讀取
-`npu_full_general_v1_resume.csv`。已量 fingerprint 只用來校正每個
+`npu_full_generalization_v2_resume.csv`。已量 fingerprint 只用來校正每個
 candidate source 的模型誤差，不再佔 NPU 候選名額；每個仍有空間的 source
-至少保留一個探索點，其餘預算依真機校正後分數分配。第一輪 187 筆完成後，
-host 契約演練會提出 145 筆不重複的第二輪候選。
+至少保留一個探索點，其餘預算依真機校正後分數分配。
 
 `--mode general` 只保留為相容別名，與 `--mode full` 使用相同設定；正常
 工作流只需執行 `full`。
@@ -295,8 +301,8 @@ exact resume。終端的 `profile_plan` 會列出
 `resume_exact_*_assigned` 與 `npu_*_pending`。
 
 general campaign 已完成的完整 fingerprint 另外保存在
-`config/general_search_v1_round{1,2,3_partial}_fingerprints.csv`。因此即使
-重新 clone 而沒有 Git 忽略的本地 resume，full 也不會靜默重跑前 380 筆。
+`config/general_search_v1_round{1,2,3_partial,4}_fingerprints.csv`。因此
+即使重新 clone 而沒有 Git 忽略的本地 resume，也不會靜默重跑前 577 筆。
 搜尋階段會輸出
 `search_feedback`，分別列出 exact profile、可用於校準的穩定 profile，
 以及 campaign manifest 排除的數量。

@@ -1987,6 +1987,34 @@ def deterministic_split_k_applicable(
     return deterministic_split_k_supported_range(workload)
 
 
+def deterministic_split_k_general_applicable(
+    workload: Workload,
+    hardware: Hardware,
+) -> bool:
+    """Use split-K when output tiles cannot occupy all AICs.
+
+    This gate is independent of the measured M=N=128 positive interval used
+    by the legacy guided policy. The callback remains authoritative for the
+    resulting kernel family and exact 23-field record.
+    """
+    if (
+        workload.dtype != "fp16"
+        or workload.trans_a
+        or workload.trans_b
+        or workload.m % 16
+        or workload.n % 16
+        or workload.k % 128
+    ):
+        return False
+    core_limit = min(workload.max_cores, hardware.aic_cores)
+    output_tiles = ceil_div(workload.m, 128) * ceil_div(workload.n, 128)
+    if output_tiles >= core_limit:
+        return False
+    required_k_parts = ceil_div(core_limit, max(1, output_tiles))
+    available_k_parts = ceil_div(workload.k, 3 * 128)
+    return required_k_parts >= 2 and available_k_parts >= required_k_parts
+
+
 def deterministic_split_k_supported_range(
     workload: Workload,
 ) -> bool:
@@ -2010,8 +2038,14 @@ def deterministic_split_k_candidate_space(
     workload: Workload,
     seed: Seed,
     hardware: Hardware,
+    generalized: bool = False,
 ) -> list[dict[str, int]]:
-    if not deterministic_split_k_applicable(workload, seed):
+    applicable = (
+        deterministic_split_k_general_applicable(workload, hardware)
+        if generalized
+        else deterministic_split_k_applicable(workload, seed)
+    )
+    if not applicable:
         return []
     candidates: list[dict[str, int]] = []
     seed_k = (
@@ -2114,7 +2148,10 @@ def all_template_candidate_spaces(
             workload, seed, hardware
         ),
         "DETERMINISTIC_SPLIT_K": deterministic_split_k_candidate_space(
-            workload, seed, hardware
+            workload,
+            seed,
+            hardware,
+            generalized=optimization_scope == "general_search_v1",
         ),
         "AL1_FULL_LOAD": al1_candidate_space(
             workload, seed, hardware
@@ -3495,7 +3532,7 @@ def general_search_candidate_proposals(
         raw_rows,
         hardware,
         32,
-        "all_templates_validation",
+        "general_search_v1",
     )
     global_pool = [
         candidate

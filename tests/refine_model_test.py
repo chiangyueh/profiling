@@ -44,6 +44,68 @@ def test_reference_pair_coherence_guard() -> None:
     )
 
 
+def test_external_generalization_verdicts_are_not_universal() -> None:
+    results = Counter(
+        {
+            "improved": 6,
+            "not_improved": 14,
+            "no_successful_searched_candidate": 2,
+        }
+    )
+    method, universal = print_summary.external_generalization_status(
+        results, {"dense", "k", "layout"}
+    )
+    assert method == "supported"
+    assert universal == "not_supported"
+    method, universal = print_summary.external_generalization_status(
+        Counter({"improved": 22}),
+        {"dense", "k", "skinny", "layout", "bf16", "fp32"},
+    )
+    assert method == "supported"
+    assert universal == "supported"
+
+
+def test_external_workloads_are_preregistered_and_shape_distinct() -> None:
+    path = ROOT / "config/workloads_generalization_v2.csv"
+    with path.open(newline="", encoding="utf-8") as source:
+        rows = list(csv.DictReader(source))
+    assert len(rows) == 22
+    assert all(row["id"].startswith("external_v2_") for row in rows)
+    shapes = {(row["m"], row["n"], row["k"]) for row in rows}
+    assert len(shapes) == 22
+    historical_shapes: set[tuple[str, str, str]] = set()
+    for historical_path in (ROOT / "config").glob("workloads*.csv"):
+        if historical_path == path:
+            continue
+        with historical_path.open(newline="", encoding="utf-8") as source:
+            historical_shapes.update(
+                (row["m"], row["n"], row["k"])
+                for row in csv.DictReader(source)
+            )
+    assert shapes.isdisjoint(historical_shapes)
+
+
+def test_general_split_k_gate_uses_hardware_parallelism() -> None:
+    underfilled = refine.Workload(
+        "underfilled", 192, 128, 24576, "fp16", False, False, 24
+    )
+    enough_output_tiles = refine.Workload(
+        "enough_output", 1024, 768, 24576, "fp16", False, False, 24
+    )
+    odd_k = refine.Workload(
+        "odd_k", 192, 128, 24577, "fp16", False, False, 24
+    )
+    assert refine.deterministic_split_k_general_applicable(
+        underfilled, HARDWARE
+    )
+    assert not refine.deterministic_split_k_general_applicable(
+        enough_output_tiles, HARDWARE
+    )
+    assert not refine.deterministic_split_k_general_applicable(
+        odd_k, HARDWARE
+    )
+
+
 def base_knowledge(
     workload: refine.Workload,
     base_m: int,
@@ -720,6 +782,13 @@ def test_campaign_manifest_excludes_exact_fingerprint() -> None:
     )
     assert round3_count == 48
     assert len(round3_history) == 48
+    round4_history, round4_count = refine.load_campaign_exclusions(
+        ROOT / "config/general_search_v1_round4_fingerprints.csv",
+        "Ascend910B3",
+        20,
+    )
+    assert round4_count == 197
+    assert len(round4_history) == 197
 
 
 def test_campaign_observations_calibrate_sources_and_transfer() -> None:
@@ -782,6 +851,16 @@ def test_campaign_observations_calibrate_sources_and_transfer() -> None:
     )
     assert 1.55 < combined_corrections["global"] < 1.60
     assert 1.55 < combined_corrections["diverse"] < 1.60
+    round4_history, round4_transfers, round4_count = (
+        refine.load_campaign_observations(
+            ROOT / "config/general_search_v1_round4_observations.csv",
+            "Ascend910B3",
+            20,
+        )
+    )
+    assert round4_count == 30
+    assert len(round4_history) == 30
+    assert len(round4_transfers) == 1
 
 
 def test_unstable_comparison_cannot_claim_improvement() -> None:
@@ -2498,6 +2577,10 @@ def test_exact_profile_resume_uses_full_tiling_fingerprint() -> None:
 
 
 def main() -> None:
+    test_reference_pair_coherence_guard()
+    test_external_generalization_verdicts_are_not_universal()
+    test_external_workloads_are_preregistered_and_shape_distinct()
+    test_general_split_k_gate_uses_hardware_parallelism()
     test_layout_specific_fp32_alignment()
     test_complete_callback_blob_parsing()
     test_cann81_kernel_key_contract()

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260730-general-reference-guard-v4"
+RUN_NPU_VERSION="20260730-external-generalization-v2"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -293,8 +293,8 @@ case "${MODE}" in
         DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
         ;;
     general|full)
-        WORKLOADS_CSV="${WORKLOADS_CSV:-${WORKLOADS:-config/workloads_general_search_v1.csv}}"
-        RESULT_STEM="${RESULT_STEM:-results/npu_full_general_v1}"
+        WORKLOADS_CSV="${WORKLOADS_CSV:-${WORKLOADS:-config/workloads_generalization_v2.csv}}"
+        RESULT_STEM="${RESULT_STEM:-results/npu_full_generalization_v2}"
         DEFAULT_BEAM_WIDTH=32
         DEFAULT_TABU_ITERS=0
         DEFAULT_LNS_ROUNDS=0
@@ -438,6 +438,9 @@ SEARCH_FEEDBACK_LINE="$(
 if [[ -n "${SEARCH_FEEDBACK_LINE}" ]]; then
     echo "  ${SEARCH_FEEDBACK_LINE}"
 fi
+python3 "${ROOT}/tools/print_search_plan.py" \
+    --candidates "${SEARCH_CANDIDATES_CSV}" \
+    --workloads "${WORKLOADS_CSV}"
 
 echo "[4/4] Run NPU ACL Event profiling ..."
 PROFILE_LOG="${ROOT}/results/logs/profile_$(date +%Y%m%d_%H%M%S).log"

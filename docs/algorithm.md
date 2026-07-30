@@ -314,6 +314,12 @@ Host 候選上限分別為 12/16/16/12，去重後每 workload 最多 60 筆並�
 官方 callback。這是供模型選擇的較深前沿，不是 NPU 預算；每輪 NPU 最多
 量 16 筆，且先保留每個仍有未測候選的來源 leader。
 
+general scope 的 deterministic split-K 不再沿用 guided policy 的
+`M=N=128, K=16K..49K` 實測區間。它只在 FP16 NN 且 M/N/K 對齊、以
+128x128 output tile 計算不足以填滿 AIC、K 又有足夠 384-element partition
+補足平行度時生成；最終 template 與 23-field record 仍必須由 CANN callback
+逐筆原樣接受。舊區間只保留給既有 guided policy，不參與外部泛化判定。
+
 完成一輪後，完整 23-field fingerprint 進入版本化 manifest。下一輪仍會
 構造相同受約束空間，但 exact fingerprint 被 active frontier 排除，因而會
 向每個來源的下一層移動。穩定的 source-best 同輪
@@ -414,9 +420,14 @@ HBM/L2 bandwidth 分母也使用 active core，不會讓空閒 core 虛構額外
    coefficient of variation 不高於 5% 才進入模型回饋。
 5. 最終只相信 correctness 後的 NPU latency。
 
-目前 44 筆 source-best 只足以做低維保守校正，還不足以訓練聲稱可泛化的
+目前 79 筆穩定 source-best 只足以做低維保守校正，還不足以訓練聲稱可泛化的
 Bayesian/TPE/神經 cost model。後續每輪保留完整候選量測後，才評估以
 template、dtype/layout 與硬體衍生特徵訓練 residual model。
+
+前四輪的 16 個 workload 已成為開發資料，不能再稱為未見 holdout。
+`workloads_generalization_v2.csv` 因此在真機結果出現前固定 20 個新 shape，
+搜索器與每 workload 16 筆預算同時凍結。詳細分層與判準見
+`docs/generalization_v2_protocol.md`。
 
 `bottleneck_guided_v1` 將 `TABU_ITERS=LNS_ROUNDS=0`，不進入本節流程。這是
 對先前廣域模型失準的修正；Tabu/LNS 程式只供全模板 reference scope 使用。

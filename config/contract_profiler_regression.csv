@@ -1,2 +1,0 @@
-id,m,n,k,dtype,trans_a,trans_b,max_cores
-contract_profiler_multibase,1792,2816,3584,fp16,0,0,24

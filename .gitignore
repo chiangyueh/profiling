@@ -1,7 +1,4 @@
-build/
+.build/
 results/
-cceprint/
-npuchk/
-stub_reg.log
-tools/__pycache__/
+__pycache__/
 *.pyc

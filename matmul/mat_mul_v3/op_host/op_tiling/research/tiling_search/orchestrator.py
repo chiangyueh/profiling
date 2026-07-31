@@ -4,7 +4,11 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
 
-from .behavior import draft_behavior_coverage, select_behavior_coverage
+from .behavior import (
+    FeedbackCostModel,
+    draft_behavior_coverage,
+    select_behavior_coverage,
+)
 from .contracts import (
     common_hardware_contract,
     template_kernel_contract,
@@ -55,6 +59,7 @@ class CandidateEngine:
         self.config = config or SearchConfig()
         self.observations = tuple(observations)
         self.exclusions = exclusions or set()
+        self._cost_models: dict[Hardware, FeedbackCostModel] = {}
         self.solvers = tuple(
             solvers
             or (
@@ -74,6 +79,10 @@ class CandidateEngine:
         local_anchor: Schedule | None = None,
     ) -> SearchResult:
         budget = self.config.budget
+        cost_model = self._cost_models.get(hardware)
+        if cost_model is None:
+            cost_model = FeedbackCostModel(self.observations, hardware)
+            self._cost_models[hardware] = cost_model
         targets = feedback_targets(workload, hardware, self.observations)
         iterators = []
         stats = []
@@ -195,6 +204,7 @@ class CandidateEngine:
             self.observations,
             hardware,
             budget.behavior_candidates,
+            cost_model=cost_model,
         )
         selected = select_behavior_coverage(
             workload,
@@ -202,6 +212,7 @@ class CandidateEngine:
             self.observations,
             hardware,
             budget.callback_candidates,
+            cost_model=cost_model,
         )
         reports = tuple(
             SolverReport(

@@ -159,10 +159,11 @@ STAGE1_RESULTS="${ROOT}/results/npu_full_stage1_candidates.csv"
 SUMMARY="${ROOT}/results/npu_full_summary.csv"
 CANDIDATE_RESULTS="${ROOT}/results/npu_full_candidates.csv"
 RESUME="${ROOT}/results/npu_full_resume.csv"
+CAMPAIGN_SUMMARY="${ROOT}/results/npu_full_campaign_incumbents.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260731-net14-runtime-risk-feedback"
+echo "  script:     run_npu.sh 20260731-net15-campaign-incumbents"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      independent_contract_behavior_search"
 echo "  mode:       ${MODE}"
@@ -304,8 +305,10 @@ generate_stage() {
         --observations "${RESEARCH}/config/measured_observations.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log11.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log14.csv"
+        --observations "${RESEARCH}/config/measured_observations_net_log15.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log14.csv"
+        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log15.csv"
         --resume-feedback "${RESUME}"
         --npu-candidates "${count}"
         --callback-candidates 48
@@ -372,9 +375,22 @@ profile_stage \
     "${CANDIDATE_RESULTS}"
 echo "  ok"
 
+python3 "${RESEARCH}/campaign_report.py" \
+    --workloads "${WORKLOADS}" \
+    --output "${CAMPAIGN_SUMMARY}" \
+    --resume "${RESUME}" \
+    --soc "${SOC}" \
+    --aic "${AIC}" \
+    --toolkit "${TOOLKIT_VERSION}" \
+    --observations "${RESEARCH}/config/measured_observations.csv" \
+    --observations "${RESEARCH}/config/measured_observations_net_log11.csv" \
+    --observations "${RESEARCH}/config/measured_observations_net_log14.csv" \
+    --observations "${RESEARCH}/config/measured_observations_net_log15.csv"
+
 echo
 echo "NPU run completed"
 echo "  Summary:    ${SUMMARY}"
 echo "  Candidates: ${CANDIDATE_RESULTS}"
 echo "  Resume:     ${RESUME}"
+echo "  Campaign:   ${CAMPAIGN_SUMMARY}"
 echo "  log:        ${RUN_LOG}"

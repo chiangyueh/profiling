@@ -16,6 +16,7 @@ from generate import (
     load_workloads,
     merge_candidate_rows,
 )
+from campaign_report import summarize_campaign
 from tiling_search.behavior import (
     BehaviorVector,
     FeedbackCostModel,
@@ -266,12 +267,44 @@ class FeedbackCostModelTest(unittest.TestCase):
         self.assertGreaterEqual(prediction.latency_uncertainty, 0.80)
         self.assertGreater(prediction.latency_ratio, 0.70)
 
-    def test_final_selection_does_not_fill_with_known_catastrophic_losers(
+    def test_same_workload_template_rejections_override_weak_neighbors(
+        self,
+    ) -> None:
+        observations = []
+        for index in range(8):
+            observations.append(
+                MeasuredObservation(
+                    workload=self.workload,
+                    schedule=self.reject_schedule.replace(
+                        l2MTileBlock=8 + index,
+                    ),
+                    ratio_vs_official=1.0,
+                    ratio_vs_bank=1.0,
+                    source="runtime_rejected",
+                    record_id=f"reject-{index}",
+                    status_vs_official="runtime_rejected",
+                    status_vs_bank="runtime_rejected",
+                )
+            )
+        prediction = FeedbackCostModel(
+            observations, self.hardware
+        ).predict(
+            self.workload,
+            behavior_vector(
+                self.workload,
+                self.success_schedule,
+                self.hardware,
+            ),
+        )
+        self.assertGreater(prediction.runtime_risk_score, 0.75)
+        self.assertEqual(prediction.runtime_risk_support, 1.0)
+
+    def test_final_selection_does_not_fill_with_known_severe_losers(
         self,
     ) -> None:
         safe = []
         severe = []
-        for index in range(8):
+        for index in range(9):
             schedule = self.success_schedule.replace(
                 usedCoreNum=20 - index,
                 l2MTileBlock=8 + index,
@@ -347,6 +380,36 @@ class FeedbackCostModelTest(unittest.TestCase):
             {candidate.template for candidate in selected},
             {Template.BASE},
         )
+        self.assertNotIn(safe[0], selected)
+
+    def test_campaign_summary_retains_prior_winner(self) -> None:
+        winner = MeasuredObservation(
+            workload=self.workload,
+            schedule=self.success_schedule,
+            ratio_vs_official=0.8,
+            ratio_vs_bank=0.9,
+            source="contract_global",
+            record_id="prior-winner",
+            status_vs_official="improved",
+            status_vs_bank="improved",
+        )
+        later_regression = MeasuredObservation(
+            workload=self.workload,
+            schedule=self.success_schedule.replace(usedCoreNum=19),
+            ratio_vs_official=1.5,
+            ratio_vs_bank=1.4,
+            source="feedback_winner_mutation",
+            record_id="later-regression",
+            status_vs_official="regressed",
+            status_vs_bank="regressed",
+        )
+        rows = summarize_campaign(
+            [self.workload],
+            [winner, later_regression],
+        )
+        self.assertEqual(rows[0]["campaign_status"], "solved")
+        self.assertEqual(rows[0]["winning_measurements"], "1")
+        self.assertEqual(rows[0]["record_id"], "prior-winner")
 
     def test_stage_merge_preserves_old_candidates_and_adds_only_new(
         self,

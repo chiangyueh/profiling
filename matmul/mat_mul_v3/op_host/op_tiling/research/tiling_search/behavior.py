@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 from heapq import nsmallest
 from statistics import median
@@ -718,7 +718,25 @@ class FeedbackCostModel:
         ] = {}
         self._category_penalties: dict[
             tuple[object, ...], tuple[float, ...]
-        ] = {}
+        ] = OrderedDict()
+        template_risk_evidence: dict[
+            tuple[
+                tuple[int, int, int, str, bool, bool, int],
+                str,
+            ],
+            list[_Evidence],
+        ] = defaultdict(list)
+        for item in self.evidence:
+            template_risk_evidence[
+                (
+                    item.workload.identity(),
+                    str(item.vector.categories[0]),
+                )
+            ].append(item)
+        self._template_risk_evidence = {
+            key: tuple(items)
+            for key, items in template_risk_evidence.items()
+        }
 
     def predict(
         self,
@@ -758,7 +776,11 @@ class FeedbackCostModel:
                 )
                 for item in self.evidence
             )
+            if len(self._category_penalties) >= 128:
+                self._category_penalties.popitem(last=False)
             self._category_penalties[vector.categories] = category_penalties
+        else:
+            self._category_penalties.move_to_end(vector.categories)
 
         neighbors: list[tuple[float, _Evidence]] = []
         for index, item in enumerate(self.evidence):
@@ -930,6 +952,47 @@ class FeedbackCostModel:
         else:
             runtime_risk_score = 0.5
             runtime_risk_support = 0.0
+
+        template_risk_items = self._template_risk_evidence.get(
+            (
+                workload_identity,
+                str(vector.categories[0]),
+            ),
+            (),
+        )
+        if (
+            exclude_workload is None
+            or exclude_workload != workload_identity
+        ):
+            if exclude_keys:
+                template_risk_items = tuple(
+                    item
+                    for item in template_risk_items
+                    if (workload_identity, item.signature)
+                    not in exclude_keys
+                )
+            if template_risk_items:
+                # Repeated failures from the same workload and kernel
+                # template are stronger executability evidence than a few
+                # nearby points in continuous behavior space. A beta(1, 1)
+                # prior keeps one exploratory failure from banning a family.
+                group_samples = len(template_risk_items)
+                group_risk = (
+                    1.0
+                    + sum(
+                        item.runtime_reject_rate
+                        for item in template_risk_items
+                    )
+                ) / (group_samples + 2.0)
+                group_support = min(1.0, group_samples / 8.0)
+                group_weight = 0.85 * group_support
+                runtime_risk_score = (
+                    group_weight * group_risk
+                    + (1.0 - group_weight) * runtime_risk_score
+                )
+                runtime_risk_support = max(
+                    runtime_risk_support, group_support
+                )
 
         return FeedbackPrediction(
             latency_ratio=latency_ratio,
@@ -1179,9 +1242,11 @@ def score_candidates(
     candidates: Iterable[Candidate],
     observations: Sequence[MeasuredObservation],
     hardware: Hardware,
+    *,
+    cost_model: FeedbackCostModel | None = None,
 ) -> list[tuple[Candidate, BehaviorVector, float, float]]:
     evaluated: list[tuple[Candidate, BehaviorVector, float, float]] = []
-    model = FeedbackCostModel(observations, hardware)
+    model = cost_model or FeedbackCostModel(observations, hardware)
     for candidate in candidates:
         vector = behavior_vector(workload, candidate.schedule, hardware)
         prediction = model.predict(workload, vector)
@@ -1251,12 +1316,17 @@ def select_behavior_coverage(
     limit: int,
     *,
     probe_templates: bool = True,
+    cost_model: FeedbackCostModel | None = None,
 ) -> list[Candidate]:
     unique: dict[tuple[int, ...], Candidate] = {}
     for candidate in candidates:
         unique.setdefault(candidate.schedule.signature(), candidate)
     scored = score_candidates(
-        workload, unique.values(), observations, hardware
+        workload,
+        unique.values(),
+        observations,
+        hardware,
+        cost_model=cost_model,
     )
     selected: list[tuple[Candidate, BehaviorVector, float, float]] = []
     selected_signatures: set[tuple[int, ...]] = set()
@@ -1279,11 +1349,11 @@ def select_behavior_coverage(
             and item[1].metrics.get("runtime_risk_support", 0.0) >= 0.25
         )
 
-    def known_catastrophic_regression(
+    def known_severe_regression(
         item: tuple[Candidate, BehaviorVector, float, float],
     ) -> bool:
         return (
-            item[1].metrics.get("predicted_latency_ratio", 1.0) >= 4.0
+            item[1].metrics.get("predicted_latency_ratio", 1.0) >= 1.25
             and item[1].metrics.get("latency_support", 0.0) >= 0.70
             and item[1].metrics.get("latency_uncertainty", 1.0) <= 0.35
         )
@@ -1316,13 +1386,13 @@ def select_behavior_coverage(
             )
             if selected_high_risk >= high_risk_budget:
                 return False
-        if enforce_regression and known_catastrophic_regression(item):
+        if enforce_regression and known_severe_regression(item):
             if candidate.source != "feedback_regression_counterfactual":
                 return False
             selected_regressions = [
                 selected_item
                 for selected_item in selected
-                if known_catastrophic_regression(selected_item)
+                if known_severe_regression(selected_item)
             ]
             if len(selected_regressions) >= severe_regression_budget:
                 return False
@@ -1352,7 +1422,7 @@ def select_behavior_coverage(
                 for item in scored
                 if item[0].template == template
                 and not known_high_risk(item)
-                and not known_catastrophic_regression(item)
+                and not known_severe_regression(item)
             ]
             if family:
                 add(family[0])

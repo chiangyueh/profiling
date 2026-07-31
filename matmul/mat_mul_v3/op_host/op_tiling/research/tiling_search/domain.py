@@ -245,3 +245,5 @@ class SearchResult:
     excluded_fingerprints: int
     observation_count: int
     behavior_bins: int
+    legal_candidates: int = 0
+    draft_candidates: int = 0

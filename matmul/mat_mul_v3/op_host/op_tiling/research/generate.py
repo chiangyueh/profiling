@@ -109,10 +109,48 @@ def load_workloads(path: Path, aic_cores: int) -> list[Workload]:
     return workloads
 
 
+def merge_candidate_rows(
+    previous: list[dict[str, str]],
+    current: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Append newly generated schedules without changing exact identities."""
+    workload_order = [
+        row["workload_id"]
+        for row in current
+        if row.get("candidate_role") == "bank_seed_control"
+    ]
+    controls = {
+        row["workload_id"]: row
+        for row in current
+        if row.get("candidate_role") == "bank_seed_control"
+    }
+    merged: list[dict[str, str]] = []
+    for workload_id in workload_order:
+        merged.append(dict(controls[workload_id]))
+        seen: set[str] = set()
+        rank = 1
+        for row in [*previous, *current]:
+            if (
+                row.get("workload_id") != workload_id
+                or row.get("candidate_role") != "searched"
+            ):
+                continue
+            signature = row.get("tiling_signature", "")
+            if not signature or signature in seen:
+                continue
+            seen.add(signature)
+            candidate = {column: row.get(column, "") for column in COLUMNS}
+            candidate["rank"] = str(rank)
+            merged.append(candidate)
+            rank += 1
+    return merged
+
+
 def load_resume_feedback(
     path: Path,
     soc: str,
     aic_cores: int,
+    toolkit: str | None = None,
 ) -> tuple[list[MeasuredObservation], set[tuple]]:
     observations: list[MeasuredObservation] = []
     exclusions: set[tuple] = set()
@@ -125,6 +163,10 @@ def load_resume_feedback(
             row.get("candidate_role") != "searched"
             or row.get("soc") != soc
             or int(row.get("aic") or 0) != aic_cores
+            or (
+                toolkit is not None
+                and row.get("toolkit") != toolkit
+            )
         ):
             continue
         try:
@@ -275,6 +317,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--all-output", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--soc", required=True)
+    parser.add_argument("--toolkit")
     parser.add_argument("--aic-cores", type=int, required=True)
     parser.add_argument("--l0a-bytes", type=int, required=True)
     parser.add_argument("--l0b-bytes", type=int, required=True)
@@ -286,10 +329,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--observations", type=Path, action="append", default=[])
     parser.add_argument("--exclusions", type=Path, action="append", default=[])
     parser.add_argument("--resume-feedback", type=Path)
+    parser.add_argument("--append-candidates", type=Path)
     parser.add_argument("--npu-candidates", type=int, default=40)
     parser.add_argument("--callback-candidates", type=int, default=48)
     parser.add_argument("--behavior-candidates", type=int, default=320)
     parser.add_argument("--workload-limit", type=int, default=0)
+    parser.add_argument("--skip-model-validation", action="store_true")
     return parser.parse_args()
 
 
@@ -321,7 +366,10 @@ def main() -> None:
     )
     if args.resume_feedback is not None:
         resume_observations, resume_exclusions = load_resume_feedback(
-            args.resume_feedback, args.soc, args.aic_cores
+            args.resume_feedback,
+            args.soc,
+            args.aic_cores,
+            args.toolkit,
         )
         observations.extend(resume_observations)
         exclusions.update(resume_exclusions)
@@ -336,33 +384,34 @@ def main() -> None:
         f"latency={latency_observations} "
         f"runtime_rejected={runtime_rejections}"
     )
-    for leave_workload_out in (False, True):
-        validation = validate_feedback_model(
-            observations,
-            hardware,
-            leave_workload_out=leave_workload_out,
-        )
-        print(
-            "COST_MODEL_VALIDATION "
-            f"mode={validation.mode} "
-            f"latency_samples={validation.latency_samples} "
-            f"spearman={validation.latency_spearman:.6g} "
-            f"mae={validation.latency_mae:.6g} "
-            f"log_mae={validation.latency_log_mae:.6g} "
-            f"median_factor={validation.latency_median_factor:.6g} "
-            f"p90_factor={validation.latency_p90_factor:.6g} "
-            f"pairwise={validation.pairwise_accuracy:.6g} "
-            f"pairwise_n={validation.pairwise_comparisons} "
-            f"top_quartile_recall={validation.top_quartile_recall:.6g} "
-            "best_candidate_percentile="
-            f"{validation.best_candidate_percentile:.6g} "
-            f"runtime_samples={validation.runtime_samples} "
-            f"risk_auc={validation.runtime_risk_auc:.6g} "
-            f"analytical_spearman={validation.analytical_spearman:.6g} "
-            "analytical_pairwise="
-            f"{validation.analytical_pairwise_accuracy:.6g} "
-            "validation_only=1"
-        )
+    if not args.skip_model_validation:
+        for leave_workload_out in (False, True):
+            validation = validate_feedback_model(
+                observations,
+                hardware,
+                leave_workload_out=leave_workload_out,
+            )
+            print(
+                "COST_MODEL_VALIDATION "
+                f"mode={validation.mode} "
+                f"latency_samples={validation.latency_samples} "
+                f"spearman={validation.latency_spearman:.6g} "
+                f"mae={validation.latency_mae:.6g} "
+                f"log_mae={validation.latency_log_mae:.6g} "
+                f"median_factor={validation.latency_median_factor:.6g} "
+                f"p90_factor={validation.latency_p90_factor:.6g} "
+                f"pairwise={validation.pairwise_accuracy:.6g} "
+                f"pairwise_n={validation.pairwise_comparisons} "
+                f"top_quartile_recall={validation.top_quartile_recall:.6g} "
+                "best_candidate_percentile="
+                f"{validation.best_candidate_percentile:.6g} "
+                f"runtime_samples={validation.runtime_samples} "
+                f"risk_auc={validation.runtime_risk_auc:.6g} "
+                f"analytical_spearman={validation.analytical_spearman:.6g} "
+                "analytical_pairwise="
+                f"{validation.analytical_pairwise_accuracy:.6g} "
+                "validation_only=1"
+            )
     engine = CandidateEngine(
         config=SearchConfig(
             budget=GenerationBudget(
@@ -447,6 +496,7 @@ def main() -> None:
             observations,
             hardware,
             args.npu_candidates,
+            probe_templates=False,
         )
         accepted = [
             (
@@ -485,6 +535,8 @@ def main() -> None:
             f"{int(workload.trans_b)} selected={len(accepted)} "
             f"callback_rejected={callback_rejected} "
             f"behavior_bins={result.behavior_bins} "
+            f"legal_pool={result.legal_candidates} "
+            f"draft_pool={result.draft_candidates} "
             f"excluded={result.excluded_fingerprints} solvers={reports}"
         )
         if len(accepted) < args.npu_candidates:
@@ -492,6 +544,23 @@ def main() -> None:
                 f"SEARCH_CAPABILITY_GAP {workload.workload_id} "
                 f"requested={args.npu_candidates} accepted={len(accepted)}"
             )
+
+    appended = 0
+    if args.append_candidates is not None:
+        with args.append_candidates.open(
+            newline="", encoding="utf-8"
+        ) as source:
+            previous = list(csv.DictReader(source))
+        before = sum(
+            row.get("candidate_role") == "searched"
+            for row in output_rows
+        )
+        output_rows = merge_candidate_rows(previous, output_rows)
+        after = sum(
+            row.get("candidate_role") == "searched"
+            for row in output_rows
+        )
+        appended = after - before
 
     for path, rows in ((args.output, output_rows), (args.all_output, all_rows)):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -503,6 +572,7 @@ def main() -> None:
     print(
         "SEARCH_FRONTIER "
         f"workloads={len(workloads)} candidates={searched} "
+        f"appended_candidates={appended} "
         f"sources={dict(sorted(source_counts.items()))} "
         f"templates={dict(sorted(template_counts.items()))} "
         f"paired_controls={len(workloads)} observations={len(observations)}"

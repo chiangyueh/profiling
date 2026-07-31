@@ -571,11 +571,17 @@ def summarize(
             if row is not None and truthy(row.get("success"))
         ]
         rejected = sum(row is not None and not truthy(row.get("success")) for row in measured)
-        best = min(
-            successful,
-            key=lambda row: float(row["median_ms"]),
-            default=None,
-        )
+        def paired_ratio(row: dict[str, str]) -> tuple[float, float]:
+            candidate_ms = float(row["median_ms"])
+            return (
+                max(
+                    candidate_ms / float(row["official_ms"]),
+                    candidate_ms / float(row["bank_ms"]),
+                ),
+                candidate_ms,
+            )
+
+        best = min(successful, key=paired_ratio, default=None)
         source = rows[0]
         summary = {column: "" for column in SUMMARY_COLUMNS}
         summary.update(

@@ -5,17 +5,30 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 RESEARCH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RESEARCH))
 
-from generate import load_resume_feedback, load_workloads
-from tiling_search.behavior import FeedbackCostModel, behavior_vector
+from generate import (
+    load_resume_feedback,
+    load_workloads,
+    merge_candidate_rows,
+)
+from tiling_search.behavior import (
+    BehaviorVector,
+    FeedbackCostModel,
+    behavior_vector,
+    select_behavior_coverage,
+)
+from tiling_search.feedback import feedback_targets
 from tiling_search.domain import (
+    Candidate,
     Hardware,
     MeasuredObservation,
     Schedule,
+    Template,
     Workload,
 )
 
@@ -124,6 +137,7 @@ class FeedbackCostModelTest(unittest.TestCase):
             "candidate_role": "searched",
             "soc": "Ascend910B3",
             "aic": "20",
+            "toolkit": "8.1.RC1",
             "workload_id": self.workload.workload_id,
             "m": str(self.workload.m),
             "n": str(self.workload.n),
@@ -152,6 +166,14 @@ class FeedbackCostModelTest(unittest.TestCase):
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0].source, "runtime_rejected")
         self.assertEqual(len(exclusions), 1)
+        incompatible, incompatible_exclusions = load_resume_feedback(
+            path,
+            soc="Ascend910B3",
+            aic_cores=20,
+            toolkit="8.5.0",
+        )
+        self.assertEqual(incompatible, [])
+        self.assertEqual(incompatible_exclusions, set())
 
     def test_deterministic_split_k_models_workspace_reduction(self) -> None:
         workload = Workload(
@@ -207,6 +229,176 @@ class FeedbackCostModelTest(unittest.TestCase):
         self.assertLessEqual(prediction.latency_support, 0.15)
         self.assertGreaterEqual(prediction.latency_uncertainty, 0.80)
         self.assertGreater(prediction.latency_ratio, 0.70)
+
+    def test_final_selection_does_not_fill_with_known_catastrophic_losers(
+        self,
+    ) -> None:
+        safe = []
+        severe = []
+        for index in range(8):
+            schedule = self.success_schedule.replace(
+                usedCoreNum=20 - index,
+                l2MTileBlock=8 + index,
+            )
+            safe.append(
+                Candidate(
+                    schedule=schedule,
+                    template=Template.BASE,
+                    source="contract_global",
+                    rationale="safe",
+                )
+            )
+        for index in range(4):
+            schedule = self.success_schedule.replace(
+                tilingEnable=2,
+                singleCoreK=128 * (index + 1),
+                usedCoreNum=16 + index,
+            )
+            severe.append(
+                Candidate(
+                    schedule=schedule,
+                    template=Template.SINGLE_CORE_SPLIT_K,
+                    source="contract_global",
+                    rationale="known loser",
+                )
+            )
+
+        scored = []
+        for candidate in [*safe, *severe]:
+            is_severe = candidate in severe
+            is_known_false_positive_range = candidate == safe[0]
+            vector = BehaviorVector(
+                categories=(
+                    candidate.template.value,
+                    candidate.schedule["tilingEnable"],
+                    "fp16",
+                    0,
+                    0,
+                ),
+                values=(
+                    candidate.schedule["usedCoreNum"] / 20.0,
+                    *(0.0 for _ in range(14)),
+                ),
+                metrics={
+                    "predicted_latency_ratio": (
+                        9.0
+                        if is_severe
+                        else (2.7 if is_known_false_positive_range else 1.0)
+                    ),
+                    "latency_support": 0.8,
+                    "latency_uncertainty": 0.1,
+                    "runtime_risk_score": 0.1,
+                    "runtime_risk_support": 0.8,
+                    "analytical_prior": 1.0,
+                },
+            )
+            scored.append((candidate, vector, 0.0, 0.1))
+
+        with patch(
+            "tiling_search.behavior.score_candidates",
+            return_value=scored,
+        ):
+            selected = select_behavior_coverage(
+                self.workload,
+                [*safe, *severe],
+                (),
+                self.hardware,
+                8,
+                probe_templates=False,
+            )
+        self.assertEqual(len(selected), 8)
+        self.assertEqual(
+            {candidate.template for candidate in selected},
+            {Template.BASE},
+        )
+
+    def test_stage_merge_preserves_old_candidates_and_adds_only_new(
+        self,
+    ) -> None:
+        control = {
+            "workload_id": "w",
+            "candidate_role": "bank_seed_control",
+            "tiling_signature": "control",
+        }
+        first = {
+            "workload_id": "w",
+            "candidate_role": "searched",
+            "tiling_signature": "first",
+            "rank": "1",
+        }
+        duplicate = dict(first)
+        duplicate["rank"] = "7"
+        second = {
+            "workload_id": "w",
+            "candidate_role": "searched",
+            "tiling_signature": "second",
+            "rank": "1",
+        }
+        merged = merge_candidate_rows(
+            [control, first],
+            [control, duplicate, second],
+        )
+        searched = [
+            row for row in merged if row["candidate_role"] == "searched"
+        ]
+        self.assertEqual(
+            [row["tiling_signature"] for row in searched],
+            ["first", "second"],
+        )
+        self.assertEqual([row["rank"] for row in searched], ["1", "2"])
+
+    def test_feedback_targets_do_not_transfer_cross_workload_regressions(
+        self,
+    ) -> None:
+        other = Workload(
+            workload_id="other",
+            m=256,
+            n=256,
+            k=16384,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        same_regression = MeasuredObservation(
+            workload=self.workload,
+            schedule=self.success_schedule,
+            ratio_vs_official=2.0,
+            ratio_vs_bank=2.0,
+            source="contract_global",
+            record_id="same-regression",
+            status_vs_official="regressed",
+            status_vs_bank="regressed",
+        )
+        cross_regression = MeasuredObservation(
+            workload=other,
+            schedule=self.success_schedule,
+            ratio_vs_official=2.0,
+            ratio_vs_bank=2.0,
+            source="contract_global",
+            record_id="cross-regression",
+            status_vs_official="regressed",
+            status_vs_bank="regressed",
+        )
+        cross_winner = MeasuredObservation(
+            workload=other,
+            schedule=self.success_schedule,
+            ratio_vs_official=0.8,
+            ratio_vs_bank=0.8,
+            source="contract_global",
+            record_id="cross-winner",
+            status_vs_official="improved",
+            status_vs_bank="improved",
+        )
+        targets = feedback_targets(
+            self.workload,
+            self.hardware,
+            [same_regression, cross_regression, cross_winner],
+        )
+        origins = [target.origin for target in targets]
+        self.assertIn("counterfactual", origins)
+        self.assertIn("transfer_winner", origins)
+        self.assertEqual(origins.count("counterfactual"), 1)
 
 
 if __name__ == "__main__":

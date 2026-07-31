@@ -11,8 +11,17 @@ RESEARCH = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = RESEARCH.parents[2]
 sys.path.insert(0, str(RESEARCH))
 
-from tiling_search import CandidateEngine, GenerationBudget, Hardware, SearchConfig, Workload
+from tiling_search import (
+    CandidateEngine,
+    GenerationBudget,
+    Hardware,
+    MeasuredObservation,
+    SearchConfig,
+    Workload,
+)
 from tiling_search.domain import KNOWLEDGE_FIELDS, Template
+from tiling_search.behavior import select_behavior_coverage
+from tiling_search.feedback import fingerprint
 
 
 class ContractSearchTest(unittest.TestCase):
@@ -64,6 +73,8 @@ class ContractSearchTest(unittest.TestCase):
         )
         result = engine.generate(workload, self.hardware)
         self.assertGreaterEqual(len(result.callback_candidates), 40)
+        self.assertGreater(result.legal_candidates, result.draft_candidates)
+        self.assertLessEqual(result.draft_candidates, 512)
         self.assertGreaterEqual(
             len({candidate.template for candidate in result.candidates}), 2
         )
@@ -80,6 +91,18 @@ class ContractSearchTest(unittest.TestCase):
         for template, count in templates.items():
             if template != Template.BASE:
                 self.assertLessEqual(count, probe_budget)
+        npu_candidates = select_behavior_coverage(
+            workload,
+            result.callback_candidates,
+            (),
+            self.hardware,
+            40,
+            probe_templates=False,
+        )
+        self.assertGreaterEqual(
+            len({candidate.template for candidate in npu_candidates}),
+            2,
+        )
 
     def test_search_does_not_import_retired_candidate_paths(self) -> None:
         forbidden = (
@@ -92,6 +115,70 @@ class ContractSearchTest(unittest.TestCase):
             text = path.read_text(encoding="utf-8").lower()
             for token in forbidden:
                 self.assertNotIn(token, text, f"{path}: {token}")
+
+    def test_feedback_stage_expands_beyond_measured_fingerprints(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="feedback_stage_probe",
+            m=1024,
+            n=1536,
+            k=32768,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        budget = GenerationBudget(
+            raw_attempts=3000,
+            legal_candidates=1200,
+            behavior_candidates=64,
+            callback_candidates=16,
+            npu_candidates=8,
+        )
+        first = CandidateEngine(
+            config=SearchConfig(budget)
+        ).generate(workload, self.hardware)
+        measured = list(first.callback_candidates[:8])
+        observations = [
+            MeasuredObservation(
+                workload=workload,
+                schedule=candidate.schedule,
+                ratio_vs_official=0.8 if index == 0 else 2.0,
+                ratio_vs_bank=0.8 if index == 0 else 2.0,
+                source=candidate.source,
+                record_id=f"stage1-{index}",
+                status_vs_official=(
+                    "improved" if index == 0 else "regressed"
+                ),
+                status_vs_bank=(
+                    "improved" if index == 0 else "regressed"
+                ),
+            )
+            for index, candidate in enumerate(measured)
+        ]
+        exclusions = {
+            fingerprint(workload, candidate.schedule)
+            for candidate in measured
+        }
+        second = CandidateEngine(
+            config=SearchConfig(budget),
+            observations=observations,
+            exclusions=exclusions,
+        ).generate(workload, self.hardware)
+        self.assertTrue(
+            all(
+                fingerprint(workload, candidate.schedule)
+                not in exclusions
+                for candidate in second.callback_candidates
+            )
+        )
+        self.assertTrue(
+            any(
+                candidate.source.startswith("feedback_")
+                for candidate in second.candidates
+            )
+        )
 
 
 if __name__ == "__main__":

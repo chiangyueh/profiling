@@ -4,7 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Sequence
 
-from .behavior import select_behavior_coverage
+from .behavior import draft_behavior_coverage, select_behavior_coverage
 from .contracts import (
     common_hardware_contract,
     template_kernel_contract,
@@ -153,11 +153,15 @@ class CandidateEngine:
                 total_legal += 1
             active = remaining
 
+        measured_mutations = feedback_mutations(
+            workload, hardware, self.observations
+        )
         expanded = [
+            # Preserve causal provenance when a feedback mutation also appears
+            # in the independent solver stream. This lets stage-two selection
+            # distinguish an intentional counterfactual from a generic probe.
+            *measured_mutations,
             *independent,
-            *feedback_mutations(
-                workload, hardware, self.observations
-            ),
             *local_anchor_mutations(
                 workload, hardware, local_anchor
             ),
@@ -175,9 +179,19 @@ class CandidateEngine:
                 continue
             filtered.append(candidate)
 
-        behavior_pool = select_behavior_coverage(
+        draft_limit = max(
+            budget.behavior_candidates * 4,
+            budget.callback_candidates * 8,
+        )
+        draft_pool = draft_behavior_coverage(
             workload,
             filtered,
+            hardware,
+            draft_limit,
+        )
+        behavior_pool = select_behavior_coverage(
+            workload,
+            draft_pool,
             self.observations,
             hardware,
             budget.behavior_candidates,
@@ -211,4 +225,6 @@ class CandidateEngine:
             behavior_bins=len(
                 {candidate.behavior_key for candidate in selected}
             ),
+            legal_candidates=len(filtered),
+            draft_candidates=len(draft_pool),
         )

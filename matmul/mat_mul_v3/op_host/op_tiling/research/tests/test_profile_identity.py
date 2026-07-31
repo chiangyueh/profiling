@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -66,6 +68,65 @@ class ProfileIdentityTest(unittest.TestCase):
         )
         self.assertTrue(all(value != base for value in variants))
         self.assertEqual(len(set(variants)), len(variants))
+
+    def test_summary_ranks_by_paired_ratio_not_cross_run_latency(
+        self,
+    ) -> None:
+        first = dict(self.row)
+        first.update(
+            {
+                "rank": "1",
+                "search_template": "BASE",
+                "candidate_source": "contract_global",
+                "tiling_signature": "first",
+            }
+        )
+        second = dict(self.row)
+        second.update(
+            {
+                "rank": "2",
+                "search_template": "BASE",
+                "candidate_source": "feedback_winner_mutation",
+                "tiling_signature": "second",
+            }
+        )
+        records = {}
+        for row, candidate_ms, baseline_ms in (
+            (first, 1.0, 1.0),
+            (second, 1.1, 2.0),
+        ):
+            key = PROFILE.measurement_key(
+                "Ascend910B3", 20, "8.1.RC1", row
+            )
+            records[key] = {
+                **row,
+                "success": "1",
+                "median_ms": str(candidate_ms),
+                "official_ms": str(baseline_ms),
+                "bank_ms": str(baseline_ms),
+                "speedup_vs_official": str(
+                    baseline_ms / candidate_ms
+                ),
+                "speedup_vs_bank": str(baseline_ms / candidate_ms),
+                "status_vs_official": (
+                    "improved" if candidate_ms < baseline_ms else "within_noise"
+                ),
+                "status_vs_bank": (
+                    "improved" if candidate_ms < baseline_ms else "within_noise"
+                ),
+            }
+        with redirect_stdout(io.StringIO()):
+            summary = PROFILE.summarize(
+                [first, second],
+                records,
+                "Ascend910B3",
+                20,
+                "8.1.RC1",
+            )[0]
+        self.assertEqual(summary["best_rank"], "2")
+        self.assertEqual(
+            summary["best_source"], "feedback_winner_mutation"
+        )
 
 
 if __name__ == "__main__":

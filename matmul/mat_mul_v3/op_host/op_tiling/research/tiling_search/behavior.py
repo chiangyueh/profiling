@@ -485,6 +485,149 @@ def behavior_distance(left: BehaviorVector, right: BehaviorVector) -> float:
     return category_penalty + numeric
 
 
+def draft_behavior_coverage(
+    workload: Workload,
+    candidates: Iterable[Candidate],
+    hardware: Hardware,
+    limit: int,
+    *,
+    representatives_per_bin: int = 3,
+) -> list[Candidate]:
+    """Reduce near-duplicate schedules before the feedback model is evaluated.
+
+    The draft stage uses only hardware behavior. It deliberately does not use
+    measured latency, RuntimeKb geometry, workload names, or shape families.
+    """
+    unique: dict[tuple[int, ...], tuple[Candidate, BehaviorVector]] = {}
+    for candidate in candidates:
+        signature = candidate.schedule.signature()
+        if signature in unique:
+            continue
+        unique[signature] = (
+            candidate,
+            behavior_vector(workload, candidate.schedule, hardware),
+        )
+    evaluated = list(unique.values())
+    if len(evaluated) <= limit:
+        return [candidate for candidate, _ in evaluated]
+
+    grouped: dict[
+        tuple[object, ...],
+        list[tuple[Candidate, BehaviorVector]],
+    ] = defaultdict(list)
+    for item in evaluated:
+        grouped[behavior_key(item[1])].append(item)
+
+    retained: list[tuple[Candidate, BehaviorVector]] = []
+    for members in grouped.values():
+        ordered = sorted(
+            members,
+            key=lambda item: (
+                item[1].metrics["analytical_prior"],
+                item[0].schedule.signature(),
+            ),
+        )
+        chosen = [ordered[0]]
+        remaining = ordered[1:]
+        while remaining and len(chosen) < representatives_per_bin:
+            farthest = max(
+                remaining,
+                key=lambda item: (
+                    min(
+                        behavior_distance(item[1], selected[1])
+                        for selected in chosen
+                    ),
+                    -item[1].metrics["analytical_prior"],
+                    tuple(-value for value in item[0].schedule.signature()),
+                ),
+            )
+            chosen.append(farthest)
+            remaining.remove(farthest)
+        retained.extend(chosen)
+
+    if len(retained) <= limit:
+        return [candidate for candidate, _ in retained]
+
+    # If behavior bins themselves exceed the draft budget, retain extrema of
+    # every hardware feature and then fill deterministically across templates.
+    # This keeps rare execution structures visible without invoking latency
+    # predictions for the entire legal pool.
+    selected: list[tuple[Candidate, BehaviorVector]] = []
+    selected_signatures: set[tuple[int, ...]] = set()
+
+    def add(item: tuple[Candidate, BehaviorVector]) -> None:
+        signature = item[0].schedule.signature()
+        if signature in selected_signatures or len(selected) >= limit:
+            return
+        selected.append(item)
+        selected_signatures.add(signature)
+
+    by_template: dict[
+        object, list[tuple[Candidate, BehaviorVector]]
+    ] = defaultdict(list)
+    for item in retained:
+        by_template[item[0].template].append(item)
+    for members in by_template.values():
+        add(
+            min(
+                members,
+                key=lambda item: (
+                    item[1].metrics["analytical_prior"],
+                    item[0].schedule.signature(),
+                ),
+            )
+        )
+        for feature in range(len(members[0][1].values)):
+            add(min(members, key=lambda item: item[1].values[feature]))
+            add(max(members, key=lambda item: item[1].values[feature]))
+
+    queues: dict[object, list[tuple[Candidate, BehaviorVector]]] = {}
+    for template, members in by_template.items():
+        ordered = sorted(
+            members,
+            key=lambda item: (
+                behavior_key(item[1]),
+                item[1].metrics["analytical_prior"],
+                item[0].schedule.signature(),
+            ),
+        )
+        # Alternating ends traverses distant behavior bins before adjacent
+        # bins, while remaining deterministic across hosts and runs.
+        spread: list[tuple[Candidate, BehaviorVector]] = []
+        left = 0
+        right = len(ordered) - 1
+        while left <= right:
+            spread.append(ordered[left])
+            left += 1
+            if left <= right:
+                spread.append(ordered[right])
+                right -= 1
+        queues[template] = spread
+
+    templates = sorted(queues, key=str)
+    cursor = Counter()
+    while len(selected) < limit:
+        progress = False
+        for template in templates:
+            queue = queues[template]
+            while (
+                cursor[template] < len(queue)
+                and queue[cursor[template]][0].schedule.signature()
+                in selected_signatures
+            ):
+                cursor[template] += 1
+            if cursor[template] >= len(queue):
+                continue
+            add(queue[cursor[template]])
+            cursor[template] += 1
+            progress = True
+            if len(selected) >= limit:
+                break
+        if not progress:
+            break
+    return [candidate for candidate, _ in selected]
+
+
 def workload_distance(left: Workload, right: Workload) -> float:
     categorical = (
         (0.0 if left.dtype == right.dtype else 1.5)
@@ -1073,6 +1216,8 @@ def select_behavior_coverage(
     observations: Sequence[MeasuredObservation],
     hardware: Hardware,
     limit: int,
+    *,
+    probe_templates: bool = True,
 ) -> list[Candidate]:
     unique: dict[tuple[int, ...], Candidate] = {}
     for candidate in candidates:
@@ -1080,20 +1225,11 @@ def select_behavior_coverage(
     scored = score_candidates(
         workload, unique.values(), observations, hardware
     )
-    if len(scored) <= limit:
-        return [
-            candidate.with_selection(
-                acquisition=acquisition,
-                behavior_key=behavior_key(vector),
-                metrics=vector.metrics,
-            )
-            for candidate, vector, acquisition, _ in scored
-        ]
-
     selected: list[tuple[Candidate, BehaviorVector, float, float]] = []
     selected_signatures: set[tuple[int, ...]] = set()
     template_counts: Counter[object] = Counter()
     high_risk_budget = max(1, limit // 10)
+    severe_regression_budget = max(1, limit // 20)
     non_base_probe_budget = max(2, limit // 8)
     winning_templates = {
         template_of(observation.schedule)
@@ -1110,6 +1246,15 @@ def select_behavior_coverage(
             and item[1].metrics.get("runtime_risk_support", 0.0) >= 0.25
         )
 
+    def known_catastrophic_regression(
+        item: tuple[Candidate, BehaviorVector, float, float],
+    ) -> bool:
+        return (
+            item[1].metrics.get("predicted_latency_ratio", 1.0) >= 4.0
+            and item[1].metrics.get("latency_support", 0.0) >= 0.70
+            and item[1].metrics.get("latency_uncertainty", 1.0) <= 0.35
+        )
+
     def template_budget(candidate: Candidate) -> int:
         if candidate.template.value == "BASE":
             return limit
@@ -1122,6 +1267,7 @@ def select_behavior_coverage(
         *,
         enforce_risk: bool = True,
         enforce_template: bool = True,
+        enforce_regression: bool = True,
     ) -> bool:
         candidate = item[0]
         if (
@@ -1137,6 +1283,21 @@ def select_behavior_coverage(
             )
             if selected_high_risk >= high_risk_budget:
                 return False
+        if enforce_regression and known_catastrophic_regression(item):
+            if candidate.source != "feedback_regression_counterfactual":
+                return False
+            selected_regressions = [
+                selected_item
+                for selected_item in selected
+                if known_catastrophic_regression(selected_item)
+            ]
+            if len(selected_regressions) >= severe_regression_budget:
+                return False
+            if any(
+                selected_item[0].template == candidate.template
+                for selected_item in selected_regressions
+            ):
+                return False
         return True
 
     def add(
@@ -1146,14 +1307,22 @@ def select_behavior_coverage(
         selected_signatures.add(item[0].schedule.signature())
         template_counts[item[0].template] += 1
 
-    # One callback capability probe per generated kernel family is retained.
-    for template in sorted({item[0].template for item in scored}, key=str):
-        family = [item for item in scored if item[0].template == template]
-        representative = next(
-            (item for item in family if not known_high_risk(item)),
-            family[0],
-        )
-        add(representative)
+    # Callback coverage can retain one safe probe per generated kernel family.
+    # Final NPU selection disables this: a known losing family does not earn
+    # device budget merely because the host solver generated it.
+    if probe_templates:
+        for template in sorted(
+            {item[0].template for item in scored}, key=str
+        ):
+            family = [
+                item
+                for item in scored
+                if item[0].template == template
+                and not known_high_risk(item)
+                and not known_catastrophic_regression(item)
+            ]
+            if family:
+                add(family[0])
 
     exploitation_limit = max(len(selected), limit // 2)
     for item in scored:
@@ -1214,23 +1383,16 @@ def select_behavior_coverage(
                 best = item
                 best_key = key
         if best is None:
-            # Relax risk before template balance. Only when the preferred
-            # template pool is exhausted do we allow one family to consume
-            # the remaining budget.
+            # Template balance is a soft exploration policy. Runtime risk and
+            # well-supported severe latency regressions are not relaxed merely
+            # to fill a nominal NPU quota.
             remaining = [
                 item
                 for item in scored
                 if item[0].schedule.signature()
                 not in selected_signatures
-                and can_select(item, enforce_risk=False)
+                and can_select(item, enforce_template=False)
             ]
-            if not remaining:
-                remaining = [
-                    item
-                    for item in scored
-                    if item[0].schedule.signature()
-                    not in selected_signatures
-                ]
             if not remaining:
                 break
             best = min(remaining, key=lambda item: item[2])

@@ -6,7 +6,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Iterable, Sequence, Tuple
 
-from .behavior import behavior_key, behavior_vector
+from .behavior import behavior_key, behavior_vector, workload_distance
 from .contracts import ceil_div, template_of, validate_schedule
 from .domain import (
     BehaviorTarget,
@@ -296,9 +296,26 @@ def feedback_targets(
     hardware: Hardware,
     observations: Sequence[MeasuredObservation],
 ) -> list[BehaviorTarget]:
-    del workload
     targets: list[BehaviorTarget] = []
-    for observation in observations:
+    same_workload = [
+        observation
+        for observation in observations
+        if observation.workload.identity() == workload.identity()
+    ]
+    transfer_winners = sorted(
+        (
+            observation
+            for observation in observations
+            if observation.workload.identity() != workload.identity()
+            and observation.is_winner
+            and not _runtime_rejected(observation)
+        ),
+        key=lambda observation: (
+            workload_distance(workload, observation.workload),
+            observation.record_id,
+        ),
+    )[:12]
+    for observation in [*same_workload, *transfer_winners]:
         # A poisoned or incomplete NPU output proves that this exact schedule
         # must not run again. It does not identify a legal local direction to
         # mutate, so retain it for coverage/model feedback only.
@@ -310,7 +327,14 @@ def feedback_targets(
             observation.workload, observation.schedule, hardware
         )
         metrics = vector.metrics
-        origin = "winner" if observation.is_winner else "counterfactual"
+        is_transfer = (
+            observation.workload.identity() != workload.identity()
+        )
+        origin = (
+            "transfer_winner"
+            if is_transfer
+            else ("winner" if observation.is_winner else "counterfactual")
+        )
         direction = 1.0 if observation.is_winner else -1.0
         targets.append(
             BehaviorTarget(
@@ -353,7 +377,7 @@ def feedback_targets(
                 observation.workload, observation.schedule, hardware
             )
         )
-        for observation in observations
+        for observation in same_workload
     }
     coverage_grid = (
         (0.18, 0.25, 1.0, 2.0),

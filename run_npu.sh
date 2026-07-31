@@ -162,7 +162,7 @@ RESUME="${ROOT}/results/npu_full_resume.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260731-two-stage-feedback-search-v1"
+echo "  script:     run_npu.sh 20260731-net14-runtime-risk-feedback"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      independent_contract_behavior_search"
 echo "  mode:       ${MODE}"
@@ -303,7 +303,9 @@ generate_stage() {
         --hbm-bpc "${HBM_BPC:-1}"
         --observations "${RESEARCH}/config/measured_observations.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log11.csv"
+        --observations "${RESEARCH}/config/measured_observations_net_log14.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints.csv"
+        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log14.csv"
         --resume-feedback "${RESUME}"
         --npu-candidates "${count}"
         --callback-candidates 48

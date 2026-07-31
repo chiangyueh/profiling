@@ -185,19 +185,23 @@ def load_resume_feedback(
             continue
         exclusions.add(fingerprint(workload, schedule))
         if not truthy(row.get("success")):
-            if row.get("preflight_mode") == "runtime_rejected":
-                observations.append(
-                    MeasuredObservation(
-                        workload=workload,
-                        schedule=schedule,
-                        ratio_vs_official=1.0,
-                        ratio_vs_bank=1.0,
-                        source="runtime_rejected",
-                        record_id=row.get("record_id", path.stem),
-                        status_vs_official="runtime_rejected",
-                        status_vs_bank="runtime_rejected",
-                    )
+            # Every failed searched schedule is negative NPU executability
+            # evidence. Runners preserve a more specific preflight_mode such
+            # as output_not_written or timeout, but restricting feedback to
+            # the literal "runtime_rejected" label silently discards those
+            # failures and makes the next search repeat the same bad region.
+            observations.append(
+                MeasuredObservation(
+                    workload=workload,
+                    schedule=schedule,
+                    ratio_vs_official=1.0,
+                    ratio_vs_bank=1.0,
+                    source="runtime_rejected",
+                    record_id=row.get("record_id", path.stem),
+                    status_vs_official="runtime_rejected",
+                    status_vs_bank="runtime_rejected",
                 )
+            )
             continue
         if not row.get("official_ms") or not row.get("bank_ms"):
             continue

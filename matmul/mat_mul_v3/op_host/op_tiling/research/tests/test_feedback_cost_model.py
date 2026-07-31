@@ -175,6 +175,42 @@ class FeedbackCostModelTest(unittest.TestCase):
         self.assertEqual(incompatible, [])
         self.assertEqual(incompatible_exclusions, set())
 
+    def test_output_not_written_becomes_runtime_risk_evidence(
+        self,
+    ) -> None:
+        row = {
+            "candidate_role": "searched",
+            "soc": "Ascend910B3",
+            "aic": "20",
+            "toolkit": "8.1.RC1",
+            "workload_id": self.workload.workload_id,
+            "m": str(self.workload.m),
+            "n": str(self.workload.n),
+            "k": str(self.workload.k),
+            "dtype": self.workload.dtype,
+            "trans_a": "0",
+            "trans_b": "0",
+            "tiling_signature": self.reject_schedule.signature_text(),
+            "success": "0",
+            "preflight_mode": "output_not_written",
+            "record_id": "output-coverage-reject",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resume.csv"
+            with path.open("w", newline="", encoding="utf-8") as output:
+                writer = csv.DictWriter(output, fieldnames=tuple(row))
+                writer.writeheader()
+                writer.writerow(row)
+            observations, exclusions = load_resume_feedback(
+                path,
+                soc="Ascend910B3",
+                aic_cores=20,
+                toolkit="8.1.RC1",
+            )
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].source, "runtime_rejected")
+        self.assertEqual(len(exclusions), 1)
+
     def test_deterministic_split_k_models_workspace_reduction(self) -> None:
         workload = Workload(
             workload_id="deterministic_probe",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from heapq import nsmallest
 from statistics import median
 from typing import Iterable, Sequence
 
@@ -476,12 +477,7 @@ def behavior_distance(left: BehaviorVector, right: BehaviorVector) -> float:
         if left_value == right_value:
             continue
         category_penalty += 2.0 if index < 5 else 0.2
-    numeric = math.sqrt(
-        sum(
-            (left_value - right_value) ** 2
-            for left_value, right_value in zip(left.values, right.values)
-        )
-    )
+    numeric = math.dist(left.values, right.values)
     return category_penalty + numeric
 
 
@@ -713,6 +709,16 @@ class FeedbackCostModel:
             for workload, items in by_workload.items()
             if (model := _fit_local_model(items)) is not None
         }
+        self._evidence_identities = tuple(
+            item.workload.identity() for item in self.evidence
+        )
+        self._workload_distances: dict[
+            tuple[int, int, int, str, bool, bool, int],
+            tuple[float, ...],
+        ] = {}
+        self._category_penalties: dict[
+            tuple[object, ...], tuple[float, ...]
+        ] = {}
 
     def predict(
         self,
@@ -729,28 +735,55 @@ class FeedbackCostModel:
             tuple[int, int, int, str, bool, bool, int] | None
         ) = None,
     ) -> FeedbackPrediction:
+        workload_identity = workload.identity()
+        workload_distances = self._workload_distances.get(workload_identity)
+        if workload_distances is None:
+            workload_distances = tuple(
+                workload_distance(
+                    workload, item.workload
+                )
+                for item in self.evidence
+            )
+            self._workload_distances[workload_identity] = workload_distances
+
+        category_penalties = self._category_penalties.get(vector.categories)
+        if category_penalties is None:
+            category_penalties = tuple(
+                sum(
+                    (2.0 if index < 5 else 0.2)
+                    for index, (left_value, right_value) in enumerate(
+                        zip(vector.categories, item.vector.categories)
+                    )
+                    if left_value != right_value
+                )
+                for item in self.evidence
+            )
+            self._category_penalties[vector.categories] = category_penalties
+
         neighbors: list[tuple[float, _Evidence]] = []
-        for item in self.evidence:
-            key = item.workload.identity(), item.signature
-            if key in exclude_keys:
+        for index, item in enumerate(self.evidence):
+            item_identity = self._evidence_identities[index]
+            if exclude_keys and (item_identity, item.signature) in exclude_keys:
                 continue
             if (
                 exclude_workload is not None
-                and item.workload.identity() == exclude_workload
+                and item_identity == exclude_workload
             ):
                 continue
-            distance = behavior_distance(vector, item.vector)
-            distance += workload_distance(workload, item.workload)
+            distance = category_penalties[index]
+            distance += math.dist(vector.values, item.vector.values)
+            distance += workload_distances[index]
             neighbors.append((distance, item))
 
-        latency_neighbors = sorted(
+        latency_neighbors = nsmallest(
+            5,
             (
                 (distance, item)
                 for distance, item in neighbors
                 if item.latency_ratio is not None
             ),
             key=lambda item: item[0],
-        )[:5]
+        )
         if latency_neighbors:
             latency_weights = [
                 math.exp(-distance)
@@ -861,9 +894,9 @@ class FeedbackCostModel:
             latency_support = min(latency_support, 0.15)
             latency_uncertainty = max(latency_uncertainty, 0.80)
 
-        risk_neighbors = sorted(
-            neighbors, key=lambda item: item[0]
-        )[:7]
+        risk_neighbors = nsmallest(
+            7, neighbors, key=lambda item: item[0]
+        )
         if risk_neighbors:
             risk_weights = [
                 math.exp(-distance)

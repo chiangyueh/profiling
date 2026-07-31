@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Iterator, Sequence
+from functools import lru_cache
 
 from ..contracts import align_up, base_k_alignment, ceil_div
 from ..domain import (
@@ -184,13 +185,59 @@ def tile_specs(
     return ordered
 
 
+@lru_cache(maxsize=4096)
+def _partition_geometries_cached(
+    workload_m: int,
+    workload_n: int,
+    core_limit: int,
+    base_m: int,
+    base_n: int,
+    target_rounds: tuple[int, ...],
+) -> tuple[tuple[int, int, int], ...]:
+    geometries: set[tuple[int, int, int]] = set()
+    for rounds in target_rounds:
+        task_target = max(1, core_limit * rounds)
+        for m_parts in range(1, min(task_target, core_limit * 2) + 1):
+            n_parts = ceil_div(task_target, m_parts)
+            for adjusted_n in {max(1, n_parts - 1), n_parts, n_parts + 1}:
+                single_m = max(
+                    base_m,
+                    align_up(ceil_div(workload_m, m_parts), 16),
+                )
+                single_n = max(
+                    base_n,
+                    align_up(ceil_div(workload_n, adjusted_n), 16),
+                )
+                m_tasks = ceil_div(workload_m, single_m)
+                n_tasks = ceil_div(workload_n, single_n)
+                tasks = max(1, m_tasks * n_tasks)
+                geometries.add((single_m, single_n, min(core_limit, tasks)))
+    return tuple(
+        sorted(
+            geometries,
+            key=lambda value: (
+                ceil_div(
+                    ceil_div(workload_m, value[0])
+                    * ceil_div(workload_n, value[1]),
+                    value[2],
+                ),
+                abs(
+                    value[0] / max(1, value[1])
+                    - workload_m / max(1, workload_n)
+                ),
+                value,
+            ),
+        )
+    )
+
+
 def partition_geometries(
     workload: Workload,
     hardware: Hardware,
     base_m: int,
     base_n: int,
     targets: Sequence[BehaviorTarget],
-) -> list[tuple[int, int, int]]:
+) -> tuple[tuple[int, int, int], ...]:
     core_limit = min(workload.max_cores, hardware.aic_cores)
     target_rounds = {1, 2, 4, 8}
     target_rounds.update(
@@ -198,35 +245,13 @@ def partition_geometries(
         for target in targets
         if target.core_rounds is not None
     )
-    geometries: set[tuple[int, int, int]] = set()
-    for rounds in sorted(target_rounds):
-        task_target = max(1, core_limit * rounds)
-        for m_parts in range(1, min(task_target, core_limit * 2) + 1):
-            n_parts = ceil_div(task_target, m_parts)
-            for adjusted_n in {max(1, n_parts - 1), n_parts, n_parts + 1}:
-                single_m = max(
-                    base_m,
-                    align_up(ceil_div(workload.m, m_parts), 16),
-                )
-                single_n = max(
-                    base_n,
-                    align_up(ceil_div(workload.n, adjusted_n), 16),
-                )
-                m_tasks = ceil_div(workload.m, single_m)
-                n_tasks = ceil_div(workload.n, single_n)
-                tasks = max(1, m_tasks * n_tasks)
-                geometries.add((single_m, single_n, min(core_limit, tasks)))
-    return sorted(
-        geometries,
-        key=lambda value: (
-            ceil_div(
-                ceil_div(workload.m, value[0])
-                * ceil_div(workload.n, value[1]),
-                value[2],
-            ),
-            abs(value[0] / max(1, value[1]) - workload.m / max(1, workload.n)),
-            value,
-        ),
+    return _partition_geometries_cached(
+        workload.m,
+        workload.n,
+        core_limit,
+        base_m,
+        base_n,
+        tuple(sorted(target_rounds)),
     )
 
 

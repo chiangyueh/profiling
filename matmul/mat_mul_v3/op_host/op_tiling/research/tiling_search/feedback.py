@@ -48,7 +48,10 @@ def _row_workload(row: dict[str, str], aic_cores: int) -> Workload | None:
             dtype=row["dtype"].lower(),
             trans_a=_truthy(row.get("trans_a")),
             trans_b=_truthy(row.get("trans_b")),
-            max_cores=int(row.get("max_cores") or aic_cores),
+            max_cores=min(
+                int(row.get("max_cores") or aic_cores),
+                aic_cores,
+            ),
         )
     except (KeyError, ValueError):
         return None

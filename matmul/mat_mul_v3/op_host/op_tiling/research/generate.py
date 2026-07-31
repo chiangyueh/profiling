@@ -23,7 +23,10 @@ from tiling_search import (
     Workload,
 )
 from tiling_search.domain import KNOWLEDGE_FIELDS, Candidate, Schedule
-from tiling_search.behavior import select_behavior_coverage
+from tiling_search.behavior import (
+    select_behavior_coverage,
+    validate_feedback_model,
+)
 from tiling_search.feedback import fingerprint, load_feedback
 
 
@@ -97,7 +100,10 @@ def load_workloads(path: Path, aic_cores: int) -> list[Workload]:
                 dtype=row["dtype"].lower(),
                 trans_a=truthy(row.get("trans_a")),
                 trans_b=truthy(row.get("trans_b")),
-                max_cores=int(row.get("max_cores") or aic_cores),
+                max_cores=min(
+                    int(row.get("max_cores") or aic_cores),
+                    aic_cores,
+                ),
             )
         )
     return workloads
@@ -136,11 +142,22 @@ def load_resume_feedback(
         except (KeyError, ValueError):
             continue
         exclusions.add(fingerprint(workload, schedule))
-        if (
-            not truthy(row.get("success"))
-            or not row.get("official_ms")
-            or not row.get("bank_ms")
-        ):
+        if not truthy(row.get("success")):
+            if row.get("preflight_mode") == "runtime_rejected":
+                observations.append(
+                    MeasuredObservation(
+                        workload=workload,
+                        schedule=schedule,
+                        ratio_vs_official=1.0,
+                        ratio_vs_bank=1.0,
+                        source="runtime_rejected",
+                        record_id=row.get("record_id", path.stem),
+                        status_vs_official="runtime_rejected",
+                        status_vs_bank="runtime_rejected",
+                    )
+                )
+            continue
+        if not row.get("official_ms") or not row.get("bank_ms"):
             continue
         try:
             candidate_ms = float(row["median_ms"])
@@ -308,6 +325,44 @@ def main() -> None:
         )
         observations.extend(resume_observations)
         exclusions.update(resume_exclusions)
+    latency_observations = sum(
+        observation.source != "runtime_rejected"
+        for observation in observations
+    )
+    runtime_rejections = len(observations) - latency_observations
+    print(
+        "COST_MODEL_EVIDENCE "
+        f"records={len(observations)} "
+        f"latency={latency_observations} "
+        f"runtime_rejected={runtime_rejections}"
+    )
+    for leave_workload_out in (False, True):
+        validation = validate_feedback_model(
+            observations,
+            hardware,
+            leave_workload_out=leave_workload_out,
+        )
+        print(
+            "COST_MODEL_VALIDATION "
+            f"mode={validation.mode} "
+            f"latency_samples={validation.latency_samples} "
+            f"spearman={validation.latency_spearman:.6g} "
+            f"mae={validation.latency_mae:.6g} "
+            f"log_mae={validation.latency_log_mae:.6g} "
+            f"median_factor={validation.latency_median_factor:.6g} "
+            f"p90_factor={validation.latency_p90_factor:.6g} "
+            f"pairwise={validation.pairwise_accuracy:.6g} "
+            f"pairwise_n={validation.pairwise_comparisons} "
+            f"top_quartile_recall={validation.top_quartile_recall:.6g} "
+            "best_candidate_percentile="
+            f"{validation.best_candidate_percentile:.6g} "
+            f"runtime_samples={validation.runtime_samples} "
+            f"risk_auc={validation.runtime_risk_auc:.6g} "
+            f"analytical_spearman={validation.analytical_spearman:.6g} "
+            "analytical_pairwise="
+            f"{validation.analytical_pairwise_accuracy:.6g} "
+            "validation_only=1"
+        )
     engine = CandidateEngine(
         config=SearchConfig(
             budget=GenerationBudget(

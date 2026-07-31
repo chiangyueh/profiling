@@ -6,6 +6,7 @@ from typing import Callable
 from .domain import (
     INPUT_BYTES,
     KNOWLEDGE_FIELDS,
+    OUTPUT_BYTES,
     Hardware,
     Schedule,
     Template,
@@ -530,8 +531,21 @@ def profitability_prior(
     m_tasks = ceil_div(workload.m, schedule["singleCoreM"])
     n_tasks = ceil_div(workload.n, schedule["singleCoreN"])
     output_tasks = m_tasks * n_tasks
-    active = min(schedule["usedCoreNum"], max(1, output_tasks))
-    rounds = ceil_div(output_tasks, max(1, active))
+    split = split_mode(schedule)
+    split_k_chunks = (
+        ceil_div(workload.k, schedule["singleCoreK"])
+        if split in (2, 3)
+        else 1
+    )
+    if split == 3:
+        active = min(schedule["usedCoreNum"], split_k_chunks)
+        rounds = (
+            output_tasks
+            * ceil_div(split_k_chunks, max(1, active))
+        )
+    else:
+        active = min(schedule["usedCoreNum"], max(1, output_tasks))
+        rounds = ceil_div(output_tasks, max(1, active))
     padded_m = m_tasks * schedule["singleCoreM"]
     padded_n = n_tasks * schedule["singleCoreN"]
     padded_k = align_up(workload.k, schedule["baseK"])
@@ -548,6 +562,32 @@ def profitability_prior(
     )
     l1_occupancy = common.metrics.get("l1_occupancy", 0.0)
     k_passes = ceil_div(workload.k, schedule["baseK"])
+    in_bytes = INPUT_BYTES[workload.dtype]
+    out_bytes = OUTPUT_BYTES[workload.dtype]
+    input_lower_bound = (
+        workload.m * workload.k * in_bytes
+        + workload.k * workload.n * in_bytes
+    )
+    output_bytes = workload.m * workload.n * out_bytes
+    if split == 2:
+        output_write_multiplier = 2 * split_k_chunks - 1
+    elif split == 3:
+        reduction_bytes = (
+            2.0 * active * workload.m * workload.n * 4
+        )
+        output_write_multiplier = (
+            output_bytes + reduction_bytes
+        ) / max(1.0, output_bytes)
+    else:
+        output_write_multiplier = 1
+    partitioned_input_bytes = (
+        padded_m * workload.k * in_bytes * n_tasks
+        + workload.k * padded_n * in_bytes * m_tasks
+    )
+    traffic_amplification = (
+        partitioned_input_bytes
+        + output_bytes * output_write_multiplier
+    ) / max(1.0, input_lower_bound + output_bytes)
     core_utilization = active / max(
         1.0, min(workload.max_cores, hardware.aic_cores)
     )
@@ -560,6 +600,7 @@ def profitability_prior(
         / max(0.05, core_utilization)
         * (1.0 + 0.12 * occupancy_penalty)
         * (1.0 + 0.002 * k_passes)
+        * (1.0 + 0.15 * max(0.0, traffic_amplification - 1.0))
     )
     metrics = dict(common.metrics)
     metrics.update(
@@ -570,6 +611,9 @@ def profitability_prior(
             "core_utilization": core_utilization,
             "padding_efficiency": padding_efficiency,
             "k_passes": float(k_passes),
+            "split_k_chunks": float(split_k_chunks),
+            "output_write_multiplier": float(output_write_multiplier),
+            "traffic_amplification": traffic_amplification,
             "profitability_prior": score,
         }
     )

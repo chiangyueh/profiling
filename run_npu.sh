@@ -158,7 +158,7 @@ RESUME="${ROOT}/results/npu_full_resume.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260730-cann-runtime-loader-fix"
+echo "  script:     run_npu.sh 20260731-feedback-cost-model-v2"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      independent_contract_behavior_search"
 echo "  mode:       ${MODE}"
@@ -280,6 +280,7 @@ python3 "${RESEARCH}/generate.py" \
     --l2-bpc "${L2_BPC:-1}" \
     --hbm-bpc "${HBM_BPC:-1}" \
     --observations "${RESEARCH}/config/measured_observations.csv" \
+    --observations "${RESEARCH}/config/measured_observations_net_log11.csv" \
     --exclusions "${RESEARCH}/config/measured_fingerprints.csv" \
     --resume-feedback "${RESUME}" \
     --npu-candidates "${NPU_CANDIDATES}" \

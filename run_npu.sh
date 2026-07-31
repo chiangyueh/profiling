@@ -158,7 +158,7 @@ RESUME="${ROOT}/results/npu_full_resume.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260731-feedback-cost-model-v2"
+echo "  script:     run_npu.sh 20260731-feedback-cost-model-v3"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      independent_contract_behavior_search"
 echo "  mode:       ${MODE}"

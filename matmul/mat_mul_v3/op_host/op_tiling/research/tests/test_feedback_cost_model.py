@@ -177,6 +177,37 @@ class FeedbackCostModelTest(unittest.TestCase):
         self.assertGreater(metrics["split_reduction_ratio"], 0.0)
         self.assertGreater(metrics["core_rounds"], 1.0)
 
+    def test_cross_workload_latency_is_only_a_weak_prior(self) -> None:
+        other = Workload(
+            workload_id="other",
+            m=4096,
+            n=4096,
+            k=4096,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        observations = [
+            MeasuredObservation(
+                workload=self.workload,
+                schedule=self.success_schedule,
+                ratio_vs_official=0.2,
+                ratio_vs_bank=0.2,
+                source="contract_global",
+                record_id="cross-workload",
+            )
+        ]
+        prediction = FeedbackCostModel(
+            observations, self.hardware
+        ).predict(
+            other,
+            behavior_vector(other, self.success_schedule, self.hardware),
+        )
+        self.assertLessEqual(prediction.latency_support, 0.15)
+        self.assertGreaterEqual(prediction.latency_uncertainty, 0.80)
+        self.assertGreater(prediction.latency_ratio, 0.70)
+
 
 if __name__ == "__main__":
     unittest.main()

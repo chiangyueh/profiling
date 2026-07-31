@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import sys
 import unittest
+from collections import Counter
 from pathlib import Path
 
 
@@ -11,7 +12,7 @@ SOURCE_ROOT = RESEARCH.parents[2]
 sys.path.insert(0, str(RESEARCH))
 
 from tiling_search import CandidateEngine, GenerationBudget, Hardware, SearchConfig, Workload
-from tiling_search.domain import KNOWLEDGE_FIELDS
+from tiling_search.domain import KNOWLEDGE_FIELDS, Template
 
 
 class ContractSearchTest(unittest.TestCase):
@@ -70,6 +71,15 @@ class ContractSearchTest(unittest.TestCase):
             {candidate.source for candidate in result.candidates},
             {"contract_global"},
         )
+        templates = Counter(
+            candidate.template for candidate in result.callback_candidates
+        )
+        probe_budget = max(
+            2, len(result.callback_candidates) // 8
+        )
+        for template, count in templates.items():
+            if template != Template.BASE:
+                self.assertLessEqual(count, probe_budget)
 
     def test_search_does_not_import_retired_candidate_paths(self) -> None:
         forbidden = (

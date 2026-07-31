@@ -602,6 +602,19 @@ def profitability_prior(
         * (1.0 + 0.002 * k_passes)
         * (1.0 + 0.15 * max(0.0, traffic_amplification - 1.0))
     )
+    if split == 2:
+        # A single-core split does not create additional output-tile
+        # parallelism. Once the output grid already fills the AICs, repeated
+        # partial writes are pure overhead. This remains a ranking prior, not
+        # an applicability gate, so split-K probes stay reachable.
+        output_parallelism = min(
+            1.0,
+            output_tasks
+            / max(1.0, min(workload.max_cores, hardware.aic_cores)),
+        )
+        score *= 1.0 + min(32.0, split_k_chunks - 1.0) * (
+            0.05 + 0.20 * output_parallelism
+        )
     metrics = dict(common.metrics)
     metrics.update(
         {

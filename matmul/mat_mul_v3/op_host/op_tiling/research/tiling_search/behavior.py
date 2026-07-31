@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from statistics import median
 from typing import Iterable, Sequence
@@ -703,6 +703,21 @@ class FeedbackCostModel:
                     ),
                 )
 
+        has_same_workload_latency = any(
+            item.workload.identity() == workload.identity()
+            for _, item in latency_neighbors
+        )
+        if local_model is None and not has_same_workload_latency:
+            # The saved campaign has useful same-workload ordering signal, but
+            # leave-workload-out validation is indistinguishable from random.
+            # Keep cross-workload latency as a weak prior rather than allowing
+            # it to dominate an unseen workload's exploitation budget.
+            latency_ratio = math.exp(
+                0.15 * math.log(max(0.1, latency_ratio))
+            )
+            latency_support = min(latency_support, 0.15)
+            latency_uncertainty = max(latency_uncertainty, 0.80)
+
         risk_neighbors = sorted(
             neighbors, key=lambda item: item[0]
         )[:7]
@@ -1027,19 +1042,21 @@ def score_candidates(
         risk = vector.metrics["runtime_risk_score"]
         risk_support = vector.metrics["runtime_risk_support"]
         latency_support = vector.metrics["latency_support"]
+        prior_weight = 0.05 + 0.30 * (1.0 - latency_support)
         exploitation = (
             latency_support
             * math.log(max(0.25, min(4.0, prediction)))
-            + 0.80 * max(0.0, risk - 0.5) * risk_support
-            + 0.05 * prior
+            + 1.20 * max(0.0, risk - 0.5) * risk_support
+            + prior_weight * prior
         )
         intervention_bonus = {
             "feedback_winner_mutation": 0.25,
             "feedback_regression_counterfactual": 0.15,
         }.get(candidate.source, 0.0)
-        acquisition = (
-            exploitation - 0.08 * uncertainty - intervention_bonus
-        )
+        # Behavior coverage supplies explicit exploration. The exploitation
+        # ordering therefore treats unsupported predictions conservatively
+        # instead of rewarding uncertainty a second time.
+        acquisition = exploitation + 0.05 * uncertainty - intervention_bonus
         scored.append((candidate, vector, acquisition, uncertainty))
     return sorted(
         scored,
@@ -1075,14 +1092,68 @@ def select_behavior_coverage(
 
     selected: list[tuple[Candidate, BehaviorVector, float, float]] = []
     selected_signatures: set[tuple[int, ...]] = set()
+    template_counts: Counter[object] = Counter()
+    high_risk_budget = max(1, limit // 10)
+    non_base_probe_budget = max(2, limit // 8)
+    winning_templates = {
+        template_of(observation.schedule)
+        for observation in observations
+        if observation.workload.identity() == workload.identity()
+        and observation.is_winner
+    }
+
+    def known_high_risk(
+        item: tuple[Candidate, BehaviorVector, float, float],
+    ) -> bool:
+        return (
+            item[1].metrics.get("runtime_risk_score", 0.5) >= 0.75
+            and item[1].metrics.get("runtime_risk_support", 0.0) >= 0.25
+        )
+
+    def template_budget(candidate: Candidate) -> int:
+        if candidate.template.value == "BASE":
+            return limit
+        if candidate.template in winning_templates:
+            return max(non_base_probe_budget, limit // 2)
+        return non_base_probe_budget
+
+    def can_select(
+        item: tuple[Candidate, BehaviorVector, float, float],
+        *,
+        enforce_risk: bool = True,
+        enforce_template: bool = True,
+    ) -> bool:
+        candidate = item[0]
+        if (
+            enforce_template
+            and template_counts[candidate.template]
+            >= template_budget(candidate)
+        ):
+            return False
+        if enforce_risk and known_high_risk(item):
+            selected_high_risk = sum(
+                known_high_risk(selected_item)
+                for selected_item in selected
+            )
+            if selected_high_risk >= high_risk_budget:
+                return False
+        return True
+
+    def add(
+        item: tuple[Candidate, BehaviorVector, float, float],
+    ) -> None:
+        selected.append(item)
+        selected_signatures.add(item[0].schedule.signature())
+        template_counts[item[0].template] += 1
 
     # One callback capability probe per generated kernel family is retained.
     for template in sorted({item[0].template for item in scored}, key=str):
+        family = [item for item in scored if item[0].template == template]
         representative = next(
-            item for item in scored if item[0].template == template
+            (item for item in family if not known_high_risk(item)),
+            family[0],
         )
-        selected.append(representative)
-        selected_signatures.add(representative[0].schedule.signature())
+        add(representative)
 
     exploitation_limit = max(len(selected), limit // 2)
     for item in scored:
@@ -1091,8 +1162,9 @@ def select_behavior_coverage(
         signature = item[0].schedule.signature()
         if signature in selected_signatures:
             continue
-        selected.append(item)
-        selected_signatures.add(signature)
+        if not can_select(item):
+            continue
+        add(item)
 
     observation_vectors = [
         behavior_vector(
@@ -1123,26 +1195,14 @@ def select_behavior_coverage(
     while len(selected) < limit:
         best = None
         best_key = None
-        known_high_risk = sum(
-            item[1].metrics.get("runtime_risk_score", 0.5) >= 0.75
-            and item[1].metrics.get("runtime_risk_support", 0.0) >= 0.25
-            for item in selected
-        )
-        high_risk_budget = max(1, limit // 8)
         for item in scored:
             signature = item[0].schedule.signature()
             if signature in selected_signatures:
                 continue
-            risk = item[1].metrics.get("runtime_risk_score", 0.5)
-            risk_support = item[1].metrics.get(
-                "runtime_risk_support", 0.0
-            )
-            if (
-                risk >= 0.75
-                and risk_support >= 0.25
-                and known_high_risk >= high_risk_budget
-            ):
+            if not can_select(item):
                 continue
+            risk = item[1].metrics.get("runtime_risk_score", 0.5)
+            risk_support = item[1].metrics.get("runtime_risk_support", 0.0)
             novelty = nearest_distance[signature]
             key = (
                 novelty
@@ -1154,20 +1214,28 @@ def select_behavior_coverage(
                 best = item
                 best_key = key
         if best is None:
-            # High-risk schedules are retained as bounded probes rather than
-            # being made unreachable by the learned model.
+            # Relax risk before template balance. Only when the preferred
+            # template pool is exhausted do we allow one family to consume
+            # the remaining budget.
             remaining = [
                 item
                 for item in scored
                 if item[0].schedule.signature()
                 not in selected_signatures
+                and can_select(item, enforce_risk=False)
             ]
+            if not remaining:
+                remaining = [
+                    item
+                    for item in scored
+                    if item[0].schedule.signature()
+                    not in selected_signatures
+                ]
             if not remaining:
                 break
             best = min(remaining, key=lambda item: item[2])
-        selected.append(best)
+        add(best)
         best_signature = best[0].schedule.signature()
-        selected_signatures.add(best_signature)
         nearest_distance.pop(best_signature, None)
         for item in scored:
             signature = item[0].schedule.signature()

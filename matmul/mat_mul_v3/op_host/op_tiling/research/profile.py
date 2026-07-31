@@ -59,6 +59,8 @@ MEASUREMENT_COLUMNS = [
     "candidate_role",
     "candidate_source",
     "search_template",
+    "search_acquisition",
+    "search_behavior_metrics",
     "tiling_signature",
     "success",
     "preflight_passed",
@@ -494,6 +496,8 @@ def profile_record(
         "candidate_role",
         "candidate_source",
         "search_template",
+        "search_acquisition",
+        "search_behavior_metrics",
         "tiling_signature",
     ):
         row[column] = source.get(column, "")
@@ -795,20 +799,35 @@ def main() -> None:
                     list(records.values()),
                 )
                 if truthy(record["success"]):
+                    metrics = json.loads(
+                        candidate.get("search_behavior_metrics") or "{}"
+                    )
                     print(
                         f"candidate_done [{index}/{len(pending)}] "
                         f"{workload_id} rank={candidate['rank']} "
                         f"tpl={candidate['search_template']} "
+                        f"source={candidate['candidate_source']} "
                         f"ms={record['median_ms']} "
                         f"speedup_vs_official={record['speedup_vs_official']} "
                         f"speedup_vs_bank={record['speedup_vs_bank']} "
                         f"status_vs_official={record['status_vs_official']} "
-                        f"status_vs_bank={record['status_vs_bank']}"
+                        f"status_vs_bank={record['status_vs_bank']} "
+                        f"model_ratio={metrics.get('predicted_latency_ratio', '')} "
+                        f"model_support={metrics.get('latency_support', '')} "
+                        f"runtime_risk={metrics.get('runtime_risk_score', '')} "
+                        f"signature={candidate['tiling_signature']}"
                     )
                 else:
+                    metrics = json.loads(
+                        candidate.get("search_behavior_metrics") or "{}"
+                    )
                     print(
                         f"candidate_rejected [{index}/{len(pending)}] "
                         f"{workload_id} rank={candidate['rank']} "
+                        f"tpl={candidate['search_template']} "
+                        f"source={candidate['candidate_source']} "
+                        f"runtime_risk={metrics.get('runtime_risk_score', '')} "
+                        f"signature={candidate['tiling_signature']} "
                         f"reason={record['error'][:240]}"
                     )
 

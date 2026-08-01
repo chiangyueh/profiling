@@ -189,6 +189,7 @@ class MeasuredObservation:
     status_vs_official: str = ""
     status_vs_bank: str = ""
     verified: bool = False
+    structured_verified: bool = False
 
     @property
     def measured_ratio(self) -> float:

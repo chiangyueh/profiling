@@ -155,6 +155,7 @@ class ContractSearchTest(unittest.TestCase):
                     "improved" if index == 0 else "regressed"
                 ),
                 verified=True,
+                structured_verified=True,
             )
             for index, candidate in enumerate(measured)
         ]
@@ -181,7 +182,7 @@ class ContractSearchTest(unittest.TestCase):
             )
         )
 
-    def test_provisional_winner_is_pinned_for_exact_revalidation(
+    def test_provisional_winner_fingerprint_is_not_remeasured(
         self,
     ) -> None:
         workload = Workload(
@@ -221,14 +222,12 @@ class ContractSearchTest(unittest.TestCase):
             observations=[observation],
             exclusions={fingerprint(workload, schedule)},
         ).generate(workload, self.hardware)
-        pinned = [
-            candidate
-            for candidate in result.callback_candidates
-            if candidate.source == "feedback_incumbent_revalidation"
-        ]
-        self.assertEqual(len(pinned), 1)
-        self.assertEqual(
-            pinned[0].schedule.signature(), schedule.signature()
+        self.assertNotIn(
+            schedule.signature(),
+            {
+                candidate.schedule.signature()
+                for candidate in result.callback_candidates
+            },
         )
 
 

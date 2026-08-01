@@ -83,6 +83,11 @@ MEASUREMENT_COLUMNS = [
     "bank_drift_pct",
 ]
 
+STRICT_NUMERIC_PREFLIGHT_MODES = {
+    "numeric_ones_full_v2",
+    "numeric_signed_axes_full_v3",
+}
+
 SUMMARY_COLUMNS = [
     "workload_id",
     "m",
@@ -467,7 +472,7 @@ def measurement_reusable(row: dict[str, str]) -> bool:
         }
     return (
         truthy(row.get("pair_validated"))
-        and row.get("preflight_mode") == "numeric_ones_full_v2"
+        and row.get("preflight_mode") in STRICT_NUMERIC_PREFLIGHT_MODES
         and bool(row.get("official_ms"))
         and bool(row.get("bank_ms"))
     )

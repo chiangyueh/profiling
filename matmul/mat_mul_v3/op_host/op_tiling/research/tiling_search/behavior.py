@@ -68,7 +68,9 @@ class _Evidence:
     vector: BehaviorVector
     signature: tuple[int, ...]
     latency_ratio: float | None
+    latency_reliability: float
     runtime_reject_rate: float
+    runtime_reliability: float
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,7 @@ class _LocalLinearModel:
     templates: frozenset[str]
     residual: float
     samples: int
+    reliability: float
 
     def normalized_values(self, values: Sequence[float]) -> list[float]:
         return [
@@ -157,16 +160,22 @@ def _fit_local_model(
     if len(usable) < 6:
         return None
     feature_count = len(usable[0].vector.values)
+    weights = [max(0.05, item.latency_reliability) for item in usable]
+    weight_sum = sum(weights)
     means = [
-        sum(item.vector.values[index] for item in usable) / len(usable)
+        sum(
+            weight * item.vector.values[index]
+            for weight, item in zip(weights, usable)
+        )
+        / weight_sum
         for index in range(feature_count)
     ]
     scales = []
     for index, mean in enumerate(means):
         variance = sum(
-            (item.vector.values[index] - mean) ** 2
-            for item in usable
-        ) / len(usable)
+            weight * (item.vector.values[index] - mean) ** 2
+            for weight, item in zip(weights, usable)
+        ) / weight_sum
         scales.append(max(1.0e-6, math.sqrt(variance)))
     design = [
         [
@@ -187,13 +196,19 @@ def _fit_local_model(
     columns = feature_count + 1
     normal = [
         [
-            sum(row[left] * row[right] for row in design)
+            sum(
+                weight * row[left] * row[right]
+                for weight, row in zip(weights, design)
+            )
             for right in range(columns)
         ]
         for left in range(columns)
     ]
     right_hand = [
-        sum(row[column] * target for row, target in zip(design, targets))
+        sum(
+            weight * row[column] * target
+            for weight, row, target in zip(weights, design, targets)
+        )
         for column in range(columns)
     ]
     # A compact ridge model is used only after enough same-workload NPU
@@ -226,6 +241,7 @@ def _fit_local_model(
         frozenset(str(item.vector.categories[0]) for item in usable),
         residual,
         len(usable),
+        weight_sum / len(usable),
     )
 
 
@@ -504,11 +520,6 @@ def draft_behavior_coverage(
             behavior_vector(workload, candidate.schedule, hardware),
         )
     evaluated = list(unique.values())
-    pinned = [
-        item
-        for item in evaluated
-        if item[0].source == "feedback_incumbent_revalidation"
-    ]
     if len(evaluated) <= limit:
         return [candidate for candidate, _ in evaluated]
 
@@ -548,7 +559,7 @@ def draft_behavior_coverage(
 
     retained_by_signature = {
         item[0].schedule.signature(): item
-        for item in [*pinned, *retained]
+        for item in retained
     }
     retained = list(retained_by_signature.values())
     if len(retained) <= limit:
@@ -567,9 +578,6 @@ def draft_behavior_coverage(
             return
         selected.append(item)
         selected_signatures.add(signature)
-
-    for item in pinned:
-        add(item)
 
     by_template: dict[
         object, list[tuple[Candidate, BehaviorVector]]
@@ -686,13 +694,54 @@ class FeedbackCostModel:
 
         evidence: list[_Evidence] = []
         for (_, signature), records in grouped.items():
-            successful = [
-                record.measured_ratio
+            successful_records = [
+                record
                 for record in records
                 if record.source != "runtime_rejected"
             ]
+            structured = [
+                record.measured_ratio
+                for record in successful_records
+                if record.structured_verified
+            ]
+            paired = [
+                record.measured_ratio
+                for record in successful_records
+                if record.verified
+            ]
+            successful = [
+                record.measured_ratio for record in successful_records
+            ]
+            if structured:
+                latency_samples = structured
+                latency_reliability = 1.0
+            elif paired:
+                latency_samples = paired
+                latency_reliability = 0.75
+            else:
+                latency_samples = successful
+                latency_reliability = 0.20
             reject_count = sum(
                 record.source == "runtime_rejected" for record in records
+            )
+            runtime_reliability = (
+                1.0
+                if reject_count
+                else (
+                    1.0
+                    if any(
+                        record.structured_verified
+                        for record in successful_records
+                    )
+                    else (
+                        0.75
+                        if any(
+                            record.verified
+                            for record in successful_records
+                        )
+                        else 0.20
+                    )
+                )
             )
             representative = records[-1]
             evidence.append(
@@ -705,9 +754,13 @@ class FeedbackCostModel:
                     ),
                     signature=signature,
                     latency_ratio=(
-                        median(successful) if successful else None
+                        median(latency_samples)
+                        if latency_samples
+                        else None
                     ),
+                    latency_reliability=latency_reliability,
                     runtime_reject_rate=reject_count / len(records),
+                    runtime_reliability=runtime_reliability,
                 )
             )
         self.evidence = tuple(evidence)
@@ -731,6 +784,14 @@ class FeedbackCostModel:
         ] = {}
         self._category_penalties: dict[
             tuple[object, ...], tuple[float, ...]
+        ] = OrderedDict()
+        self._prediction_cache: OrderedDict[
+            tuple[
+                tuple[int, int, int, str, bool, bool, int],
+                tuple[object, ...],
+                tuple[float, ...],
+            ],
+            FeedbackPrediction,
         ] = OrderedDict()
         template_risk_evidence: dict[
             tuple[
@@ -767,6 +828,15 @@ class FeedbackCostModel:
         ) = None,
     ) -> FeedbackPrediction:
         workload_identity = workload.identity()
+        cache_key = (
+            workload_identity,
+            vector.categories,
+            vector.values,
+        )
+        cacheable = not exclude_keys and exclude_workload is None
+        if cacheable and cache_key in self._prediction_cache:
+            self._prediction_cache.move_to_end(cache_key)
+            return self._prediction_cache[cache_key]
         workload_distances = self._workload_distances.get(workload_identity)
         if workload_distances is None:
             workload_distances = tuple(
@@ -821,8 +891,8 @@ class FeedbackCostModel:
         )
         if latency_neighbors:
             latency_weights = [
-                math.exp(-distance)
-                for distance, _ in latency_neighbors
+                math.exp(-distance) * item.latency_reliability
+                for distance, item in latency_neighbors
             ]
             weight_sum = sum(latency_weights)
             log_prediction = sum(
@@ -892,6 +962,7 @@ class FeedbackCostModel:
             local_support = (
                 min(1.0, local_model.samples / 16.0)
                 * math.exp(-max(0.0, extrapolation - 2.0))
+                * local_model.reliability
             )
             # Same-workload measurements are the strongest evidence available
             # for active search. Cross-workload neighbors retain a small role
@@ -934,8 +1005,8 @@ class FeedbackCostModel:
         )
         if risk_neighbors:
             risk_weights = [
-                math.exp(-distance)
-                for distance, _ in risk_neighbors
+                math.exp(-distance) * item.runtime_reliability
+                for distance, item in risk_neighbors
             ]
             risk_weight_sum = sum(risk_weights)
             # A neutral prior avoids interpreting the deliberately sampled
@@ -989,11 +1060,15 @@ class FeedbackCostModel:
                 # template are stronger executability evidence than a few
                 # nearby points in continuous behavior space. A beta(1, 1)
                 # prior keeps one exploratory failure from banning a family.
-                group_samples = len(template_risk_items)
+                group_samples = sum(
+                    item.runtime_reliability
+                    for item in template_risk_items
+                )
                 group_risk = (
                     1.0
                     + sum(
-                        item.runtime_reject_rate
+                        item.runtime_reliability
+                        * item.runtime_reject_rate
                         for item in template_risk_items
                     )
                 ) / (group_samples + 2.0)
@@ -1007,13 +1082,18 @@ class FeedbackCostModel:
                     runtime_risk_support, group_support
                 )
 
-        return FeedbackPrediction(
+        prediction = FeedbackPrediction(
             latency_ratio=latency_ratio,
             latency_uncertainty=latency_uncertainty,
             latency_support=latency_support,
             runtime_risk_score=runtime_risk_score,
             runtime_risk_support=runtime_risk_support,
         )
+        if cacheable:
+            self._prediction_cache[cache_key] = prediction
+            if len(self._prediction_cache) > 2048:
+                self._prediction_cache.popitem(last=False)
+        return prediction
 
 
 def _average_ranks(values: Sequence[float]) -> list[float]:
@@ -1306,6 +1386,7 @@ def score_candidates(
         intervention_bonus = {
             "feedback_winner_mutation": 0.25,
             "feedback_regression_counterfactual": 0.15,
+            "feedback_runtime_counterfactual": 0.15,
         }.get(candidate.source, 0.0)
         # Behavior coverage supplies explicit exploration. The exploitation
         # ordering therefore treats unsupported predictions conservatively
@@ -1423,16 +1504,6 @@ def select_behavior_coverage(
         selected_signatures.add(item[0].schedule.signature())
         template_counts[item[0].template] += 1
 
-    # Historical coverage-only winners are hypotheses, not established
-    # incumbents. Reserve one slot so the stricter NPU protocol can confirm or
-    # reject the exact schedule before feedback propagates it further.
-    for item in scored:
-        if (
-            item[0].source == "feedback_incumbent_revalidation"
-            and len(selected) < limit
-        ):
-            add(item)
-
     # Callback coverage can retain one safe probe per generated kernel family.
     # Final NPU selection disables this: a known losing family does not earn
     # device budget merely because the host solver generated it.
@@ -1509,19 +1580,42 @@ def select_behavior_coverage(
                 best = item
                 best_key = key
         if best is None:
-            # Template balance is a soft exploration policy. Runtime risk and
-            # well-supported severe latency regressions are not relaxed merely
-            # to fill a nominal NPU quota.
+            # Latency prediction is a ranking prior, not a legality contract.
+            # Leave-workload-out validation is weak, so it must not shrink the
+            # requested NPU experiment when callback-accepted schedules remain.
             remaining = [
                 item
                 for item in scored
                 if item[0].schedule.signature()
                 not in selected_signatures
-                and can_select(item, enforce_template=False)
+                and can_select(
+                    item,
+                    enforce_template=False,
+                    enforce_regression=False,
+                )
             ]
             if not remaining:
+                # Runtime risk retains a strict quota in the normal path. If
+                # every remaining point is risky, spend the residual budget
+                # on the least-supported/least-risky points instead of
+                # silently returning fewer candidates than requested.
+                remaining = [
+                    item
+                    for item in scored
+                    if item[0].schedule.signature()
+                    not in selected_signatures
+                ]
+            if not remaining:
                 break
-            best = min(remaining, key=lambda item: item[2])
+            best = min(
+                remaining,
+                key=lambda item: (
+                    item[1].metrics.get("runtime_risk_support", 0.0)
+                    * item[1].metrics.get("runtime_risk_score", 0.5),
+                    item[2],
+                    item[0].schedule.signature(),
+                ),
+            )
         add(best)
         best_signature = best[0].schedule.signature()
         nearest_distance.pop(best_signature, None)

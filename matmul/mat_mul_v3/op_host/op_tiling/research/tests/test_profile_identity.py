@@ -142,6 +142,9 @@ class ProfileIdentityTest(unittest.TestCase):
         verified = dict(legacy)
         verified["preflight_mode"] = "numeric_ones_full_v2"
         self.assertTrue(PROFILE.measurement_reusable(verified))
+        structured = dict(legacy)
+        structured["preflight_mode"] = "numeric_signed_axes_full_v3"
+        self.assertTrue(PROFILE.measurement_reusable(structured))
 
     def test_baseline_drift_and_conservative_reference(self) -> None:
         before = {"median_ms": "1.0", "stddev_ms": "0.01"}

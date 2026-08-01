@@ -402,48 +402,119 @@ float Bfloat16ToFloat(uint16_t value)
     return output;
 }
 
-void FillOnes(std::vector<uint8_t> &buffer, const std::string &dtype)
+void StoreScalar(
+    uint8_t *destination,
+    const std::string &dtype,
+    float value)
 {
     if (dtype == "fp16") {
-        const aclFloat16 one = aclFloatToFloat16(1.0F);
-        auto *values = reinterpret_cast<aclFloat16 *>(buffer.data());
-        std::fill(values, values + buffer.size() / sizeof(*values), one);
+        const aclFloat16 encoded = aclFloatToFloat16(value);
+        std::memcpy(destination, &encoded, sizeof(encoded));
     } else if (dtype == "bf16") {
-        const uint16_t one = FloatToBfloat16(1.0F);
-        auto *values = reinterpret_cast<uint16_t *>(buffer.data());
-        std::fill(values, values + buffer.size() / sizeof(*values), one);
+        const uint16_t encoded = FloatToBfloat16(value);
+        std::memcpy(destination, &encoded, sizeof(encoded));
     } else if (dtype == "fp32") {
-        auto *values = reinterpret_cast<float *>(buffer.data());
-        std::fill(values, values + buffer.size() / sizeof(*values), 1.0F);
+        std::memcpy(destination, &value, sizeof(value));
     } else {
-        throw std::runtime_error("cannot initialize unsupported dtype: " + dtype);
+        throw std::runtime_error("cannot encode unsupported dtype: " + dtype);
     }
 }
 
-void FillExpectedOnesOutput(
-    std::vector<uint8_t> &buffer,
-    int64_t k,
+int PatternSign(int64_t index, int axis)
+{
+    static constexpr std::array<int64_t, 3> moduli{251, 257, 263};
+    static constexpr std::array<int64_t, 3> multipliers{73, 97, 101};
+    static constexpr std::array<int64_t, 3> offsets{19, 31, 47};
+    const int64_t mixed =
+        (index * multipliers.at(static_cast<size_t>(axis)) +
+         offsets.at(static_cast<size_t>(axis))) %
+        moduli.at(static_cast<size_t>(axis));
+    return mixed < moduli.at(static_cast<size_t>(axis)) / 2 ? -1 : 1;
+}
+
+std::vector<uint8_t> EncodedPatternVector(
+    int64_t elements,
+    int axis,
+    int multiplier,
+    float magnitude,
     const std::string &dtype)
 {
-    const float value = static_cast<float>(k);
-    if (dtype == "fp16") {
-        const aclFloat16 expected = aclFloatToFloat16(value);
-        auto *values = reinterpret_cast<aclFloat16 *>(buffer.data());
-        std::fill(
-            values, values + buffer.size() / sizeof(*values), expected);
-    } else if (dtype == "bf16") {
-        const uint16_t expected = FloatToBfloat16(value);
-        auto *values = reinterpret_cast<uint16_t *>(buffer.data());
-        std::fill(
-            values, values + buffer.size() / sizeof(*values), expected);
-    } else if (dtype == "fp32") {
-        auto *values = reinterpret_cast<float *>(buffer.data());
-        std::fill(
-            values, values + buffer.size() / sizeof(*values), value);
-    } else {
-        throw std::runtime_error(
-            "cannot initialize expected output for dtype: " + dtype);
+    const size_t elementBytes = ElementBytes(dtype);
+    std::vector<uint8_t> output(
+        static_cast<size_t>(elements) * elementBytes);
+    for (int64_t index = 0; index < elements; ++index) {
+        const float value = static_cast<float>(
+            multiplier * PatternSign(index, axis)) * magnitude;
+        StoreScalar(
+            output.data() + static_cast<size_t>(index) * elementBytes,
+            dtype,
+            value);
     }
+    return output;
+}
+
+void CopyRows(
+    std::vector<uint8_t> &destination,
+    int64_t rows,
+    const std::vector<uint8_t> &positive,
+    const std::vector<uint8_t> &negative,
+    int signAxis)
+{
+    const size_t rowBytes = positive.size();
+    if (negative.size() != rowBytes ||
+        destination.size() != static_cast<size_t>(rows) * rowBytes) {
+        throw std::runtime_error("structured numeric row size mismatch");
+    }
+    for (int64_t row = 0; row < rows; ++row) {
+        const auto &source =
+            PatternSign(row, signAxis) > 0 ? positive : negative;
+        std::memcpy(
+            destination.data() + static_cast<size_t>(row) * rowBytes,
+            source.data(),
+            rowBytes);
+    }
+}
+
+void FillStructuredInputs(
+    std::vector<uint8_t> &a,
+    std::vector<uint8_t> &b,
+    const Workload &workload)
+{
+    const auto kPositive = EncodedPatternVector(
+        workload.k, 2, 1, 1.0F, workload.dtype);
+    const auto kNegative = EncodedPatternVector(
+        workload.k, 2, -1, 1.0F, workload.dtype);
+    const auto rowPositive = EncodedPatternVector(
+        workload.m, 0, 1, 1.0F, workload.dtype);
+    const auto rowNegative = EncodedPatternVector(
+        workload.m, 0, -1, 1.0F, workload.dtype);
+    const auto columnPositive = EncodedPatternVector(
+        workload.n, 1, 1, 1.0F, workload.dtype);
+    const auto columnNegative = EncodedPatternVector(
+        workload.n, 1, -1, 1.0F, workload.dtype);
+
+    if (workload.transA) {
+        CopyRows(a, workload.k, rowPositive, rowNegative, 2);
+    } else {
+        CopyRows(a, workload.m, kPositive, kNegative, 0);
+    }
+    if (workload.transB) {
+        CopyRows(b, workload.n, kPositive, kNegative, 1);
+    } else {
+        CopyRows(b, workload.k, columnPositive, columnNegative, 2);
+    }
+}
+
+void FillStructuredExpectedOutput(
+    std::vector<uint8_t> &output,
+    const Workload &workload)
+{
+    const float magnitude = static_cast<float>(workload.k);
+    const auto positive = EncodedPatternVector(
+        workload.n, 1, 1, magnitude, workload.dtype);
+    const auto negative = EncodedPatternVector(
+        workload.n, 1, -1, magnitude, workload.dtype);
+    CopyRows(output, workload.m, positive, negative, 0);
 }
 
 double DecodeOutput(uint32_t observed, const std::string &dtype)
@@ -464,14 +535,6 @@ double DecodeOutput(uint32_t observed, const std::string &dtype)
         return value;
     }
     throw std::runtime_error("cannot decode unsupported dtype: " + dtype);
-}
-
-double ExpectedOnesOutput(int64_t k, const std::string &dtype)
-{
-    const float value = static_cast<float>(k);
-    if (dtype == "fp16") return aclFloat16ToFloat(aclFloatToFloat16(value));
-    if (dtype == "bf16") return Bfloat16ToFloat(FloatToBfloat16(value));
-    return static_cast<double>(k);
 }
 
 TensorHandle CreateTensor(
@@ -558,15 +621,14 @@ ProfileSummary ProfileOfficial(
         if (numericPreflight) {
             std::vector<uint8_t> aHost(aBytes);
             std::vector<uint8_t> bHost(bBytes);
-            FillOnes(aHost, workload.dtype);
-            FillOnes(bHost, workload.dtype);
+            FillStructuredInputs(aHost, bHost, workload);
             CheckAcl(aclrtMemcpy(
                 a.ptr, a.bytes, aHost.data(), aHost.size(), ACL_MEMCPY_HOST_TO_DEVICE),
                 "aclrtMemcpy official numeric A");
             CheckAcl(aclrtMemcpy(
                 b.ptr, b.bytes, bHost.data(), bHost.size(), ACL_MEMCPY_HOST_TO_DEVICE),
                 "aclrtMemcpy official numeric B");
-            summary.preflightMode = "numeric_ones_full_v2";
+            summary.preflightMode = "numeric_signed_axes_full_v3";
         } else {
             CheckAcl(aclrtMemset(a.ptr, a.bytes, 0, a.bytes), "aclrtMemset official A");
             CheckAcl(aclrtMemset(b.ptr, b.bytes, 0, b.bytes), "aclrtMemset official B");
@@ -624,7 +686,7 @@ ProfileSummary ProfileOfficial(
                 ACL_MEMCPY_DEVICE_TO_HOST),
                 "aclrtMemcpy official full numeric output");
             std::vector<uint8_t> expected(cBytes);
-            FillExpectedOnesOutput(expected, workload.k, workload.dtype);
+            FillStructuredExpectedOutput(expected, workload);
             if (std::memcmp(observed.data(), expected.data(), cBytes) != 0) {
                 const size_t elements = cBytes / outputBytes;
                 for (size_t index = 0; index < elements; ++index) {
@@ -642,7 +704,7 @@ ProfileSummary ProfileOfficial(
                     std::memcpy(
                         &expectedBits, expected.data() + offset, outputBytes);
                     throw std::runtime_error(
-                        "official full numeric preflight failed at C index=" +
+                        "official structured numeric preflight failed at C index=" +
                         std::to_string(index) + ", actual=" +
                         std::to_string(
                             DecodeOutput(actualBits, workload.dtype)) +
@@ -651,7 +713,7 @@ ProfileSummary ProfileOfficial(
                             DecodeOutput(expectedBits, workload.dtype)));
                 }
                 throw std::runtime_error(
-                    "official full numeric preflight output mismatch");
+                    "official structured numeric preflight output mismatch");
             }
         } else {
             constexpr int64_t coverageGrid = 9;

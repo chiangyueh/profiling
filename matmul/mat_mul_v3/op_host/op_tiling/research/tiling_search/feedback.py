@@ -20,6 +20,10 @@ from .domain import (
 
 
 Fingerprint = Tuple[int, int, int, str, bool, bool, Tuple[int, ...]]
+STRICT_NUMERIC_PREFLIGHT_MODES = {
+    "numeric_ones_full_v2",
+    "numeric_signed_axes_full_v3",
+}
 
 
 def _truthy(value: object) -> bool:
@@ -196,6 +200,9 @@ def load_feedback(
                         ),
                         status_vs_bank=row.get("status_vs_bank", ""),
                         verified=_truthy(row.get("verified")),
+                        structured_verified=_truthy(
+                            row.get("structured_verified")
+                        ),
                     )
                 )
                 exclusions.add(fingerprint(workload, schedule))
@@ -268,6 +275,7 @@ def load_feedback(
                 bank_ms = float(bank["median_ms"])
             except (KeyError, ValueError):
                 continue
+            preflight_mode = row.get("preflight_mode")
             observations.append(
                 MeasuredObservation(
                     workload=workload,
@@ -282,8 +290,11 @@ def load_feedback(
                     status_vs_bank=_comparison_status(bank, row),
                     verified=(
                         _truthy(row.get("pair_validated"))
-                        and row.get("preflight_mode")
-                        == "numeric_ones_full_v2"
+                        and preflight_mode in STRICT_NUMERIC_PREFLIGHT_MODES
+                    ),
+                    structured_verified=(
+                        _truthy(row.get("pair_validated"))
+                        and preflight_mode == "numeric_signed_axes_full_v3"
                     ),
                 )
             )
@@ -322,9 +333,8 @@ def feedback_targets(
         ),
     )[:12]
     for observation in [*same_workload, *transfer_winners]:
-        # A poisoned or incomplete NPU output proves that this exact schedule
-        # must not run again. It does not identify a legal local direction to
-        # mutate, so retain it for coverage/model feedback only.
+        # A poisoned or incomplete NPU output is not a latency target.
+        # Exact one-factor runtime counterfactuals are generated separately.
         if _runtime_rejected(observation):
             continue
         if not (observation.is_winner or observation.is_regression):
@@ -514,8 +524,8 @@ def feedback_mutations(
         if observation.workload.identity() != workload.identity():
             continue
         if _runtime_rejected(observation):
-            continue
-        if observation.is_winner:
+            source = "feedback_runtime_counterfactual"
+        elif observation.is_winner:
             source = "feedback_winner_mutation"
         elif observation.is_regression:
             source = "feedback_regression_counterfactual"
@@ -530,55 +540,6 @@ def feedback_mutations(
                 parent=observation.schedule.signature(),
             )
         )
-    return candidates
-
-
-def incumbent_revalidations(
-    workload: Workload,
-    hardware: Hardware,
-    observations: Sequence[MeasuredObservation],
-    *,
-    limit: int = 1,
-) -> list[Candidate]:
-    candidates: list[Candidate] = []
-    seen: set[tuple[int, ...]] = set()
-    provisional = sorted(
-        (
-            observation
-            for observation in observations
-            if observation.workload.identity() == workload.identity()
-            and observation.is_winner
-            and not observation.verified
-            and not _runtime_rejected(observation)
-        ),
-        key=lambda observation: (
-            observation.measured_ratio,
-            observation.schedule.signature(),
-        ),
-    )
-    for observation in provisional:
-        signature = observation.schedule.signature()
-        if signature in seen:
-            continue
-        seen.add(signature)
-        if not validate_schedule(
-            workload, observation.schedule, hardware
-        ).valid:
-            continue
-        candidates.append(
-            Candidate(
-                schedule=observation.schedule,
-                template=template_of(observation.schedule),
-                source="feedback_incumbent_revalidation",
-                rationale=(
-                    "revalidate historical winner with full numeric "
-                    "preflight and pre/post paired baselines"
-                ),
-                parent_signatures=(signature,),
-            )
-        )
-        if len(candidates) >= limit:
-            break
     return candidates
 
 

@@ -23,7 +23,7 @@ from tiling_search.behavior import (
     behavior_vector,
     select_behavior_coverage,
 )
-from tiling_search.feedback import feedback_targets
+from tiling_search.feedback import feedback_mutations, feedback_targets
 from tiling_search.domain import (
     Candidate,
     Hardware,
@@ -267,7 +267,51 @@ class FeedbackCostModelTest(unittest.TestCase):
             )
         self.assertEqual(len(observations), 1)
         self.assertTrue(observations[0].verified)
+        self.assertFalse(observations[0].structured_verified)
         self.assertEqual(len(exclusions), 1)
+
+        row["preflight_mode"] = "numeric_signed_axes_full_v3"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resume.csv"
+            with path.open("w", newline="", encoding="utf-8") as output:
+                writer = csv.DictWriter(output, fieldnames=tuple(row))
+                writer.writeheader()
+                writer.writerow(row)
+            observations, _ = load_resume_feedback(
+                path,
+                soc="Ascend910B3",
+                aic_cores=20,
+                toolkit="8.1.RC1",
+            )
+        self.assertTrue(observations[0].structured_verified)
+
+    def test_structured_measurement_overrides_provisional_duplicate(
+        self,
+    ) -> None:
+        provisional = MeasuredObservation(
+            workload=self.workload,
+            schedule=self.success_schedule,
+            ratio_vs_official=0.2,
+            ratio_vs_bank=0.2,
+            source="contract_global",
+            record_id="provisional",
+        )
+        structured = MeasuredObservation(
+            workload=self.workload,
+            schedule=self.success_schedule,
+            ratio_vs_official=1.2,
+            ratio_vs_bank=1.1,
+            source="contract_global",
+            record_id="structured",
+            verified=True,
+            structured_verified=True,
+        )
+        evidence = FeedbackCostModel(
+            [provisional, structured], self.hardware
+        ).evidence
+        self.assertEqual(len(evidence), 1)
+        self.assertAlmostEqual(evidence[0].latency_ratio or 0.0, 1.2)
+        self.assertEqual(evidence[0].latency_reliability, 1.0)
 
     def test_deterministic_split_k_models_workspace_reduction(self) -> None:
         workload = Workload(
@@ -439,6 +483,81 @@ class FeedbackCostModelTest(unittest.TestCase):
         )
         self.assertNotIn(safe[0], selected)
 
+    def test_final_selection_fills_budget_when_only_risky_points_remain(
+        self,
+    ) -> None:
+        candidates = [
+            Candidate(
+                schedule=self.success_schedule.replace(
+                    usedCoreNum=20 - index,
+                    l2MTileBlock=8 + index,
+                ),
+                template=Template.BASE,
+                source="contract_global",
+                rationale="risk-budget probe",
+            )
+            for index in range(6)
+        ]
+        scored = []
+        for index, candidate in enumerate(candidates):
+            vector = BehaviorVector(
+                categories=(Template.BASE.value, 0, "fp16", 0, 0),
+                values=(index / 6.0, *(0.0 for _ in range(14))),
+                metrics={
+                    "predicted_latency_ratio": 2.0,
+                    "latency_support": 1.0,
+                    "latency_uncertainty": 0.1,
+                    "runtime_risk_score": 0.9,
+                    "runtime_risk_support": 1.0,
+                    "analytical_prior": 1.0,
+                },
+            )
+            scored.append((candidate, vector, float(index), 0.1))
+        with patch(
+            "tiling_search.behavior.score_candidates",
+            return_value=scored,
+        ):
+            selected = select_behavior_coverage(
+                self.workload,
+                candidates,
+                (),
+                self.hardware,
+                6,
+                probe_templates=False,
+            )
+        self.assertEqual(len(selected), 6)
+
+    def test_runtime_rejection_generates_new_legal_counterfactuals(
+        self,
+    ) -> None:
+        rejected = MeasuredObservation(
+            workload=self.workload,
+            schedule=self.success_schedule.replace(
+                depthA1=2,
+                depthB1=2,
+            ),
+            ratio_vs_official=1.0,
+            ratio_vs_bank=1.0,
+            source="runtime_rejected",
+            record_id="runtime-reject",
+            status_vs_official="runtime_rejected",
+            status_vs_bank="runtime_rejected",
+        )
+        mutations = feedback_mutations(
+            self.workload, self.hardware, [rejected]
+        )
+        self.assertTrue(mutations)
+        self.assertTrue(
+            all(
+                mutation.source == "feedback_runtime_counterfactual"
+                for mutation in mutations
+            )
+        )
+        self.assertNotIn(
+            rejected.schedule.signature(),
+            {mutation.schedule.signature() for mutation in mutations},
+        )
+
     def test_campaign_summary_retains_prior_winner(self) -> None:
         winner = MeasuredObservation(
             workload=self.workload,
@@ -450,6 +569,7 @@ class FeedbackCostModelTest(unittest.TestCase):
             status_vs_official="improved",
             status_vs_bank="improved",
             verified=True,
+            structured_verified=True,
         )
         later_regression = MeasuredObservation(
             workload=self.workload,
@@ -563,6 +683,7 @@ class FeedbackCostModelTest(unittest.TestCase):
             status_vs_official="improved",
             status_vs_bank="improved",
             verified=True,
+            structured_verified=True,
         )
         targets = feedback_targets(
             self.workload,

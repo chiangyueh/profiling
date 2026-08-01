@@ -163,7 +163,7 @@ CAMPAIGN_SUMMARY="${ROOT}/results/npu_full_campaign_incumbents.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260801-strict-numeric-paired-v1"
+echo "  script:     run_npu.sh 20260801-structured-feedback-budget-v3"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      independent_contract_behavior_search"
 echo "  mode:       ${MODE}"
@@ -243,6 +243,26 @@ platform_field() {
     printf '%s\n' "${PLATFORM}" |
         sed -n "s/.*[[:space:]]$1=\\([0-9][0-9.]*\\).*/\\1/p"
 }
+toolkit_identity() {
+    local version_file="${CANN_ROOT}/toolkit/version.info"
+    local release=""
+    local component=""
+    if [[ -f "${version_file}" ]]; then
+        release="$(sed -n 's/^version_dir=//p' "${version_file}" | head -1)"
+        component="$(sed -n 's/^Version=//p' "${version_file}" | head -1)"
+    fi
+    if [[ -z "${release}" && -f "${CANN_ROOT}/pyACL/version.info" ]]; then
+        release="$(sed -n 's/^Version=//p' "${CANN_ROOT}/pyACL/version.info" | head -1)"
+    fi
+    if [[ -z "${release}" ]]; then
+        release="$(basename "$(readlink -f "${CANN_ROOT}")")"
+    fi
+    if [[ -n "${component}" && "${component}" != "${release}" ]]; then
+        printf '%s+toolkit-%s' "${release}" "${component}"
+    else
+        printf '%s' "${release}"
+    fi
+}
 AIC="$(platform_field aic)"
 L0A="$(platform_field L0A)"
 L0B="$(platform_field L0B)"
@@ -257,7 +277,7 @@ for value in "${AIC}" "${L0A}" "${L0B}" "${L0C}" "${L1}" "${L2}"; do
         exit 1
     fi
 done
-TOOLKIT_VERSION="$(basename "$(readlink -f "${CANN_ROOT}")")"
+TOOLKIT_VERSION="$(toolkit_identity)"
 echo "  detected_soc=${SOC} aic=${AIC} runtime_toolkit=${TOOLKIT_VERSION}"
 if [[ "${TOOLKIT_VERSION}" != 8.5* ]]; then
     echo "  compatibility: source baseline is 8.5.0; execution uses installed ${TOOLKIT_VERSION}"
@@ -306,9 +326,11 @@ generate_stage() {
         --observations "${RESEARCH}/config/measured_observations_net_log11.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log14.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log15.csv"
+        --observations "${RESEARCH}/config/measured_observations_net_log17.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log14.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log15.csv"
+        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log17.csv"
         --resume-feedback "${RESUME}"
         --npu-candidates "${count}"
         --callback-candidates 48
@@ -387,7 +409,8 @@ python3 "${RESEARCH}/campaign_report.py" \
     --observations "${RESEARCH}/config/measured_observations.csv" \
     --observations "${RESEARCH}/config/measured_observations_net_log11.csv" \
     --observations "${RESEARCH}/config/measured_observations_net_log14.csv" \
-    --observations "${RESEARCH}/config/measured_observations_net_log15.csv"
+    --observations "${RESEARCH}/config/measured_observations_net_log15.csv" \
+    --observations "${RESEARCH}/config/measured_observations_net_log17.csv"
 
 echo
 echo "NPU run completed"

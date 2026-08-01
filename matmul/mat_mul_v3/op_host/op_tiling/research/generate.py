@@ -210,9 +210,11 @@ def load_resume_feedback(
                 )
             )
             continue
+        preflight_mode = row.get("preflight_mode")
         verified = (
             truthy(row.get("pair_validated"))
-            and row.get("preflight_mode") == "numeric_ones_full_v2"
+            and preflight_mode
+            in {"numeric_ones_full_v2", "numeric_signed_axes_full_v3"}
         )
         if not verified:
             continue
@@ -236,6 +238,9 @@ def load_resume_feedback(
                 status_vs_official=row.get("status_vs_official", ""),
                 status_vs_bank=row.get("status_vs_bank", ""),
                 verified=True,
+                structured_verified=(
+                    preflight_mode == "numeric_signed_axes_full_v3"
+                ),
             )
         )
     return observations, exclusions

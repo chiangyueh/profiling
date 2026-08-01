@@ -478,6 +478,17 @@ def measurement_reusable(row: dict[str, str]) -> bool:
     )
 
 
+def measurement_completed(row: dict[str, str]) -> bool:
+    """Return whether an exact fingerprint must never be measured again."""
+    if not truthy(row.get("success")):
+        return measurement_reusable(row)
+    return (
+        truthy(row.get("preflight_passed"))
+        and row.get("preflight_mode") in STRICT_NUMERIC_PREFLIGHT_MODES
+        and bool(row.get("median_ms"))
+    )
+
+
 def baseline_drift_pct(
     before: dict[str, str],
     after: dict[str, str],
@@ -726,13 +737,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=50)
     parser.add_argument("--samples", type=int, default=15)
+    parser.add_argument("--baseline-repeat", type=int, default=30)
+    parser.add_argument("--baseline-samples", type=int, default=9)
     parser.add_argument("--numeric-preflight-max-mib", type=int, default=256)
     parser.add_argument("--baseline-drift-pct", type=float, default=3.0)
+    parser.add_argument("--pair-block-size", type=int, default=4)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.pair_block_size <= 0:
+        raise ProfileError("--pair-block-size must be positive")
+    if args.baseline_repeat <= 0 or args.baseline_samples <= 0:
+        raise ProfileError("baseline repeat and samples must be positive")
     env = os.environ.copy()
     args.summary.parent.mkdir(parents=True, exist_ok=True)
     rows = read_csv(args.candidates)
@@ -746,7 +764,7 @@ def main() -> None:
     records = {
         row["record_id"]: row
         for row in existing
-        if measurement_reusable(row)
+        if measurement_completed(row)
     }
     run_id = time.strftime("%Y%m%d_%H%M%S")
 
@@ -775,7 +793,9 @@ def main() -> None:
             f"searched_candidates={len(searched)} "
             f"npu_searched_pending={pending_total} "
             f"resume_exact={len(records)} "
-            "paired_measurement=pre_post numeric_preflight=full"
+            f"paired_measurement=blocked_pre_post:{args.pair_block_size} "
+            f"baseline_sampling={args.baseline_repeat}x"
+            f"{args.baseline_samples} numeric_preflight=full"
         )
 
         for workload_id, workload_rows in by_workload.items():
@@ -797,24 +817,6 @@ def main() -> None:
             official_env = dict(env)
             official_env["TUNE_BANK_PATH"] = str(empty_bank)
             official_env["ASCEND_CACHE_PATH"] = str(pair_dir / "official_cache")
-            official = run_runner(
-                args.runner,
-                args.candidates,
-                workload_id,
-                official_env,
-                pair_dir / "official",
-                args.timeout,
-                args.warmup,
-                args.repeat,
-                args.samples,
-                args.numeric_preflight_max_mib,
-                True,
-            )
-            if not truthy(official.get("success")):
-                raise ProfileError(
-                    f"{workload_id}: official baseline failed: "
-                    f"{official.get('error')}"
-                )
             bank_env = create_bank(
                 control,
                 spec,
@@ -822,209 +824,263 @@ def main() -> None:
                 pair_dir / "bank_control",
                 env,
             )
-            bank = run_runner(
-                args.runner,
-                args.candidates,
-                workload_id,
-                bank_env,
-                pair_dir / "bank_runner",
-                args.timeout,
-                args.warmup,
-                args.repeat,
-                args.samples,
-                args.numeric_preflight_max_mib,
-                True,
-            )
-            if not truthy(bank.get("success")):
-                raise ProfileError(
-                    f"{workload_id}: bank control failed: {bank.get('error')}"
-                )
-            pending_measurements: list[
-                tuple[dict[str, str], dict[str, str], str]
-            ] = []
-            for index, candidate in enumerate(pending, 1):
-                record_id = measurement_key(
-                    args.soc, args.aic, args.toolkit, candidate
-                )
-                candidate_dir = pair_dir / f"candidate_{candidate['rank']}"
-                try:
-                    candidate_env = create_bank(
-                        candidate, spec, args.probe, candidate_dir / "bank", env
-                    )
-                    measured = run_runner(
+            official_before: dict[str, str] | None = None
+            bank_before: dict[str, str] | None = None
+            for block_start in range(
+                0, len(pending), args.pair_block_size
+            ):
+                block = pending[
+                    block_start:block_start + args.pair_block_size
+                ]
+                block_number = block_start // args.pair_block_size + 1
+                block_dir = pair_dir / f"pair_block_{block_number}"
+                if official_before is None:
+                    official_before = run_runner(
                         args.runner,
                         args.candidates,
                         workload_id,
-                        candidate_env,
-                        candidate_dir / "runner",
+                        official_env,
+                        block_dir / "official_pre",
                         args.timeout,
                         args.warmup,
-                        args.repeat,
-                        args.samples,
+                        args.baseline_repeat,
+                        args.baseline_samples,
                         args.numeric_preflight_max_mib,
                         True,
                     )
-                except Exception as exception:
-                    measured = {
-                        "success": "0",
-                        "preflight_passed": "0",
-                        "preflight_mode": "runtime_rejected",
-                        "error": str(exception),
-                        "median_ms": "",
-                        "stddev_ms": "",
-                    }
-                provisional = profile_record(
-                    candidate,
-                    measured,
-                    record_id=record_id,
-                    run_id=run_id,
-                    soc=args.soc,
-                    aic=args.aic,
-                    toolkit=args.toolkit,
-                    official=official,
-                    bank=bank,
-                )
-                provisional["preflight_mode"] = (
-                    measured.get("preflight_mode", "")
-                    if not truthy(measured.get("success"))
-                    else "provisional"
-                )
-                records[record_id] = provisional
-                pending_measurements.append(
-                    (candidate, measured, record_id)
-                )
-                write_csv(
-                    args.resume,
-                    MEASUREMENT_COLUMNS,
-                    list(records.values()),
-                )
+                official = official_before
+                if not truthy(official.get("success")):
+                    raise ProfileError(
+                        f"{workload_id}: official baseline failed: "
+                        f"{official.get('error')}"
+                    )
+                if bank_before is None:
+                    bank_before = run_runner(
+                        args.runner,
+                        args.candidates,
+                        workload_id,
+                        bank_env,
+                        block_dir / "bank_pre",
+                        args.timeout,
+                        args.warmup,
+                        args.baseline_repeat,
+                        args.baseline_samples,
+                        args.numeric_preflight_max_mib,
+                        True,
+                    )
+                bank = bank_before
+                if not truthy(bank.get("success")):
+                    raise ProfileError(
+                        f"{workload_id}: bank control failed: "
+                        f"{bank.get('error')}"
+                    )
 
-            official_post = run_runner(
-                args.runner,
-                args.candidates,
-                workload_id,
-                official_env,
-                pair_dir / "official_post",
-                args.timeout,
-                args.warmup,
-                args.repeat,
-                args.samples,
-                args.numeric_preflight_max_mib,
-                True,
-            )
-            bank_post = run_runner(
-                args.runner,
-                args.candidates,
-                workload_id,
-                bank_env,
-                pair_dir / "bank_runner_post",
-                args.timeout,
-                args.warmup,
-                args.repeat,
-                args.samples,
-                args.numeric_preflight_max_mib,
-                True,
-            )
-            if not truthy(official_post.get("success")):
-                raise ProfileError(
-                    f"{workload_id}: post official baseline failed: "
-                    f"{official_post.get('error')}"
+                block_measurements: list[
+                    tuple[dict[str, str], dict[str, str], str, int]
+                ] = []
+                for block_offset, candidate in enumerate(block):
+                    index = block_start + block_offset + 1
+                    record_id = measurement_key(
+                        args.soc, args.aic, args.toolkit, candidate
+                    )
+                    candidate_dir = (
+                        block_dir / f"candidate_{candidate['rank']}"
+                    )
+                    try:
+                        candidate_env = create_bank(
+                            candidate,
+                            spec,
+                            args.probe,
+                            candidate_dir / "bank",
+                            env,
+                        )
+                        measured = run_runner(
+                            args.runner,
+                            args.candidates,
+                            workload_id,
+                            candidate_env,
+                            candidate_dir / "runner",
+                            args.timeout,
+                            args.warmup,
+                            args.repeat,
+                            args.samples,
+                            args.numeric_preflight_max_mib,
+                            True,
+                        )
+                    except Exception as exception:
+                        measured = {
+                            "success": "0",
+                            "preflight_passed": "0",
+                            "preflight_mode": "runtime_rejected",
+                            "error": str(exception),
+                            "median_ms": "",
+                            "stddev_ms": "",
+                        }
+                    # Persist exact correctness/executability immediately. If
+                    # the process is interrupted before post controls, this
+                    # fingerprint remains completed but is never rankable.
+                    provisional = profile_record(
+                        candidate,
+                        measured,
+                        record_id=record_id,
+                        run_id=run_id,
+                        soc=args.soc,
+                        aic=args.aic,
+                        toolkit=args.toolkit,
+                        official=official,
+                        bank=bank,
+                    )
+                    records[record_id] = provisional
+                    block_measurements.append(
+                        (candidate, measured, record_id, index)
+                    )
+                    write_csv(
+                        args.resume,
+                        MEASUREMENT_COLUMNS,
+                        list(records.values()),
+                    )
+
+                official_post = run_runner(
+                    args.runner,
+                    args.candidates,
+                    workload_id,
+                    official_env,
+                    block_dir / "official_post",
+                    args.timeout,
+                    args.warmup,
+                    args.baseline_repeat,
+                    args.baseline_samples,
+                    args.numeric_preflight_max_mib,
+                    True,
                 )
-            if not truthy(bank_post.get("success")):
-                raise ProfileError(
-                    f"{workload_id}: post bank control failed: "
-                    f"{bank_post.get('error')}"
+                bank_post = run_runner(
+                    args.runner,
+                    args.candidates,
+                    workload_id,
+                    bank_env,
+                    block_dir / "bank_post",
+                    args.timeout,
+                    args.warmup,
+                    args.baseline_repeat,
+                    args.baseline_samples,
+                    args.numeric_preflight_max_mib,
+                    True,
                 )
-            official_drift = baseline_drift_pct(official, official_post)
-            bank_drift = baseline_drift_pct(bank, bank_post)
-            pair_valid = (
-                official_drift <= args.baseline_drift_pct
-                and bank_drift <= args.baseline_drift_pct
-            )
-            print(
-                f"PAIR_REFERENCE {workload_id} "
-                f"official_ms={official['median_ms']}/"
-                f"{official_post['median_ms']} "
-                f"bank_ms={bank['median_ms']}/{bank_post['median_ms']} "
-                f"drift_pct={official_drift:.6g}/{bank_drift:.6g} "
-                f"validated={int(pair_valid)}"
-            )
-            if not pair_valid:
-                discarded = 0
-                for _, measured, record_id in pending_measurements:
-                    if truthy(measured.get("success")):
-                        records.pop(record_id, None)
-                        discarded += 1
-                write_csv(
-                    args.resume,
-                    MEASUREMENT_COLUMNS,
-                    list(records.values()),
+                if not truthy(official_post.get("success")):
+                    raise ProfileError(
+                        f"{workload_id}: post official baseline failed: "
+                        f"{official_post.get('error')}"
+                    )
+                if not truthy(bank_post.get("success")):
+                    raise ProfileError(
+                        f"{workload_id}: post bank control failed: "
+                        f"{bank_post.get('error')}"
+                    )
+                # The post controls are already the nearest measurements
+                # before the next block. Reusing them avoids an immediate
+                # duplicate control run without weakening the bracket.
+                official_before = official_post
+                bank_before = bank_post
+                official_drift = baseline_drift_pct(
+                    official, official_post
+                )
+                bank_drift = baseline_drift_pct(bank, bank_post)
+                pair_valid = (
+                    official_drift <= args.baseline_drift_pct
+                    and bank_drift <= args.baseline_drift_pct
                 )
                 print(
-                    f"PAIR_INVALID {workload_id} "
-                    f"threshold_pct={args.baseline_drift_pct:.6g} "
-                    f"successful_candidates_discarded={discarded}"
+                    f"PAIR_REFERENCE {workload_id} "
+                    f"block={block_number} candidates={len(block)} "
+                    f"official_ms={official['median_ms']}/"
+                    f"{official_post['median_ms']} "
+                    f"bank_ms={bank['median_ms']}/"
+                    f"{bank_post['median_ms']} "
+                    f"drift_pct={official_drift:.6g}/{bank_drift:.6g} "
+                    f"validated={int(pair_valid)}"
                 )
-                continue
-
-            official_reference = conservative_reference(
-                official, official_post
-            )
-            bank_reference = conservative_reference(bank, bank_post)
-            for index, (candidate, measured, record_id) in enumerate(
-                pending_measurements, 1
-            ):
-                record = profile_record(
-                    candidate,
-                    measured,
-                    record_id=record_id,
-                    run_id=run_id,
-                    soc=args.soc,
-                    aic=args.aic,
-                    toolkit=args.toolkit,
-                    official=official_reference,
-                    bank=bank_reference,
-                    official_post=official_post,
-                    bank_post=bank_post,
-                    pair_validated=True,
+                official_reference = conservative_reference(
+                    official, official_post
                 )
-                record["official_drift_pct"] = f"{official_drift:.12g}"
-                record["bank_drift_pct"] = f"{bank_drift:.12g}"
-                records[record_id] = record
-                metrics = json.loads(
-                    candidate.get("search_behavior_metrics") or "{}"
-                )
-                if truthy(record["success"]):
-                    print(
-                        f"candidate_done [{index}/{len(pending)}] "
-                        f"{workload_id} rank={candidate['rank']} "
-                        f"tpl={candidate['search_template']} "
-                        f"source={candidate['candidate_source']} "
-                        f"ms={record['median_ms']} "
-                        f"speedup_vs_official={record['speedup_vs_official']} "
-                        f"speedup_vs_bank={record['speedup_vs_bank']} "
-                        f"status_vs_official={record['status_vs_official']} "
-                        f"status_vs_bank={record['status_vs_bank']} "
-                        f"model_ratio={metrics.get('predicted_latency_ratio', '')} "
-                        f"model_support={metrics.get('latency_support', '')} "
-                        f"runtime_risk={metrics.get('runtime_risk_score', '')} "
-                        f"signature={candidate['tiling_signature']}"
+                bank_reference = conservative_reference(bank, bank_post)
+                for candidate, measured, record_id, index in block_measurements:
+                    record = profile_record(
+                        candidate,
+                        measured,
+                        record_id=record_id,
+                        run_id=run_id,
+                        soc=args.soc,
+                        aic=args.aic,
+                        toolkit=args.toolkit,
+                        official=official_reference,
+                        bank=bank_reference,
+                        official_post=official_post,
+                        bank_post=bank_post,
+                        pair_validated=pair_valid,
                     )
-                else:
-                    print(
-                        f"candidate_rejected [{index}/{len(pending)}] "
-                        f"{workload_id} rank={candidate['rank']} "
-                        f"tpl={candidate['search_template']} "
-                        f"source={candidate['candidate_source']} "
-                        f"runtime_risk={metrics.get('runtime_risk_score', '')} "
-                        f"signature={candidate['tiling_signature']} "
-                        f"reason={record['error'][:240]}"
+                    record["official_drift_pct"] = (
+                        f"{official_drift:.12g}"
                     )
-            write_csv(
-                args.resume,
-                MEASUREMENT_COLUMNS,
-                list(records.values()),
-            )
+                    record["bank_drift_pct"] = f"{bank_drift:.12g}"
+                    if (
+                        truthy(record["success"])
+                        and not pair_valid
+                    ):
+                        record["error"] = (
+                            "latency_untrusted_baseline_drift "
+                            f"official={official_drift:.6g}% "
+                            f"bank={bank_drift:.6g}%"
+                        )
+                    records[record_id] = record
+                    metrics = json.loads(
+                        candidate.get("search_behavior_metrics") or "{}"
+                    )
+                    if truthy(record["success"]) and pair_valid:
+                        print(
+                            f"candidate_done [{index}/{len(pending)}] "
+                            f"{workload_id} rank={candidate['rank']} "
+                            f"tpl={candidate['search_template']} "
+                            f"source={candidate['candidate_source']} "
+                            f"ms={record['median_ms']} "
+                            "speedup_vs_official="
+                            f"{record['speedup_vs_official']} "
+                            f"speedup_vs_bank={record['speedup_vs_bank']} "
+                            "status_vs_official="
+                            f"{record['status_vs_official']} "
+                            f"status_vs_bank={record['status_vs_bank']} "
+                            "model_ratio="
+                            f"{metrics.get('predicted_latency_ratio', '')} "
+                            "model_support="
+                            f"{metrics.get('latency_support', '')} "
+                            "runtime_risk="
+                            f"{metrics.get('runtime_risk_score', '')} "
+                            f"signature={candidate['tiling_signature']}"
+                        )
+                    elif truthy(record["success"]):
+                        print(
+                            f"candidate_unpaired [{index}/{len(pending)}] "
+                            f"{workload_id} rank={candidate['rank']} "
+                            f"tpl={candidate['search_template']} "
+                            f"source={candidate['candidate_source']} "
+                            f"ms={record['median_ms']} "
+                            "action=retain_preflight_exclude_latency"
+                        )
+                    else:
+                        print(
+                            f"candidate_rejected [{index}/{len(pending)}] "
+                            f"{workload_id} rank={candidate['rank']} "
+                            f"tpl={candidate['search_template']} "
+                            f"source={candidate['candidate_source']} "
+                            "runtime_risk="
+                            f"{metrics.get('runtime_risk_score', '')} "
+                            f"signature={candidate['tiling_signature']} "
+                            f"reason={record['error'][:240]}"
+                        )
+                write_csv(
+                    args.resume,
+                    MEASUREMENT_COLUMNS,
+                    list(records.values()),
+                )
 
     summaries = summarize(
         rows, records, args.soc, args.aic, args.toolkit

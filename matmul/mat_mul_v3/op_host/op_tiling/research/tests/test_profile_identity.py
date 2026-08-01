@@ -146,6 +146,31 @@ class ProfileIdentityTest(unittest.TestCase):
         structured["preflight_mode"] = "numeric_signed_axes_full_v3"
         self.assertTrue(PROFILE.measurement_reusable(structured))
 
+    def test_unpaired_numeric_result_is_completed_but_not_rankable(
+        self,
+    ) -> None:
+        unpaired = {
+            "success": "1",
+            "preflight_passed": "1",
+            "preflight_mode": "numeric_signed_axes_full_v3",
+            "pair_validated": "0",
+            "median_ms": "0.25",
+            "official_ms": "0.2",
+            "bank_ms": "0.2",
+        }
+        self.assertTrue(PROFILE.measurement_completed(unpaired))
+        self.assertFalse(PROFILE.measurement_reusable(unpaired))
+
+    def test_interrupted_provisional_result_can_be_resumed(self) -> None:
+        provisional = {
+            "success": "1",
+            "preflight_passed": "1",
+            "preflight_mode": "provisional",
+            "pair_validated": "0",
+            "median_ms": "0.25",
+        }
+        self.assertFalse(PROFILE.measurement_completed(provisional))
+
     def test_baseline_drift_and_conservative_reference(self) -> None:
         before = {"median_ms": "1.0", "stddev_ms": "0.01"}
         after = {"median_ms": "2.0", "stddev_ms": "0.02"}

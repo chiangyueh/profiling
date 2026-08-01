@@ -5,7 +5,7 @@ from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
 from heapq import nsmallest
 from statistics import median
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from .contracts import (
     align_up,
@@ -23,6 +23,7 @@ from .domain import (
     Hardware,
     MeasuredObservation,
     Schedule,
+    Template,
     Workload,
 )
 
@@ -1410,6 +1411,9 @@ def select_behavior_coverage(
     limit: int,
     *,
     probe_templates: bool = True,
+    template_probe_floor: int = 1,
+    template_quotas: Mapping[Template, int] | None = None,
+    allow_risky_template_probes: bool = False,
     cost_model: FeedbackCostModel | None = None,
 ) -> list[Candidate]:
     unique: dict[tuple[int, ...], Candidate] = {}
@@ -1453,11 +1457,17 @@ def select_behavior_coverage(
         )
 
     def template_budget(candidate: Candidate) -> int:
+        if template_quotas is not None:
+            return max(0, template_quotas.get(candidate.template, 0))
         if candidate.template.value == "BASE":
             return limit
+        probe_budget = max(
+            non_base_probe_budget,
+            template_probe_floor if probe_templates else 0,
+        )
         if candidate.template in winning_templates:
-            return max(non_base_probe_budget, limit // 2)
-        return non_base_probe_budget
+            return max(probe_budget, limit // 2)
+        return probe_budget
 
     def can_select(
         item: tuple[Candidate, BehaviorVector, float, float],
@@ -1504,9 +1514,9 @@ def select_behavior_coverage(
         selected_signatures.add(item[0].schedule.signature())
         template_counts[item[0].template] += 1
 
-    # Callback coverage can retain one safe probe per generated kernel family.
-    # Final NPU selection disables this: a known losing family does not earn
-    # device budget merely because the host solver generated it.
+    # Retain explicit probes for generated kernel families when requested.
+    # Stage 1 uses this to keep a weak model from eliminating a template;
+    # stage 2 supplies measured quotas from the template race.
     if probe_templates:
         for template in sorted(
             {item[0].template for item in scored}, key=str
@@ -1515,11 +1525,22 @@ def select_behavior_coverage(
                 item
                 for item in scored
                 if item[0].template == template
-                and not known_high_risk(item)
-                and not known_severe_regression(item)
+                and (
+                    allow_risky_template_probes
+                    or (
+                        not known_high_risk(item)
+                        and not known_severe_regression(item)
+                    )
+                )
             ]
-            if family:
-                add(family[0])
+            probe_limit = min(
+                template_probe_floor,
+                template_budget(family[0][0]) if family else 0,
+            )
+            for item in family[:probe_limit]:
+                if len(selected) >= limit:
+                    break
+                add(item)
 
     exploitation_limit = max(len(selected), limit // 2)
     for item in scored:
@@ -1590,7 +1611,7 @@ def select_behavior_coverage(
                 not in selected_signatures
                 and can_select(
                     item,
-                    enforce_template=False,
+                    enforce_template=template_quotas is not None,
                     enforce_regression=False,
                 )
             ]
@@ -1604,6 +1625,12 @@ def select_behavior_coverage(
                     for item in scored
                     if item[0].schedule.signature()
                     not in selected_signatures
+                    and can_select(
+                        item,
+                        enforce_risk=False,
+                        enforce_template=template_quotas is not None,
+                        enforce_regression=False,
+                    )
                 ]
             if not remaining:
                 break

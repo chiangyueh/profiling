@@ -14,6 +14,7 @@ from .domain import (
     Workload,
 )
 from .orchestrator import CandidateEngine, SearchConfig
+from .racing import RacingPlan, TemplateEvidence, plan_template_race
 
 __all__ = [
     "KNOWLEDGE_FIELDS",
@@ -23,10 +24,13 @@ __all__ = [
     "GenerationBudget",
     "Hardware",
     "MeasuredObservation",
+    "RacingPlan",
     "Schedule",
     "SearchConfig",
     "SearchResult",
     "SolverReport",
     "Template",
+    "TemplateEvidence",
     "Workload",
+    "plan_template_race",
 ]

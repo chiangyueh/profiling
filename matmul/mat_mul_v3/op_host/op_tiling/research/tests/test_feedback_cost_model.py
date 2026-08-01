@@ -285,6 +285,22 @@ class FeedbackCostModelTest(unittest.TestCase):
             )
         self.assertTrue(observations[0].structured_verified)
 
+        row["pair_validated"] = "0"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resume.csv"
+            with path.open("w", newline="", encoding="utf-8") as output:
+                writer = csv.DictWriter(output, fieldnames=tuple(row))
+                writer.writeheader()
+                writer.writerow(row)
+            observations, exclusions = load_resume_feedback(
+                path,
+                soc="Ascend910B3",
+                aic_cores=20,
+                toolkit="8.1.RC1",
+            )
+        self.assertEqual(observations, [])
+        self.assertEqual(len(exclusions), 1)
+
     def test_structured_measurement_overrides_provisional_duplicate(
         self,
     ) -> None:

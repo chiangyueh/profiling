@@ -206,6 +206,8 @@ class CandidateEngine:
             self.observations,
             hardware,
             budget.behavior_candidates,
+            template_probe_floor=8,
+            allow_risky_template_probes=True,
             cost_model=cost_model,
         )
         selected = select_behavior_coverage(
@@ -214,6 +216,8 @@ class CandidateEngine:
             self.observations,
             hardware,
             budget.callback_candidates,
+            template_probe_floor=3,
+            allow_risky_template_probes=True,
             cost_model=cost_model,
         )
         reports = tuple(

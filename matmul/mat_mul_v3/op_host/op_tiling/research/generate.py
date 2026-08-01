@@ -21,6 +21,7 @@ from tiling_search import (
     MeasuredObservation,
     SearchConfig,
     Workload,
+    plan_template_race,
 )
 from tiling_search.domain import KNOWLEDGE_FIELDS, Candidate, Schedule
 from tiling_search.behavior import (
@@ -80,6 +81,11 @@ COLUMNS = [
     "callback_workspace_bytes",
     "callback_tiling_sha256",
 ]
+
+STRICT_NUMERIC_PREFLIGHT_MODES = {
+    "numeric_ones_full_v2",
+    "numeric_signed_axes_full_v3",
+}
 
 
 def truthy(value: object) -> bool:
@@ -211,10 +217,15 @@ def load_resume_feedback(
             )
             continue
         preflight_mode = row.get("preflight_mode")
+        if preflight_mode in STRICT_NUMERIC_PREFLIGHT_MODES:
+            # A completed numeric preflight is exact executability evidence
+            # even if surrounding baseline drift makes its latency unusable.
+            # Exclude the fingerprint without feeding the unpaired timing to
+            # the cost model.
+            exclusions.add(fingerprint(workload, schedule))
         verified = (
             truthy(row.get("pair_validated"))
-            and preflight_mode
-            in {"numeric_ones_full_v2", "numeric_signed_axes_full_v3"}
+            and preflight_mode in STRICT_NUMERIC_PREFLIGHT_MODES
         )
         if not verified:
             continue
@@ -359,6 +370,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--behavior-candidates", type=int, default=320)
     parser.add_argument("--workload-limit", type=int, default=0)
     parser.add_argument("--skip-model-validation", action="store_true")
+    parser.add_argument(
+        "--search-stage",
+        choices=("stage1", "stage2"),
+        default="stage1",
+    )
     return parser.parse_args()
 
 
@@ -514,14 +530,48 @@ def main() -> None:
             candidate.schedule.signature(): callback
             for candidate, callback in callback_accepted
         }
-        selected_candidates = select_behavior_coverage(
-            workload,
-            (candidate for candidate, _ in callback_accepted),
-            observations,
-            hardware,
-            args.npu_candidates,
-            probe_templates=False,
-        )
+        callback_candidates = [
+            candidate for candidate, _ in callback_accepted
+        ]
+        racing_plan = None
+        if args.search_stage == "stage2":
+            racing_plan = plan_template_race(
+                workload,
+                callback_candidates,
+                observations,
+                args.npu_candidates,
+            )
+            selected_candidates = select_behavior_coverage(
+                workload,
+                callback_candidates,
+                observations,
+                hardware,
+                racing_plan.budget,
+                probe_templates=True,
+                template_probe_floor=1,
+                template_quotas=racing_plan.template_quotas,
+            )
+        else:
+            template_count = len(
+                {candidate.template for candidate in callback_candidates}
+            )
+            template_probe_floor = max(
+                1,
+                min(
+                    3,
+                    args.npu_candidates // max(1, template_count),
+                ),
+            )
+            selected_candidates = select_behavior_coverage(
+                workload,
+                callback_candidates,
+                observations,
+                hardware,
+                args.npu_candidates,
+                probe_templates=True,
+                template_probe_floor=template_probe_floor,
+                allow_risky_template_probes=True,
+            )
         accepted = [
             (
                 candidate,
@@ -563,10 +613,37 @@ def main() -> None:
             f"draft_pool={result.draft_candidates} "
             f"excluded={result.excluded_fingerprints} solvers={reports}"
         )
-        if len(accepted) < args.npu_candidates:
+        if racing_plan is not None:
+            evidence = ",".join(
+                (
+                    f"{item.template.value}:{item.samples}:"
+                    f"{item.best_ratio:.6g}:{item.robust_ratio:.6g}:"
+                    f"{item.winners}"
+                )
+                for item in racing_plan.evidence
+            ) or "none"
+            quotas = ",".join(
+                f"{template.value}:{quota}"
+                for template, quota in sorted(
+                    racing_plan.template_quotas.items(),
+                    key=lambda item: item[0].value,
+                )
+            )
+            print(
+                "TEMPLATE_RACE "
+                f"{workload.workload_id} state={racing_plan.state} "
+                f"budget={racing_plan.budget}/{args.npu_candidates} "
+                f"quotas={quotas or 'none'} evidence={evidence}"
+            )
+        expected_candidates = (
+            racing_plan.budget
+            if racing_plan is not None
+            else args.npu_candidates
+        )
+        if len(accepted) < expected_candidates:
             print(
                 f"SEARCH_CAPABILITY_GAP {workload.workload_id} "
-                f"requested={args.npu_candidates} accepted={len(accepted)}"
+                f"requested={expected_candidates} accepted={len(accepted)}"
             )
 
     appended = 0

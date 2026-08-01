@@ -163,7 +163,7 @@ CAMPAIGN_SUMMARY="${ROOT}/results/npu_full_campaign_incumbents.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260801-structured-feedback-budget-v3"
+echo "  script:     run_npu.sh 20260802-adaptive-template-racing-v1"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      independent_contract_behavior_search"
 echo "  mode:       ${MODE}"
@@ -306,6 +306,7 @@ generate_stage() {
     local count="$3"
     local append="${4:-}"
     local skip_validation="${5:-0}"
+    local search_stage="${6:-stage1}"
     local command=(
         python3 "${RESEARCH}/generate.py"
         --workloads "${WORKLOADS}"
@@ -327,14 +328,17 @@ generate_stage() {
         --observations "${RESEARCH}/config/measured_observations_net_log14.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log15.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log17.csv"
+        --observations "${RESEARCH}/config/measured_observations_net_log18.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log14.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log15.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log17.csv"
+        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log18.csv"
         --resume-feedback "${RESUME}"
         --npu-candidates "${count}"
         --callback-candidates 48
         --behavior-candidates 320
+        --search-stage "${search_stage}"
     )
     if [[ -n "${append}" ]]; then
         command+=(--append-candidates "${append}")
@@ -364,8 +368,11 @@ profile_stage() {
         --warmup "${WARMUP:-10}" \
         --repeat "${REPEAT:-50}" \
         --samples "${SAMPLES:-15}" \
+        --baseline-repeat "${BASELINE_REPEAT:-30}" \
+        --baseline-samples "${BASELINE_SAMPLES:-9}" \
         --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-256}" \
-        --baseline-drift-pct "${BASELINE_DRIFT_PCT:-3}"
+        --baseline-drift-pct "${BASELINE_DRIFT_PCT:-3}" \
+        --pair-block-size "${PAIR_BLOCK_SIZE:-4}"
 }
 
 echo "[3a/4] Generate feedback stage 1 (${STAGE1_NPU_CANDIDATES} candidates/workload) ..."
@@ -374,7 +381,8 @@ generate_stage \
     "${STAGE1_ALL_CANDIDATES}" \
     "${STAGE1_NPU_CANDIDATES}" \
     "" \
-    "1"
+    "1" \
+    "stage1"
 echo "  ok"
 
 echo "[4a/4] Measure feedback stage 1 with paired baselines ..."
@@ -389,7 +397,9 @@ generate_stage \
     "${CANDIDATES}" \
     "${ALL_CANDIDATES}" \
     "${STAGE2_NPU_CANDIDATES}" \
-    "${STAGE1_CANDIDATES}"
+    "${STAGE1_CANDIDATES}" \
+    "0" \
+    "stage2"
 echo "  ok"
 
 echo "[4b/4] Measure only new exact schedules and summarize both stages ..."
@@ -410,7 +420,8 @@ python3 "${RESEARCH}/campaign_report.py" \
     --observations "${RESEARCH}/config/measured_observations_net_log11.csv" \
     --observations "${RESEARCH}/config/measured_observations_net_log14.csv" \
     --observations "${RESEARCH}/config/measured_observations_net_log15.csv" \
-    --observations "${RESEARCH}/config/measured_observations_net_log17.csv"
+    --observations "${RESEARCH}/config/measured_observations_net_log17.csv" \
+    --observations "${RESEARCH}/config/measured_observations_net_log18.csv"
 
 echo
 echo "NPU run completed"

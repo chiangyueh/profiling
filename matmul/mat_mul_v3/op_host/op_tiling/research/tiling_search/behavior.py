@@ -504,6 +504,11 @@ def draft_behavior_coverage(
             behavior_vector(workload, candidate.schedule, hardware),
         )
     evaluated = list(unique.values())
+    pinned = [
+        item
+        for item in evaluated
+        if item[0].source == "feedback_incumbent_revalidation"
+    ]
     if len(evaluated) <= limit:
         return [candidate for candidate, _ in evaluated]
 
@@ -541,6 +546,11 @@ def draft_behavior_coverage(
             remaining.remove(farthest)
         retained.extend(chosen)
 
+    retained_by_signature = {
+        item[0].schedule.signature(): item
+        for item in [*pinned, *retained]
+    }
+    retained = list(retained_by_signature.values())
     if len(retained) <= limit:
         return [candidate for candidate, _ in retained]
 
@@ -557,6 +567,9 @@ def draft_behavior_coverage(
             return
         selected.append(item)
         selected_signatures.add(signature)
+
+    for item in pinned:
+        add(item)
 
     by_template: dict[
         object, list[tuple[Candidate, BehaviorVector]]
@@ -1338,7 +1351,7 @@ def select_behavior_coverage(
         template_of(observation.schedule)
         for observation in observations
         if observation.workload.identity() == workload.identity()
-        and observation.is_winner
+        and observation.is_verified_winner
     }
 
     def known_high_risk(
@@ -1409,6 +1422,16 @@ def select_behavior_coverage(
         selected.append(item)
         selected_signatures.add(item[0].schedule.signature())
         template_counts[item[0].template] += 1
+
+    # Historical coverage-only winners are hypotheses, not established
+    # incumbents. Reserve one slot so the stricter NPU protocol can confirm or
+    # reject the exact schedule before feedback propagates it further.
+    for item in scored:
+        if (
+            item[0].source == "feedback_incumbent_revalidation"
+            and len(selected) < limit
+        ):
+            add(item)
 
     # Callback coverage can retain one safe probe per generated kernel family.
     # Final NPU selection disables this: a known losing family does not earn

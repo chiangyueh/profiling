@@ -183,8 +183,15 @@ def load_resume_feedback(
             schedule = Schedule.from_signature(row["tiling_signature"])
         except (KeyError, ValueError):
             continue
-        exclusions.add(fingerprint(workload, schedule))
         if not truthy(row.get("success")):
+            if row.get("preflight_mode") in {
+                "",
+                "baseline_drift",
+                "provisional",
+                "runner_failed",
+            }:
+                continue
+            exclusions.add(fingerprint(workload, schedule))
             # Every failed searched schedule is negative NPU executability
             # evidence. Runners preserve a more specific preflight_mode such
             # as output_not_written or timeout, but restricting feedback to
@@ -203,6 +210,12 @@ def load_resume_feedback(
                 )
             )
             continue
+        verified = (
+            truthy(row.get("pair_validated"))
+            and row.get("preflight_mode") == "numeric_ones_full_v2"
+        )
+        if not verified:
+            continue
         if not row.get("official_ms") or not row.get("bank_ms"):
             continue
         try:
@@ -211,6 +224,7 @@ def load_resume_feedback(
             bank_ms = float(row["bank_ms"])
         except (KeyError, ValueError):
             continue
+        exclusions.add(fingerprint(workload, schedule))
         observations.append(
             MeasuredObservation(
                 workload=workload,
@@ -221,6 +235,7 @@ def load_resume_feedback(
                 record_id=row.get("record_id", path.stem),
                 status_vs_official=row.get("status_vs_official", ""),
                 status_vs_bank=row.get("status_vs_bank", ""),
+                verified=True,
             )
         )
     return observations, exclusions

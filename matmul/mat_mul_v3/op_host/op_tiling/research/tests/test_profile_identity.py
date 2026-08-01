@@ -101,6 +101,8 @@ class ProfileIdentityTest(unittest.TestCase):
             records[key] = {
                 **row,
                 "success": "1",
+                "preflight_mode": "numeric_ones_full_v2",
+                "pair_validated": "1",
                 "median_ms": str(candidate_ms),
                 "official_ms": str(baseline_ms),
                 "bank_ms": str(baseline_ms),
@@ -127,6 +129,27 @@ class ProfileIdentityTest(unittest.TestCase):
         self.assertEqual(
             summary["best_source"], "feedback_winner_mutation"
         )
+
+    def test_resume_requires_full_numeric_and_paired_validation(self) -> None:
+        legacy = {
+            "success": "1",
+            "preflight_mode": "zero_coverage_grid9_v1",
+            "pair_validated": "1",
+            "official_ms": "1",
+            "bank_ms": "1",
+        }
+        self.assertFalse(PROFILE.measurement_reusable(legacy))
+        verified = dict(legacy)
+        verified["preflight_mode"] = "numeric_ones_full_v2"
+        self.assertTrue(PROFILE.measurement_reusable(verified))
+
+    def test_baseline_drift_and_conservative_reference(self) -> None:
+        before = {"median_ms": "1.0", "stddev_ms": "0.01"}
+        after = {"median_ms": "2.0", "stddev_ms": "0.02"}
+        self.assertEqual(PROFILE.baseline_drift_pct(before, after), 100.0)
+        reference = PROFILE.conservative_reference(before, after)
+        self.assertEqual(reference["median_ms"], "1")
+        self.assertEqual(reference["stddev_ms"], "0.02")
 
 
 if __name__ == "__main__":

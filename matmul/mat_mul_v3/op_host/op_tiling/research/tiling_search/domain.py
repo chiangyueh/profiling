@@ -188,6 +188,7 @@ class MeasuredObservation:
     record_id: str
     status_vs_official: str = ""
     status_vs_bank: str = ""
+    verified: bool = False
 
     @property
     def measured_ratio(self) -> float:
@@ -204,6 +205,10 @@ class MeasuredObservation:
             self.ratio_vs_official <= 0.99
             and self.ratio_vs_bank <= 0.99
         )
+
+    @property
+    def is_verified_winner(self) -> bool:
+        return self.verified and self.is_winner
 
     @property
     def is_regression(self) -> bool:

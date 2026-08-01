@@ -22,6 +22,8 @@ COLUMNS = (
     "trans_b",
     "campaign_status",
     "measurements",
+    "verified_measurements",
+    "provisional_measurements",
     "runtime_rejected",
     "winning_measurements",
     "best_template",
@@ -57,9 +59,12 @@ def summarize_campaign(
         winners = [
             observation
             for observation in measured
-            if observation.is_winner
+            if observation.is_verified_winner
         ]
-        eligible = winners or measured
+        verified = [
+            observation for observation in measured if observation.verified
+        ]
+        eligible = winners or verified or measured
         best = (
             min(
                 eligible,
@@ -83,6 +88,10 @@ def summarize_campaign(
                 "trans_b": str(int(workload.trans_b)),
                 "campaign_status": "solved" if winners else "open",
                 "measurements": str(len(measured)),
+                "verified_measurements": str(len(verified)),
+                "provisional_measurements": str(
+                    len(measured) - len(verified)
+                ),
                 "runtime_rejected": str(len(rejected)),
                 "winning_measurements": str(len(winners)),
             }
@@ -148,6 +157,8 @@ def main() -> None:
             f"CAMPAIGN_WORKLOAD {row['workload_id']} "
             f"status={row['campaign_status']} "
             f"measurements={row['measurements']} "
+            f"verified={row['verified_measurements']} "
+            f"provisional={row['provisional_measurements']} "
             f"runtime_rejected={row['runtime_rejected']} "
             f"winners={row['winning_measurements']} "
             f"best_template={row['best_template'] or 'NA'} "
@@ -159,6 +170,10 @@ def main() -> None:
         f"CAMPAIGN_TOTAL workloads={len(rows)} solved={solved} "
         f"open={len(rows) - solved} "
         f"measurements={sum(int(row['measurements']) for row in rows)} "
+        f"verified_measurements="
+        f"{sum(int(row['verified_measurements']) for row in rows)} "
+        f"provisional_measurements="
+        f"{sum(int(row['provisional_measurements']) for row in rows)} "
         f"runtime_rejected="
         f"{sum(int(row['runtime_rejected']) for row in rows)}"
     )

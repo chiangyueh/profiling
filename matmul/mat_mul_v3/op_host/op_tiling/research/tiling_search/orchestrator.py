@@ -29,6 +29,7 @@ from .feedback import (
     feedback_mutations,
     feedback_targets,
     fingerprint,
+    incumbent_revalidations,
     local_anchor_mutations,
 )
 from .solvers import (
@@ -166,6 +167,9 @@ class CandidateEngine:
             workload, hardware, self.observations
         )
         expanded = [
+            *incumbent_revalidations(
+                workload, hardware, self.observations
+            ),
             # Preserve causal provenance when a feedback mutation also appears
             # in the independent solver stream. This lets stage-two selection
             # distinguish an intentional counterfactual from a generic probe.
@@ -183,7 +187,11 @@ class CandidateEngine:
             if signature in seen:
                 continue
             seen.add(signature)
-            if fingerprint(workload, candidate.schedule) in self.exclusions:
+            if (
+                candidate.source != "feedback_incumbent_revalidation"
+                and fingerprint(workload, candidate.schedule)
+                in self.exclusions
+            ):
                 excluded += 1
                 continue
             filtered.append(candidate)

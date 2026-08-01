@@ -19,7 +19,7 @@ from tiling_search import (
     SearchConfig,
     Workload,
 )
-from tiling_search.domain import KNOWLEDGE_FIELDS, Template
+from tiling_search.domain import KNOWLEDGE_FIELDS, Schedule, Template
 from tiling_search.behavior import select_behavior_coverage
 from tiling_search.feedback import fingerprint
 
@@ -154,6 +154,7 @@ class ContractSearchTest(unittest.TestCase):
                 status_vs_bank=(
                     "improved" if index == 0 else "regressed"
                 ),
+                verified=True,
             )
             for index, candidate in enumerate(measured)
         ]
@@ -178,6 +179,56 @@ class ContractSearchTest(unittest.TestCase):
                 candidate.source.startswith("feedback_")
                 for candidate in second.candidates
             )
+        )
+
+    def test_provisional_winner_is_pinned_for_exact_revalidation(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="revalidation_probe",
+            m=128,
+            n=128,
+            k=16384,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        budget = GenerationBudget(
+            raw_attempts=3000,
+            legal_candidates=1200,
+            behavior_candidates=64,
+            callback_candidates=16,
+            npu_candidates=8,
+        )
+        schedule = CandidateEngine(
+            config=SearchConfig(budget)
+        ).generate(workload, self.hardware).callback_candidates[0].schedule
+        observation = MeasuredObservation(
+            workload=workload,
+            schedule=schedule,
+            ratio_vs_official=0.8,
+            ratio_vs_bank=0.8,
+            source="contract_global",
+            record_id="coverage-only-winner",
+            status_vs_official="improved",
+            status_vs_bank="improved",
+        )
+        result = CandidateEngine(
+            config=SearchConfig(
+                budget
+            ),
+            observations=[observation],
+            exclusions={fingerprint(workload, schedule)},
+        ).generate(workload, self.hardware)
+        pinned = [
+            candidate
+            for candidate in result.callback_candidates
+            if candidate.source == "feedback_incumbent_revalidation"
+        ]
+        self.assertEqual(len(pinned), 1)
+        self.assertEqual(
+            pinned[0].schedule.signature(), schedule.signature()
         )
 
 

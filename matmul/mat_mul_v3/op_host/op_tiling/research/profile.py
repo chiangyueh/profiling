@@ -76,6 +76,11 @@ MEASUREMENT_COLUMNS = [
     "speedup_vs_bank",
     "status_vs_official",
     "status_vs_bank",
+    "pair_validated",
+    "official_post_ms",
+    "bank_post_ms",
+    "official_drift_pct",
+    "bank_drift_pct",
 ]
 
 SUMMARY_COLUMNS = [
@@ -362,6 +367,8 @@ def run_runner(
     warmup: int,
     repeat: int,
     samples: int,
+    numeric_preflight_max_mib: int,
+    require_numeric_preflight: bool,
 ) -> dict[str, str]:
     work_dir.mkdir(parents=True, exist_ok=True)
     output = work_dir / "profile.csv"
@@ -382,7 +389,11 @@ def run_runner(
         str(repeat),
         "--samples",
         str(samples),
+        "--numeric-preflight-max-mib",
+        str(numeric_preflight_max_mib),
     ]
+    if require_numeric_preflight:
+        command.append("--require-numeric-preflight")
     process = subprocess.Popen(
         command,
         env=env,
@@ -446,6 +457,41 @@ def comparison(
     return speedup, "within_noise"
 
 
+def measurement_reusable(row: dict[str, str]) -> bool:
+    if not truthy(row.get("success")):
+        return row.get("preflight_mode") not in {
+            "",
+            "baseline_drift",
+            "provisional",
+            "runner_failed",
+        }
+    return (
+        truthy(row.get("pair_validated"))
+        and row.get("preflight_mode") == "numeric_ones_full_v2"
+        and bool(row.get("official_ms"))
+        and bool(row.get("bank_ms"))
+    )
+
+
+def baseline_drift_pct(
+    before: dict[str, str],
+    after: dict[str, str],
+) -> float:
+    before_ms = float(before["median_ms"])
+    after_ms = float(after["median_ms"])
+    return 100.0 * abs(after_ms - before_ms) / min(before_ms, after_ms)
+
+
+def conservative_reference(
+    before: dict[str, str],
+    after: dict[str, str],
+) -> dict[str, str]:
+    result = dict(before)
+    result["median_ms"] = f"{min(float(before['median_ms']), float(after['median_ms'])):.12g}"
+    result["stddev_ms"] = f"{max(float(before['stddev_ms']), float(after['stddev_ms'])):.12g}"
+    return result
+
+
 def measurement_key(
     soc: str,
     aic: int,
@@ -482,6 +528,9 @@ def profile_record(
     toolkit: str,
     official: dict[str, str] | None = None,
     bank: dict[str, str] | None = None,
+    official_post: dict[str, str] | None = None,
+    bank_post: dict[str, str] | None = None,
+    pair_validated: bool = False,
 ) -> dict[str, str]:
     row = {column: "" for column in MEASUREMENT_COLUMNS}
     for column in (
@@ -514,8 +563,26 @@ def profile_record(
             "error": measured.get("error", ""),
             "median_ms": measured.get("median_ms", ""),
             "stddev_ms": measured.get("stddev_ms", ""),
+            "pair_validated": str(int(pair_validated)),
         }
     )
+    if official_post is not None and bank_post is not None:
+        row.update(
+            {
+                "official_post_ms": official_post.get("median_ms", ""),
+                "bank_post_ms": bank_post.get("median_ms", ""),
+                "official_drift_pct": (
+                    f"{baseline_drift_pct(official, official_post):.12g}"
+                    if official is not None
+                    else ""
+                ),
+                "bank_drift_pct": (
+                    f"{baseline_drift_pct(bank, bank_post):.12g}"
+                    if bank is not None
+                    else ""
+                ),
+            }
+        )
     if (
         source.get("candidate_role") == "searched"
         and official is not None
@@ -568,7 +635,9 @@ def summarize(
         ]
         successful = [
             row for row in measured
-            if row is not None and truthy(row.get("success"))
+            if row is not None
+            and truthy(row.get("success"))
+            and measurement_reusable(row)
         ]
         rejected = sum(row is not None and not truthy(row.get("success")) for row in measured)
         def paired_ratio(row: dict[str, str]) -> tuple[float, float]:
@@ -652,6 +721,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=50)
     parser.add_argument("--samples", type=int, default=15)
+    parser.add_argument("--numeric-preflight-max-mib", type=int, default=256)
+    parser.add_argument("--baseline-drift-pct", type=float, default=3.0)
     return parser.parse_args()
 
 
@@ -667,7 +738,11 @@ def main() -> None:
     }
     searched = [row for row in rows if row["candidate_role"] == "searched"]
     existing = read_csv(args.resume) if args.resume.is_file() else []
-    records = {row["record_id"]: row for row in existing}
+    records = {
+        row["record_id"]: row
+        for row in existing
+        if measurement_reusable(row)
+    }
     run_id = time.strftime("%Y%m%d_%H%M%S")
 
     with tempfile.TemporaryDirectory(
@@ -694,7 +769,8 @@ def main() -> None:
             f"profile_plan: workloads={len(by_workload)} "
             f"searched_candidates={len(searched)} "
             f"npu_searched_pending={pending_total} "
-            f"resume_exact={len(records)} paired_measurement=1"
+            f"resume_exact={len(records)} "
+            "paired_measurement=pre_post numeric_preflight=full"
         )
 
         for workload_id, workload_rows in by_workload.items():
@@ -726,6 +802,8 @@ def main() -> None:
                 args.warmup,
                 args.repeat,
                 args.samples,
+                args.numeric_preflight_max_mib,
+                True,
             )
             if not truthy(official.get("success")):
                 raise ProfileError(
@@ -749,15 +827,16 @@ def main() -> None:
                 args.warmup,
                 args.repeat,
                 args.samples,
+                args.numeric_preflight_max_mib,
+                True,
             )
             if not truthy(bank.get("success")):
                 raise ProfileError(
                     f"{workload_id}: bank control failed: {bank.get('error')}"
                 )
-            print(
-                f"PAIR_REFERENCE {workload_id} "
-                f"official_ms={official['median_ms']} bank_ms={bank['median_ms']}"
-            )
+            pending_measurements: list[
+                tuple[dict[str, str], dict[str, str], str]
+            ] = []
             for index, candidate in enumerate(pending, 1):
                 record_id = measurement_key(
                     args.soc, args.aic, args.toolkit, candidate
@@ -777,6 +856,8 @@ def main() -> None:
                         args.warmup,
                         args.repeat,
                         args.samples,
+                        args.numeric_preflight_max_mib,
+                        True,
                     )
                 except Exception as exception:
                     measured = {
@@ -787,7 +868,7 @@ def main() -> None:
                         "median_ms": "",
                         "stddev_ms": "",
                     }
-                record = profile_record(
+                provisional = profile_record(
                     candidate,
                     measured,
                     record_id=record_id,
@@ -798,16 +879,117 @@ def main() -> None:
                     official=official,
                     bank=bank,
                 )
-                records[record_id] = record
+                provisional["preflight_mode"] = (
+                    measured.get("preflight_mode", "")
+                    if not truthy(measured.get("success"))
+                    else "provisional"
+                )
+                records[record_id] = provisional
+                pending_measurements.append(
+                    (candidate, measured, record_id)
+                )
                 write_csv(
                     args.resume,
                     MEASUREMENT_COLUMNS,
                     list(records.values()),
                 )
+
+            official_post = run_runner(
+                args.runner,
+                args.candidates,
+                workload_id,
+                official_env,
+                pair_dir / "official_post",
+                args.timeout,
+                args.warmup,
+                args.repeat,
+                args.samples,
+                args.numeric_preflight_max_mib,
+                True,
+            )
+            bank_post = run_runner(
+                args.runner,
+                args.candidates,
+                workload_id,
+                bank_env,
+                pair_dir / "bank_runner_post",
+                args.timeout,
+                args.warmup,
+                args.repeat,
+                args.samples,
+                args.numeric_preflight_max_mib,
+                True,
+            )
+            if not truthy(official_post.get("success")):
+                raise ProfileError(
+                    f"{workload_id}: post official baseline failed: "
+                    f"{official_post.get('error')}"
+                )
+            if not truthy(bank_post.get("success")):
+                raise ProfileError(
+                    f"{workload_id}: post bank control failed: "
+                    f"{bank_post.get('error')}"
+                )
+            official_drift = baseline_drift_pct(official, official_post)
+            bank_drift = baseline_drift_pct(bank, bank_post)
+            pair_valid = (
+                official_drift <= args.baseline_drift_pct
+                and bank_drift <= args.baseline_drift_pct
+            )
+            print(
+                f"PAIR_REFERENCE {workload_id} "
+                f"official_ms={official['median_ms']}/"
+                f"{official_post['median_ms']} "
+                f"bank_ms={bank['median_ms']}/{bank_post['median_ms']} "
+                f"drift_pct={official_drift:.6g}/{bank_drift:.6g} "
+                f"validated={int(pair_valid)}"
+            )
+            if not pair_valid:
+                discarded = 0
+                for _, measured, record_id in pending_measurements:
+                    if truthy(measured.get("success")):
+                        records.pop(record_id, None)
+                        discarded += 1
+                write_csv(
+                    args.resume,
+                    MEASUREMENT_COLUMNS,
+                    list(records.values()),
+                )
+                print(
+                    f"PAIR_INVALID {workload_id} "
+                    f"threshold_pct={args.baseline_drift_pct:.6g} "
+                    f"successful_candidates_discarded={discarded}"
+                )
+                continue
+
+            official_reference = conservative_reference(
+                official, official_post
+            )
+            bank_reference = conservative_reference(bank, bank_post)
+            for index, (candidate, measured, record_id) in enumerate(
+                pending_measurements, 1
+            ):
+                record = profile_record(
+                    candidate,
+                    measured,
+                    record_id=record_id,
+                    run_id=run_id,
+                    soc=args.soc,
+                    aic=args.aic,
+                    toolkit=args.toolkit,
+                    official=official_reference,
+                    bank=bank_reference,
+                    official_post=official_post,
+                    bank_post=bank_post,
+                    pair_validated=True,
+                )
+                record["official_drift_pct"] = f"{official_drift:.12g}"
+                record["bank_drift_pct"] = f"{bank_drift:.12g}"
+                records[record_id] = record
+                metrics = json.loads(
+                    candidate.get("search_behavior_metrics") or "{}"
+                )
                 if truthy(record["success"]):
-                    metrics = json.loads(
-                        candidate.get("search_behavior_metrics") or "{}"
-                    )
                     print(
                         f"candidate_done [{index}/{len(pending)}] "
                         f"{workload_id} rank={candidate['rank']} "
@@ -824,9 +1006,6 @@ def main() -> None:
                         f"signature={candidate['tiling_signature']}"
                     )
                 else:
-                    metrics = json.loads(
-                        candidate.get("search_behavior_metrics") or "{}"
-                    )
                     print(
                         f"candidate_rejected [{index}/{len(pending)}] "
                         f"{workload_id} rank={candidate['rank']} "
@@ -836,6 +1015,11 @@ def main() -> None:
                         f"signature={candidate['tiling_signature']} "
                         f"reason={record['error'][:240]}"
                     )
+            write_csv(
+                args.resume,
+                MEASUREMENT_COLUMNS,
+                list(records.values()),
+            )
 
     summaries = summarize(
         rows, records, args.soc, args.aic, args.toolkit

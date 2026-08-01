@@ -163,7 +163,7 @@ CAMPAIGN_SUMMARY="${ROOT}/results/npu_full_campaign_incumbents.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260731-net15-campaign-incumbents"
+echo "  script:     run_npu.sh 20260801-strict-numeric-paired-v1"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      independent_contract_behavior_search"
 echo "  mode:       ${MODE}"
@@ -341,7 +341,9 @@ profile_stage() {
         --timeout "${PROFILE_TIMEOUT_SEC:-120}" \
         --warmup "${WARMUP:-10}" \
         --repeat "${REPEAT:-50}" \
-        --samples "${SAMPLES:-15}"
+        --samples "${SAMPLES:-15}" \
+        --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-256}" \
+        --baseline-drift-pct "${BASELINE_DRIFT_PCT:-3}"
 }
 
 echo "[3a/4] Generate feedback stage 1 (${STAGE1_NPU_CANDIDATES} candidates/workload) ..."

@@ -195,6 +195,7 @@ def load_feedback(
                             "status_vs_official", ""
                         ),
                         status_vs_bank=row.get("status_vs_bank", ""),
+                        verified=_truthy(row.get("verified")),
                     )
                 )
                 exclusions.add(fingerprint(workload, schedule))
@@ -279,6 +280,11 @@ def load_feedback(
                         official, row
                     ),
                     status_vs_bank=_comparison_status(bank, row),
+                    verified=(
+                        _truthy(row.get("pair_validated"))
+                        and row.get("preflight_mode")
+                        == "numeric_ones_full_v2"
+                    ),
                 )
             )
     unique: dict[
@@ -307,7 +313,7 @@ def feedback_targets(
             observation
             for observation in observations
             if observation.workload.identity() != workload.identity()
-            and observation.is_winner
+            and observation.is_verified_winner
             and not _runtime_rejected(observation)
         ),
         key=lambda observation: (
@@ -524,6 +530,55 @@ def feedback_mutations(
                 parent=observation.schedule.signature(),
             )
         )
+    return candidates
+
+
+def incumbent_revalidations(
+    workload: Workload,
+    hardware: Hardware,
+    observations: Sequence[MeasuredObservation],
+    *,
+    limit: int = 1,
+) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    seen: set[tuple[int, ...]] = set()
+    provisional = sorted(
+        (
+            observation
+            for observation in observations
+            if observation.workload.identity() == workload.identity()
+            and observation.is_winner
+            and not observation.verified
+            and not _runtime_rejected(observation)
+        ),
+        key=lambda observation: (
+            observation.measured_ratio,
+            observation.schedule.signature(),
+        ),
+    )
+    for observation in provisional:
+        signature = observation.schedule.signature()
+        if signature in seen:
+            continue
+        seen.add(signature)
+        if not validate_schedule(
+            workload, observation.schedule, hardware
+        ).valid:
+            continue
+        candidates.append(
+            Candidate(
+                schedule=observation.schedule,
+                template=template_of(observation.schedule),
+                source="feedback_incumbent_revalidation",
+                rationale=(
+                    "revalidate historical winner with full numeric "
+                    "preflight and pre/post paired baselines"
+                ),
+                parent_signatures=(signature,),
+            )
+        )
+        if len(candidates) >= limit:
+            break
     return candidates
 
 

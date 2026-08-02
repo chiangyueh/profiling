@@ -330,7 +330,7 @@ class ContractSearchTest(unittest.TestCase):
             workload, candidates, observations, 24
         )
         self.assertEqual(plan.state, "clear_template_leader")
-        self.assertEqual(plan.budget, 12)
+        self.assertEqual(plan.budget, 16)
         self.assertGreater(
             plan.template_quotas[leader],
             min(

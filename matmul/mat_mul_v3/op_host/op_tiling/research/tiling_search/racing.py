@@ -190,7 +190,10 @@ def plan_template_race(
         state = "balanced_cold_start"
         exploration_floor = max(1, budget // max(1, len(templates)))
     elif clear_winner:
-        budget = min(max_budget, max(12, 2 * len(templates)))
+        # Stage 1 measures 16 schedules. Retain at least 16 stage-2
+        # schedules so a stopped race still supplies the promised 32-point
+        # NPU experiment while avoiding the full 40 when evidence is decisive.
+        budget = min(max_budget, max(16, 2 * len(templates)))
         state = "clear_template_leader"
         exploration_floor = 1
     else:

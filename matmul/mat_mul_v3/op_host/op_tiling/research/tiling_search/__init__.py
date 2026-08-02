@@ -14,6 +14,7 @@ from .domain import (
     Workload,
 )
 from .orchestrator import CandidateEngine, SearchConfig
+from .one_shot import OneShotDecision, select_one_shot_candidate
 from .racing import RacingPlan, TemplateEvidence, plan_template_race
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "GenerationBudget",
     "Hardware",
     "MeasuredObservation",
+    "OneShotDecision",
     "RacingPlan",
     "Schedule",
     "SearchConfig",
@@ -33,4 +35,5 @@ __all__ = [
     "TemplateEvidence",
     "Workload",
     "plan_template_race",
+    "select_one_shot_candidate",
 ]

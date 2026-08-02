@@ -152,23 +152,20 @@ exec > >(tee -a "${RUN_LOG}") 2>&1
 BUILD_DIR="${ROOT}/.build/matmul_v3_tiling_research"
 CANDIDATES="${ROOT}/results/npu_full_search_candidates.csv"
 ALL_CANDIDATES="${ROOT}/results/npu_full_search_all.csv"
-STAGE1_CANDIDATES="${ROOT}/results/npu_full_stage1_search_candidates.csv"
-STAGE1_ALL_CANDIDATES="${ROOT}/results/npu_full_stage1_search_all.csv"
-STAGE1_SUMMARY="${ROOT}/results/npu_full_stage1_summary.csv"
-STAGE1_RESULTS="${ROOT}/results/npu_full_stage1_candidates.csv"
 SUMMARY="${ROOT}/results/npu_full_summary.csv"
+FAMILY_SUMMARY="${ROOT}/results/npu_full_family_summary.csv"
 CANDIDATE_RESULTS="${ROOT}/results/npu_full_candidates.csv"
 RESUME="${ROOT}/results/npu_full_resume.csv"
-CAMPAIGN_SUMMARY="${ROOT}/results/npu_full_campaign_incumbents.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260802-balanced-risk-aware-racing-v2"
+echo "  script:     run_npu.sh 20260802-one-shot-generalization-v1"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      independent_contract_behavior_search"
+echo "  scope:      one_shot_contract_model_selection"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  summary:    ${SUMMARY}"
+echo "  families:   ${FAMILY_SUMMARY}"
 echo "  candidates: ${CANDIDATE_RESULTS}"
 echo "  resume:     ${RESUME}"
 echo "  log:        ${RUN_LOG}"
@@ -284,29 +281,17 @@ if [[ "${TOOLKIT_VERSION}" != 8.5* ]]; then
     echo "  compatibility: exact callback roundtrip and RuntimeKb preflight remain mandatory"
 fi
 
-NPU_CANDIDATES="${NPU_CANDIDATES:-40}"
+NPU_CANDIDATES=1
+CALLBACK_CANDIDATES=192
+BEHAVIOR_CANDIDATES=512
 if [[ "${MODE}" == "smoke" ]]; then
-    NPU_CANDIDATES=4
+    CALLBACK_CANDIDATES=48
+    BEHAVIOR_CANDIDATES=128
 fi
-if ((NPU_CANDIDATES < 2)); then
-    echo "fatal: two-stage search requires at least 2 NPU candidates" >&2
-    exit 2
-fi
-if [[ "${MODE}" == "smoke" ]]; then
-    STAGE1_NPU_CANDIDATES=2
-else
-    STAGE1_NPU_CANDIDATES=$((NPU_CANDIDATES * 2 / 5))
-    ((STAGE1_NPU_CANDIDATES > 0)) || STAGE1_NPU_CANDIDATES=1
-fi
-STAGE2_NPU_CANDIDATES=$((NPU_CANDIDATES - STAGE1_NPU_CANDIDATES))
 
-generate_stage() {
+generate_candidates() {
     local output="$1"
     local all_output="$2"
-    local count="$3"
-    local append="${4:-}"
-    local skip_validation="${5:-0}"
-    local search_stage="${6:-stage1}"
     local command=(
         python3 "${RESEARCH}/generate.py"
         --workloads "${WORKLOADS}"
@@ -330,24 +315,20 @@ generate_stage() {
         --observations "${RESEARCH}/config/measured_observations_net_log17.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log18.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log19.csv"
+        --observations "${RESEARCH}/config/measured_observations_net_log21.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log14.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log15.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log17.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log18.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log19.csv"
+        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log21.csv"
         --resume-feedback "${RESUME}"
-        --npu-candidates "${count}"
-        --callback-candidates 48
-        --behavior-candidates 320
-        --search-stage "${search_stage}"
+        --npu-candidates "${NPU_CANDIDATES}"
+        --callback-candidates "${CALLBACK_CANDIDATES}"
+        --behavior-candidates "${BEHAVIOR_CANDIDATES}"
+        --selection-mode one-shot
     )
-    if [[ -n "${append}" ]]; then
-        command+=(--append-candidates "${append}")
-    fi
-    if [[ "${skip_validation}" == "1" ]]; then
-        command+=(--skip-model-validation)
-    fi
     "${command[@]}"
 }
 
@@ -358,6 +339,7 @@ profile_stage() {
     python3 "${RESEARCH}/profile.py" \
         --candidates "${candidates}" \
         --summary "${summary}" \
+        --family-summary "${FAMILY_SUMMARY}" \
         --candidate-results "${results}" \
         --resume "${RESUME}" \
         --runner "${RUNNER}" \
@@ -374,62 +356,24 @@ profile_stage() {
         --baseline-samples "${BASELINE_SAMPLES:-9}" \
         --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-256}" \
         --baseline-drift-pct "${BASELINE_DRIFT_PCT:-3}" \
-        --pair-block-size "${PAIR_BLOCK_SIZE:-2}"
+        --pair-block-size 1
 }
 
-echo "[3a/4] Generate feedback stage 1 (${STAGE1_NPU_CANDIDATES} candidates/workload) ..."
-generate_stage \
-    "${STAGE1_CANDIDATES}" \
-    "${STAGE1_ALL_CANDIDATES}" \
-    "${STAGE1_NPU_CANDIDATES}" \
-    "" \
-    "1" \
-    "stage1"
+echo "[3/4] Generate one custom tiling per workload ..."
+generate_candidates "${CANDIDATES}" "${ALL_CANDIDATES}"
 echo "  ok"
 
-echo "[4a/4] Measure feedback stage 1 with paired baselines ..."
-profile_stage \
-    "${STAGE1_CANDIDATES}" \
-    "${STAGE1_SUMMARY}" \
-    "${STAGE1_RESULTS}"
-echo "  ok"
-
-echo "[3b/4] Expand from stage-1 NPU feedback (${STAGE2_NPU_CANDIDATES} new candidates/workload) ..."
-generate_stage \
-    "${CANDIDATES}" \
-    "${ALL_CANDIDATES}" \
-    "${STAGE2_NPU_CANDIDATES}" \
-    "${STAGE1_CANDIDATES}" \
-    "0" \
-    "stage2"
-echo "  ok"
-
-echo "[4b/4] Measure only new exact schedules and summarize both stages ..."
+echo "[4/4] Measure one-shot custom tiling against original MatMulV3 ..."
 profile_stage \
     "${CANDIDATES}" \
     "${SUMMARY}" \
     "${CANDIDATE_RESULTS}"
 echo "  ok"
 
-python3 "${RESEARCH}/campaign_report.py" \
-    --workloads "${WORKLOADS}" \
-    --output "${CAMPAIGN_SUMMARY}" \
-    --resume "${RESUME}" \
-    --soc "${SOC}" \
-    --aic "${AIC}" \
-    --toolkit "${TOOLKIT_VERSION}" \
-    --observations "${RESEARCH}/config/measured_observations.csv" \
-    --observations "${RESEARCH}/config/measured_observations_net_log11.csv" \
-    --observations "${RESEARCH}/config/measured_observations_net_log14.csv" \
-    --observations "${RESEARCH}/config/measured_observations_net_log15.csv" \
-    --observations "${RESEARCH}/config/measured_observations_net_log17.csv" \
-    --observations "${RESEARCH}/config/measured_observations_net_log18.csv" \
-    --observations "${RESEARCH}/config/measured_observations_net_log19.csv"
-
 echo
 echo "NPU run completed"
 echo "  Summary:    ${SUMMARY}"
+echo "  Families:   ${FAMILY_SUMMARY}"
 echo "  Candidates: ${CANDIDATE_RESULTS}"
 echo "  Resume:     ${RESUME}"
-echo "  Campaign:   ${CAMPAIGN_SUMMARY}"
 echo "  log:        ${RUN_LOG}"

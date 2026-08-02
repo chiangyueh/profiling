@@ -843,6 +843,7 @@ class FeedbackCostModel:
         exclude_workload: (
             tuple[int, int, int, str, bool, bool, int] | None
         ) = None,
+        cross_workload_latency_weight: float = 0.15,
     ) -> FeedbackPrediction:
         workload_identity = workload.identity()
         cache_key = (
@@ -850,7 +851,11 @@ class FeedbackCostModel:
             vector.categories,
             vector.values,
         )
-        cacheable = not exclude_keys and exclude_workload is None
+        cacheable = (
+            not exclude_keys
+            and exclude_workload is None
+            and cross_workload_latency_weight == 0.15
+        )
         if cacheable and cache_key in self._prediction_cache:
             self._prediction_cache.move_to_end(cache_key)
             return self._prediction_cache[cache_key]
@@ -1013,7 +1018,8 @@ class FeedbackCostModel:
             # Keep cross-workload latency as a weak prior rather than allowing
             # it to dominate an unseen workload's exploitation budget.
             latency_ratio = math.exp(
-                0.15 * math.log(max(0.1, latency_ratio))
+                max(0.0, min(1.0, cross_workload_latency_weight))
+                * math.log(max(0.1, latency_ratio))
             )
             latency_support = min(latency_support, 0.15)
             latency_uncertainty = max(latency_uncertainty, 0.80)

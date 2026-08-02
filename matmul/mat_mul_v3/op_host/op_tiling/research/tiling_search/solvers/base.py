@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 
+from ..contracts import ceil_div
 from ..domain import BehaviorTarget, Hardware, Schedule, Template, Workload
 from .common import (
     l1_variants,
@@ -31,14 +32,27 @@ class BaseSolver:
                 db_b,
                 db_c,
             ) in enumerate(specs):
-                geometries = partition_geometries(
-                    workload, hardware, base_m, base_n, targets
-                )
-                if not geometries:
-                    continue
-                single_m, single_n, cores = geometries[
-                    (index + variant_round) % len(geometries)
-                ]
+                if variant_round == 0:
+                    single_m = base_m
+                    single_n = base_n
+                    output_tasks = (
+                        ceil_div(workload.m, single_m)
+                        * ceil_div(workload.n, single_n)
+                    )
+                    cores = min(
+                        workload.max_cores,
+                        hardware.aic_cores,
+                        output_tasks,
+                    )
+                else:
+                    geometries = partition_geometries(
+                        workload, hardware, base_m, base_n, targets
+                    )
+                    if not geometries:
+                        continue
+                    single_m, single_n, cores = geometries[
+                        (index + variant_round - 1) % len(geometries)
+                    ]
                 l1 = l1_variants(
                     workload,
                     hardware,

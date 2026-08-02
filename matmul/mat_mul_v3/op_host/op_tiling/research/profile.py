@@ -15,6 +15,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from tiling_search.domain import Workload
+from tiling_search.families import classify_workload
+
 
 KNOWLEDGE_COLUMNS = {
     "usedCoreNum": "used_core_num",
@@ -96,6 +99,12 @@ SUMMARY_COLUMNS = [
     "dtype",
     "trans_a",
     "trans_b",
+    "shape_family",
+    "geometry_family",
+    "reduction_family",
+    "parallelism_family",
+    "alignment_family",
+    "layout_family",
     "searched",
     "successful",
     "runtime_rejected",
@@ -112,6 +121,29 @@ SUMMARY_COLUMNS = [
     "status_vs_bank",
     "optimization_result",
 ]
+
+FAMILY_SUMMARY_COLUMNS = [
+    "axis",
+    "family",
+    "workloads",
+    "measured",
+    "improved",
+    "not_improved",
+    "runtime_rejected",
+    "geomean_speedup_vs_official",
+    "geomean_speedup_vs_bank",
+    "min_speedup_vs_official",
+    "max_speedup_vs_official",
+]
+
+FAMILY_AXES = {
+    "geometry": "geometry_family",
+    "reduction": "reduction_family",
+    "parallelism": "parallelism_family",
+    "alignment": "alignment_family",
+    "dtype": "dtype",
+    "layout": "layout_family",
+}
 
 
 class ProfileError(RuntimeError):
@@ -668,6 +700,20 @@ def summarize(
 
         best = min(successful, key=paired_ratio, default=None)
         source = rows[0]
+        workload = Workload(
+            workload_id=workload_id,
+            m=int(source["m"]),
+            n=int(source["n"]),
+            k=int(source["k"]),
+            dtype=source["dtype"],
+            trans_a=truthy(source["trans_a"]),
+            trans_b=truthy(source["trans_b"]),
+            max_cores=min(
+                int(source.get("max_cores") or aic),
+                aic,
+            ),
+        )
+        strata = classify_workload(workload, aic)
         summary = {column: "" for column in SUMMARY_COLUMNS}
         summary.update(
             {
@@ -678,6 +724,12 @@ def summarize(
                 "dtype": source["dtype"],
                 "trans_a": source["trans_a"],
                 "trans_b": source["trans_b"],
+                "shape_family": strata.composite,
+                "geometry_family": strata.geometry,
+                "reduction_family": strata.reduction,
+                "parallelism_family": strata.parallelism,
+                "alignment_family": strata.alignment,
+                "layout_family": strata.layout,
                 "searched": str(len(rows)),
                 "successful": str(len(successful)),
                 "runtime_rejected": str(rejected),
@@ -710,7 +762,8 @@ def summarize(
         summaries.append(summary)
         print(
             "WORKLOAD_RESULT "
-            f"{workload_id} best_rank={summary['best_rank'] or 'none'} "
+            f"{workload_id} family={summary['shape_family']} "
+            f"best_rank={summary['best_rank'] or 'none'} "
             f"best_ms={summary['best_ms'] or 'NA'} "
             f"official_ms={summary['official_ms'] or 'NA'} "
             f"bank_ms={summary['bank_ms'] or 'NA'} "
@@ -721,10 +774,83 @@ def summarize(
     return summaries
 
 
+def summarize_families(
+    summaries: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    family_rows: list[dict[str, str]] = []
+    for axis, column in FAMILY_AXES.items():
+        groups: dict[str, list[dict[str, str]]] = {}
+        for row in summaries:
+            groups.setdefault(row[column], []).append(row)
+        for family, rows in sorted(groups.items()):
+            measured = [
+                row
+                for row in rows
+                if row.get("speedup_vs_official")
+                and row.get("speedup_vs_bank")
+            ]
+            official_speedups = [
+                float(row["speedup_vs_official"])
+                for row in measured
+            ]
+            bank_speedups = [
+                float(row["speedup_vs_bank"])
+                for row in measured
+            ]
+
+            def geomean(values: list[float]) -> str:
+                if not values or any(value <= 0 for value in values):
+                    return ""
+                return f"{math.exp(sum(math.log(value) for value in values) / len(values)):.12g}"
+
+            family_rows.append(
+                {
+                    "axis": axis,
+                    "family": family,
+                    "workloads": str(len(rows)),
+                    "measured": str(len(measured)),
+                    "improved": str(
+                        sum(
+                            row["optimization_result"] == "improved"
+                            for row in rows
+                        )
+                    ),
+                    "not_improved": str(
+                        sum(
+                            row["optimization_result"] == "not_improved"
+                            for row in rows
+                        )
+                    ),
+                    "runtime_rejected": str(
+                        sum(
+                            int(row.get("runtime_rejected") or 0)
+                            for row in rows
+                        )
+                    ),
+                    "geomean_speedup_vs_official": geomean(
+                        official_speedups
+                    ),
+                    "geomean_speedup_vs_bank": geomean(bank_speedups),
+                    "min_speedup_vs_official": (
+                        f"{min(official_speedups):.12g}"
+                        if official_speedups
+                        else ""
+                    ),
+                    "max_speedup_vs_official": (
+                        f"{max(official_speedups):.12g}"
+                        if official_speedups
+                        else ""
+                    ),
+                }
+            )
+    return family_rows
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--summary", type=Path, required=True)
+    parser.add_argument("--family-summary", type=Path)
     parser.add_argument("--candidate-results", type=Path, required=True)
     parser.add_argument("--resume", type=Path, required=True)
     parser.add_argument("--runner", type=Path, required=True)
@@ -1086,7 +1212,14 @@ def main() -> None:
     summaries = summarize(
         rows, records, args.soc, args.aic, args.toolkit
     )
+    family_summaries = summarize_families(summaries)
     write_csv(args.summary, SUMMARY_COLUMNS, summaries)
+    if args.family_summary is not None:
+        write_csv(
+            args.family_summary,
+            FAMILY_SUMMARY_COLUMNS,
+            family_summaries,
+        )
     write_csv(
         args.candidate_results,
         MEASUREMENT_COLUMNS,
@@ -1107,6 +1240,22 @@ def main() -> None:
         f"not_improved={not_improved} "
         f"other={len(summaries) - improved - not_improved}"
     )
+    print("FAMILY_RESULT_BEGIN")
+    for row in family_summaries:
+        print(
+            f"FAMILY_RESULT axis={row['axis']} family={row['family']} "
+            f"workloads={row['workloads']} measured={row['measured']} "
+            f"improved={row['improved']} "
+            f"not_improved={row['not_improved']} "
+            f"runtime_rejected={row['runtime_rejected']} "
+            "geomean_speedup="
+            f"{row['geomean_speedup_vs_official'] or 'NA'} "
+            "geomean_speedup_vs_bank="
+            f"{row['geomean_speedup_vs_bank'] or 'NA'} "
+            f"range={row['min_speedup_vs_official'] or 'NA'}/"
+            f"{row['max_speedup_vs_official'] or 'NA'}"
+        )
+    print("FAMILY_RESULT_END")
     print(
         f"profile_npu completed summary={args.summary} "
         f"candidates={args.candidate_results} resume={args.resume}"

@@ -22,9 +22,11 @@ from tiling_search import (
     SearchConfig,
     Workload,
     plan_template_race,
+    select_one_shot_candidate,
 )
 from tiling_search.domain import KNOWLEDGE_FIELDS, Candidate, Schedule
 from tiling_search.behavior import (
+    FeedbackCostModel,
     select_behavior_coverage,
     validate_feedback_model,
 )
@@ -375,6 +377,11 @@ def parse_args() -> argparse.Namespace:
         choices=("stage1", "stage2"),
         default="stage1",
     )
+    parser.add_argument(
+        "--selection-mode",
+        choices=("campaign", "one-shot"),
+        default="campaign",
+    )
     return parser.parse_args()
 
 
@@ -413,6 +420,26 @@ def main() -> None:
         )
         observations.extend(resume_observations)
         exclusions.update(resume_exclusions)
+    if args.selection_mode == "one-shot":
+        # A deployment decision must not learn from an earlier measurement of
+        # the target shape. This also makes a resumed run regenerate the same
+        # fingerprint so profile.py can reuse its exact completed measurement.
+        target_identities = {
+            workload.identity() for workload in workloads
+        }
+        target_prefixes = {
+            identity[:6] for identity in target_identities
+        }
+        observations = [
+            observation
+            for observation in observations
+            if observation.workload.identity() not in target_identities
+        ]
+        exclusions = {
+            item
+            for item in exclusions
+            if item[:6] not in target_prefixes
+        }
     latency_observations = sum(
         observation.source != "runtime_rejected"
         for observation in observations
@@ -452,6 +479,9 @@ def main() -> None:
                 f"{validation.analytical_pairwise_accuracy:.6g} "
                 "validation_only=1"
             )
+    engine_observations = (
+        () if args.selection_mode == "one-shot" else observations
+    )
     engine = CandidateEngine(
         config=SearchConfig(
             budget=GenerationBudget(
@@ -462,8 +492,13 @@ def main() -> None:
                 npu_candidates=args.npu_candidates,
             )
         ),
-        observations=observations,
+        observations=engine_observations,
         exclusions=exclusions,
+    )
+    one_shot_cost_model = (
+        FeedbackCostModel(observations, hardware)
+        if args.selection_mode == "one-shot"
+        else None
     )
 
     output_rows: list[dict[str, str]] = []
@@ -533,7 +568,18 @@ def main() -> None:
         callback_candidates = [
             candidate for candidate, _ in callback_accepted
         ]
-        if args.search_stage == "stage2":
+        one_shot_decision = None
+        if args.selection_mode == "one-shot":
+            one_shot_decision = select_one_shot_candidate(
+                workload,
+                callback_candidates,
+                observations,
+                hardware,
+                cost_model=one_shot_cost_model,
+            )
+            selected_candidates = [one_shot_decision.candidate]
+            racing_plan = None
+        elif args.search_stage == "stage2":
             racing_plan = plan_template_race(
                 workload,
                 callback_candidates,
@@ -609,28 +655,48 @@ def main() -> None:
             f"draft_pool={result.draft_candidates} "
             f"excluded={result.excluded_fingerprints} solvers={reports}"
         )
-        evidence = ",".join(
-            (
-                f"{item.template.value}:{item.samples}:"
-                f"{item.best_ratio:.6g}:{item.robust_ratio:.6g}:"
-                f"{item.winners}"
+        if one_shot_decision is not None:
+            selected = one_shot_decision.candidate
+            metrics = selected.metrics
+            print(
+                "ONE_SHOT_DECISION "
+                f"{workload.workload_id} template={selected.template.value} "
+                f"evaluated={one_shot_decision.evaluated} "
+                f"safe={one_shot_decision.safe_candidates} "
+                f"direct_base={one_shot_decision.direct_base_candidates} "
+                "transfer_eligible="
+                f"{one_shot_decision.transfer_eligible_candidates} "
+                f"score={selected.acquisition:.6g} "
+                "predicted_ratio="
+                f"{metrics.get('predicted_latency_ratio', 1.0):.6g} "
+                "runtime_risk="
+                f"{metrics.get('runtime_risk_score', 0.5):.6g} "
+                f"signature={selected.schedule.signature_text()}"
             )
-            for item in racing_plan.evidence
-        ) or "none"
-        quotas = ",".join(
-            f"{template.value}:{quota}"
-            for template, quota in sorted(
-                racing_plan.template_quotas.items(),
-                key=lambda item: item[0].value,
+            expected_candidates = 1
+        else:
+            evidence = ",".join(
+                (
+                    f"{item.template.value}:{item.samples}:"
+                    f"{item.best_ratio:.6g}:{item.robust_ratio:.6g}:"
+                    f"{item.winners}"
+                )
+                for item in racing_plan.evidence
+            ) or "none"
+            quotas = ",".join(
+                f"{template.value}:{quota}"
+                for template, quota in sorted(
+                    racing_plan.template_quotas.items(),
+                    key=lambda item: item[0].value,
+                )
             )
-        )
-        print(
-            "TEMPLATE_RACE "
-            f"{workload.workload_id} state={racing_plan.state} "
-            f"budget={racing_plan.budget}/{args.npu_candidates} "
-            f"quotas={quotas or 'none'} evidence={evidence}"
-        )
-        expected_candidates = racing_plan.budget
+            print(
+                "TEMPLATE_RACE "
+                f"{workload.workload_id} state={racing_plan.state} "
+                f"budget={racing_plan.budget}/{args.npu_candidates} "
+                f"quotas={quotas or 'none'} evidence={evidence}"
+            )
+            expected_candidates = racing_plan.budget
         if len(accepted) < expected_candidates:
             print(
                 f"SEARCH_CAPABILITY_GAP {workload.workload_id} "
@@ -638,7 +704,10 @@ def main() -> None:
             )
 
     appended = 0
-    if args.append_candidates is not None:
+    if (
+        args.append_candidates is not None
+        and args.selection_mode != "one-shot"
+    ):
         with args.append_candidates.open(
             newline="", encoding="utf-8"
         ) as source:

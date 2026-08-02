@@ -84,6 +84,16 @@ class ContractSearchTest(unittest.TestCase):
             {candidate.source for candidate in result.candidates},
             {"contract_global"},
         )
+        self.assertTrue(
+            any(
+                candidate.template == Template.BASE
+                and candidate.schedule["singleCoreM"]
+                == candidate.schedule["baseM"]
+                and candidate.schedule["singleCoreN"]
+                == candidate.schedule["baseN"]
+                for candidate in result.callback_candidates
+            )
+        )
         templates = Counter(
             candidate.template for candidate in result.callback_candidates
         )
@@ -106,7 +116,7 @@ class ContractSearchTest(unittest.TestCase):
             2,
         )
 
-    def test_external_v4_campaign_shapes_are_not_in_feedback(self) -> None:
+    def test_one_shot_shapes_are_not_in_feedback(self) -> None:
         config = RESEARCH / "config"
         with (config / "workloads.csv").open(
             newline="", encoding="utf-8"
@@ -136,7 +146,7 @@ class ContractSearchTest(unittest.TestCase):
                     )
                     for row in csv.DictReader(source)
                 )
-        self.assertEqual(len(workloads), 22)
+        self.assertEqual(len(workloads), 24)
         self.assertFalse(workloads.intersection(observed))
 
     def test_search_does_not_import_retired_candidate_paths(self) -> None:

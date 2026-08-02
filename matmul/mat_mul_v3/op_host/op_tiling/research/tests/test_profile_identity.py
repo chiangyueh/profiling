@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 RESEARCH = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(RESEARCH))
 SPEC = importlib.util.spec_from_file_location(
     "matmul_v3_research_profile", RESEARCH / "profile.py"
 )
@@ -128,6 +129,48 @@ class ProfileIdentityTest(unittest.TestCase):
         self.assertEqual(summary["best_rank"], "2")
         self.assertEqual(
             summary["best_source"], "feedback_winner_mutation"
+        )
+
+    def test_family_summary_reports_one_shot_speedups(self) -> None:
+        rows = [
+            {
+                "geometry_family": "balanced",
+                "reduction_family": "regular_k",
+                "parallelism_family": "multi_wave",
+                "alignment_family": "macro_aligned",
+                "layout_family": "NN",
+                "dtype": "fp16",
+                "optimization_result": "improved",
+                "runtime_rejected": "0",
+                "speedup_vs_official": "1.10",
+                "speedup_vs_bank": "1.05",
+            },
+            {
+                "geometry_family": "balanced",
+                "reduction_family": "regular_k",
+                "parallelism_family": "multi_wave",
+                "alignment_family": "tail",
+                "layout_family": "NN",
+                "dtype": "fp16",
+                "optimization_result": "not_improved",
+                "runtime_rejected": "0",
+                "speedup_vs_official": "0.90",
+                "speedup_vs_bank": "0.95",
+            },
+        ]
+        families = PROFILE.summarize_families(rows)
+        balanced = next(
+            row
+            for row in families
+            if row["axis"] == "geometry"
+            and row["family"] == "balanced"
+        )
+        self.assertEqual(balanced["workloads"], "2")
+        self.assertEqual(balanced["improved"], "1")
+        self.assertEqual(balanced["not_improved"], "1")
+        self.assertAlmostEqual(
+            float(balanced["geomean_speedup_vs_official"]),
+            (1.10 * 0.90) ** 0.5,
         )
 
     def test_resume_requires_full_numeric_and_paired_validation(self) -> None:

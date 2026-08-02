@@ -129,7 +129,30 @@ def plan_template_race(
     observations: Sequence[MeasuredObservation],
     max_budget: int,
 ) -> RacingPlan:
-    availability = Counter(candidate.template for candidate in candidates)
+    candidate_list = list(candidates)
+    generated_availability = Counter(
+        candidate.template for candidate in candidate_list
+    )
+    safe_availability = Counter(
+        candidate.template
+        for candidate in candidate_list
+        if not (
+            candidate.metrics.get("runtime_risk_score", 0.5) >= 0.75
+            and candidate.metrics.get("runtime_risk_support", 0.0) >= 0.25
+        )
+    )
+    # Runtime risk is learned from strict NPU preflight. Keep one uncertain
+    # probe per generated template, but let safer templates consume the rest
+    # of the budget instead of forcing quota-filling from known bad regions.
+    availability = Counter(
+        {
+            template: min(
+                count,
+                safe_availability[template] + 1,
+            )
+            for template, count in generated_availability.items()
+        }
+    )
     templates = tuple(sorted(availability, key=lambda item: item.value))
     evidence = _same_workload_evidence(workload, observations)
     evidence_by_template = {item.template: item for item in evidence}
@@ -162,17 +185,17 @@ def plan_template_race(
             )
         )
 
-    if clear_winner:
+    if not evidence:
+        budget = max_budget
+        state = "balanced_cold_start"
+        exploration_floor = max(1, budget // max(1, len(templates)))
+    elif clear_winner:
         budget = min(max_budget, max(12, 2 * len(templates)))
         state = "clear_template_leader"
         exploration_floor = 1
     else:
         budget = max_budget
-        state = (
-            "insufficient_paired_evidence"
-            if not evidence
-            else "templates_competitive"
-        )
+        state = "templates_competitive"
         exploration_floor = 2
 
     budget = min(budget, sum(availability.values()))

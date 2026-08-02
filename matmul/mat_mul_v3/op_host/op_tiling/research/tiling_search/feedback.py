@@ -524,7 +524,12 @@ def feedback_mutations(
         if observation.workload.identity() != workload.identity():
             continue
         if _runtime_rejected(observation):
-            source = "feedback_runtime_counterfactual"
+            # Runtime rejection is evidence for the executability model, not
+            # a useful mutation centre. net_log19 rejected 48/50 schedules
+            # generated around rejected parents, so expanding that
+            # neighbourhood spends NPU budget without supplying a meaningful
+            # counterfactual.
+            continue
         elif observation.is_winner:
             source = "feedback_winner_mutation"
         elif observation.is_regression:

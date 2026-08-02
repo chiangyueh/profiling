@@ -771,9 +771,25 @@ class FeedbackCostModel:
         ] = defaultdict(list)
         for item in self.evidence:
             by_workload[item.workload.identity()].append(item)
+        local_groups: dict[
+            tuple[
+                tuple[int, int, int, str, bool, bool, int],
+                str,
+            ],
+            list[_Evidence],
+        ] = defaultdict(list)
+        for workload, items in by_workload.items():
+            for item in items:
+                local_groups[
+                    (workload, str(item.vector.categories[0]))
+                ].append(item)
+        # BASE and split-K have different latency mechanisms. Fitting one
+        # same-workload regression across templates made broad template
+        # differences look predictive while providing almost no ordering
+        # signal inside BASE. Keep each local model template-specific.
         self.local_models = {
-            workload: model
-            for workload, items in by_workload.items()
+            key: model
+            for key, items in local_groups.items()
             if (model := _fit_local_model(items)) is not None
         }
         self._evidence_identities = tuple(
@@ -940,23 +956,24 @@ class FeedbackCostModel:
             latency_support = 0.0
 
         local_model = None
+        local_model_key = (
+            workload.identity(),
+            str(vector.categories[0]),
+        )
         if exclude_workload is None:
             if exclude_keys:
                 local_evidence = [
                     item
                     for item in self.evidence
                     if item.workload.identity() == workload.identity()
+                    and str(item.vector.categories[0])
+                    == str(vector.categories[0])
                     and (item.workload.identity(), item.signature)
                     not in exclude_keys
                 ]
                 local_model = _fit_local_model(local_evidence)
             else:
-                local_model = self.local_models.get(workload.identity())
-        if (
-            local_model is not None
-            and str(vector.categories[0]) not in local_model.templates
-        ):
-            local_model = None
+                local_model = self.local_models.get(local_model_key)
         if local_model is not None:
             local_ratio = local_model.predict(vector.values)
             extrapolation = local_model.extrapolation(vector.values)
@@ -1387,7 +1404,6 @@ def score_candidates(
         intervention_bonus = {
             "feedback_winner_mutation": 0.25,
             "feedback_regression_counterfactual": 0.15,
-            "feedback_runtime_counterfactual": 0.15,
         }.get(candidate.source, 0.0)
         # Behavior coverage supplies explicit exploration. The exploitation
         # ordering therefore treats unsupported predictions conservatively

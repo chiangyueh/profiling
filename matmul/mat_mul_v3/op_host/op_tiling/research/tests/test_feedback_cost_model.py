@@ -543,7 +543,7 @@ class FeedbackCostModelTest(unittest.TestCase):
             )
         self.assertEqual(len(selected), 6)
 
-    def test_runtime_rejection_generates_new_legal_counterfactuals(
+    def test_runtime_rejection_is_not_used_as_mutation_centre(
         self,
     ) -> None:
         rejected = MeasuredObservation(
@@ -562,17 +562,7 @@ class FeedbackCostModelTest(unittest.TestCase):
         mutations = feedback_mutations(
             self.workload, self.hardware, [rejected]
         )
-        self.assertTrue(mutations)
-        self.assertTrue(
-            all(
-                mutation.source == "feedback_runtime_counterfactual"
-                for mutation in mutations
-            )
-        )
-        self.assertNotIn(
-            rejected.schedule.signature(),
-            {mutation.schedule.signature() for mutation in mutations},
-        )
+        self.assertEqual(mutations, [])
 
     def test_campaign_summary_retains_prior_winner(self) -> None:
         winner = MeasuredObservation(

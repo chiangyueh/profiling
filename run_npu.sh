@@ -163,7 +163,7 @@ CAMPAIGN_SUMMARY="${ROOT}/results/npu_full_campaign_incumbents.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260802-adaptive-template-racing-v1"
+echo "  script:     run_npu.sh 20260802-balanced-risk-aware-racing-v2"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      independent_contract_behavior_search"
 echo "  mode:       ${MODE}"
@@ -329,11 +329,13 @@ generate_stage() {
         --observations "${RESEARCH}/config/measured_observations_net_log15.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log17.csv"
         --observations "${RESEARCH}/config/measured_observations_net_log18.csv"
+        --observations "${RESEARCH}/config/measured_observations_net_log19.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log14.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log15.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log17.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log18.csv"
+        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log19.csv"
         --resume-feedback "${RESUME}"
         --npu-candidates "${count}"
         --callback-candidates 48
@@ -372,7 +374,7 @@ profile_stage() {
         --baseline-samples "${BASELINE_SAMPLES:-9}" \
         --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-256}" \
         --baseline-drift-pct "${BASELINE_DRIFT_PCT:-3}" \
-        --pair-block-size "${PAIR_BLOCK_SIZE:-4}"
+        --pair-block-size "${PAIR_BLOCK_SIZE:-2}"
 }
 
 echo "[3a/4] Generate feedback stage 1 (${STAGE1_NPU_CANDIDATES} candidates/workload) ..."
@@ -421,7 +423,8 @@ python3 "${RESEARCH}/campaign_report.py" \
     --observations "${RESEARCH}/config/measured_observations_net_log14.csv" \
     --observations "${RESEARCH}/config/measured_observations_net_log15.csv" \
     --observations "${RESEARCH}/config/measured_observations_net_log17.csv" \
-    --observations "${RESEARCH}/config/measured_observations_net_log18.csv"
+    --observations "${RESEARCH}/config/measured_observations_net_log18.csv" \
+    --observations "${RESEARCH}/config/measured_observations_net_log19.csv"
 
 echo
 echo "NPU run completed"

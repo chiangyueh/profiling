@@ -1063,6 +1063,7 @@ def main() -> None:
                             f"tpl={candidate['search_template']} "
                             f"source={candidate['candidate_source']} "
                             f"ms={record['median_ms']} "
+                            f"signature={candidate['tiling_signature']} "
                             "action=retain_preflight_exclude_latency"
                         )
                     else:

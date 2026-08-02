@@ -533,7 +533,6 @@ def main() -> None:
         callback_candidates = [
             candidate for candidate, _ in callback_accepted
         ]
-        racing_plan = None
         if args.search_stage == "stage2":
             racing_plan = plan_template_race(
                 workload,
@@ -552,24 +551,21 @@ def main() -> None:
                 template_quotas=racing_plan.template_quotas,
             )
         else:
-            template_count = len(
-                {candidate.template for candidate in callback_candidates}
-            )
-            template_probe_floor = max(
-                1,
-                min(
-                    3,
-                    args.npu_candidates // max(1, template_count),
-                ),
+            racing_plan = plan_template_race(
+                workload,
+                callback_candidates,
+                (),
+                args.npu_candidates,
             )
             selected_candidates = select_behavior_coverage(
                 workload,
                 callback_candidates,
                 observations,
                 hardware,
-                args.npu_candidates,
+                racing_plan.budget,
                 probe_templates=True,
-                template_probe_floor=template_probe_floor,
+                template_probe_floor=1,
+                template_quotas=racing_plan.template_quotas,
                 allow_risky_template_probes=True,
             )
         accepted = [
@@ -613,33 +609,28 @@ def main() -> None:
             f"draft_pool={result.draft_candidates} "
             f"excluded={result.excluded_fingerprints} solvers={reports}"
         )
-        if racing_plan is not None:
-            evidence = ",".join(
-                (
-                    f"{item.template.value}:{item.samples}:"
-                    f"{item.best_ratio:.6g}:{item.robust_ratio:.6g}:"
-                    f"{item.winners}"
-                )
-                for item in racing_plan.evidence
-            ) or "none"
-            quotas = ",".join(
-                f"{template.value}:{quota}"
-                for template, quota in sorted(
-                    racing_plan.template_quotas.items(),
-                    key=lambda item: item[0].value,
-                )
+        evidence = ",".join(
+            (
+                f"{item.template.value}:{item.samples}:"
+                f"{item.best_ratio:.6g}:{item.robust_ratio:.6g}:"
+                f"{item.winners}"
             )
-            print(
-                "TEMPLATE_RACE "
-                f"{workload.workload_id} state={racing_plan.state} "
-                f"budget={racing_plan.budget}/{args.npu_candidates} "
-                f"quotas={quotas or 'none'} evidence={evidence}"
+            for item in racing_plan.evidence
+        ) or "none"
+        quotas = ",".join(
+            f"{template.value}:{quota}"
+            for template, quota in sorted(
+                racing_plan.template_quotas.items(),
+                key=lambda item: item[0].value,
             )
-        expected_candidates = (
-            racing_plan.budget
-            if racing_plan is not None
-            else args.npu_candidates
         )
+        print(
+            "TEMPLATE_RACE "
+            f"{workload.workload_id} state={racing_plan.state} "
+            f"budget={racing_plan.budget}/{args.npu_candidates} "
+            f"quotas={quotas or 'none'} evidence={evidence}"
+        )
+        expected_candidates = racing_plan.budget
         if len(accepted) < expected_candidates:
             print(
                 f"SEARCH_CAPABILITY_GAP {workload.workload_id} "

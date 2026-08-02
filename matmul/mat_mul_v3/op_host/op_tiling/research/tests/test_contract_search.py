@@ -106,7 +106,7 @@ class ContractSearchTest(unittest.TestCase):
             2,
         )
 
-    def test_external_v3_campaign_shapes_are_not_in_feedback(self) -> None:
+    def test_external_v4_campaign_shapes_are_not_in_feedback(self) -> None:
         config = RESEARCH / "config"
         with (config / "workloads.csv").open(
             newline="", encoding="utf-8"
@@ -401,6 +401,90 @@ class ContractSearchTest(unittest.TestCase):
         )
         self.assertEqual(plan.state, "templates_competitive")
         self.assertEqual(plan.budget, 24)
+
+    def test_cold_start_balances_templates_and_caps_known_risk(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="cold_start_risk_probe",
+            m=1792,
+            n=2816,
+            k=3584,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        result = CandidateEngine(
+            config=SearchConfig(
+                GenerationBudget(
+                    raw_attempts=5000,
+                    legal_candidates=2000,
+                    behavior_candidates=128,
+                    callback_candidates=96,
+                    npu_candidates=40,
+                )
+            )
+        ).generate(workload, self.hardware)
+        by_template = {}
+        for candidate in result.candidates:
+            by_template.setdefault(candidate.template, []).append(candidate)
+        eligible = {
+            template: candidates[:16]
+            for template, candidates in by_template.items()
+            if len(candidates) >= 16
+        }
+        self.assertGreaterEqual(len(eligible), 2)
+        selected_templates = sorted(
+            eligible, key=lambda item: item.value
+        )[:2]
+        candidates = [
+            candidate.with_selection(
+                acquisition=0.0,
+                behavior_key=(),
+                metrics={
+                    "runtime_risk_score": 0.1,
+                    "runtime_risk_support": 1.0,
+                },
+            )
+            for template in selected_templates
+            for candidate in eligible[template]
+        ]
+        cold_plan = plan_template_race(
+            workload, candidates, (), 16
+        )
+        self.assertEqual(cold_plan.state, "balanced_cold_start")
+        self.assertEqual(cold_plan.budget, 16)
+        self.assertLessEqual(
+            max(cold_plan.template_quotas.values())
+            - min(cold_plan.template_quotas.values()),
+            1,
+        )
+
+        risky_template = selected_templates[0]
+        risk_annotated = [
+            candidate.with_selection(
+                acquisition=0.0,
+                behavior_key=(),
+                metrics={
+                    "runtime_risk_score": (
+                        0.9
+                        if candidate.template == risky_template
+                        else 0.1
+                    ),
+                    "runtime_risk_support": 1.0,
+                },
+            )
+            for candidate in candidates
+        ]
+        risk_plan = plan_template_race(
+            workload, risk_annotated, (), 12
+        )
+        self.assertEqual(risk_plan.budget, 12)
+        self.assertEqual(
+            risk_plan.template_quotas[risky_template],
+            1,
+        )
 
 
 if __name__ == "__main__":

@@ -22,8 +22,11 @@ from tiling_search import (
 )
 from tiling_search.domain import KNOWLEDGE_FIELDS, Schedule, Template
 from tiling_search.behavior import select_behavior_coverage
+from tiling_search.behavior import behavior_vector
+from tiling_search.contracts import validate_schedule
 from tiling_search.feedback import fingerprint
 from tiling_search.racing import plan_template_race
+from tiling_search.solvers import BaseSolver, SingleCoreSplitKSolver
 
 
 class ContractSearchTest(unittest.TestCase):
@@ -50,6 +53,124 @@ class ContractSearchTest(unittest.TestCase):
             )
         )
         self.assertEqual(fields, KNOWLEDGE_FIELDS)
+
+    def test_base_solver_leads_with_upstream_coupled_l1_policy(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="base_policy_probe",
+            m=4096,
+            n=6144,
+            k=4096,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        schedule = next(BaseSolver().generate(workload, self.hardware))
+        self.assertEqual(
+            (
+                schedule["baseM"],
+                schedule["baseN"],
+                schedule["baseK"],
+                schedule["depthA1"],
+                schedule["depthB1"],
+                schedule["stepKa"],
+                schedule["stepKb"],
+                schedule["dbL0A"],
+                schedule["dbL0B"],
+                schedule["dbL0C"],
+            ),
+            (128, 256, 64, 16, 8, 8, 4, 2, 2, 1),
+        )
+        self.assertTrue(
+            validate_schedule(workload, schedule, self.hardware).valid
+        )
+        vector = behavior_vector(workload, schedule, self.hardware)
+        self.assertGreater(
+            vector.metrics["l1_pipeline_efficiency"], 0.90
+        )
+        self.assertLessEqual(
+            vector.metrics["l2_capacity_pressure"], 1.0
+        )
+        self.assertGreater(
+            vector.metrics["l2_wave_efficiency"], 0.90
+        )
+        underfilled = schedule.replace(
+            depthA1=1,
+            depthB1=1,
+            stepKa=1,
+            stepKb=1,
+        )
+        underfilled_vector = behavior_vector(
+            workload, underfilled, self.hardware
+        )
+        self.assertLess(
+            underfilled_vector.metrics["l1_pipeline_efficiency"],
+            0.30,
+        )
+        self.assertGreater(
+            underfilled_vector.metrics["analytical_prior"],
+            vector.metrics["analytical_prior"],
+        )
+
+    def test_single_core_split_k_uses_coupled_upstream_algorithms(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="single_split_policy_probe",
+            m=1792,
+            n=2816,
+            k=32768,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        schedules = list(
+            SingleCoreSplitKSolver().generate(
+                workload, self.hardware
+            )
+        )
+        self.assertGreaterEqual(len(schedules), 32)
+        allowed = {
+            (3, 1, 3, 9, 6),
+            (1, 3, 3, 6, 9),
+            (2, 1, 4, 8, 8),
+            (1, 1, 4, 8, 8),
+        }
+        self.assertEqual(
+            {
+                (
+                    schedule["stepM"],
+                    schedule["stepN"],
+                    schedule["stepKa"],
+                    schedule["depthA1"],
+                    schedule["depthB1"],
+                )
+                for schedule in schedules
+            },
+            allowed,
+        )
+        self.assertTrue(
+            all(
+                (
+                    schedule["baseM"],
+                    schedule["baseN"],
+                    schedule["baseK"],
+                    schedule["stepKa"],
+                    schedule["stepKb"],
+                )
+                in {
+                    (128, 128, 128, 3, 3),
+                    (128, 128, 128, 4, 4),
+                }
+                and validate_schedule(
+                    workload, schedule, self.hardware
+                ).valid
+                for schedule in schedules
+            )
+        )
 
     def test_unseen_name_generates_multiple_templates(self) -> None:
         workload = Workload(
@@ -80,9 +201,15 @@ class ContractSearchTest(unittest.TestCase):
         self.assertGreaterEqual(
             len({candidate.template for candidate in result.candidates}), 2
         )
-        self.assertEqual(
+        self.assertLessEqual(
             {candidate.source for candidate in result.candidates},
-            {"contract_global"},
+            {"contract_global", "contract_upstream_policy"},
+        )
+        self.assertTrue(
+            any(
+                candidate.source == "contract_upstream_policy"
+                for candidate in result.callback_candidates
+            )
         )
         self.assertTrue(
             any(

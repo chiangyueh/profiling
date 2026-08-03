@@ -11,12 +11,8 @@ from ..domain import (
     Template,
     Workload,
 )
-from .common import (
-    l2_variants,
-    make_schedule,
-    partition_geometries,
-    tile_specs,
-)
+from .base_policy import core_partition_variants, l2_policy_variants
+from .common import make_schedule
 
 
 class SingleCoreSplitKSolver:
@@ -28,74 +24,80 @@ class SingleCoreSplitKSolver:
         hardware: Hardware,
         targets: Sequence[BehaviorTarget] = (),
     ) -> Iterator[Schedule]:
-        specs = tile_specs(workload, hardware, targets)
-        for index, (
-            base_m,
-            base_n,
-            base_k,
-            db_a,
-            db_b,
-            db_c,
-        ) in enumerate(specs):
-            max_step_k = max(1, (workload.k - 1) // base_k)
-            step_k_values = {
-                value
-                for value in (1, 2, 3, 4, 6, 8)
-                if value <= max_step_k
-            }
-            step_k_values.update(
-                max(
-                    1,
-                    min(max_step_k, int(round(target.k_passes or 1))),
-                )
-                for target in targets
-                if target.k_passes is not None
+        del targets
+        in_bytes = INPUT_BYTES[workload.dtype]
+        base_k = 256 // in_bytes
+        if 3 * base_k >= workload.k:
+            return
+        alignment_m = max(
+            16, (512 if workload.trans_a else 256) // in_bytes
+        )
+        alignment_n = max(16, 512 // in_bytes)
+        layouts = (
+            # MK33 keeps three M blocks resident and double-buffers B.
+            (3, 1, 3, 9, 6, 1, 384, 128),
+            # NK33 is the transposed data-reuse policy.
+            (1, 3, 3, 6, 9, 0, 128, 384),
+            # Upstream SetBasicBlockOf24 variants used when the 3x3 output
+            # grid cannot fill the machine or one output axis is small.
+            (2, 1, 4, 8, 8, 1, 256, 128),
+            (1, 1, 4, 8, 8, 1, 128, 128),
+        )
+        for (
+            step_m,
+            step_n,
+            step_k,
+            depth_a,
+            depth_b,
+            iterate_order,
+            inner_m,
+            inner_n,
+        ) in layouts:
+            single_k = step_k * base_k
+            if single_k >= workload.k:
+                continue
+            geometries = core_partition_variants(
+                workload,
+                hardware,
+                minimum_m=inner_m,
+                minimum_n=inner_n,
+                alignment_m=alignment_m,
+                alignment_n=alignment_n,
+                rounds=(1, 2, 3),
             )
-            for step_k in sorted(step_k_values):
-                single_k = step_k * base_k
-                if single_k >= workload.k:
-                    continue
-                step_m = (1, 2, 3, 4)[index % 4]
-                step_n = (1, 3, 2, 4)[index % 4]
-                inner_m = step_m * base_m
-                inner_n = step_n * base_n
-                geometries = partition_geometries(
-                    workload, hardware, inner_m, inner_n, targets
+            for single_m, single_n, cores in geometries[:12]:
+                l2 = l2_policy_variants(
+                    workload,
+                    hardware,
+                    single_m=single_m,
+                    single_n=single_n,
+                    used_cores=cores,
                 )
-                if not geometries:
-                    continue
-                single_m, single_n, cores = geometries[index % len(geometries)]
-                for a_buffers, b_buffers in ((1, 1), (2, 1), (1, 2), (2, 2)):
-                    l2 = l2_variants(
-                        workload, hardware, single_m, single_n, targets
-                    )
-                    if not l2:
-                        continue
-                    (
-                        l2_m_count,
-                        l2_n_count,
-                        l2_m_block,
-                        l2_n_block,
-                        l2_order,
-                    ) = l2[(index + a_buffers + b_buffers) % len(l2)]
+                for (
+                    l2_m_count,
+                    l2_n_count,
+                    l2_m_block,
+                    l2_n_block,
+                    l2_order,
+                ) in l2[:4]:
                     yield make_schedule(
                         usedCoreNum=cores,
-                        singleCoreM=max(single_m, inner_m),
-                        singleCoreN=max(single_n, inner_n),
+                        singleCoreM=single_m,
+                        singleCoreN=single_n,
                         singleCoreK=single_k,
-                        baseM=base_m,
-                        baseN=base_n,
+                        baseM=128,
+                        baseN=128,
                         baseK=base_k,
-                        depthA1=step_m * step_k * a_buffers,
-                        depthB1=step_n * step_k * b_buffers,
+                        depthA1=depth_a,
+                        depthB1=depth_b,
                         stepM=step_m,
                         stepN=step_n,
-                        iterateOrder=(index + step_k) % 2,
+                        iterateOrder=iterate_order,
                         stepKa=step_k,
                         stepKb=step_k,
-                        dbL0A=db_a,
-                        dbL0B=db_b,
-                        dbL0C=db_c,
+                        dbL0A=2,
+                        dbL0B=2,
+                        dbL0C=2,
                         l2MTileCnt=l2_m_count,
                         l2NTileCnt=l2_n_count,
                         l2MTileBlock=l2_m_block,
@@ -126,16 +128,19 @@ class DeterministicSplitKSolver:
             (384, max(128, align_up(workload.n, 16)), 3, 1, 9, 6, 1, 0),
             (max(128, align_up(workload.m, 16)), 384, 1, 3, 6, 9, 0, 1),
         )
-        core_values = sorted(
-            {
+        core_values = [
+            core_limit,
+            *sorted(
+                {
                 1,
                 min(2, core_limit),
                 min(4, core_limit),
                 min(8, core_limit),
                 min(16, core_limit),
-                core_limit,
-            }
-        )
+                }
+            ),
+        ]
+        core_values = list(dict.fromkeys(core_values))
         for (
             single_m,
             single_n,

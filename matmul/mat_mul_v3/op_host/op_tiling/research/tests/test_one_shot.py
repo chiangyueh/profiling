@@ -20,6 +20,7 @@ from tiling_search.domain import (
 from tiling_search.families import classify_workload
 from tiling_search.one_shot import select_one_shot_candidate
 from tiling_search.ranking import PairwiseLatencyPrediction
+from tiling_search.solvers import BaseSolver
 
 
 class _PredictionModel:
@@ -126,7 +127,7 @@ class OneShotSelectionTest(unittest.TestCase):
             decision.candidate.schedule, self.incumbent.schedule
         )
         self.assertEqual(
-            decision.selection_policy, "global_exploration"
+            decision.selection_policy, "upstream_coupled_global"
         )
         self.assertEqual(decision.evaluated, 2)
         self.assertEqual(decision.direct_base_candidates, 2)
@@ -259,6 +260,43 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(
             decision.selection_policy, "local_counterfactual"
+        )
+
+    def test_local_anchor_does_not_hide_coupled_global_policy(
+        self,
+    ) -> None:
+        local = Candidate(
+            schedule=self.incumbent.schedule.replace(dbL0C=2),
+            template=Template.BASE,
+            source="local_bank_anchor",
+            rationale="one-field bank mutation",
+        )
+        coupled_global = Candidate(
+            schedule=next(
+                BaseSolver().generate(
+                    self.workload, self.hardware
+                )
+            ),
+            template=Template.BASE,
+            source="contract_upstream_policy",
+            rationale="upstream coupled policy",
+        )
+        decision = select_one_shot_candidate(
+            self.workload,
+            [local, coupled_global],
+            self.incumbent,
+            (),
+            self.hardware,
+            cost_model=_PredictionModel(),
+            latency_ranker=_Ranker(
+                coupled_global.schedule.signature()
+            ),
+        )
+        self.assertEqual(
+            decision.candidate.schedule, coupled_global.schedule
+        )
+        self.assertEqual(
+            decision.selection_policy, "upstream_coupled_global"
         )
 
     def test_pairwise_ranker_orders_local_custom_candidates(self) -> None:

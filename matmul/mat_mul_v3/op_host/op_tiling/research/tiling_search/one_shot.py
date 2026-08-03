@@ -301,10 +301,26 @@ def _hardware_penalty(
         metrics.get("l0b_occupancy", 0.0),
     )
     input_penalty = max(0.0, 0.50 - input_occupancy)
+    l1_pipeline_penalty = max(
+        0.0, 0.90 - metrics.get("l1_pipeline_efficiency", 0.0)
+    )
+    l2_wave_penalty = max(
+        0.0, 0.90 - metrics.get("l2_wave_efficiency", 0.0)
+    )
+    l2_capacity_penalty = max(
+        0.0, metrics.get("l2_capacity_pressure", 0.0) - 1.0
+    )
+    alignment_penalty = max(
+        0.0, 0.95 - metrics.get("alignment_efficiency", 0.0)
+    )
     return (
         0.25 * base_k_penalty
         + 0.40 * l0c_penalty
         + 0.20 * input_penalty
+        + 1.00 * l1_pipeline_penalty
+        + 0.60 * l2_wave_penalty
+        + 0.50 * l2_capacity_penalty
+        + 0.15 * alignment_penalty
     )
 
 
@@ -332,6 +348,7 @@ def select_one_shot_candidate(
     for candidate in candidates:
         if candidate.source not in {
             "contract_global",
+            "contract_upstream_policy",
             "local_bank_anchor",
         }:
             continue
@@ -526,8 +543,40 @@ def select_one_shot_candidate(
             for item in runtime_safe_candidates
             if item[0].source == "local_bank_anchor"
         ]
+        coupled_base_pool = [
+            item
+            for item in runtime_safe_candidates
+            if (
+                item[0].source == "contract_upstream_policy"
+                and _is_direct_base(item[0])
+                and item[1].metrics.get(
+                    "l1_pipeline_efficiency", 0.0
+                )
+                >= 0.75
+                and item[1].metrics.get(
+                    "l2_wave_efficiency", 0.0
+                )
+                >= 0.70
+                and item[1].metrics.get(
+                    "l2_capacity_pressure", math.inf
+                )
+                <= 1.10
+            )
+        ]
+        local_signatures = {
+            item[0].schedule.signature() for item in local_pool
+        }
+        policy_pool = [
+            *local_pool,
+            *(
+                item
+                for item in coupled_base_pool
+                if item[0].schedule.signature()
+                not in local_signatures
+            ),
+        ]
         exploration_pool = (
-            local_pool or runtime_safe_candidates or evaluated
+            policy_pool or runtime_safe_candidates or evaluated
         )
         if not exploration_pool:
             raise ValueError(
@@ -587,7 +636,7 @@ def select_one_shot_candidate(
         policy = (
             "local_counterfactual"
             if original.source == "local_bank_anchor"
-            else "global_exploration"
+            else "upstream_coupled_global"
         )
         vector.metrics.update(
             {

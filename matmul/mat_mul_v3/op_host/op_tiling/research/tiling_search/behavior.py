@@ -336,6 +336,121 @@ def behavior_vector(
     )
     inner_m_loops = ceil_div(schedule["singleCoreM"], inner_m_extent)
     inner_n_loops = ceil_div(schedule["singleCoreN"], inner_n_extent)
+    l1_occupancy = metrics.get("l1_occupancy", 0.0)
+    k_tiles = ceil_div(workload.k, schedule["baseK"])
+    a_buffers = schedule["depthA1"] / max(
+        1.0, schedule["stepM"] * schedule["stepKa"]
+    )
+    b_buffers = schedule["depthB1"] / max(
+        1.0, schedule["stepN"] * schedule["stepKb"]
+    )
+    if split in (2, 3):
+        # The upstream 3x3/2x4 split-K algorithms intentionally keep one
+        # operand single-buffered while the reused operand is ping-ponged.
+        double_buffer_efficiency = min(
+            1.0, (a_buffers + b_buffers) / 3.0
+        )
+    else:
+        double_buffer_efficiency = min(
+            1.0, min(a_buffers, b_buffers) / 2.0
+        )
+    harmonic_step_k = (
+        2.0
+        * schedule["stepKa"]
+        * schedule["stepKb"]
+        / max(1.0, schedule["stepKa"] + schedule["stepKb"])
+    )
+    dma_batch_efficiency = min(
+        1.0, harmonic_step_k / (4.0 if split in (2, 3) else 8.0)
+    )
+    l1_balance = min(
+        schedule["baseM"]
+        * schedule["baseK"]
+        * schedule["depthA1"]
+        * in_bytes,
+        schedule["baseN"]
+        * schedule["baseK"]
+        * schedule["depthB1"]
+        * in_bytes,
+    ) / max(
+        1.0,
+        max(
+            schedule["baseM"]
+            * schedule["baseK"]
+            * schedule["depthA1"]
+            * in_bytes,
+            schedule["baseN"]
+            * schedule["baseK"]
+            * schedule["depthB1"]
+            * in_bytes,
+        ),
+    )
+    l1_pipeline_efficiency = (
+        0.50 * min(1.0, l1_occupancy / 0.75)
+        + 0.30 * double_buffer_efficiency
+        + 0.15 * dma_batch_efficiency
+        + 0.05 * l1_balance
+    )
+    l1_refill_rounds = (
+        ceil_div(k_tiles, schedule["stepKa"])
+        + ceil_div(k_tiles, schedule["stepKb"])
+    )
+
+    l2_m_count = max(1, schedule["l2MTileCnt"])
+    l2_n_count = max(1, schedule["l2NTileCnt"])
+    l2_m_block = max(1, schedule["l2MTileBlock"])
+    l2_n_block = max(1, schedule["l2NTileBlock"])
+    l2_m_tail = max(
+        1, m_tasks - (l2_m_count - 1) * l2_m_block
+    )
+    l2_n_tail = max(
+        1, n_tasks - (l2_n_count - 1) * l2_n_block
+    )
+    l2_slots = 0
+    l2_tasks = 0
+    l2_core_count = max(1, int(active_cores))
+    for m_size, m_repeats in (
+        (l2_m_block, max(0, l2_m_count - 1)),
+        (l2_m_tail, 1),
+    ):
+        for n_size, n_repeats in (
+            (l2_n_block, max(0, l2_n_count - 1)),
+            (l2_n_tail, 1),
+        ):
+            repeats = m_repeats * n_repeats
+            if repeats == 0:
+                continue
+            tasks = m_size * n_size
+            l2_tasks += repeats * tasks
+            l2_slots += (
+                repeats
+                * ceil_div(tasks, l2_core_count)
+                * l2_core_count
+            )
+    l2_wave_efficiency = l2_tasks / max(1.0, l2_slots)
+    l2_tail_efficiency = min(
+        1.0,
+        l2_m_tail / max(1.0, l2_m_block),
+        l2_n_tail / max(1.0, l2_n_block),
+    )
+    l2_budget = min(
+        float(hardware.l2_bytes),
+        100.0
+        * 1024.0
+        * 1024.0
+        * hardware.l2_bytes
+        / (192.0 * 1024.0 * 1024.0),
+    )
+    l2_capacity_pressure = l2_working_set / max(1.0, l2_budget)
+
+    a_inner = workload.m if workload.trans_a else workload.k
+    b_inner = workload.k if workload.trans_b else workload.n
+    a_inner_bytes = a_inner * in_bytes
+    b_inner_bytes = b_inner * in_bytes
+    alignment_efficiency = 0.5 * (
+        a_inner_bytes / max(1.0, align_up(a_inner_bytes, 256))
+        + b_inner_bytes / max(1.0, align_up(b_inner_bytes, 256))
+    )
     input_lower_bound = (
         workload.m * workload.k * in_bytes
         + workload.k * workload.n * in_bytes
@@ -401,11 +516,24 @@ def behavior_vector(
             "output_write_multiplier": float(output_write_multiplier),
             "inner_m_loops": float(inner_m_loops),
             "inner_n_loops": float(inner_n_loops),
+            "l1_pipeline_efficiency": l1_pipeline_efficiency,
+            "l1_refill_rounds": float(l1_refill_rounds),
+            "l1_balance": l1_balance,
+            "l1_double_buffer_efficiency": double_buffer_efficiency,
+            "l1_dma_batch_efficiency": dma_batch_efficiency,
+            "l2_wave_efficiency": l2_wave_efficiency,
+            "l2_tail_efficiency": l2_tail_efficiency,
+            "l2_capacity_pressure": l2_capacity_pressure,
+            "alignment_efficiency": alignment_efficiency,
             "estimated_traffic_bytes": float(estimated_traffic_bytes),
             "traffic_amplification": traffic_amplification,
             "atomic_output_ratio": atomic_output_ratio,
             "full_load_resident_ratio": full_load_resident_ratio,
-            "analytical_prior": prior,
+            "analytical_prior": prior
+            * (1.0 + 1.25 * max(0.0, 0.90 - l1_pipeline_efficiency))
+            * (1.0 + 0.75 * max(0.0, 0.90 - l2_wave_efficiency))
+            * (1.0 + 0.50 * max(0.0, l2_capacity_pressure - 1.0))
+            * (1.0 + 0.20 * max(0.0, 0.95 - alignment_efficiency)),
         }
     )
     categories = (
@@ -437,12 +565,25 @@ def behavior_vector(
         min(16.0, atomic_output_ratio) / 16.0,
         _safe_log2(inner_m_loops + 1.0) / 6.0,
         _safe_log2(inner_n_loops + 1.0) / 6.0,
+        l1_pipeline_efficiency,
+        min(1.0, _safe_log2(l1_refill_rounds + 1.0) / 12.0),
+        l1_balance,
+        l2_wave_efficiency,
+        l2_tail_efficiency,
+        min(4.0, l2_capacity_pressure) / 4.0,
+        alignment_efficiency,
     )
     return BehaviorVector(categories, values, metrics)
 
 
 def behavior_key(vector: BehaviorVector) -> tuple[object, ...]:
     template, mode, dtype, trans_a, trans_b, *_ = vector.categories
+    # Some callers construct compact vectors for ranking-policy tests. Keep
+    # their original 15-field schema readable while production vectors carry
+    # the extended upstream-pipeline features.
+    values = tuple(vector.values)
+    if len(values) < 22:
+        values = (*values, *(0.0 for _ in range(22 - len(values))))
     (
         active,
         rounds,
@@ -459,9 +600,14 @@ def behavior_key(vector: BehaviorVector) -> tuple[object, ...]:
         atomic_output,
         inner_m,
         inner_n,
-    ) = (
-        vector.values
-    )
+        l1_pipeline,
+        l1_refills,
+        l1_balance,
+        l2_waves,
+        l2_tail,
+        l2_pressure,
+        alignment,
+    ) = values
     return (
         template,
         mode,
@@ -483,6 +629,13 @@ def behavior_key(vector: BehaviorVector) -> tuple[object, ...]:
         min(4, int(atomic_output * 8)),
         min(4, int(inner_m * 6)),
         min(4, int(inner_n * 6)),
+        min(4, int(l1_pipeline * 5)),
+        min(4, int(l1_refills * 5)),
+        min(4, int(l1_balance * 5)),
+        min(4, int(l2_waves * 5)),
+        min(4, int(l2_tail * 5)),
+        min(4, int(l2_pressure * 5)),
+        min(4, int(alignment * 5)),
     )
 
 

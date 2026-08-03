@@ -22,6 +22,7 @@ from .domain import (
     Schedule,
     SearchResult,
     SolverReport,
+    Template,
     Workload,
 )
 from .feedback import (
@@ -38,6 +39,7 @@ from .solvers import (
     DeterministicSplitKSolver,
     SingleCoreSplitKSolver,
 )
+from .solvers.base_policy import is_upstream_base_policy_schedule
 
 
 @dataclass(frozen=True)
@@ -149,13 +151,26 @@ class CandidateEngine:
                 if signature in seen:
                     continue
                 seen.add(signature)
+                upstream_policy = (
+                    template_of(schedule) == Template.BASE
+                    and is_upstream_base_policy_schedule(
+                        workload, hardware, schedule
+                    )
+                )
+                rationale = (
+                    "upstream-coupled hardware policy"
+                    if upstream_policy
+                    else "independent hardware and template contract solver"
+                )
                 candidate = Candidate(
                     schedule=schedule,
                     template=template_of(schedule),
-                    source="contract_global",
-                    rationale=(
-                        "independent hardware and template contract solver"
+                    source=(
+                        "contract_upstream_policy"
+                        if upstream_policy
+                        else "contract_global"
                     ),
+                    rationale=rationale,
                 )
                 independent.append(candidate)
                 stats[index]["emitted"] += 1
@@ -226,12 +241,18 @@ class CandidateEngine:
             for candidate in filtered
             if candidate.source == "local_bank_anchor"
         ]
+        protected_policy = [
+            candidate
+            for candidate in filtered
+            if candidate.source == "contract_upstream_policy"
+        ][:8]
         protected_signatures = {
             candidate.schedule.signature()
-            for candidate in protected_local
+            for candidate in (*protected_local, *protected_policy)
         }
         selected = [
             *protected_local,
+            *protected_policy,
             *(
                 candidate
                 for candidate in selected

@@ -12,6 +12,7 @@ from ..domain import (
     Schedule,
     Workload,
 )
+from .base_policy import l1_pipeline_variant
 
 
 def _aligned_values(limit: int, alignment: int) -> list[int]:
@@ -306,6 +307,14 @@ def l1_variants(
     if not variants:
         return []
 
+    policy = l1_pipeline_variant(
+        workload,
+        hardware,
+        base_m=base_m,
+        base_n=base_n,
+        base_k=base_k,
+    )
+
     def distance(variant: tuple[int, ...]) -> tuple[float, tuple[int, ...]]:
         depth_a, depth_b, _, _, _, _ = variant
         occupancy = (
@@ -319,7 +328,11 @@ def l1_variants(
         ]
         return (min(requested, default=abs(occupancy - 0.65)), variant)
 
-    return sorted(set(variants), key=distance)
+    ordered = sorted(set(variants), key=distance)
+    if policy is not None and policy in ordered:
+        ordered.remove(policy)
+        ordered.insert(0, policy)
+    return ordered
 
 
 def l2_variants(

@@ -447,12 +447,41 @@ def feedback_targets(
     return list(unique.values())
 
 
-def _l2_mutations(workload: Workload, schedule: Schedule) -> list[Schedule]:
+def _l2_mutations(
+    workload: Workload,
+    hardware: Hardware,
+    schedule: Schedule,
+) -> list[Schedule]:
     if schedule["l2MTileBlock"] <= 0 or schedule["l2NTileBlock"] <= 0:
         return []
     m_total = ceil_div(workload.m, schedule["singleCoreM"])
     n_total = ceil_div(workload.n, schedule["singleCoreN"])
     candidates: list[Schedule] = []
+    # Import lazily to keep feedback independent from solver initialization.
+    from .solvers.base_policy import l2_policy_variants
+
+    for (
+        m_count,
+        n_count,
+        m_block,
+        n_block,
+        order,
+    ) in l2_policy_variants(
+        workload,
+        hardware,
+        single_m=schedule["singleCoreM"],
+        single_n=schedule["singleCoreN"],
+        used_cores=schedule["usedCoreNum"],
+    ):
+        candidates.append(
+            schedule.replace(
+                l2MTileCnt=m_count,
+                l2NTileCnt=n_count,
+                l2MTileBlock=m_block,
+                l2NTileBlock=n_block,
+                l2IterateOrder=order,
+            )
+        )
     for m_block, n_block in (
         (max(1, schedule["l2MTileBlock"] // 2), schedule["l2NTileBlock"]),
         (min(m_total, schedule["l2MTileBlock"] * 2), schedule["l2NTileBlock"]),
@@ -477,22 +506,26 @@ def semantic_mutations(
     *,
     source: str,
     parent: tuple[int, ...],
+    conservative: bool = False,
 ) -> list[Candidate]:
     mutations = [
         schedule.replace(iterateOrder=1 - schedule["iterateOrder"]),
         schedule.replace(
             l2IterateOrder=(schedule["l2IterateOrder"] + 1) % 3
         ),
-        schedule.replace(dbL0C=1 if schedule["dbL0C"] == 2 else 2),
-        *_l2_mutations(workload, schedule),
+        *_l2_mutations(workload, hardware, schedule),
     ]
-    core_limit = min(workload.max_cores, hardware.aic_cores)
-    for cores in {
-        max(1, schedule["usedCoreNum"] - 1),
-        min(core_limit, schedule["usedCoreNum"] + 1),
-        core_limit,
-    }:
-        mutations.append(schedule.replace(usedCoreNum=cores))
+    if not conservative:
+        mutations.append(
+            schedule.replace(dbL0C=1 if schedule["dbL0C"] == 2 else 2)
+        )
+        core_limit = min(workload.max_cores, hardware.aic_cores)
+        for cores in {
+            max(1, schedule["usedCoreNum"] - 1),
+            min(core_limit, schedule["usedCoreNum"] + 1),
+            core_limit,
+        }:
+            mutations.append(schedule.replace(usedCoreNum=cores))
     candidates = []
     seen = {schedule.signature()}
     for mutation in mutations:
@@ -563,4 +596,5 @@ def local_anchor_mutations(
         anchor,
         source="local_bank_anchor",
         parent=anchor.signature(),
+        conservative=True,
     )

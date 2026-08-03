@@ -30,6 +30,8 @@ class OneShotDecision:
     safe_candidates: int
     direct_base_candidates: int
     transfer_eligible_candidates: int
+    custom_eligible_candidates: int
+    incumbent_fallback: bool
 
 
 def _normalized_priors(
@@ -146,6 +148,7 @@ def _hardware_penalty(
 def select_one_shot_candidate(
     workload: Workload,
     candidates: Iterable[Candidate],
+    incumbent: Candidate,
     observations: Sequence[MeasuredObservation],
     hardware: Hardware,
     *,
@@ -157,13 +160,19 @@ def select_one_shot_candidate(
     This selector does neither: it uses only leave-target-workload-out latency,
     NPU rejection risk, and the hardware analytical prior.
     """
+    if incumbent.source != "bank_incumbent":
+        raise ValueError("one-shot incumbent must be the bank control")
+
     unique: dict[tuple[int, ...], Candidate] = {}
     for candidate in candidates:
-        if candidate.source != "contract_global":
+        if candidate.source not in {
+            "contract_global",
+            "local_bank_anchor",
+        }:
+            continue
+        if candidate.schedule.signature() == incumbent.schedule.signature():
             continue
         unique.setdefault(candidate.schedule.signature(), candidate)
-    if not unique:
-        raise ValueError("one-shot selection has no independent candidate")
 
     model = cost_model or FeedbackCostModel(observations, hardware)
     candidate_vectors = [
@@ -176,10 +185,6 @@ def select_one_shot_candidate(
     all_direct_base = [
         item for item in candidate_vectors if _is_direct_base(item[0])
     ]
-    if not all_direct_base:
-        raise ValueError(
-            "one-shot selection has no direct BASE exploitation candidate"
-        )
     direct_base = sorted(
         all_direct_base,
         key=lambda item: (
@@ -188,21 +193,16 @@ def select_one_shot_candidate(
             * math.log1p(item[1].metrics["analytical_prior"]),
             item[0].schedule.signature(),
         ),
-    )[:48]
-    alternatives = sorted(
-        (
-            item
-            for item in candidate_vectors
-            if item[0].template != Template.BASE
-        ),
+    )
+    considered = sorted(
+        candidate_vectors,
         key=lambda item: (
             _hardware_penalty(item[0], item[1].metrics, workload)
             + 0.03
             * math.log1p(item[1].metrics["analytical_prior"]),
             item[0].schedule.signature(),
         ),
-    )[:48]
-    considered = [*direct_base, *alternatives]
+    )
     observation_vectors = [
         (
             observation,
@@ -283,25 +283,70 @@ def select_one_shot_candidate(
         )
         evaluated.append((candidate, vector, prediction, transfer))
 
-    evaluated_direct_base = [
-        item for item in evaluated if _is_direct_base(item[0])
+    runtime_safe_candidates = [
+        item
+        for item in evaluated
+        if not (
+            item[2].runtime_risk_support >= 0.10
+            and item[2].runtime_risk_score >= 0.45
+        )
     ]
 
     transfer_eligible = [
         item
         for item in evaluated
-        if item[0].template != Template.BASE
-        and item[3].samples >= 6
-        and item[3].winners >= 2
-        and item[3].robust_ratio <= 0.99
-        and item[3].upper_ratio <= 1.02
-        and item[2].latency_ratio <= 0.98
+        if item[3].samples >= 8
+        and item[3].winners >= 3
+        and item[3].robust_ratio <= 0.97
+        and item[3].upper_ratio <= 0.99
+        and item[3].nearest_distance <= 1.0
+        and item[2].latency_ratio <= 0.97
+        and item[2].latency_support >= 0.05
         and not (
             item[2].runtime_risk_support >= 0.10
-            and item[2].runtime_risk_score >= 0.45
+            and item[2].runtime_risk_score >= 0.25
         )
     ]
-    exploitation_pool = [*evaluated_direct_base, *transfer_eligible]
+    exploitation_pool = transfer_eligible
+
+    if not exploitation_pool:
+        incumbent_vector = behavior_vector(
+            workload, incumbent.schedule, hardware
+        )
+        incumbent_vector.metrics.update(
+            {
+                "predicted_latency_ratio": 1.0,
+                "latency_uncertainty": 0.0,
+                "latency_support": 1.0,
+                "runtime_risk_score": 0.0,
+                "runtime_risk_support": 1.0,
+                "one_shot_score": 0.0,
+                "one_shot_target_observations": 0.0,
+                "one_shot_incumbent_fallback": 1.0,
+            }
+        )
+        selected = Candidate(
+            schedule=incumbent.schedule,
+            template=incumbent.template,
+            source="one_shot_bank_fallback",
+            rationale=(
+                "bank incumbent retained because no custom candidate has "
+                "independent cross-workload replacement evidence"
+            ),
+            acquisition=0.0,
+            parent_signatures=(),
+            behavior_key=behavior_key(incumbent_vector),
+            metrics=dict(incumbent_vector.metrics),
+        )
+        return OneShotDecision(
+            candidate=selected,
+            evaluated=len(evaluated),
+            safe_candidates=len(runtime_safe_candidates),
+            direct_base_candidates=len(direct_base),
+            transfer_eligible_candidates=0,
+            custom_eligible_candidates=0,
+            incumbent_fallback=True,
+        )
 
     prior_scores = _normalized_priors(
         [
@@ -327,11 +372,7 @@ def select_one_shot_candidate(
             * vector.metrics["runtime_risk_support"]
             * max(0.0, vector.metrics["runtime_risk_score"] - 0.10)
         )
-        transfer_ratio = (
-            transfer.upper_ratio
-            if candidate.template != Template.BASE
-            else prediction.latency_ratio
-        )
+        transfer_ratio = transfer.upper_ratio
         score = (
             math.log(
                 max(
@@ -386,10 +427,13 @@ def select_one_shot_candidate(
         behavior_key=behavior_key(vector),
         metrics=dict(vector.metrics),
     )
+    selected.metrics["one_shot_incumbent_fallback"] = 0.0
     return OneShotDecision(
         candidate=selected,
         evaluated=len(ranked),
         safe_candidates=len(safe),
         direct_base_candidates=len(direct_base),
         transfer_eligible_candidates=len(transfer_eligible),
+        custom_eligible_candidates=len(exploitation_pool),
+        incumbent_fallback=False,
     )

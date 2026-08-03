@@ -24,6 +24,7 @@ from tiling_search import (
     plan_template_race,
     select_one_shot_candidate,
 )
+from tiling_search.contracts import template_of
 from tiling_search.domain import KNOWLEDGE_FIELDS, Candidate, Schedule
 from tiling_search.behavior import (
     FeedbackCostModel,
@@ -519,7 +520,17 @@ def main() -> None:
                 bank,
             )
         )
-        result = engine.generate(workload, hardware, local_anchor=None)
+        incumbent = Candidate(
+            schedule=bank.schedule,
+            template=template_of(bank.schedule),
+            source="bank_incumbent",
+            rationale="exact official RuntimeKb control",
+        )
+        result = engine.generate(
+            workload,
+            hardware,
+            local_anchor=bank.schedule,
+        )
         ordered: list[Candidate] = [
             *result.callback_candidates,
             *(
@@ -568,11 +579,13 @@ def main() -> None:
         callback_candidates = [
             candidate for candidate, _ in callback_accepted
         ]
+        callback_by_signature[bank.schedule.signature()] = bank
         one_shot_decision = None
         if args.selection_mode == "one-shot":
             one_shot_decision = select_one_shot_candidate(
                 workload,
                 callback_candidates,
+                incumbent,
                 observations,
                 hardware,
                 cost_model=one_shot_cost_model,
@@ -666,6 +679,9 @@ def main() -> None:
                 f"direct_base={one_shot_decision.direct_base_candidates} "
                 "transfer_eligible="
                 f"{one_shot_decision.transfer_eligible_candidates} "
+                "custom_eligible="
+                f"{one_shot_decision.custom_eligible_candidates} "
+                f"fallback={int(one_shot_decision.incumbent_fallback)} "
                 f"score={selected.acquisition:.6g} "
                 "predicted_ratio="
                 f"{metrics.get('predicted_latency_ratio', 1.0):.6g} "

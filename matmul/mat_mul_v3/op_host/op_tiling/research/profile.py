@@ -769,6 +769,7 @@ def summarize(
             f"bank_ms={summary['bank_ms'] or 'NA'} "
             f"speedup={summary['speedup_vs_official'] or 'NA'} "
             f"speedup_vs_bank={summary['speedup_vs_bank'] or 'NA'} "
+            f"best_source={summary['best_source'] or 'none'} "
             f"optimization_result={summary['optimization_result']}"
         )
     return summaries
@@ -1235,10 +1236,20 @@ def main() -> None:
     not_improved = sum(
         row["optimization_result"] == "not_improved" for row in summaries
     )
+    bank_fallback = sum(
+        row.get("best_source") == "one_shot_bank_fallback"
+        for row in summaries
+    )
+    custom_selected = sum(
+        row.get("best_source") == "one_shot_model"
+        for row in summaries
+    )
     print(
         f"RESULT_TOTAL workloads={len(summaries)} improved={improved} "
         f"not_improved={not_improved} "
-        f"other={len(summaries) - improved - not_improved}"
+        f"other={len(summaries) - improved - not_improved} "
+        f"custom_selected={custom_selected} "
+        f"bank_fallback={bank_fallback}"
     )
     print("FAMILY_RESULT_BEGIN")
     for row in family_summaries:

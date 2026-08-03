@@ -865,7 +865,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--baseline-repeat", type=int, default=30)
     parser.add_argument("--baseline-samples", type=int, default=9)
-    parser.add_argument("--numeric-preflight-max-mib", type=int, default=256)
+    parser.add_argument("--numeric-preflight-max-mib", type=int, default=512)
     parser.add_argument("--baseline-drift-pct", type=float, default=3.0)
     parser.add_argument("--pair-block-size", type=int, default=4)
     return parser.parse_args()

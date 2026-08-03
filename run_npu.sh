@@ -159,7 +159,7 @@ RESUME="${ROOT}/results/npu_full_resume.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260802-one-shot-generalization-v1"
+echo "  script:     run_npu.sh 20260803-one-shot-preflight512-v1"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      one_shot_contract_model_selection"
 echo "  mode:       ${MODE}"
@@ -354,7 +354,7 @@ profile_stage() {
         --samples "${SAMPLES:-15}" \
         --baseline-repeat "${BASELINE_REPEAT:-30}" \
         --baseline-samples "${BASELINE_SAMPLES:-9}" \
-        --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-256}" \
+        --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-512}" \
         --baseline-drift-pct "${BASELINE_DRIFT_PCT:-3}" \
         --pair-block-size 1
 }

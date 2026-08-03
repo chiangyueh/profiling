@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass
+from statistics import median
 from typing import Iterable, Sequence
 
 from .behavior import (
@@ -15,6 +17,7 @@ from .behavior import (
 from .contracts import template_of
 from .domain import (
     INPUT_BYTES,
+    KNOWLEDGE_FIELDS,
     Candidate,
     Hardware,
     MeasuredObservation,
@@ -31,7 +34,8 @@ class OneShotDecision:
     direct_base_candidates: int
     transfer_eligible_candidates: int
     custom_eligible_candidates: int
-    incumbent_fallback: bool
+    local_candidates: int
+    selection_policy: str
 
 
 def _normalized_priors(
@@ -50,6 +54,164 @@ class _TransferEvidence:
     robust_ratio: float
     upper_ratio: float
     nearest_distance: float
+
+
+@dataclass(frozen=True)
+class _CounterfactualPair:
+    workload: Workload
+    template: Template
+    field: str
+    low_value: int
+    high_value: int
+    high_over_low: float
+
+
+@dataclass(frozen=True)
+class CounterfactualEvidence:
+    samples: int
+    robust_ratio: float
+    upper_ratio: float
+    nearest_distance: float
+
+
+class CounterfactualPolicyModel:
+    """Learn one-field schedule effects from paired NPU observations."""
+
+    def __init__(
+        self,
+        observations: Sequence[MeasuredObservation],
+    ) -> None:
+        grouped: dict[
+            tuple[
+                tuple[int, int, int, str, bool, bool, int],
+                str,
+            ],
+            dict[tuple[int, ...], list[MeasuredObservation]],
+        ] = defaultdict(lambda: defaultdict(list))
+        for observation in observations:
+            if (
+                observation.source == "runtime_rejected"
+                or not observation.structured_verified
+            ):
+                continue
+            grouped[
+                (
+                    observation.workload.identity(),
+                    observation.record_id,
+                )
+            ][
+                observation.schedule.signature()
+            ].append(observation)
+
+        pairs = []
+        for signatures in grouped.values():
+            representatives = []
+            for items in signatures.values():
+                representatives.append(
+                    (
+                        items[0],
+                        median(item.measured_ratio for item in items),
+                    )
+                )
+            for index, (left, left_ratio) in enumerate(representatives):
+                for right, right_ratio in representatives[index + 1 :]:
+                    left_template = template_of(left.schedule)
+                    if left_template != template_of(right.schedule):
+                        continue
+                    changed = [
+                        field_index
+                        for field_index, (left_value, right_value) in enumerate(
+                            zip(
+                                left.schedule.values,
+                                right.schedule.values,
+                            )
+                        )
+                        if left_value != right_value
+                    ]
+                    if len(changed) != 1:
+                        continue
+                    field_index = changed[0]
+                    if (
+                        left.schedule.values[field_index]
+                        < right.schedule.values[field_index]
+                    ):
+                        low, low_ratio = left, left_ratio
+                        high, high_ratio = right, right_ratio
+                    else:
+                        low, low_ratio = right, right_ratio
+                        high, high_ratio = left, left_ratio
+                    pairs.append(
+                        _CounterfactualPair(
+                            workload=left.workload,
+                            template=left_template,
+                            field=KNOWLEDGE_FIELDS[field_index],
+                            low_value=low.schedule.values[field_index],
+                            high_value=high.schedule.values[field_index],
+                            high_over_low=high_ratio / low_ratio,
+                        )
+                    )
+        self.pairs = tuple(pairs)
+
+    def predict(
+        self,
+        workload: Workload,
+        incumbent: Candidate,
+        candidate: Candidate,
+    ) -> CounterfactualEvidence:
+        changed = [
+            index
+            for index, (incumbent_value, candidate_value) in enumerate(
+                zip(
+                    incumbent.schedule.values,
+                    candidate.schedule.values,
+                )
+            )
+            if incumbent_value != candidate_value
+        ]
+        if (
+            len(changed) != 1
+            or incumbent.template != candidate.template
+        ):
+            return CounterfactualEvidence(0, 1.0, 1.0, math.inf)
+        field_index = changed[0]
+        field = KNOWLEDGE_FIELDS[field_index]
+        incumbent_value = incumbent.schedule.values[field_index]
+        candidate_value = candidate.schedule.values[field_index]
+        target_low = min(incumbent_value, candidate_value)
+        target_high = max(incumbent_value, candidate_value)
+        neighbors = []
+        for pair in self.pairs:
+            if (
+                pair.template != candidate.template
+                or pair.workload.dtype != workload.dtype
+                or pair.workload.trans_a != workload.trans_a
+                or pair.workload.trans_b != workload.trans_b
+                or pair.field != field
+            ):
+                continue
+            value_distance = abs(
+                math.log1p(pair.low_value) - math.log1p(target_low)
+            ) + abs(
+                math.log1p(pair.high_value) - math.log1p(target_high)
+            )
+            distance = (
+                workload_distance(workload, pair.workload)
+                + 0.5 * value_distance
+            )
+            effect = pair.high_over_low
+            if candidate_value < incumbent_value:
+                effect = 1.0 / effect
+            neighbors.append((distance, effect))
+        nearest = sorted(neighbors)[:12]
+        if not nearest:
+            return CounterfactualEvidence(0, 1.0, 1.0, math.inf)
+        effects = sorted(effect for _, effect in nearest)
+        return CounterfactualEvidence(
+            samples=len(effects),
+            robust_ratio=median(effects),
+            upper_ratio=effects[int(0.75 * (len(effects) - 1))],
+            nearest_distance=nearest[0][0],
+        )
 
 
 def _is_direct_base(candidate: Candidate) -> bool:
@@ -153,6 +315,7 @@ def select_one_shot_candidate(
     hardware: Hardware,
     *,
     cost_model: FeedbackCostModel | None = None,
+    counterfactual_model: CounterfactualPolicyModel | None = None,
 ) -> OneShotDecision:
     """Choose one deployment candidate without target-workload measurements.
 
@@ -175,6 +338,18 @@ def select_one_shot_candidate(
         unique.setdefault(candidate.schedule.signature(), candidate)
 
     model = cost_model or FeedbackCostModel(observations, hardware)
+    counterfactuals = counterfactual_model or CounterfactualPolicyModel(
+        observations
+    )
+    incumbent_vector = behavior_vector(
+        workload, incumbent.schedule, hardware
+    )
+    incumbent_prediction = model.predict(
+        workload,
+        incumbent_vector,
+        exclude_workload=workload.identity(),
+        cross_workload_latency_weight=1.0,
+    )
     candidate_vectors = [
         (
             candidate,
@@ -251,6 +426,19 @@ def select_one_shot_candidate(
             observation_vectors,
             hardware,
         )
+        broad_prediction = model.predict(
+            workload,
+            vector,
+            exclude_workload=workload.identity(),
+            cross_workload_latency_weight=1.0,
+        )
+        counterfactual = counterfactuals.predict(
+            workload, incumbent, candidate
+        )
+        relative_prediction = (
+            broad_prediction.latency_ratio
+            / max(0.10, incumbent_prediction.latency_ratio)
+        )
         effective_risk = (
             min(prediction.runtime_risk_score, direct_base_risk)
             if _is_direct_base(candidate)
@@ -279,6 +467,15 @@ def select_one_shot_candidate(
                 "transfer_upper_ratio": transfer.upper_ratio,
                 "transfer_nearest_distance": transfer.nearest_distance,
                 "direct_base_geometry": float(_is_direct_base(candidate)),
+                "relative_model_ratio": relative_prediction,
+                "counterfactual_samples": float(counterfactual.samples),
+                "counterfactual_robust_ratio": (
+                    counterfactual.robust_ratio
+                ),
+                "counterfactual_upper_ratio": counterfactual.upper_ratio,
+                "counterfactual_nearest_distance": (
+                    counterfactual.nearest_distance
+                ),
             }
         )
         evaluated.append((candidate, vector, prediction, transfer))
@@ -310,33 +507,89 @@ def select_one_shot_candidate(
     exploitation_pool = transfer_eligible
 
     if not exploitation_pool:
-        incumbent_vector = behavior_vector(
-            workload, incumbent.schedule, hardware
+        local_pool = [
+            item
+            for item in runtime_safe_candidates
+            if item[0].source == "local_bank_anchor"
+        ]
+        exploration_pool = (
+            local_pool or runtime_safe_candidates or evaluated
         )
-        incumbent_vector.metrics.update(
+        if not exploration_pool:
+            raise ValueError(
+                "one-shot selection has no callback-valid custom candidate"
+            )
+        incumbent_hardware_penalty = _hardware_penalty(
+            incumbent, incumbent_vector.metrics, workload
+        )
+
+        def exploration_score(item) -> tuple[float, tuple[int, ...]]:
+            candidate, vector, prediction, _ = item
+            metrics = vector.metrics
+            counterfactual_support = min(
+                1.0, metrics["counterfactual_samples"] / 6.0
+            )
+            counterfactual_ratio = (
+                metrics["counterfactual_upper_ratio"]
+                if metrics["counterfactual_samples"] >= 2
+                else 1.0
+            )
+            score = (
+                counterfactual_support
+                * math.log(max(0.10, counterfactual_ratio))
+                + 0.30
+                * math.log(
+                    max(0.10, metrics["relative_model_ratio"])
+                )
+                + 0.20
+                * max(
+                    -0.25,
+                    _hardware_penalty(
+                        candidate, metrics, workload
+                    )
+                    - incumbent_hardware_penalty,
+                )
+                + 0.50
+                * metrics["runtime_risk_support"]
+                * max(0.0, metrics["runtime_risk_score"] - 0.10)
+                + 0.05 * prediction.latency_uncertainty
+            )
+            return score, candidate.schedule.signature()
+
+        selected_item = min(
+            exploration_pool,
+            key=exploration_score,
+        )
+        original, vector, _, _ = selected_item
+        score = exploration_score(selected_item)[0]
+        policy = (
+            "local_counterfactual"
+            if original.source == "local_bank_anchor"
+            else "global_exploration"
+        )
+        vector.metrics.update(
             {
-                "predicted_latency_ratio": 1.0,
-                "latency_uncertainty": 0.0,
-                "latency_support": 1.0,
-                "runtime_risk_score": 0.0,
-                "runtime_risk_support": 1.0,
-                "one_shot_score": 0.0,
+                "one_shot_score": score,
                 "one_shot_target_observations": 0.0,
-                "one_shot_incumbent_fallback": 1.0,
+                "one_shot_incumbent_fallback": 0.0,
             }
         )
         selected = Candidate(
-            schedule=incumbent.schedule,
-            template=incumbent.template,
-            source="one_shot_bank_fallback",
-            rationale=(
-                "bank incumbent retained because no custom candidate has "
-                "independent cross-workload replacement evidence"
+            schedule=original.schedule,
+            template=original.template,
+            source=(
+                "one_shot_local_exploration"
+                if original.source == "local_bank_anchor"
+                else "one_shot_global_exploration"
             ),
-            acquisition=0.0,
-            parent_signatures=(),
-            behavior_key=behavior_key(incumbent_vector),
-            metrics=dict(incumbent_vector.metrics),
+            rationale=(
+                "single custom deployment decision from bank-relative "
+                f"{policy}; generator={original.source}"
+            ),
+            acquisition=score,
+            parent_signatures=original.parent_signatures,
+            behavior_key=behavior_key(vector),
+            metrics=dict(vector.metrics),
         )
         return OneShotDecision(
             candidate=selected,
@@ -345,7 +598,8 @@ def select_one_shot_candidate(
             direct_base_candidates=len(direct_base),
             transfer_eligible_candidates=0,
             custom_eligible_candidates=0,
-            incumbent_fallback=True,
+            local_candidates=len(local_pool),
+            selection_policy=policy,
         )
 
     prior_scores = _normalized_priors(
@@ -435,5 +689,9 @@ def select_one_shot_candidate(
         direct_base_candidates=len(direct_base),
         transfer_eligible_candidates=len(transfer_eligible),
         custom_eligible_candidates=len(exploitation_pool),
-        incumbent_fallback=False,
+        local_candidates=sum(
+            item[0].source == "local_bank_anchor"
+            for item in evaluated
+        ),
+        selection_policy="cross_workload_evidence",
     )

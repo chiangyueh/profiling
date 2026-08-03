@@ -159,9 +159,9 @@ RESUME="${ROOT}/results/npu_full_resume.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260803-one-shot-incumbent-guard-v2"
+echo "  script:     run_npu.sh 20260803-one-shot-counterfactual-v3"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      one_shot_evidence_gated_bank_replacement"
+echo "  scope:      one_shot_custom_counterfactual_selection"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  summary:    ${SUMMARY}"

@@ -14,7 +14,11 @@ from .domain import (
     Workload,
 )
 from .orchestrator import CandidateEngine, SearchConfig
-from .one_shot import OneShotDecision, select_one_shot_candidate
+from .one_shot import (
+    CounterfactualPolicyModel,
+    OneShotDecision,
+    select_one_shot_candidate,
+)
 from .racing import RacingPlan, TemplateEvidence, plan_template_race
 
 __all__ = [
@@ -22,6 +26,7 @@ __all__ = [
     "BehaviorTarget",
     "Candidate",
     "CandidateEngine",
+    "CounterfactualPolicyModel",
     "GenerationBudget",
     "Hardware",
     "MeasuredObservation",

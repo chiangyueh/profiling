@@ -16,6 +16,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from callback import CallbackError, exact_roundtrip, invoke
 from tiling_search import (
     CandidateEngine,
+    CounterfactualPolicyModel,
     GenerationBudget,
     Hardware,
     MeasuredObservation,
@@ -501,6 +502,11 @@ def main() -> None:
         if args.selection_mode == "one-shot"
         else None
     )
+    one_shot_counterfactual_model = (
+        CounterfactualPolicyModel(observations)
+        if args.selection_mode == "one-shot"
+        else None
+    )
 
     output_rows: list[dict[str, str]] = []
     all_rows: list[dict[str, str]] = []
@@ -589,6 +595,7 @@ def main() -> None:
                 observations,
                 hardware,
                 cost_model=one_shot_cost_model,
+                counterfactual_model=one_shot_counterfactual_model,
             )
             selected_candidates = [one_shot_decision.candidate]
             racing_plan = None
@@ -681,7 +688,8 @@ def main() -> None:
                 f"{one_shot_decision.transfer_eligible_candidates} "
                 "custom_eligible="
                 f"{one_shot_decision.custom_eligible_candidates} "
-                f"fallback={int(one_shot_decision.incumbent_fallback)} "
+                f"local={one_shot_decision.local_candidates} "
+                f"policy={one_shot_decision.selection_policy} "
                 f"score={selected.acquisition:.6g} "
                 "predicted_ratio="
                 f"{metrics.get('predicted_latency_ratio', 1.0):.6g} "

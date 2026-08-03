@@ -1236,20 +1236,25 @@ def main() -> None:
     not_improved = sum(
         row["optimization_result"] == "not_improved" for row in summaries
     )
-    bank_fallback = sum(
-        row.get("best_source") == "one_shot_bank_fallback"
+    evidence_selected = sum(
+        row.get("best_source") == "one_shot_model"
         for row in summaries
     )
-    custom_selected = sum(
-        row.get("best_source") == "one_shot_model"
+    local_exploration = sum(
+        row.get("best_source") == "one_shot_local_exploration"
+        for row in summaries
+    )
+    global_exploration = sum(
+        row.get("best_source") == "one_shot_global_exploration"
         for row in summaries
     )
     print(
         f"RESULT_TOTAL workloads={len(summaries)} improved={improved} "
         f"not_improved={not_improved} "
         f"other={len(summaries) - improved - not_improved} "
-        f"custom_selected={custom_selected} "
-        f"bank_fallback={bank_fallback}"
+        f"evidence_selected={evidence_selected} "
+        f"local_exploration={local_exploration} "
+        f"global_exploration={global_exploration}"
     )
     print("FAMILY_RESULT_BEGIN")
     for row in family_summaries:

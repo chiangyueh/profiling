@@ -79,7 +79,7 @@ class OneShotSelectionTest(unittest.TestCase):
             rationale="bank",
         )
 
-    def test_one_shot_retains_incumbent_without_replacement_evidence(
+    def test_one_shot_still_selects_custom_without_transfer_evidence(
         self,
     ) -> None:
         safe = Candidate(
@@ -103,23 +103,28 @@ class OneShotSelectionTest(unittest.TestCase):
             self.hardware,
             cost_model=model,
         )
+        self.assertEqual(decision.candidate.schedule, safe.schedule)
         self.assertEqual(
+            decision.candidate.source, "one_shot_global_exploration"
+        )
+        self.assertNotEqual(
             decision.candidate.schedule, self.incumbent.schedule
         )
         self.assertEqual(
-            decision.candidate.source, "one_shot_bank_fallback"
+            decision.selection_policy, "global_exploration"
         )
-        self.assertTrue(decision.incumbent_fallback)
         self.assertEqual(decision.evaluated, 2)
         self.assertEqual(decision.direct_base_candidates, 2)
         self.assertEqual(decision.transfer_eligible_candidates, 0)
         self.assertEqual(decision.custom_eligible_candidates, 0)
         self.assertTrue(
             all(
-                call
-                == (self.workload.identity(), 0.15)
+                call[0] == self.workload.identity()
                 for call in model.calls
             )
+        )
+        self.assertEqual(
+            {call[1] for call in model.calls}, {0.15, 1.0}
         )
 
     def test_one_shot_selects_custom_only_with_cross_workload_evidence(
@@ -173,7 +178,9 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.candidate.schedule, self.schedule)
         self.assertEqual(decision.candidate.source, "one_shot_model")
-        self.assertFalse(decision.incumbent_fallback)
+        self.assertEqual(
+            decision.selection_policy, "cross_workload_evidence"
+        )
         self.assertEqual(decision.custom_eligible_candidates, 1)
         self.assertGreaterEqual(
             decision.transfer_eligible_candidates, 1
@@ -201,7 +208,43 @@ class OneShotSelectionTest(unittest.TestCase):
             cost_model=_PredictionModel(),
         )
         self.assertEqual(decision.evaluated, 1)
-        self.assertTrue(decision.incumbent_fallback)
+        self.assertEqual(
+            decision.candidate.schedule, global_candidate.schedule
+        )
+        self.assertEqual(
+            decision.candidate.source, "one_shot_global_exploration"
+        )
+
+    def test_one_shot_prefers_bank_relative_local_exploration(
+        self,
+    ) -> None:
+        local = Candidate(
+            schedule=self.incumbent.schedule.replace(dbL0C=2),
+            template=Template.BASE,
+            source="local_bank_anchor",
+            rationale="one-field bank mutation",
+        )
+        distant = Candidate(
+            schedule=self.schedule.replace(usedCoreNum=18),
+            template=Template.BASE,
+            source="contract_global",
+            rationale="independent",
+        )
+        decision = select_one_shot_candidate(
+            self.workload,
+            [distant, local],
+            self.incumbent,
+            (),
+            self.hardware,
+            cost_model=_PredictionModel(),
+        )
+        self.assertEqual(decision.candidate.schedule, local.schedule)
+        self.assertEqual(
+            decision.candidate.source, "one_shot_local_exploration"
+        )
+        self.assertEqual(
+            decision.selection_policy, "local_counterfactual"
+        )
 
     def test_shape_strata_are_name_independent_and_orthogonal(self) -> None:
         first = classify_workload(self.workload, 20)

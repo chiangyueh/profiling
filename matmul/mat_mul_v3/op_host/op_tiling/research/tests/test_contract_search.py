@@ -149,6 +149,46 @@ class ContractSearchTest(unittest.TestCase):
         self.assertEqual(len(workloads), 24)
         self.assertFalse(workloads.intersection(observed))
 
+    def test_bank_local_mutations_reach_callback_frontier(self) -> None:
+        workload = Workload(
+            workload_id="local_anchor_probe",
+            m=1024,
+            n=1536,
+            k=8192,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        engine = CandidateEngine(
+            config=SearchConfig(
+                GenerationBudget(
+                    raw_attempts=2000,
+                    legal_candidates=800,
+                    behavior_candidates=48,
+                    callback_candidates=24,
+                    npu_candidates=1,
+                )
+            )
+        )
+        initial = engine.generate(workload, self.hardware)
+        anchor = next(
+            candidate.schedule
+            for candidate in initial.callback_candidates
+            if candidate.template == Template.BASE
+        )
+        anchored = engine.generate(
+            workload,
+            self.hardware,
+            local_anchor=anchor,
+        )
+        self.assertTrue(
+            any(
+                candidate.source == "local_bank_anchor"
+                for candidate in anchored.callback_candidates
+            )
+        )
+
     def test_search_does_not_import_retired_candidate_paths(self) -> None:
         forbidden = (
             "refine_matmul",

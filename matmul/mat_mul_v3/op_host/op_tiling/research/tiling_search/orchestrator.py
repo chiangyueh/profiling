@@ -165,15 +165,16 @@ class CandidateEngine:
         measured_mutations = feedback_mutations(
             workload, hardware, self.observations
         )
+        local_candidates = local_anchor_mutations(
+            workload, hardware, local_anchor
+        )
         expanded = [
             # Preserve causal provenance when a feedback mutation also appears
             # in the independent solver stream. This lets stage-two selection
             # distinguish an intentional counterfactual from a generic probe.
             *measured_mutations,
             *independent,
-            *local_anchor_mutations(
-                workload, hardware, local_anchor
-            ),
+            *local_candidates,
         ]
         filtered: list[Candidate] = []
         excluded = 0
@@ -220,6 +221,24 @@ class CandidateEngine:
             allow_risky_template_probes=True,
             cost_model=cost_model,
         )
+        protected_local = [
+            candidate
+            for candidate in filtered
+            if candidate.source == "local_bank_anchor"
+        ]
+        protected_signatures = {
+            candidate.schedule.signature()
+            for candidate in protected_local
+        }
+        selected = [
+            *protected_local,
+            *(
+                candidate
+                for candidate in selected
+                if candidate.schedule.signature()
+                not in protected_signatures
+            ),
+        ][: budget.callback_candidates]
         reports = tuple(
             SolverReport(
                 template=item["template"],

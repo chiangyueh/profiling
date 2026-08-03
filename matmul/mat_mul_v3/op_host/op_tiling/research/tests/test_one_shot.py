@@ -19,6 +19,7 @@ from tiling_search.domain import (
 )
 from tiling_search.families import classify_workload
 from tiling_search.one_shot import select_one_shot_candidate
+from tiling_search.ranking import PairwiseLatencyPrediction
 
 
 class _PredictionModel:
@@ -44,6 +45,20 @@ class _PredictionModel:
         return FeedbackPrediction(
             self.latency_ratio, 0.20, 0.50, 0.10, 1.0
         )
+
+
+class _Ranker:
+    def __init__(self, preferred_signature) -> None:
+        self.preferred_signature = preferred_signature
+
+    def compare(self, workload, incumbent, candidate, hardware):
+        del workload, incumbent, hardware
+        ratio = (
+            0.70
+            if candidate.schedule.signature() == self.preferred_signature
+            else 1.20
+        )
+        return PairwiseLatencyPrediction(ratio, 0.10, 0.80, 0.10)
 
 
 class OneShotSelectionTest(unittest.TestCase):
@@ -244,6 +259,35 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(
             decision.selection_policy, "local_counterfactual"
+        )
+
+    def test_pairwise_ranker_orders_local_custom_candidates(self) -> None:
+        preferred = Candidate(
+            schedule=self.incumbent.schedule.replace(iterateOrder=0),
+            template=Template.BASE,
+            source="local_bank_anchor",
+            rationale="preferred mutation",
+        )
+        slower = Candidate(
+            schedule=self.incumbent.schedule.replace(dbL0C=2),
+            template=Template.BASE,
+            source="local_bank_anchor",
+            rationale="slower mutation",
+        )
+        decision = select_one_shot_candidate(
+            self.workload,
+            [slower, preferred],
+            self.incumbent,
+            (),
+            self.hardware,
+            cost_model=_PredictionModel(),
+            latency_ranker=_Ranker(preferred.schedule.signature()),
+        )
+        self.assertEqual(
+            decision.candidate.schedule, preferred.schedule
+        )
+        self.assertLess(
+            decision.candidate.metrics["pairwise_rank_ratio"], 1.0
         )
 
     def test_shape_strata_are_name_independent_and_orthogonal(self) -> None:

@@ -24,6 +24,7 @@ from .domain import (
     Template,
     Workload,
 )
+from .ranking import PairwiseLatencyRanker
 
 
 @dataclass(frozen=True)
@@ -316,6 +317,7 @@ def select_one_shot_candidate(
     *,
     cost_model: FeedbackCostModel | None = None,
     counterfactual_model: CounterfactualPolicyModel | None = None,
+    latency_ranker: PairwiseLatencyRanker | None = None,
 ) -> OneShotDecision:
     """Choose one deployment candidate without target-workload measurements.
 
@@ -340,6 +342,9 @@ def select_one_shot_candidate(
     model = cost_model or FeedbackCostModel(observations, hardware)
     counterfactuals = counterfactual_model or CounterfactualPolicyModel(
         observations
+    )
+    ranker = latency_ranker or PairwiseLatencyRanker(
+        observations, hardware
     )
     incumbent_vector = behavior_vector(
         workload, incumbent.schedule, hardware
@@ -435,6 +440,9 @@ def select_one_shot_candidate(
         counterfactual = counterfactuals.predict(
             workload, incumbent, candidate
         )
+        pairwise = ranker.compare(
+            workload, incumbent, candidate, hardware
+        )
         relative_prediction = (
             broad_prediction.latency_ratio
             / max(0.10, incumbent_prediction.latency_ratio)
@@ -475,6 +483,12 @@ def select_one_shot_candidate(
                 "counterfactual_upper_ratio": counterfactual.upper_ratio,
                 "counterfactual_nearest_distance": (
                     counterfactual.nearest_distance
+                ),
+                "pairwise_rank_ratio": pairwise.relative_ratio,
+                "pairwise_rank_uncertainty": pairwise.uncertainty,
+                "pairwise_rank_support": pairwise.support,
+                "pairwise_rank_nearest_distance": (
+                    pairwise.nearest_workload_distance
                 ),
             }
         )
@@ -535,13 +549,21 @@ def select_one_shot_candidate(
                 else 1.0
             )
             score = (
-                counterfactual_support
+                0.30
+                * counterfactual_support
                 * math.log(max(0.10, counterfactual_ratio))
-                + 0.30
+                + 0.80
+                * math.log(
+                    max(0.10, metrics["pairwise_rank_ratio"])
+                )
+                + 0.15
+                * (1.0 - metrics["pairwise_rank_support"])
+                * metrics["pairwise_rank_uncertainty"]
+                + 0.05
                 * math.log(
                     max(0.10, metrics["relative_model_ratio"])
                 )
-                + 0.20
+                + 0.10
                 * max(
                     -0.25,
                     _hardware_penalty(
@@ -636,6 +658,10 @@ def select_one_shot_candidate(
                         max(prediction.latency_ratio, transfer_ratio),
                     ),
                 )
+            )
+            + 0.50
+            * math.log(
+                max(0.10, vector.metrics["pairwise_rank_ratio"])
             )
             + risk_penalty
             + 0.15 * prior_score

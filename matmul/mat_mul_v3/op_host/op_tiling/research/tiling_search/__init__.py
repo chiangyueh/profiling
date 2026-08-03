@@ -20,6 +20,7 @@ from .one_shot import (
     select_one_shot_candidate,
 )
 from .racing import RacingPlan, TemplateEvidence, plan_template_race
+from .ranking import PairwiseLatencyRanker, PairwiseLatencyPrediction
 
 __all__ = [
     "KNOWLEDGE_FIELDS",
@@ -31,6 +32,8 @@ __all__ = [
     "Hardware",
     "MeasuredObservation",
     "OneShotDecision",
+    "PairwiseLatencyPrediction",
+    "PairwiseLatencyRanker",
     "RacingPlan",
     "Schedule",
     "SearchConfig",

@@ -33,6 +33,10 @@ from tiling_search.behavior import (
     validate_feedback_model,
 )
 from tiling_search.feedback import fingerprint, load_feedback
+from tiling_search.ranking import (
+    PairwiseLatencyRanker,
+    validate_pairwise_ranker,
+)
 
 
 FIELD_COLUMNS = {
@@ -507,6 +511,43 @@ def main() -> None:
         if args.selection_mode == "one-shot"
         else None
     )
+    one_shot_latency_ranker = (
+        PairwiseLatencyRanker(observations, hardware)
+        if args.selection_mode == "one-shot"
+        else None
+    )
+    if one_shot_latency_ranker is not None:
+        rank_validation = validate_pairwise_ranker(
+            observations, hardware
+        )
+        print(
+            "PAIRWISE_RANK_MODEL "
+            f"groups={one_shot_latency_ranker.groups} "
+            f"samples={one_shot_latency_ranker.samples} "
+            f"residual={one_shot_latency_ranker.residual:.6g}"
+        )
+        print(
+            "PAIRWISE_RANK_VALIDATION "
+            f"mode=grouped_leave_workload_out "
+            f"folds={rank_validation.folds} "
+            f"groups={rank_validation.groups} "
+            f"pairs={rank_validation.informative_pairs} "
+            f"pairwise={rank_validation.pairwise_accuracy:.6g} "
+            f"one_field_pairs={rank_validation.one_field_pairs} "
+            "one_field_accuracy="
+            f"{rank_validation.one_field_accuracy:.6g} "
+            "base_one_field_pairs="
+            f"{rank_validation.base_one_field_pairs} "
+            "base_one_field_accuracy="
+            f"{rank_validation.base_one_field_accuracy:.6g} "
+            "top_quartile_recall="
+            f"{rank_validation.top_quartile_recall:.6g} "
+            "best_candidate_percentile="
+            f"{rank_validation.best_candidate_percentile:.6g} "
+            "median_top1_regret="
+            f"{rank_validation.median_top1_regret:.6g} "
+            f"p90_top1_regret={rank_validation.p90_top1_regret:.6g}"
+        )
 
     output_rows: list[dict[str, str]] = []
     all_rows: list[dict[str, str]] = []
@@ -596,6 +637,7 @@ def main() -> None:
                 hardware,
                 cost_model=one_shot_cost_model,
                 counterfactual_model=one_shot_counterfactual_model,
+                latency_ranker=one_shot_latency_ranker,
             )
             selected_candidates = [one_shot_decision.candidate]
             racing_plan = None
@@ -693,6 +735,10 @@ def main() -> None:
                 f"score={selected.acquisition:.6g} "
                 "predicted_ratio="
                 f"{metrics.get('predicted_latency_ratio', 1.0):.6g} "
+                "pairwise_ratio="
+                f"{metrics.get('pairwise_rank_ratio', 1.0):.6g} "
+                "pairwise_support="
+                f"{metrics.get('pairwise_rank_support', 0.0):.6g} "
                 "runtime_risk="
                 f"{metrics.get('runtime_risk_score', 0.5):.6g} "
                 f"signature={selected.schedule.signature_text()}"

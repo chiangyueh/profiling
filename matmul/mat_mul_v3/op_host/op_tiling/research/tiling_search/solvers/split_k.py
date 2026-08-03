@@ -17,6 +17,7 @@ from .common import make_schedule
 
 class SingleCoreSplitKSolver:
     template = Template.SINGLE_CORE_SPLIT_K
+    source = "contract_coupled_policy"
 
     def generate(
         self,
@@ -109,6 +110,7 @@ class SingleCoreSplitKSolver:
 
 class DeterministicSplitKSolver:
     template = Template.DETERMINISTIC_SPLIT_K
+    source = "contract_coupled_policy"
 
     def generate(
         self,

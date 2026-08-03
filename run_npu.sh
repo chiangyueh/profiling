@@ -159,9 +159,9 @@ RESUME="${ROOT}/results/npu_full_resume.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260803-upstream-coupled-policy-v1"
+echo "  script:     run_npu.sh 20260803-no-broad-fallback-v1"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      one_shot_upstream_coupled_policy"
+echo "  scope:      one_shot_coupled_policy_no_broad_fallback"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  summary:    ${SUMMARY}"

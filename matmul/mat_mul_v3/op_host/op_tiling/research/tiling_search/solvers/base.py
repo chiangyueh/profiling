@@ -21,6 +21,7 @@ from .base_policy import (
 
 class BaseSolver:
     template = Template.BASE
+    source = "contract_coupled_policy"
 
     def generate(
         self,
@@ -28,10 +29,7 @@ class BaseSolver:
         hardware: Hardware,
         targets: Sequence[BehaviorTarget] = (),
     ) -> Iterator[Schedule]:
-        # Lead with coupled schedules reconstructed from the upstream BASE
-        # policy. The broad contract space below remains available for
-        # exploration, but cannot dominate a lazy prefix with arbitrary
-        # combinations of L1, L2 and buffering fields.
+        del targets
         for (
             base_m,
             base_n,
@@ -103,6 +101,19 @@ class BaseSolver:
                         tilingEnable=0,
                     )
 
+
+class BaseExplorationSolver:
+    """Broad contract-valid BASE space for offline research campaigns."""
+
+    template = Template.BASE
+    source = "contract_global"
+
+    def generate(
+        self,
+        workload: Workload,
+        hardware: Hardware,
+        targets: Sequence[BehaviorTarget] = (),
+    ) -> Iterator[Schedule]:
         specs = tile_specs(workload, hardware, targets)
         for variant_round in range(4):
             for index, (

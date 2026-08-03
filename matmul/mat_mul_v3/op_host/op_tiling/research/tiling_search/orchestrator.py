@@ -22,7 +22,6 @@ from .domain import (
     Schedule,
     SearchResult,
     SolverReport,
-    Template,
     Workload,
 )
 from .feedback import (
@@ -34,17 +33,18 @@ from .feedback import (
 )
 from .solvers import (
     Al1FullLoadSolver,
+    BaseExplorationSolver,
     BaseSolver,
     Bl1FullLoadSolver,
     DeterministicSplitKSolver,
     SingleCoreSplitKSolver,
 )
-from .solvers.base_policy import is_upstream_base_policy_schedule
 
 
 @dataclass(frozen=True)
 class SearchConfig:
     budget: GenerationBudget = GenerationBudget()
+    include_exploration: bool = True
 
 
 class CandidateEngine:
@@ -62,16 +62,28 @@ class CandidateEngine:
         self.observations = tuple(observations)
         self.exclusions = exclusions or set()
         self._cost_models: dict[Hardware, FeedbackCostModel] = {}
-        self.solvers = tuple(
-            solvers
-            or (
+        if solvers is not None:
+            selected_solvers = tuple(solvers)
+        else:
+            deployment_solvers = (
                 BaseSolver(),
                 SingleCoreSplitKSolver(),
                 DeterministicSplitKSolver(),
+            )
+            exploration_solvers = (
+                BaseExplorationSolver(),
                 Al1FullLoadSolver(),
                 Bl1FullLoadSolver(),
             )
-        )
+            selected_solvers = (
+                *deployment_solvers,
+                *(
+                    exploration_solvers
+                    if self.config.include_exploration
+                    else ()
+                ),
+            )
+        self.solvers = selected_solvers
 
     def generate(
         self,
@@ -89,6 +101,11 @@ class CandidateEngine:
         iterators = []
         stats = []
         for solver in self.solvers:
+            source = getattr(solver, "source", "")
+            if not source:
+                raise ValueError(
+                    f"{type(solver).__name__} must declare candidate source"
+                )
             solver_targets = [
                 target
                 for target in targets
@@ -101,6 +118,7 @@ class CandidateEngine:
             stats.append(
                 {
                     "template": solver.template,
+                    "source": source,
                     "raw": 0,
                     "common": 0,
                     "template_legal": 0,
@@ -151,25 +169,16 @@ class CandidateEngine:
                 if signature in seen:
                     continue
                 seen.add(signature)
-                upstream_policy = (
-                    template_of(schedule) == Template.BASE
-                    and is_upstream_base_policy_schedule(
-                        workload, hardware, schedule
-                    )
-                )
+                source = stats[index]["source"]
                 rationale = (
-                    "upstream-coupled hardware policy"
-                    if upstream_policy
+                    "contract-coupled deployment policy"
+                    if source == "contract_coupled_policy"
                     else "independent hardware and template contract solver"
                 )
                 candidate = Candidate(
                     schedule=schedule,
                     template=template_of(schedule),
-                    source=(
-                        "contract_upstream_policy"
-                        if upstream_policy
-                        else "contract_global"
-                    ),
+                    source=source,
                     rationale=rationale,
                 )
                 independent.append(candidate)
@@ -240,12 +249,12 @@ class CandidateEngine:
             candidate
             for candidate in filtered
             if candidate.source == "local_bank_anchor"
-        ]
+        ][: max(1, budget.callback_candidates // 4)]
         protected_policy = [
             candidate
             for candidate in filtered
-            if candidate.source == "contract_upstream_policy"
-        ][:8]
+            if candidate.source == "contract_coupled_policy"
+        ][: max(1, budget.callback_candidates // 2)]
         protected_signatures = {
             candidate.schedule.signature()
             for candidate in (*protected_local, *protected_policy)

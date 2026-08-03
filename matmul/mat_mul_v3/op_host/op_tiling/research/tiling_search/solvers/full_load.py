@@ -21,6 +21,7 @@ from .common import (
 
 class Al1FullLoadSolver:
     template = Template.AL1_FULL_LOAD
+    source = "contract_global"
 
     def generate(
         self,
@@ -100,6 +101,7 @@ class Al1FullLoadSolver:
 
 class Bl1FullLoadSolver:
     template = Template.BL1_FULL_LOAD
+    source = "contract_global"
 
     def generate(
         self,

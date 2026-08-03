@@ -95,20 +95,67 @@ class OneShotSelectionTest(unittest.TestCase):
             rationale="bank",
         )
 
+    def _counterfactual_evidence(
+        self, candidate: Candidate, prefix: str
+    ) -> list[MeasuredObservation]:
+        evidence_workload = Workload(
+            workload_id=f"{prefix}_evidence",
+            m=3968,
+            n=128,
+            k=16384,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        observations = []
+        for suffix in ("a", "b"):
+            record_id = f"{prefix}_{suffix}"
+            observations.extend(
+                (
+                    MeasuredObservation(
+                        workload=evidence_workload,
+                        schedule=self.incumbent.schedule,
+                        ratio_vs_official=1.0,
+                        ratio_vs_bank=1.0,
+                        source="paired_evidence",
+                        record_id=record_id,
+                        verified=True,
+                        structured_verified=True,
+                    ),
+                    MeasuredObservation(
+                        workload=evidence_workload,
+                        schedule=candidate.schedule,
+                        ratio_vs_official=0.80,
+                        ratio_vs_bank=0.80,
+                        source="paired_evidence",
+                        record_id=record_id,
+                        status_vs_official="improved",
+                        status_vs_bank="improved",
+                        verified=True,
+                        structured_verified=True,
+                    ),
+                )
+            )
+        return observations
+
     def test_one_shot_still_selects_custom_without_transfer_evidence(
         self,
     ) -> None:
+        coupled_schedule = next(
+            BaseSolver().generate(self.workload, self.hardware)
+        )
         safe = Candidate(
-            schedule=self.schedule,
+            schedule=coupled_schedule,
             template=Template.BASE,
-            source="contract_global",
-            rationale="independent",
+            source="contract_coupled_policy",
+            rationale="coupled deployment policy",
         )
         risky = Candidate(
-            schedule=self.schedule.replace(usedCoreNum=19),
+            schedule=coupled_schedule.replace(usedCoreNum=19),
             template=Template.BASE,
-            source="contract_global",
-            rationale="independent",
+            source="contract_coupled_policy",
+            rationale="coupled deployment policy",
         )
         model = _PredictionModel()
         decision = select_one_shot_candidate(
@@ -121,13 +168,13 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.candidate.schedule, safe.schedule)
         self.assertEqual(
-            decision.candidate.source, "one_shot_global_exploration"
+            decision.candidate.source, "one_shot_coupled_policy"
         )
         self.assertNotEqual(
             decision.candidate.schedule, self.incumbent.schedule
         )
         self.assertEqual(
-            decision.selection_policy, "upstream_coupled_global"
+            decision.selection_policy, "coupled_policy_global"
         )
         self.assertEqual(decision.evaluated, 2)
         self.assertEqual(decision.direct_base_candidates, 2)
@@ -149,8 +196,8 @@ class OneShotSelectionTest(unittest.TestCase):
         global_candidate = Candidate(
             schedule=self.schedule,
             template=Template.BASE,
-            source="contract_global",
-            rationale="independent",
+            source="contract_coupled_policy",
+            rationale="coupled deployment policy",
         )
         local_candidate = Candidate(
             schedule=self.schedule,
@@ -202,12 +249,12 @@ class OneShotSelectionTest(unittest.TestCase):
             decision.transfer_eligible_candidates, 1
         )
 
-    def test_one_shot_rejects_non_candidate_sources(self) -> None:
-        global_candidate = Candidate(
+    def test_one_shot_refuses_broad_only_fallback(self) -> None:
+        broad_candidate = Candidate(
             schedule=self.schedule,
             template=Template.BASE,
             source="contract_global",
-            rationale="independent",
+            rationale="research-only broad exploration",
         )
         feedback_candidate = Candidate(
             schedule=self.schedule.replace(usedCoreNum=18),
@@ -215,21 +262,17 @@ class OneShotSelectionTest(unittest.TestCase):
             source="feedback_winner_mutation",
             rationale="target feedback",
         )
-        decision = select_one_shot_candidate(
-            self.workload,
-            [feedback_candidate, global_candidate],
-            self.incumbent,
-            (),
-            self.hardware,
-            cost_model=_PredictionModel(),
-        )
-        self.assertEqual(decision.evaluated, 1)
-        self.assertEqual(
-            decision.candidate.schedule, global_candidate.schedule
-        )
-        self.assertEqual(
-            decision.candidate.source, "one_shot_global_exploration"
-        )
+        with self.assertRaisesRegex(
+            ValueError, "broad or unsupported-local fallback is disabled"
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [feedback_candidate, broad_candidate],
+                self.incumbent,
+                (),
+                self.hardware,
+                cost_model=_PredictionModel(),
+            )
 
     def test_one_shot_prefers_bank_relative_local_exploration(
         self,
@@ -246,11 +289,12 @@ class OneShotSelectionTest(unittest.TestCase):
             source="contract_global",
             rationale="independent",
         )
+        observations = self._counterfactual_evidence(local, "db_l0c")
         decision = select_one_shot_candidate(
             self.workload,
             [distant, local],
             self.incumbent,
-            (),
+            observations,
             self.hardware,
             cost_model=_PredictionModel(),
         )
@@ -261,6 +305,25 @@ class OneShotSelectionTest(unittest.TestCase):
         self.assertEqual(
             decision.selection_policy, "local_counterfactual"
         )
+
+    def test_one_shot_refuses_unsupported_local_fallback(self) -> None:
+        local = Candidate(
+            schedule=self.incumbent.schedule.replace(dbL0C=2),
+            template=Template.BASE,
+            source="local_bank_anchor",
+            rationale="one-field bank mutation",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "unsupported-local fallback is disabled"
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [local],
+                self.incumbent,
+                (),
+                self.hardware,
+                cost_model=_PredictionModel(),
+            )
 
     def test_local_anchor_does_not_hide_coupled_global_policy(
         self,
@@ -278,8 +341,8 @@ class OneShotSelectionTest(unittest.TestCase):
                 )
             ),
             template=Template.BASE,
-            source="contract_upstream_policy",
-            rationale="upstream coupled policy",
+            source="contract_coupled_policy",
+            rationale="coupled deployment policy",
         )
         decision = select_one_shot_candidate(
             self.workload,
@@ -296,7 +359,7 @@ class OneShotSelectionTest(unittest.TestCase):
             decision.candidate.schedule, coupled_global.schedule
         )
         self.assertEqual(
-            decision.selection_policy, "upstream_coupled_global"
+            decision.selection_policy, "coupled_policy_global"
         )
 
     def test_pairwise_ranker_orders_local_custom_candidates(self) -> None:
@@ -316,7 +379,14 @@ class OneShotSelectionTest(unittest.TestCase):
             self.workload,
             [slower, preferred],
             self.incumbent,
-            (),
+            [
+                *self._counterfactual_evidence(
+                    slower, "pairwise_slower"
+                ),
+                *self._counterfactual_evidence(
+                    preferred, "pairwise_preferred"
+                ),
+            ],
             self.hardware,
             cost_model=_PredictionModel(),
             latency_ranker=_Ranker(preferred.schedule.signature()),

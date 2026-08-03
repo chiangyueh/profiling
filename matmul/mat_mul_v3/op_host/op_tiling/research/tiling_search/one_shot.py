@@ -347,8 +347,7 @@ def select_one_shot_candidate(
     unique: dict[tuple[int, ...], Candidate] = {}
     for candidate in candidates:
         if candidate.source not in {
-            "contract_global",
-            "contract_upstream_policy",
+            "contract_coupled_policy",
             "local_bank_anchor",
         }:
             continue
@@ -541,13 +540,21 @@ def select_one_shot_candidate(
         local_pool = [
             item
             for item in runtime_safe_candidates
-            if item[0].source == "local_bank_anchor"
+            if (
+                item[0].source == "local_bank_anchor"
+                and item[1].metrics["counterfactual_samples"] >= 2
+                and item[1].metrics["counterfactual_upper_ratio"] <= 0.99
+                and item[1].metrics[
+                    "counterfactual_nearest_distance"
+                ]
+                <= 2.0
+            )
         ]
         coupled_base_pool = [
             item
             for item in runtime_safe_candidates
             if (
-                item[0].source == "contract_upstream_policy"
+                item[0].source == "contract_coupled_policy"
                 and _is_direct_base(item[0])
                 and item[1].metrics.get(
                     "l1_pipeline_efficiency", 0.0
@@ -575,13 +582,13 @@ def select_one_shot_candidate(
                 not in local_signatures
             ),
         ]
-        exploration_pool = (
-            policy_pool or runtime_safe_candidates or evaluated
-        )
-        if not exploration_pool:
+        if not policy_pool:
             raise ValueError(
-                "one-shot selection has no callback-valid custom candidate"
+                "one-shot selection has no safe deployment-policy "
+                "candidate; broad or unsupported-local fallback is "
+                "disabled"
             )
+        exploration_pool = policy_pool
         incumbent_hardware_penalty = _hardware_penalty(
             incumbent, incumbent_vector.metrics, workload
         )
@@ -636,7 +643,7 @@ def select_one_shot_candidate(
         policy = (
             "local_counterfactual"
             if original.source == "local_bank_anchor"
-            else "upstream_coupled_global"
+            else "coupled_policy_global"
         )
         vector.metrics.update(
             {
@@ -651,7 +658,7 @@ def select_one_shot_candidate(
             source=(
                 "one_shot_local_exploration"
                 if original.source == "local_bank_anchor"
-                else "one_shot_global_exploration"
+                else "one_shot_coupled_policy"
             ),
             rationale=(
                 "single custom deployment decision from bank-relative "

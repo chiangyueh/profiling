@@ -496,7 +496,8 @@ def main() -> None:
                 behavior_candidates=args.behavior_candidates,
                 callback_candidates=args.callback_candidates,
                 npu_candidates=args.npu_candidates,
-            )
+            ),
+            include_exploration=args.selection_mode != "one-shot",
         ),
         observations=engine_observations,
         exclusions=exclusions,

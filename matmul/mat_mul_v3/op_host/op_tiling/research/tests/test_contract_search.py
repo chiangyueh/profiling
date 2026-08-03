@@ -203,11 +203,11 @@ class ContractSearchTest(unittest.TestCase):
         )
         self.assertLessEqual(
             {candidate.source for candidate in result.candidates},
-            {"contract_global", "contract_upstream_policy"},
+            {"contract_global", "contract_coupled_policy"},
         )
         self.assertTrue(
             any(
-                candidate.source == "contract_upstream_policy"
+                candidate.source == "contract_coupled_policy"
                 for candidate in result.callback_candidates
             )
         )
@@ -225,7 +225,7 @@ class ContractSearchTest(unittest.TestCase):
             candidate.template for candidate in result.callback_candidates
         )
         probe_budget = max(
-            2, len(result.callback_candidates) // 8
+            2, len(result.callback_candidates) // 2
         )
         for template, count in templates.items():
             if template != Template.BASE:
@@ -242,6 +242,81 @@ class ContractSearchTest(unittest.TestCase):
             len({candidate.template for candidate in npu_candidates}),
             2,
         )
+
+    def test_deployment_engine_excludes_broad_and_full_load_solvers(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="deployment_path_has_no_family_name",
+            m=1792,
+            n=2816,
+            k=3584,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        engine = CandidateEngine(
+            config=SearchConfig(
+                GenerationBudget(
+                    raw_attempts=4000,
+                    legal_candidates=1500,
+                    behavior_candidates=96,
+                    callback_candidates=48,
+                    npu_candidates=1,
+                ),
+                include_exploration=False,
+            )
+        )
+        result = engine.generate(workload, self.hardware)
+        allowed_templates = {
+            Template.BASE,
+            Template.SINGLE_CORE_SPLIT_K,
+            Template.DETERMINISTIC_SPLIT_K,
+        }
+        self.assertTrue(result.callback_candidates)
+        self.assertLessEqual(
+            {report.template for report in result.reports},
+            allowed_templates,
+        )
+        self.assertLessEqual(
+            {
+                candidate.template
+                for candidate in result.callback_candidates
+            },
+            allowed_templates,
+        )
+        self.assertEqual(
+            {
+                candidate.source
+                for candidate in result.callback_candidates
+            },
+            {"contract_coupled_policy"},
+        )
+
+    def test_solver_without_explicit_source_is_rejected(self) -> None:
+        class UnscopedSolver:
+            template = Template.BASE
+
+            def generate(self, workload, hardware, targets=()):
+                del targets
+                yield from BaseSolver().generate(workload, hardware)
+
+        workload = Workload(
+            workload_id="unscoped_solver_probe",
+            m=512,
+            n=768,
+            k=1024,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        engine = CandidateEngine(solvers=(UnscopedSolver(),))
+        with self.assertRaisesRegex(
+            ValueError, "must declare candidate source"
+        ):
+            engine.generate(workload, self.hardware)
 
     def test_one_shot_shapes_are_not_in_feedback(self) -> None:
         config = RESEARCH / "config"

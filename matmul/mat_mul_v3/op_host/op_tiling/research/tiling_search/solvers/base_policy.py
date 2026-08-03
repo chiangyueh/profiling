@@ -4,7 +4,7 @@ import math
 from functools import lru_cache
 
 from ..contracts import align_up, ceil_div
-from ..domain import INPUT_BYTES, Hardware, Schedule, Workload
+from ..domain import INPUT_BYTES, Hardware, Workload
 
 
 _REFERENCE_L2_BYTES = 192 * 1024 * 1024
@@ -323,22 +323,22 @@ def l2_policy_variants(
                 )
             )
 
-    fallback_m = min(m_total, 4)
-    fallback_n = min(n_total, max(1, core_count // max(1, fallback_m)))
-    fallback = (
-        ceil_div(m_total, fallback_m),
-        ceil_div(n_total, fallback_n),
-        fallback_m,
-        fallback_n,
+    balanced_m = min(m_total, 4)
+    balanced_n = min(n_total, max(1, core_count // max(1, balanced_m)))
+    balanced_partition = (
+        ceil_div(m_total, balanced_m),
+        ceil_div(n_total, balanced_n),
+        balanced_m,
+        balanced_n,
         0,
     )
     whole = (1, 1, m_total, n_total, 0)
     if working_set(m_total, n_total) <= target_bytes:
-        ordered = [fallback]
+        ordered = [balanced_partition]
         ordered.extend(value for _, value in sorted(candidates))
     else:
         ordered = [value for _, value in sorted(candidates)]
-        ordered.append(fallback)
+        ordered.append(balanced_partition)
     ordered.append(whole)
 
     result = []
@@ -351,74 +351,3 @@ def l2_policy_variants(
         if len(result) >= 16:
             break
     return tuple(result)
-
-
-def is_upstream_base_policy_schedule(
-    workload: Workload,
-    hardware: Hardware,
-    schedule: Schedule,
-) -> bool:
-    """Return whether every coupled BASE field came from this policy."""
-
-    for (
-        base_m,
-        base_n,
-        base_k,
-        db_a,
-        db_b,
-        db_c,
-    ) in base_geometry_variants(workload, hardware):
-        if (
-            schedule["baseM"],
-            schedule["baseN"],
-            schedule["baseK"],
-            schedule["dbL0A"],
-            schedule["dbL0B"],
-            schedule["dbL0C"],
-        ) != (base_m, base_n, base_k, db_a, db_b, db_c):
-            continue
-        l1 = l1_pipeline_variant(
-            workload,
-            hardware,
-            base_m=base_m,
-            base_n=base_n,
-            base_k=base_k,
-        )
-        if l1 is None:
-            continue
-        if (
-            schedule["depthA1"],
-            schedule["depthB1"],
-            schedule["stepM"],
-            schedule["stepN"],
-            schedule["stepKa"],
-            schedule["stepKb"],
-        ) != l1:
-            continue
-        core = (
-            schedule["singleCoreM"],
-            schedule["singleCoreN"],
-            schedule["usedCoreNum"],
-        )
-        if core not in core_partition_variants(
-            workload,
-            hardware,
-            minimum_m=base_m,
-            minimum_n=base_n,
-        )[:4]:
-            continue
-        l2 = (
-            schedule["l2MTileCnt"],
-            schedule["l2NTileCnt"],
-            schedule["l2MTileBlock"],
-            schedule["l2NTileBlock"],
-            schedule["l2IterateOrder"],
-        )
-        return l2 in l2_policy_variants(
-            workload,
-            hardware,
-            single_m=schedule["singleCoreM"],
-            single_n=schedule["singleCoreN"],
-            used_cores=schedule["usedCoreNum"],
-        )[:8]
-    return False

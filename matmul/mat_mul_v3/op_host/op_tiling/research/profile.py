@@ -1244,8 +1244,8 @@ def main() -> None:
         row.get("best_source") == "one_shot_local_exploration"
         for row in summaries
     )
-    global_exploration = sum(
-        row.get("best_source") == "one_shot_global_exploration"
+    coupled_policy = sum(
+        row.get("best_source") == "one_shot_coupled_policy"
         for row in summaries
     )
     print(
@@ -1254,7 +1254,7 @@ def main() -> None:
         f"other={len(summaries) - improved - not_improved} "
         f"evidence_selected={evidence_selected} "
         f"local_exploration={local_exploration} "
-        f"global_exploration={global_exploration}"
+        f"coupled_policy={coupled_policy}"
     )
     print("FAMILY_RESULT_BEGIN")
     for row in family_summaries:

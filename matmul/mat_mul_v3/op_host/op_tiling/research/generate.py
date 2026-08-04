@@ -308,7 +308,14 @@ def hydrate_bank_context(
         Workload,
     ] = {}
     for observation in observations:
-        if observation.verified and observation.bank_schedule is None:
+        if (
+            observation.bank_schedule is None
+            and (
+                observation.verified
+                or observation.source
+                in {"runtime_rejected", "runtime_verified"}
+            )
+        ):
             missing.setdefault(
                 observation.workload.identity(),
                 observation.workload,
@@ -451,7 +458,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hbm-bpc", type=float, default=1.0)
     parser.add_argument("--observations", type=Path, action="append", default=[])
     parser.add_argument("--exclusions", type=Path, action="append", default=[])
-    parser.add_argument("--resume-feedback", type=Path)
+    parser.add_argument(
+        "--resume-feedback",
+        type=Path,
+        action="append",
+        default=[],
+    )
     parser.add_argument("--append-candidates", type=Path)
     parser.add_argument("--npu-candidates", type=int, default=40)
     parser.add_argument("--callback-candidates", type=int, default=48)
@@ -498,9 +510,9 @@ def main() -> None:
         exclusion_paths=args.exclusions,
     )
     resume_completed: set[tuple] = set()
-    if args.resume_feedback is not None:
+    for resume_feedback in args.resume_feedback:
         resume_observations, resume_exclusions = load_resume_feedback(
-            args.resume_feedback,
+            resume_feedback,
             args.soc,
             args.aic_cores,
             args.toolkit,

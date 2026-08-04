@@ -102,6 +102,24 @@ class ProfileIdentityTest(unittest.TestCase):
             source["bank_tiling_signature"],
         )
 
+    def test_research_measurement_does_not_report_custom_deployment(
+        self,
+    ) -> None:
+        self.assertEqual(
+            PROFILE.deployment_decision(
+                "one_shot_research_candidate",
+                "improved",
+                "improved",
+            ),
+            "retain_bank_research_candidate_faster",
+        )
+        self.assertEqual(
+            PROFILE.deployment_decision(
+                "one_shot_research_candidate"
+            ),
+            "retain_bank_research_measurement_failed",
+        )
+
     def test_summary_ranks_by_paired_ratio_not_cross_run_latency(
         self,
     ) -> None:

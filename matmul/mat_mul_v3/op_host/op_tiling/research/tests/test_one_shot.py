@@ -20,6 +20,7 @@ from tiling_search.domain import (
 from tiling_search.families import classify_workload
 from tiling_search.one_shot import (
     BankRelativeEffectModel,
+    BankRelativePrediction,
     BankRelativeSafetyPrediction,
     select_calibration_candidates,
     select_one_shot_candidate,
@@ -62,6 +63,26 @@ class _UnsafeRelativeSafetyModel:
             risk=1.0,
             nearest_distance=0.1,
             support=1.0,
+        )
+
+
+class _ExpectedRatioModel:
+    def predict(self, workload, bank, candidate, hardware, **_):
+        del workload, bank, hardware
+        if candidate["tilingEnable"] == 3:
+            return BankRelativePrediction(
+                samples=8,
+                robust_ratio=1.80,
+                upper_ratio=2.00,
+                nearest_distance=0.20,
+                support=0.80,
+            )
+        return BankRelativePrediction(
+            samples=4,
+            robust_ratio=1.01,
+            upper_ratio=3.00,
+            nearest_distance=0.50,
+            support=0.50,
         )
 
 
@@ -264,6 +285,30 @@ class OneShotSelectionTest(unittest.TestCase):
         self.assertEqual(
             strong_decision.deployment_candidate.schedule, split.schedule
         )
+
+    def test_research_measurement_uses_expected_latency_not_tighter_regression(
+        self,
+    ) -> None:
+        split = Candidate(
+            schedule=self.bank.replace(tilingEnable=3),
+            template=Template.DETERMINISTIC_SPLIT_K,
+            source="contract_coupled_policy",
+            rationale="known slow cross-template candidate",
+        )
+        decision = select_one_shot_candidate(
+            self.workload,
+            [self.custom, split],
+            self.incumbent,
+            (),
+            self.hardware,
+            cost_model=_RuntimeModel(),
+            effect_model=_ExpectedRatioModel(),
+        )
+        self.assertEqual(decision.candidate.schedule, self.custom.schedule)
+        self.assertEqual(
+            decision.candidate.source, "one_shot_research_candidate"
+        )
+        self.assertEqual(decision.deployment_candidate.schedule, self.bank)
 
     def test_calibration_separates_local_coupled_and_template_probes(
         self,

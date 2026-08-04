@@ -1148,16 +1148,22 @@ def select_one_shot_candidate(
                 * runtime.runtime_risk_support
             )
         )
-        predicted = (
-            prediction.upper_ratio
-            if math.isfinite(prediction.upper_ratio)
-            else 1.0
+        predicted = prediction.robust_ratio
+        uncertainty = (
+            0.12 * (1.0 - prediction.support)
+            + 0.03 * min(3.0, prediction.nearest_distance)
+            if prediction.samples
+            else 0.18
         )
         cross_template = candidate.template != incumbent.template
         return (
             not runtime_safe,
             cross_template and prediction.samples < 3,
-            predicted + 0.20 * risk + 0.05 * cross_template,
+            predicted
+            + uncertainty
+            + 0.20 * risk
+            + 0.03 * cross_template,
+            predicted,
             vector.metrics.get("analytical_prior", math.inf),
             candidate.schedule.signature(),
         )

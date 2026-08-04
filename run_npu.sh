@@ -163,10 +163,11 @@ CALIBRATION_SUMMARY="${ROOT}/results/npu_calibration_summary.csv"
 CALIBRATION_FAMILY_SUMMARY="${ROOT}/results/npu_calibration_family_summary.csv"
 CALIBRATION_RESULTS="${ROOT}/results/npu_calibration_candidates.csv"
 CALIBRATION_RESUME="${ROOT}/results/npu_calibration_resume.csv"
+PAIRED_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log25_26.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260804-adaptive-paired-oneshot-v2"
+echo "  script:     run_npu.sh 20260804-bank-relative-performance-oneshot-v3"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      paired_bank_relative_calibration_then_unseen_one_shot"
 echo "  mode:       ${MODE}"
@@ -350,6 +351,7 @@ generate_candidates() {
         --callback-candidates "${callback_candidates}"
         --behavior-candidates "${BEHAVIOR_CANDIDATES}"
         --selection-mode "${selection_mode}"
+        --resume-feedback "${PAIRED_EVIDENCE}"
     )
     if [[ -n "${resume_feedback}" ]]; then
         command+=(--resume-feedback "${resume_feedback}")
@@ -400,13 +402,17 @@ generate_candidates \
     "${CALIBRATION_NPU_CANDIDATES}" \
     "${CALIBRATION_CALLBACK_CANDIDATES}" \
     "${CALIBRATION_RESUME}"
-profile_stage \
-    "${CALIBRATION_CANDIDATES}" \
-    "${CALIBRATION_SUMMARY}" \
-    "${CALIBRATION_RESULTS}" \
-    "${CALIBRATION_FAMILY_SUMMARY}" \
-    "${CALIBRATION_RESUME}" \
-    4
+if [[ "$(wc -l < "${CALIBRATION_CANDIDATES}")" -gt 1 ]]; then
+    profile_stage \
+        "${CALIBRATION_CANDIDATES}" \
+        "${CALIBRATION_SUMMARY}" \
+        "${CALIBRATION_RESULTS}" \
+        "${CALIBRATION_FAMILY_SUMMARY}" \
+        "${CALIBRATION_RESUME}" \
+        4
+else
+    echo "  calibration_profile: skipped; tracked paired evidence is complete"
+fi
 echo "  ok"
 
 echo "[4/5] Generate one-shot decisions for unseen workloads ..."

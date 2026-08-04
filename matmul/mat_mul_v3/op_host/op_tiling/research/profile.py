@@ -527,6 +527,30 @@ def paired_outcome(
     return "within_noise"
 
 
+def deployment_decision(
+    candidate_source: str,
+    status_official: str = "",
+    status_bank: str = "",
+) -> str:
+    if candidate_source == "one_shot_bank_incumbent":
+        return "retain_bank_no_supported_custom"
+    if candidate_source == "one_shot_research_candidate":
+        if not status_official or not status_bank:
+            return "retain_bank_research_measurement_failed"
+        if status_official == "improved" and status_bank == "improved":
+            outcome = "faster"
+        elif status_official == "regressed" or status_bank == "regressed":
+            outcome = "slower"
+        else:
+            outcome = "within_noise"
+        return f"retain_bank_research_candidate_{outcome}"
+    if status_official == "improved" and status_bank == "improved":
+        return "custom_faster"
+    if status_official == "regressed" or status_bank == "regressed":
+        return "custom_slower"
+    return "custom_within_noise"
+
+
 def measurement_reusable(row: dict[str, str]) -> bool:
     if not truthy(row.get("success")):
         return row.get("preflight_mode") not in {
@@ -783,7 +807,16 @@ def summarize(
         )
         if best is None:
             summary["paired_outcome"] = "failed"
-            summary["deployment_decision"] = "measurement_failed"
+            if source["candidate_source"] in {
+                "one_shot_research_candidate",
+                "one_shot_bank_incumbent",
+            }:
+                summary["best_source"] = source["candidate_source"]
+                summary["deployment_decision"] = deployment_decision(
+                    source["candidate_source"]
+                )
+            else:
+                summary["deployment_decision"] = "measurement_failed"
             summary["optimization_result"] = "no_successful_candidate"
         else:
             best_ms = float(best["median_ms"])
@@ -818,21 +851,10 @@ def summarize(
                         best["status_vs_official"],
                         best["status_vs_bank"],
                     ),
-                    "deployment_decision": (
-                        "retain_bank_no_supported_custom"
-                        if best["candidate_source"]
-                        == "one_shot_bank_incumbent"
-                        else (
-                            "custom_faster"
-                            if best["status_vs_official"] == "improved"
-                            and best["status_vs_bank"] == "improved"
-                            else (
-                                "custom_slower"
-                                if best["status_vs_official"] == "regressed"
-                                or best["status_vs_bank"] == "regressed"
-                                else "custom_within_noise"
-                            )
-                        )
+                    "deployment_decision": deployment_decision(
+                        best["candidate_source"],
+                        best["status_vs_official"],
+                        best["status_vs_bank"],
                     ),
                     "optimization_result": (
                         "improved"
@@ -1400,11 +1422,12 @@ def main() -> None:
         for row in summaries
     )
     deployed_custom = sum(
-        row.get("best_source") == "one_shot_bank_relative"
+        row.get("deployment_decision", "").startswith("custom_")
+        and row.get("best_source") == "one_shot_bank_relative"
         for row in summaries
     )
     retained_bank = sum(
-        row.get("best_source") == "one_shot_bank_incumbent"
+        row.get("deployment_decision", "").startswith("retain_bank_")
         for row in summaries
     )
     calibration_local = sum(

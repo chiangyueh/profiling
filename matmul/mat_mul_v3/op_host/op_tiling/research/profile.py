@@ -1425,7 +1425,7 @@ def main() -> None:
             if measurement_key(args.soc, args.aic, args.toolkit, row) in records
         ],
     )
-    accepted_custom = sum(
+    accepted_nonbank = sum(
         row["optimization_result"] == "improved"
         and row.get("best_source") != "one_shot_bank_equivalent"
         for row in summaries
@@ -1463,6 +1463,28 @@ def main() -> None:
         and row.get("optimization_result") == "improved"
         for row in summaries
     )
+    research_attempted = sum(
+        row.get("best_source") == "one_shot_research_candidate"
+        for row in summaries
+    )
+    research_measured = sum(
+        row.get("best_source") == "one_shot_research_candidate"
+        and bool(row.get("best_ms"))
+        for row in summaries
+    )
+    research_faster = sum(
+        row.get("best_source") == "one_shot_research_candidate"
+        and row.get("optimization_result") == "improved"
+        for row in summaries
+    )
+    research_slower = sum(
+        row.get("best_source") == "one_shot_research_candidate"
+        and (
+            row.get("status_vs_official") == "regressed"
+            or row.get("status_vs_bank") == "regressed"
+        )
+        for row in summaries
+    )
     reconstructed_bank = sum(
         row.get("best_source") == "one_shot_bank_equivalent"
         and bool(row.get("best_ms"))
@@ -1493,7 +1515,7 @@ def main() -> None:
     )
     print(
         f"RESULT_TOTAL workloads={len(summaries)} "
-        f"accepted_custom_vs_official_and_bank={accepted_custom} "
+        f"accepted_nonbank_vs_official_and_bank={accepted_nonbank} "
         f"vs_official_faster={official_faster} "
         f"vs_official_within_noise={official_within_noise} "
         f"vs_official_slower={official_slower} "
@@ -1501,6 +1523,10 @@ def main() -> None:
         f"custom_attempted={custom_attempted} "
         f"custom_measured={custom_measured} "
         f"custom_faster={custom_faster} "
+        f"research_attempted={research_attempted} "
+        f"research_measured={research_measured} "
+        f"research_faster={research_faster} "
+        f"research_slower={research_slower} "
         f"bank_equivalent_measured={reconstructed_bank} "
         f"bank_equivalent_failed={bank_measurement_failed} "
         f"retained_bank={retained_bank} "

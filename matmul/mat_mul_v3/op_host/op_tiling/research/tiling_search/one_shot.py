@@ -1003,10 +1003,11 @@ def select_one_shot_candidate(
     """Select exactly one independently generated tiling.
 
     The bank is an incumbent and paired measurement control, not a normal
-    candidate source or deployment seed. An independent solver is allowed to
-    reconstruct the same effective kernel schedule; equality is evidence of
-    coverage, not bank fallback. Bank-anchor mutations remain calibration
-    probes. Other candidates must pass the runtime-safety policy.
+    candidate source or deployment seed. Strong repeated paired evidence may
+    recommend one custom deployment. Otherwise a runtime-safe non-bank
+    candidate is selected only as an active-learning measurement; it does not
+    become the deployment recommendation. An independent reconstruction of
+    the bank schedule remains a coverage result when no custom is executable.
     """
 
     if incumbent.source != "bank_incumbent":
@@ -1029,6 +1030,7 @@ def select_one_shot_candidate(
             "contract_coupled_policy",
             "contract_global",
             "feedback_regression_counterfactual",
+            "feedback_winner_transfer",
             "feedback_winner_mutation",
         }:
             continue
@@ -1198,11 +1200,10 @@ def select_one_shot_candidate(
             )
         )
         predicted = prediction.robust_ratio
-        uncertainty = (
-            0.12 * (1.0 - prediction.support)
-            + 0.03 * min(3.0, prediction.nearest_distance)
+        information_bonus = (
+            0.10 * (1.0 - prediction.support)
             if prediction.samples
-            else 0.18
+            else 0.12
         )
         cross_template = candidate.template != incumbent.template
         transition = bank_transition(
@@ -1212,14 +1213,37 @@ def select_one_shot_candidate(
         structural_penalty = min(
             0.03, 0.004 * max(0, changed_fields - 1)
         )
+        source_bonus = {
+            "feedback_winner_transfer": 0.10,
+            "feedback_winner_mutation": 0.08,
+            "feedback_regression_counterfactual": 0.07,
+            "contract_coupled_policy": 0.02,
+        }.get(candidate.source, 0.0)
+        upper_penalty = (
+            0.10 * max(0.0, prediction.upper_ratio - 1.0)
+            if math.isfinite(prediction.upper_ratio)
+            else 0.0
+        )
+        unsupported_optimism_penalty = (
+            0.20
+            if (
+                prediction.samples
+                and prediction.support < 0.15
+                and prediction.robust_ratio < 0.95
+            )
+            else 0.0
+        )
         return (
+            predicted
+            + upper_penalty
+            + unsupported_optimism_penalty
+            + 0.25 * risk
+            + 0.04 * cross_template
+            + structural_penalty
+            - information_bonus
+            - source_bonus,
             transition.risk_tier,
             cross_template and prediction.samples < 3,
-            predicted
-            + uncertainty
-            + 0.20 * risk
-            + 0.03 * cross_template
-            + structural_penalty,
             predicted,
             changed_fields,
             vector.metrics.get("analytical_prior", math.inf),
@@ -1248,6 +1272,14 @@ def select_one_shot_candidate(
         selection_policy = "paired_control_relative_effect"
         deployment_recommended = 1.0
     else:
+        research_pool = [
+            item
+            for item in eligible
+            if not schedules_execution_equivalent(
+                incumbent.schedule, item[0].schedule
+            )
+        ]
+        selection_pool = research_pool or eligible
         (
             original,
             vector,
@@ -1256,7 +1288,7 @@ def select_one_shot_candidate(
             relative_safety,
             _,
             _,
-        ) = min(eligible, key=research_score)
+        ) = min(selection_pool, key=research_score)
         acquisition = research_score(
             (
                 original,
@@ -1271,11 +1303,11 @@ def select_one_shot_candidate(
                 ),
                 True,
             )
-        )[2]
-        deployment_candidate = original
+        )[0]
         if schedules_execution_equivalent(
             incumbent.schedule, original.schedule
         ):
+            deployment_candidate = original
             source = "one_shot_bank_equivalent"
             rationale = (
                 "independent solver reconstructed the bank kernel "
@@ -1284,14 +1316,16 @@ def select_one_shot_candidate(
             selection_policy = "independent_bank_reconstruction"
             deployment_recommended = 0.0
         else:
-            source = "one_shot_custom_policy"
+            deployment_candidate = incumbent
+            source = "one_shot_research_candidate"
             rationale = (
-                "single runtime-safe custom deployment chosen by expected "
-                "bank-relative latency, uncertainty, structural distance, "
-                f"and rejection risk; generator={original.source}"
+                "single runtime-safe non-bank challenger selected for paired "
+                "active-learning measurement from expected bank-relative "
+                "latency, information gain, structural transfer, and "
+                f"rejection risk; generator={original.source}"
             )
-            selection_policy = "risk_bounded_custom_first"
-            deployment_recommended = 1.0
+            selection_policy = "paired_feedback_active_challenger"
+            deployment_recommended = 0.0
 
     vector.metrics.update(
         {

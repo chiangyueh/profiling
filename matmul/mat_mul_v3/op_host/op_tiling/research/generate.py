@@ -319,6 +319,7 @@ def load_unpaired_one_shot_candidates(
                 not in {
                     "one_shot_bank_relative",
                     "one_shot_custom_policy",
+                    "one_shot_research_candidate",
                 }
                 or row.get("soc") != soc
                 or int(row.get("aic") or 0) != aic_cores
@@ -673,7 +674,9 @@ def main() -> None:
                 "validation_only=1"
             )
     engine_observations = (
-        observations if args.selection_mode == "campaign" else ()
+        observations
+        if args.selection_mode in {"campaign", "one-shot"}
+        else ()
     )
     engine = CandidateEngine(
         config=SearchConfig(
@@ -872,7 +875,7 @@ def main() -> None:
                     metrics.update(
                         {
                             "deployment_evidence_strong": 0.0,
-                            "deployment_recommended_custom": 1.0,
+                            "deployment_recommended_custom": 0.0,
                             "bank_execution_equivalent": 0.0,
                             "bank_signature_exact": 0.0,
                             "resume_unpaired_remeasurement": 1.0,
@@ -881,10 +884,10 @@ def main() -> None:
                     selected = Candidate(
                         schedule=pending_candidate.schedule,
                         template=pending_candidate.template,
-                        source="one_shot_custom_policy",
+                        source="one_shot_research_candidate",
                         rationale=(
-                            "repeat the same numerically verified custom "
-                            "tiling because its paired latency was invalid; "
+                            "repeat the same numerically verified research "
+                            "challenger because its paired latency was invalid; "
                             f"generator={pending_candidate.source}"
                         ),
                         acquisition=pending_candidate.acquisition,
@@ -896,7 +899,7 @@ def main() -> None:
                     )
                     one_shot_decision = OneShotDecision(
                         candidate=selected,
-                        deployment_candidate=selected,
+                        deployment_candidate=incumbent,
                         generator_source=pending_candidate.source,
                         evaluated=one_shot_decision.evaluated,
                         safe_candidates=one_shot_decision.safe_candidates,
@@ -926,7 +929,19 @@ def main() -> None:
                         f"{workload.workload_id} "
                         "reason=prior_signature_not_regenerated"
                     )
-            if (
+            research_measurement = (
+                one_shot_decision.candidate.source
+                == "one_shot_research_candidate"
+            )
+            if research_measurement and (
+                one_shot_decision.deployment_candidate.schedule
+                != incumbent.schedule
+            ):
+                raise ValueError(
+                    "one-shot research measurement must retain the bank "
+                    "deployment recommendation"
+                )
+            if not research_measurement and (
                 one_shot_decision.deployment_candidate.schedule
                 != one_shot_decision.candidate.schedule
             ):
@@ -1046,7 +1061,7 @@ def main() -> None:
                 f"generator={one_shot_decision.generator_source} "
                 f"policy={one_shot_decision.selection_policy} "
                 "deployment="
-                f"{'bank_equivalent' if metrics.get('bank_execution_equivalent', 0.0) else 'custom'} "
+                f"{'custom' if metrics.get('deployment_recommended_custom', 0.0) else 'bank'} "
                 "bank_signature_exact="
                 f"{int(metrics.get('bank_signature_exact', 0.0))} "
                 "deployment_signature="

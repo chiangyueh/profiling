@@ -6,6 +6,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Iterable, Sequence, Tuple
 
+from .bank_structure import (
+    BANK_SUBSYSTEM_FIELDS,
+    bank_transition,
+    schedules_execution_equivalent,
+    subsystem_mask_distance,
+)
 from .behavior import behavior_key, behavior_vector, workload_distance
 from .contracts import ceil_div, template_of, validate_schedule
 from .domain import (
@@ -596,6 +602,289 @@ def feedback_mutations(
             )
         )
     return candidates
+
+
+def bank_relative_transfer_candidates(
+    workload: Workload,
+    hardware: Hardware,
+    anchor: Schedule | None,
+    independent: Sequence[Candidate],
+    observations: Sequence[MeasuredObservation],
+    *,
+    winner_donors: int = 16,
+    regression_donors: int = 16,
+    per_winner: int = 2,
+) -> list[Candidate]:
+    """Generate target schedules from measured candidate-vs-bank effects.
+
+    Donor records provide only a behavior delta and a changed-subsystem mask.
+    Field values come from independently generated schedules for the target
+    workload. Target-side subsystem crossover creates a new schedule, which is
+    then checked by the complete hardware and template contract.
+    """
+
+    if anchor is None or not independent:
+        return []
+    target_bank_vector = behavior_vector(workload, anchor, hardware)
+    target_bank_template = template_of(anchor)
+    donors = [
+        observation
+        for observation in observations
+        if (
+            observation.verified
+            and observation.structured_verified
+            and observation.bank_schedule is not None
+            and observation.workload.identity() != workload.identity()
+            and observation.workload.dtype == workload.dtype
+            and observation.workload.trans_a == workload.trans_a
+            and observation.workload.trans_b == workload.trans_b
+            and template_of(observation.bank_schedule)
+            == target_bank_template
+            and not schedules_execution_equivalent(
+                observation.bank_schedule, observation.schedule
+            )
+            and (observation.is_winner or observation.is_regression)
+        )
+    ]
+    winners = sorted(
+        (observation for observation in donors if observation.is_winner),
+        key=lambda observation: (
+            workload_distance(workload, observation.workload),
+            observation.measured_ratio,
+            observation.record_id,
+        ),
+    )[:winner_donors]
+    regressions = sorted(
+        (
+            observation
+            for observation in donors
+            if observation.is_regression
+        ),
+        key=lambda observation: (
+            workload_distance(workload, observation.workload),
+            -observation.measured_ratio,
+            observation.record_id,
+        ),
+    )[:regression_donors]
+    if not winners and not regressions:
+        return []
+
+    projected = []
+    for candidate in independent:
+        if schedules_execution_equivalent(anchor, candidate.schedule):
+            continue
+        candidate_vector = behavior_vector(
+            workload, candidate.schedule, hardware
+        )
+        projected.append(
+            (
+                candidate,
+                candidate_vector,
+                tuple(
+                    candidate_value - bank_value
+                    for candidate_value, bank_value in zip(
+                        candidate_vector.values,
+                        target_bank_vector.values,
+                    )
+                ),
+                bank_transition(anchor, candidate.schedule),
+            )
+        )
+
+    selected: list[Candidate] = []
+    seen: set[tuple[int, ...]] = set()
+
+    def crossover(
+        base: Schedule,
+        component: Schedule,
+        subsystems: Iterable[str],
+    ) -> Schedule:
+        fields = {
+            field
+            for subsystem in subsystems
+            for field in BANK_SUBSYSTEM_FIELDS[subsystem]
+        }
+        return base.replace(
+            **{field: component[field] for field in fields}
+        )
+
+    def accept(
+        schedule: Schedule,
+        *,
+        source: str,
+        rationale: str,
+        parents: tuple[tuple[int, ...], ...],
+    ) -> bool:
+        signature = schedule.signature()
+        if (
+            signature in seen
+            or schedules_execution_equivalent(anchor, schedule)
+            or not validate_schedule(workload, schedule, hardware).valid
+        ):
+            return False
+        seen.add(signature)
+        selected.append(
+            Candidate(
+                schedule=schedule,
+                template=template_of(schedule),
+                source=source,
+                rationale=rationale,
+                parent_signatures=parents,
+            )
+        )
+        return True
+
+    def donor_effect(observation: MeasuredObservation):
+        donor_bank_vector = behavior_vector(
+            observation.workload,
+            observation.bank_schedule,
+            hardware,
+        )
+        donor_candidate_vector = behavior_vector(
+            observation.workload,
+            observation.schedule,
+            hardware,
+        )
+        return (
+            tuple(
+                candidate_value - bank_value
+                for candidate_value, bank_value in zip(
+                    donor_candidate_vector.values,
+                    donor_bank_vector.values,
+                )
+            ),
+            bank_transition(
+                observation.bank_schedule, observation.schedule
+            ),
+        )
+
+    def effect_distance(
+        candidate_delta: tuple[float, ...],
+        donor_delta: tuple[float, ...],
+    ) -> float:
+        return math.sqrt(
+            sum(
+                (candidate_value - donor_value) ** 2
+                for candidate_value, donor_value in zip(
+                    candidate_delta, donor_delta
+                )
+            )
+            / max(1, len(candidate_delta))
+        )
+
+    for donor in winners:
+        donor_delta, donor_transition = donor_effect(donor)
+        if not donor_transition.changed_subsystems:
+            continue
+        compatible = [
+            (
+                1.5
+                * subsystem_mask_distance(
+                    candidate_transition, donor_transition
+                )
+                + effect_distance(candidate_delta, donor_delta),
+                candidate.schedule.signature(),
+                candidate,
+            )
+            for (
+                candidate,
+                _,
+                candidate_delta,
+                candidate_transition,
+            ) in projected
+            if candidate.template == template_of(donor.schedule)
+        ]
+        emitted = 0
+        for _, _, component in sorted(compatible):
+            schedule = crossover(
+                anchor,
+                component.schedule,
+                donor_transition.changed_subsystems,
+            )
+            if accept(
+                schedule,
+                source="feedback_winner_transfer",
+                rationale=(
+                    "target-side subsystem crossover matching a verified "
+                    "candidate-vs-bank winner transition"
+                ),
+                parents=(
+                    donor.bank_schedule.signature(),
+                    donor.schedule.signature(),
+                    component.schedule.signature(),
+                ),
+            ):
+                emitted += 1
+            if emitted >= per_winner:
+                break
+
+    for donor in regressions:
+        donor_delta, donor_transition = donor_effect(donor)
+        if not donor_transition.changed_subsystems:
+            continue
+        compatible = sorted(
+            (
+                1.5
+                * subsystem_mask_distance(
+                    candidate_transition, donor_transition
+                )
+                + effect_distance(candidate_delta, donor_delta),
+                candidate_transition.risk_tier,
+                candidate.schedule.signature(),
+                candidate,
+            )
+            for (
+                candidate,
+                _,
+                candidate_delta,
+                candidate_transition,
+            ) in projected
+            if candidate.template == template_of(donor.schedule)
+        )
+        emitted = False
+        for _, _, _, primary in compatible[:8]:
+            for subsystem in sorted(
+                donor_transition.changed_subsystems
+            ):
+                alternatives = [
+                    candidate
+                    for candidate, _, _, _ in projected
+                    if (
+                        candidate.template == primary.template
+                        and any(
+                            candidate.schedule[field]
+                            != primary.schedule[field]
+                            for field in BANK_SUBSYSTEM_FIELDS[subsystem]
+                        )
+                    )
+                ]
+                for alternative in alternatives[:16]:
+                    schedule = crossover(
+                        primary.schedule,
+                        alternative.schedule,
+                        (subsystem,),
+                    )
+                    if accept(
+                        schedule,
+                        source="feedback_regression_counterfactual",
+                        rationale=(
+                            "target-side one-subsystem counterfactual to a "
+                            "measured candidate-vs-bank regression"
+                        ),
+                        parents=(
+                            donor.bank_schedule.signature(),
+                            donor.schedule.signature(),
+                            primary.schedule.signature(),
+                            alternative.schedule.signature(),
+                        ),
+                    ):
+                        emitted = True
+                        break
+                if emitted:
+                    break
+            if emitted:
+                break
+    return selected
 
 
 def local_anchor_mutations(

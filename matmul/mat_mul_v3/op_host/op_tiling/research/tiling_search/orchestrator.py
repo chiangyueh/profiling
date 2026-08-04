@@ -27,6 +27,7 @@ from .domain import (
 )
 from .feedback import (
     Fingerprint,
+    bank_relative_transfer_candidates,
     feedback_mutations,
     feedback_targets,
     fingerprint,
@@ -190,13 +191,21 @@ class CandidateEngine:
         measured_mutations = feedback_mutations(
             workload, hardware, self.observations
         )
+        transferred = bank_relative_transfer_candidates(
+            workload,
+            hardware,
+            local_anchor,
+            independent,
+            self.observations,
+        )
         local_candidates = local_anchor_mutations(
             workload, hardware, local_anchor
         )
         expanded = [
-            # Preserve causal provenance when a feedback mutation also appears
-            # in the independent solver stream. This lets stage-two selection
-            # distinguish an intentional counterfactual from a generic probe.
+            # Preserve feedback provenance when the same schedule also appears
+            # in the independent stream. Stage two can then distinguish a
+            # measured structural hypothesis from a generic coverage probe.
+            *transferred,
             *measured_mutations,
             *independent,
             *local_candidates,
@@ -274,6 +283,24 @@ class CandidateEngine:
             candidate.schedule.signature()
             for candidate in protected_local
         )
+        protected_feedback = [
+            candidate
+            for candidate in filtered
+            if (
+                candidate.source
+                in {
+                    "feedback_winner_transfer",
+                    "feedback_winner_mutation",
+                    "feedback_regression_counterfactual",
+                }
+                and candidate.schedule.signature()
+                not in protected_signatures
+            )
+        ][: max(1, budget.callback_candidates // 3)]
+        protected_signatures.update(
+            candidate.schedule.signature()
+            for candidate in protected_feedback
+        )
         protected_policy = [
             candidate
             for candidate in filtered
@@ -282,13 +309,14 @@ class CandidateEngine:
                 and candidate.schedule.signature()
                 not in protected_signatures
             )
-        ][: max(1, budget.callback_candidates // 2)]
+        ][: max(1, budget.callback_candidates // 4)]
         protected_signatures.update(
             candidate.schedule.signature()
             for candidate in protected_policy
         )
         selected = [
             *protected_reproductions,
+            *protected_feedback,
             *protected_local,
             *protected_policy,
             *(

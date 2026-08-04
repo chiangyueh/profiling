@@ -191,7 +191,7 @@ class OneShotSelectionTest(unittest.TestCase):
             )
         return evidence
 
-    def test_no_paired_effect_evidence_deploys_runtime_safe_custom(
+    def test_no_paired_effect_evidence_selects_research_challenger(
         self,
     ) -> None:
         decision = select_one_shot_candidate(
@@ -204,18 +204,22 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.candidate.schedule, self.custom.schedule)
         self.assertEqual(
-            decision.candidate.source, "one_shot_custom_policy"
+            decision.candidate.source, "one_shot_research_candidate"
         )
         self.assertEqual(
-            decision.deployment_candidate.schedule, self.custom.schedule
+            decision.deployment_candidate.schedule, self.bank
         )
         self.assertEqual(
             decision.selection_policy,
-            "risk_bounded_custom_first",
+            "paired_feedback_active_challenger",
+        )
+        self.assertEqual(
+            decision.candidate.metrics["deployment_recommended_custom"],
+            0.0,
         )
         self.assertEqual(decision.custom_eligible_candidates, 1)
 
-    def test_independent_contract_candidate_can_be_deployed(
+    def test_independent_contract_candidate_can_be_measured(
         self,
     ) -> None:
         broad = Candidate(
@@ -234,7 +238,42 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.candidate.schedule, broad.schedule)
         self.assertEqual(
-            decision.deployment_candidate.schedule, broad.schedule
+            decision.deployment_candidate.schedule, self.bank
+        )
+
+    def test_feedback_transfer_is_preferred_for_active_measurement(
+        self,
+    ) -> None:
+        transferred = Candidate(
+            schedule=self.custom.schedule,
+            template=Template.BASE,
+            source="feedback_winner_transfer",
+            rationale="projected paired winner transition",
+        )
+        generic = Candidate(
+            schedule=self.bank.replace(l2IterateOrder=1),
+            template=Template.BASE,
+            source="contract_global",
+            rationale="generic independent candidate",
+        )
+        decision = select_one_shot_candidate(
+            self.workload,
+            [generic, transferred],
+            self.incumbent,
+            (),
+            self.hardware,
+            cost_model=_RuntimeModel(),
+        )
+        self.assertEqual(decision.candidate.schedule, transferred.schedule)
+        self.assertEqual(
+            decision.generator_source, "feedback_winner_transfer"
+        )
+        self.assertEqual(
+            decision.candidate.source, "one_shot_research_candidate"
+        )
+        self.assertEqual(
+            decision.selection_policy,
+            "paired_feedback_active_challenger",
         )
 
     def test_independent_bank_reconstruction_is_not_discarded(
@@ -455,11 +494,11 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(weak_decision.candidate.schedule, split.schedule)
         self.assertEqual(
-            weak_decision.deployment_candidate.schedule, split.schedule
+            weak_decision.deployment_candidate.schedule, self.bank
         )
         self.assertEqual(
             weak_decision.selection_policy,
-            "risk_bounded_custom_first",
+            "paired_feedback_active_challenger",
         )
 
         strong = self._paired_effects(split, ratio=0.80, count=3)
@@ -496,10 +535,10 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.candidate.schedule, self.custom.schedule)
         self.assertEqual(
-            decision.candidate.source, "one_shot_custom_policy"
+            decision.candidate.source, "one_shot_research_candidate"
         )
         self.assertEqual(
-            decision.deployment_candidate.schedule, self.custom.schedule
+            decision.deployment_candidate.schedule, self.bank
         )
 
     def test_calibration_separates_local_coupled_and_template_probes(

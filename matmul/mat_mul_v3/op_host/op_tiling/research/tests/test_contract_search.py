@@ -613,6 +613,133 @@ class ContractSearchTest(unittest.TestCase):
             )
         )
 
+    def test_verified_cross_workload_winner_changes_callback_frontier(
+        self,
+    ) -> None:
+        target = Workload(
+            workload_id="unseen_feedback_target",
+            m=1408,
+            n=1152,
+            k=12288,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        donor = Workload(
+            workload_id="measured_feedback_donor",
+            m=1536,
+            n=1024,
+            k=8192,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        budget = GenerationBudget(
+            raw_attempts=4000,
+            legal_candidates=1600,
+            behavior_candidates=96,
+            callback_candidates=32,
+            npu_candidates=8,
+        )
+        baseline_engine = CandidateEngine(
+            config=SearchConfig(budget, include_exploration=False)
+        )
+        target_baseline = baseline_engine.generate(target, self.hardware)
+        donor_baseline = baseline_engine.generate(donor, self.hardware)
+        target_bank = next(
+            candidate.schedule
+            for candidate in target_baseline.callback_candidates
+            if candidate.template == Template.BASE
+        )
+        donor_base = [
+            candidate.schedule
+            for candidate in donor_baseline.callback_candidates
+            if candidate.template == Template.BASE
+        ]
+        self.assertGreaterEqual(len(donor_base), 2)
+        winner = MeasuredObservation(
+            workload=donor,
+            schedule=donor_base[1],
+            ratio_vs_official=0.82,
+            ratio_vs_bank=0.80,
+            source="measured_winner",
+            record_id="paired-donor-winner",
+            status_vs_official="improved",
+            status_vs_bank="improved",
+            verified=True,
+            structured_verified=True,
+            bank_schedule=donor_base[0],
+        )
+        with_feedback = CandidateEngine(
+            config=SearchConfig(budget, include_exploration=False),
+            observations=[winner],
+        ).generate(
+            target,
+            self.hardware,
+            local_anchor=target_bank,
+        )
+        transferred = [
+            candidate
+            for candidate in with_feedback.callback_candidates
+            if candidate.source == "feedback_winner_transfer"
+        ]
+        self.assertTrue(transferred)
+        self.assertTrue(
+            all(
+                candidate.parent_signatures[:2]
+                == (
+                    donor_base[0].signature(),
+                    donor_base[1].signature(),
+                )
+                for candidate in transferred
+            )
+        )
+        baseline_signatures = {
+            candidate.schedule.signature()
+            for candidate in target_baseline.candidates
+        }
+        self.assertTrue(
+            any(
+                candidate.schedule.signature() not in baseline_signatures
+                for candidate in transferred
+            )
+        )
+        regression = MeasuredObservation(
+            workload=donor,
+            schedule=donor_base[1],
+            ratio_vs_official=1.30,
+            ratio_vs_bank=1.25,
+            source="measured_regression",
+            record_id="paired-donor-regression",
+            status_vs_official="regressed",
+            status_vs_bank="regressed",
+            verified=True,
+            structured_verified=True,
+            bank_schedule=donor_base[0],
+        )
+        with_regression = CandidateEngine(
+            config=SearchConfig(budget, include_exploration=False),
+            observations=[regression],
+        ).generate(
+            target,
+            self.hardware,
+            local_anchor=target_bank,
+        )
+        counterfactuals = [
+            candidate
+            for candidate in with_regression.callback_candidates
+            if candidate.source == "feedback_regression_counterfactual"
+        ]
+        self.assertTrue(counterfactuals)
+        self.assertTrue(
+            any(
+                candidate.schedule.signature() not in baseline_signatures
+                for candidate in counterfactuals
+            )
+        )
+
     def test_provisional_winner_fingerprint_is_not_remeasured(
         self,
     ) -> None:

@@ -544,6 +544,8 @@ def deployment_decision(
         else:
             outcome = "within_noise"
         return f"retain_bank_research_candidate_{outcome}"
+    if not status_official or not status_bank:
+        return "custom_measurement_failed"
     if status_official == "improved" and status_bank == "improved":
         return "custom_faster"
     if status_official == "regressed" or status_bank == "regressed":
@@ -810,6 +812,8 @@ def summarize(
             if source["candidate_source"] in {
                 "one_shot_research_candidate",
                 "one_shot_bank_incumbent",
+                "one_shot_bank_relative",
+                "one_shot_custom_policy",
             }:
                 summary["best_source"] = source["candidate_source"]
                 summary["deployment_decision"] = deployment_decision(
@@ -1423,7 +1427,8 @@ def main() -> None:
     )
     deployed_custom = sum(
         row.get("deployment_decision", "").startswith("custom_")
-        and row.get("best_source") == "one_shot_bank_relative"
+        and row.get("best_source")
+        in {"one_shot_bank_relative", "one_shot_custom_policy"}
         for row in summaries
     )
     retained_bank = sum(

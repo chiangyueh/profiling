@@ -789,6 +789,14 @@ def main() -> None:
                 effect_model=one_shot_effect_model,
                 safety_model=one_shot_safety_model,
             )
+            if (
+                one_shot_decision.deployment_candidate.schedule
+                != one_shot_decision.candidate.schedule
+            ):
+                raise ValueError(
+                    "one-shot deployment must use the selected custom "
+                    "candidate; bank fallback is disabled"
+                )
             selected_candidates = [one_shot_decision.candidate]
             racing_plan = None
         elif args.selection_mode == "calibration":
@@ -893,6 +901,8 @@ def main() -> None:
                 f"{one_shot_decision.transfer_eligible_candidates} "
                 "custom_eligible="
                 f"{one_shot_decision.custom_eligible_candidates} "
+                "strong_evidence="
+                f"{int(metrics.get('deployment_evidence_strong', 0.0))} "
                 f"local={one_shot_decision.local_candidates} "
                 f"policy={one_shot_decision.selection_policy} "
                 "deployment="

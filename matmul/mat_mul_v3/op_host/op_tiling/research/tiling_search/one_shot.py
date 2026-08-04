@@ -979,7 +979,13 @@ def select_one_shot_candidate(
     safety_model: BankRelativeSafetyModel | None = None,
     **_ignored,
 ) -> OneShotDecision:
-    """Select one tiling with a measured bank-relative safety criterion."""
+    """Select exactly one custom tiling using bank-relative evidence.
+
+    The bank is an incumbent and paired measurement control, not a normal
+    deployment fallback. A candidate must pass the runtime-safety policy.
+    Strong latency evidence changes the confidence tier; it does not decide
+    whether the custom search is used at all.
+    """
 
     if incumbent.source != "bank_incumbent":
         raise ValueError("one-shot incumbent must be the bank control")
@@ -994,6 +1000,9 @@ def select_one_shot_candidate(
     for candidate in candidates:
         if candidate.source not in {
             "contract_coupled_policy",
+            "contract_global",
+            "feedback_regression_counterfactual",
+            "feedback_winner_mutation",
             "local_bank_anchor",
         }:
             continue
@@ -1065,7 +1074,8 @@ def select_one_shot_candidate(
             )
         )
 
-    eligible = [item for item in evaluated if item[6]]
+    strong_evidence = [item for item in evaluated if item[6]]
+    eligible = [item for item in evaluated if item[5]]
     runtime_safe_count = sum(item[5] for item in evaluated)
     direct_base_count = sum(
         item[0].template.value == "BASE"
@@ -1078,45 +1088,14 @@ def select_one_shot_candidate(
     )
 
     if not evaluated:
-        vector = behavior_vector(
-            workload, incumbent.schedule, hardware
+        raise ValueError(
+            "one-shot search produced no independent custom candidate; "
+            "bank fallback is disabled"
         )
-        vector.metrics.update(
-            {
-                "predicted_latency_ratio": 1.0,
-                "bank_relative_upper_ratio": 1.0,
-                "bank_relative_samples": 0.0,
-                "bank_relative_nearest_distance": math.inf,
-                "bank_relative_support": 0.0,
-                "bank_changed_fields": 0.0,
-                "runtime_risk_score": 0.0,
-                "runtime_risk_support": 1.0,
-                "one_shot_incumbent_fallback": 1.0,
-            }
-        )
-        selected = Candidate(
-            schedule=incumbent.schedule,
-            template=incumbent.template,
-            source="one_shot_bank_incumbent",
-            rationale=(
-                "no custom candidate has leave-workload-out paired "
-                "evidence sufficient to beat the bank safely"
-            ),
-            acquisition=0.0,
-            parent_signatures=(incumbent.schedule.signature(),),
-            behavior_key=behavior_key(vector),
-            metrics=dict(vector.metrics),
-        )
-        return OneShotDecision(
-            candidate=selected,
-            deployment_candidate=incumbent,
-            evaluated=len(evaluated),
-            safe_candidates=runtime_safe_count,
-            direct_base_candidates=direct_base_count,
-            transfer_eligible_candidates=0,
-            custom_eligible_candidates=0,
-            local_candidates=local_count,
-            selection_policy="bank_incumbent",
+    if not eligible:
+        raise ValueError(
+            "one-shot search produced no runtime-safe custom candidate; "
+            "bank fallback is disabled"
         )
 
     def deployment_score(item) -> tuple[float, float, tuple[int, ...]]:
@@ -1156,19 +1135,26 @@ def select_one_shot_candidate(
             else 0.18
         )
         cross_template = candidate.template != incumbent.template
+        changed_fields = len(
+            _changed_fields(incumbent.schedule, candidate.schedule)
+        )
+        structural_penalty = min(
+            0.03, 0.004 * max(0, changed_fields - 1)
+        )
         return (
-            not runtime_safe,
             cross_template and prediction.samples < 3,
             predicted
             + uncertainty
             + 0.20 * risk
-            + 0.03 * cross_template,
+            + 0.03 * cross_template
+            + structural_penalty,
             predicted,
+            changed_fields,
             vector.metrics.get("analytical_prior", math.inf),
             candidate.schedule.signature(),
         )
 
-    if eligible:
+    if strong_evidence:
         (
             original,
             vector,
@@ -1177,7 +1163,7 @@ def select_one_shot_candidate(
             _,
             _,
             _,
-        ) = min(eligible, key=deployment_score)
+        ) = min(strong_evidence, key=deployment_score)
         acquisition = deployment_score(
             (original, vector, prediction, None, None, True, True)
         )[0]
@@ -1198,7 +1184,7 @@ def select_one_shot_candidate(
             relative_safety,
             _,
             _,
-        ) = min(evaluated, key=research_score)
+        ) = min(eligible, key=research_score)
         acquisition = research_score(
             (
                 original,
@@ -1211,24 +1197,25 @@ def select_one_shot_candidate(
                     if relative_safety.support >= 0.15
                     else _is_runtime_safe(runtime)
                 ),
-                False,
+                True,
             )
-        )[2]
-        deployment_candidate = incumbent
-        source = "one_shot_research_candidate"
+        )[1]
+        deployment_candidate = original
+        source = "one_shot_custom_policy"
         rationale = (
-            "one custom counterfactual retained for paired NPU learning; "
-            "deployment remains on the bank because independent effect "
-            f"support is insufficient; generator={original.source}"
+            "single runtime-safe custom deployment chosen by expected "
+            "bank-relative latency, uncertainty, structural distance, "
+            f"and rejection risk; generator={original.source}"
         )
-        selection_policy = "research_measurement_bank_deployment"
-        deployment_recommended = 0.0
+        selection_policy = "risk_bounded_custom_first"
+        deployment_recommended = 1.0
 
     vector.metrics.update(
         {
             "one_shot_score": acquisition,
             "one_shot_incumbent_fallback": 0.0,
             "deployment_recommended_custom": deployment_recommended,
+            "deployment_evidence_strong": float(bool(strong_evidence)),
         }
     )
     selected = Candidate(
@@ -1248,8 +1235,8 @@ def select_one_shot_candidate(
         safe_candidates=runtime_safe_count,
         direct_base_candidates=direct_base_count,
         transfer_eligible_candidates=sum(
-            item[6] and item[0].template != incumbent.template
-            for item in evaluated
+            item[5] and item[0].template != incumbent.template
+            for item in eligible
         ),
         custom_eligible_candidates=len(eligible),
         local_candidates=local_count,

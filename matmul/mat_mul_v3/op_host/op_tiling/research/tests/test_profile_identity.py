@@ -120,6 +120,20 @@ class ProfileIdentityTest(unittest.TestCase):
             "retain_bank_research_measurement_failed",
         )
 
+    def test_custom_policy_reports_real_custom_deployment(self) -> None:
+        self.assertEqual(
+            PROFILE.deployment_decision(
+                "one_shot_custom_policy",
+                "improved",
+                "improved",
+            ),
+            "custom_faster",
+        )
+        self.assertEqual(
+            PROFILE.deployment_decision("one_shot_custom_policy"),
+            "custom_measurement_failed",
+        )
+
     def test_summary_ranks_by_paired_ratio_not_cross_run_latency(
         self,
     ) -> None:

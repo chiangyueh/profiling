@@ -167,7 +167,7 @@ class OneShotSelectionTest(unittest.TestCase):
             )
         return evidence
 
-    def test_no_paired_effect_evidence_measures_custom_but_deploys_bank(
+    def test_no_paired_effect_evidence_deploys_runtime_safe_custom(
         self,
     ) -> None:
         decision = select_one_shot_candidate(
@@ -180,17 +180,20 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.candidate.schedule, self.custom.schedule)
         self.assertEqual(
-            decision.candidate.source, "one_shot_research_candidate"
+            decision.candidate.source, "one_shot_custom_policy"
         )
         self.assertEqual(
-            decision.deployment_candidate.schedule, self.bank
+            decision.deployment_candidate.schedule, self.custom.schedule
         )
         self.assertEqual(
             decision.selection_policy,
-            "research_measurement_bank_deployment",
+            "risk_bounded_custom_first",
         )
+        self.assertEqual(decision.custom_eligible_candidates, 1)
 
-    def test_broad_candidates_cannot_force_a_deployment(self) -> None:
+    def test_independent_contract_candidate_can_be_deployed(
+        self,
+    ) -> None:
         broad = Candidate(
             schedule=self.custom.schedule,
             template=Template.BASE,
@@ -205,9 +208,29 @@ class OneShotSelectionTest(unittest.TestCase):
             self.hardware,
             cost_model=_RuntimeModel(),
         )
-        self.assertEqual(decision.candidate.schedule, self.bank)
-        self.assertEqual(decision.deployment_candidate.schedule, self.bank)
-        self.assertEqual(decision.evaluated, 0)
+        self.assertEqual(decision.candidate.schedule, broad.schedule)
+        self.assertEqual(
+            decision.deployment_candidate.schedule, broad.schedule
+        )
+
+    def test_empty_custom_pool_fails_instead_of_using_bank(self) -> None:
+        unsupported = Candidate(
+            schedule=self.custom.schedule,
+            template=Template.BASE,
+            source="unsupported_test_source",
+            rationale="not part of the one-shot candidate layer",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "no independent custom candidate"
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [unsupported],
+                self.incumbent,
+                (),
+                self.hardware,
+                cost_model=_RuntimeModel(),
+            )
 
     def test_repeated_bank_relative_effect_selects_custom(self) -> None:
         observations = self._paired_effects(
@@ -235,21 +258,24 @@ class OneShotSelectionTest(unittest.TestCase):
             decision.candidate.metrics["bank_relative_samples"], 3
         )
 
-    def test_runtime_risk_overrides_positive_latency_effect(self) -> None:
+    def test_no_runtime_safe_candidate_fails_instead_of_using_bank(
+        self,
+    ) -> None:
         observations = self._paired_effects(
             self.custom, ratio=0.82, count=4
         )
-        decision = select_one_shot_candidate(
-            self.workload,
-            [self.custom],
-            self.incumbent,
-            observations,
-            self.hardware,
-            cost_model=_AlwaysRiskyModel(),
-            safety_model=_UnsafeRelativeSafetyModel(),
-        )
-        self.assertEqual(decision.candidate.schedule, self.custom.schedule)
-        self.assertEqual(decision.deployment_candidate.schedule, self.bank)
+        with self.assertRaisesRegex(
+            ValueError, "no runtime-safe custom candidate"
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [self.custom],
+                self.incumbent,
+                observations,
+                self.hardware,
+                cost_model=_AlwaysRiskyModel(),
+                safety_model=_UnsafeRelativeSafetyModel(),
+            )
 
     def test_cross_template_requires_stronger_independent_support(self) -> None:
         split = Candidate(
@@ -269,7 +295,11 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(weak_decision.candidate.schedule, split.schedule)
         self.assertEqual(
-            weak_decision.deployment_candidate.schedule, self.bank
+            weak_decision.deployment_candidate.schedule, split.schedule
+        )
+        self.assertEqual(
+            weak_decision.selection_policy,
+            "risk_bounded_custom_first",
         )
 
         strong = self._paired_effects(split, ratio=0.80, count=3)
@@ -306,9 +336,11 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.candidate.schedule, self.custom.schedule)
         self.assertEqual(
-            decision.candidate.source, "one_shot_research_candidate"
+            decision.candidate.source, "one_shot_custom_policy"
         )
-        self.assertEqual(decision.deployment_candidate.schedule, self.bank)
+        self.assertEqual(
+            decision.deployment_candidate.schedule, self.custom.schedule
+        )
 
     def test_calibration_separates_local_coupled_and_template_probes(
         self,

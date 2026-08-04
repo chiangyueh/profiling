@@ -203,6 +203,13 @@ def load_feedback(
                         structured_verified=_truthy(
                             row.get("structured_verified")
                         ),
+                        bank_schedule=_row_schedule(
+                            {
+                                "tiling_signature": row.get(
+                                    "bank_tiling_signature", ""
+                                )
+                            }
+                        ),
                     )
                 )
                 exclusions.add(fingerprint(workload, schedule))
@@ -283,7 +290,10 @@ def load_feedback(
                     ratio_vs_official=candidate_ms / official_ms,
                     ratio_vs_bank=candidate_ms / bank_ms,
                     source=row.get("search_candidate_source", ""),
-                    record_id=row.get("resume_record_id") or path.stem,
+                    record_id=(
+                        f"{row.get('resume_run') or path.stem}:"
+                        f"{workload.workload_id}"
+                    ),
                     status_vs_official=_comparison_status(
                         official, row
                     ),
@@ -295,6 +305,13 @@ def load_feedback(
                     structured_verified=(
                         _truthy(row.get("pair_validated"))
                         and preflight_mode == "numeric_signed_axes_full_v3"
+                    ),
+                    bank_schedule=_row_schedule(
+                        {
+                            "tiling_signature": row.get(
+                                "bank_tiling_signature", ""
+                            )
+                        }
                     ),
                 )
             )

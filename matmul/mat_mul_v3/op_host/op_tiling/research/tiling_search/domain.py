@@ -190,6 +190,7 @@ class MeasuredObservation:
     status_vs_bank: str = ""
     verified: bool = False
     structured_verified: bool = False
+    bank_schedule: Schedule | None = None
 
     @property
     def measured_ratio(self) -> float:

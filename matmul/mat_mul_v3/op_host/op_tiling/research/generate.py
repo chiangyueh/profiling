@@ -8,6 +8,7 @@ import re
 import sys
 import warnings
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -15,15 +16,17 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from callback import CallbackError, exact_roundtrip, invoke
 from tiling_search import (
+    BankRelativeEffectModel,
     CandidateEngine,
-    CounterfactualPolicyModel,
     GenerationBudget,
     Hardware,
     MeasuredObservation,
     SearchConfig,
     Workload,
     plan_template_race,
+    select_calibration_candidates,
     select_one_shot_candidate,
+    validate_bank_relative_selector,
 )
 from tiling_search.contracts import template_of
 from tiling_search.domain import KNOWLEDGE_FIELDS, Candidate, Schedule
@@ -33,10 +36,6 @@ from tiling_search.behavior import (
     validate_feedback_model,
 )
 from tiling_search.feedback import fingerprint, load_feedback
-from tiling_search.ranking import (
-    PairwiseLatencyRanker,
-    validate_pairwise_ranker,
-)
 
 
 FIELD_COLUMNS = {
@@ -83,6 +82,7 @@ COLUMNS = [
     "search_behavior_key",
     "search_behavior_metrics",
     "tiling_signature",
+    "bank_tiling_signature",
     *FIELD_COLUMNS.values(),
     "callback_tiling_key",
     "callback_block_dim",
@@ -98,6 +98,15 @@ STRICT_NUMERIC_PREFLIGHT_MODES = {
 
 def truthy(value: object) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def optional_schedule(value: str | None) -> Schedule | None:
+    if not value:
+        return None
+    try:
+        return Schedule.from_signature(value)
+    except ValueError:
+        return None
 
 
 def load_workloads(path: Path, aic_cores: int) -> list[Workload]:
@@ -253,16 +262,69 @@ def load_resume_feedback(
                 ratio_vs_official=candidate_ms / official_ms,
                 ratio_vs_bank=candidate_ms / bank_ms,
                 source=row.get("candidate_source", ""),
-                record_id=row.get("record_id", path.stem),
+                record_id=(
+                    f"{row.get('run_id') or path.stem}:"
+                    f"{workload.workload_id}"
+                ),
                 status_vs_official=row.get("status_vs_official", ""),
                 status_vs_bank=row.get("status_vs_bank", ""),
                 verified=True,
                 structured_verified=(
                     preflight_mode == "numeric_signed_axes_full_v3"
                 ),
+                bank_schedule=optional_schedule(
+                    row.get("bank_tiling_signature")
+                ),
             )
         )
     return observations, exclusions
+
+
+def hydrate_bank_context(
+    observations: list[MeasuredObservation],
+) -> tuple[list[MeasuredObservation], int, int]:
+    """Attach current RuntimeKb bank schedules to trusted legacy records."""
+
+    missing: dict[
+        tuple[int, int, int, str, bool, bool, int],
+        Workload,
+    ] = {}
+    for observation in observations:
+        if observation.verified and observation.bank_schedule is None:
+            missing.setdefault(
+                observation.workload.identity(),
+                observation.workload,
+            )
+    resolved: dict[
+        tuple[int, int, int, str, bool, bool, int],
+        Schedule,
+    ] = {}
+    failures = 0
+    for identity, workload in sorted(missing.items()):
+        try:
+            official = invoke(workload)
+            resolved[identity] = exact_roundtrip(
+                workload, official.schedule
+            ).schedule
+        except Exception:
+            failures += 1
+    hydrated = [
+        (
+            replace(
+                observation,
+                bank_schedule=resolved.get(
+                    observation.workload.identity()
+                ),
+            )
+            if (
+                observation.bank_schedule is None
+                and observation.workload.identity() in resolved
+            )
+            else observation
+        )
+        for observation in observations
+    ]
+    return hydrated, len(resolved), failures
 
 
 def verify_upstream_contract(source_root: Path) -> None:
@@ -385,7 +447,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--selection-mode",
-        choices=("campaign", "one-shot"),
+        choices=("calibration", "campaign", "one-shot"),
         default="campaign",
     )
     return parser.parse_args()
@@ -446,6 +508,15 @@ def main() -> None:
             for item in exclusions
             if item[:6] not in target_prefixes
         }
+        observations, hydrated, hydration_failures = hydrate_bank_context(
+            observations
+        )
+        print(
+            "BANK_CONTEXT "
+            f"hydrated_workloads={hydrated} "
+            f"failed_workloads={hydration_failures} "
+            "source=current_RuntimeKb_callback"
+        )
     latency_observations = sum(
         observation.source != "runtime_rejected"
         for observation in observations
@@ -457,13 +528,22 @@ def main() -> None:
         f"latency={latency_observations} "
         f"runtime_rejected={runtime_rejections}"
     )
-    if not args.skip_model_validation:
+    if not args.skip_model_validation and args.selection_mode != "calibration":
         for leave_workload_out in (False, True):
             validation = validate_feedback_model(
                 observations,
                 hardware,
                 leave_workload_out=leave_workload_out,
             )
+            if args.selection_mode == "one-shot":
+                print(
+                    "RUNTIME_RISK_VALIDATION "
+                    f"mode={validation.mode} "
+                    f"runtime_samples={validation.runtime_samples} "
+                    f"risk_auc={validation.runtime_risk_auc:.6g} "
+                    "latency_model_used_for_deployment=0"
+                )
+                continue
             print(
                 "COST_MODEL_VALIDATION "
                 f"mode={validation.mode} "
@@ -486,7 +566,7 @@ def main() -> None:
                 "validation_only=1"
             )
     engine_observations = (
-        () if args.selection_mode == "one-shot" else observations
+        observations if args.selection_mode == "campaign" else ()
     )
     engine = CandidateEngine(
         config=SearchConfig(
@@ -497,7 +577,7 @@ def main() -> None:
                 callback_candidates=args.callback_candidates,
                 npu_candidates=args.npu_candidates,
             ),
-            include_exploration=args.selection_mode != "one-shot",
+            include_exploration=args.selection_mode == "campaign",
         ),
         observations=engine_observations,
         exclusions=exclusions,
@@ -507,47 +587,34 @@ def main() -> None:
         if args.selection_mode == "one-shot"
         else None
     )
-    one_shot_counterfactual_model = (
-        CounterfactualPolicyModel(observations)
+    one_shot_effect_model = (
+        BankRelativeEffectModel(observations, hardware)
         if args.selection_mode == "one-shot"
         else None
     )
-    one_shot_latency_ranker = (
-        PairwiseLatencyRanker(observations, hardware)
-        if args.selection_mode == "one-shot"
-        else None
-    )
-    if one_shot_latency_ranker is not None:
-        rank_validation = validate_pairwise_ranker(
+    if one_shot_effect_model is not None:
+        relative_validation = validate_bank_relative_selector(
             observations, hardware
         )
         print(
-            "PAIRWISE_RANK_MODEL "
-            f"groups={one_shot_latency_ranker.groups} "
-            f"samples={one_shot_latency_ranker.samples} "
-            f"residual={one_shot_latency_ranker.residual:.6g}"
+            "BANK_RELATIVE_MODEL "
+            f"rows={len(one_shot_effect_model.rows)} "
+            f"workloads={one_shot_effect_model.workloads} "
+            f"structured_rows={one_shot_effect_model.structured_rows}"
         )
         print(
-            "PAIRWISE_RANK_VALIDATION "
-            f"mode=grouped_leave_workload_out "
-            f"folds={rank_validation.folds} "
-            f"groups={rank_validation.groups} "
-            f"pairs={rank_validation.informative_pairs} "
-            f"pairwise={rank_validation.pairwise_accuracy:.6g} "
-            f"one_field_pairs={rank_validation.one_field_pairs} "
-            "one_field_accuracy="
-            f"{rank_validation.one_field_accuracy:.6g} "
-            "base_one_field_pairs="
-            f"{rank_validation.base_one_field_pairs} "
-            "base_one_field_accuracy="
-            f"{rank_validation.base_one_field_accuracy:.6g} "
-            "top_quartile_recall="
-            f"{rank_validation.top_quartile_recall:.6g} "
-            "best_candidate_percentile="
-            f"{rank_validation.best_candidate_percentile:.6g} "
-            "median_top1_regret="
-            f"{rank_validation.median_top1_regret:.6g} "
-            f"p90_top1_regret={rank_validation.p90_top1_regret:.6g}"
+            "BANK_RELATIVE_VALIDATION "
+            "mode=leave_workload_out_with_bank_incumbent "
+            f"groups={relative_validation.groups} "
+            "oracle_opportunities="
+            f"{relative_validation.oracle_opportunities} "
+            f"custom_selections={relative_validation.custom_selections} "
+            f"custom_winners={relative_validation.custom_winners} "
+            f"custom_regressions={relative_validation.custom_regressions} "
+            f"severe_regressions={relative_validation.severe_regressions} "
+            "median_selected_ratio="
+            f"{relative_validation.median_selected_ratio:.6g} "
+            f"p90_selected_ratio={relative_validation.p90_selected_ratio:.6g}"
         )
 
     output_rows: list[dict[str, str]] = []
@@ -558,16 +625,18 @@ def main() -> None:
     for workload in workloads:
         official = invoke(workload)
         bank = exact_roundtrip(workload, official.schedule)
-        output_rows.append(
-            candidate_row(
-                workload,
-                0,
-                "bank_seed_control",
-                "official_callback_control",
-                bank.schedule,
-                bank,
-            )
+        control_row = candidate_row(
+            workload,
+            0,
+            "bank_seed_control",
+            "official_callback_control",
+            bank.schedule,
+            bank,
         )
+        control_row["bank_tiling_signature"] = (
+            bank.schedule.signature_text()
+        )
+        output_rows.append(control_row)
         incumbent = Candidate(
             schedule=bank.schedule,
             template=template_of(bank.schedule),
@@ -615,6 +684,9 @@ def main() -> None:
                 rejected["search_rationale"] = (
                     f"{candidate.rationale}; callback={str(exception)[:240]}"
                 )
+                rejected["bank_tiling_signature"] = (
+                    bank.schedule.signature_text()
+                )
                 all_rows.append(rejected)
                 continue
             callback_accepted.append((candidate, callback))
@@ -637,10 +709,19 @@ def main() -> None:
                 observations,
                 hardware,
                 cost_model=one_shot_cost_model,
-                counterfactual_model=one_shot_counterfactual_model,
-                latency_ranker=one_shot_latency_ranker,
+                effect_model=one_shot_effect_model,
             )
             selected_candidates = [one_shot_decision.candidate]
+            racing_plan = None
+        elif args.selection_mode == "calibration":
+            selected_candidates = select_calibration_candidates(
+                workload,
+                callback_candidates,
+                incumbent,
+                observations,
+                hardware,
+                args.npu_candidates,
+            )
             racing_plan = None
         elif args.search_stage == "stage2":
             racing_plan = plan_template_race(
@@ -694,6 +775,9 @@ def main() -> None:
                 callback,
                 candidate,
             )
+            row["bank_tiling_signature"] = (
+                bank.schedule.signature_text()
+            )
             output_rows.append(row)
             all_rows.append(row)
             source_counts[candidate.source] += 1
@@ -736,10 +820,12 @@ def main() -> None:
                 f"score={selected.acquisition:.6g} "
                 "predicted_ratio="
                 f"{metrics.get('predicted_latency_ratio', 1.0):.6g} "
-                "pairwise_ratio="
-                f"{metrics.get('pairwise_rank_ratio', 1.0):.6g} "
-                "pairwise_support="
-                f"{metrics.get('pairwise_rank_support', 0.0):.6g} "
+                "upper_ratio="
+                f"{metrics.get('bank_relative_upper_ratio', 1.0):.6g} "
+                "effect_samples="
+                f"{metrics.get('bank_relative_samples', 0.0):.6g} "
+                "effect_support="
+                f"{metrics.get('bank_relative_support', 0.0):.6g} "
                 "l1_pipeline="
                 f"{metrics.get('l1_pipeline_efficiency', 0.0):.6g} "
                 "l2_wave="
@@ -751,7 +837,7 @@ def main() -> None:
                 f"signature={selected.schedule.signature_text()}"
             )
             expected_candidates = 1
-        else:
+        elif args.selection_mode == "campaign":
             evidence = ",".join(
                 (
                     f"{item.template.value}:{item.samples}:"
@@ -774,6 +860,26 @@ def main() -> None:
                 f"quotas={quotas or 'none'} evidence={evidence}"
             )
             expected_candidates = racing_plan.budget
+        else:
+            expected_candidates = args.npu_candidates
+            local = sum(
+                candidate.source
+                == "calibration_local_counterfactual"
+                for candidate in selected_candidates
+            )
+            template_probes = sum(
+                candidate.source == "calibration_template_probe"
+                for candidate in selected_candidates
+            )
+            print(
+                "CALIBRATION_PLAN "
+                f"{workload.workload_id} selected={len(accepted)} "
+                f"local={local} "
+                "coupled="
+                f"{len(accepted) - local - template_probes} "
+                f"template_probes={template_probes} "
+                f"bank_template={incumbent.template.value}"
+            )
         if len(accepted) < expected_candidates:
             print(
                 f"SEARCH_CAPABILITY_GAP {workload.workload_id} "
@@ -783,7 +889,7 @@ def main() -> None:
     appended = 0
     if (
         args.append_candidates is not None
-        and args.selection_mode != "one-shot"
+        and args.selection_mode == "campaign"
     ):
         with args.append_candidates.open(
             newline="", encoding="utf-8"

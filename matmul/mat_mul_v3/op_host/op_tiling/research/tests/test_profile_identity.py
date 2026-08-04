@@ -70,6 +70,38 @@ class ProfileIdentityTest(unittest.TestCase):
         self.assertTrue(all(value != base for value in variants))
         self.assertEqual(len(set(variants)), len(variants))
 
+    def test_profile_record_preserves_paired_bank_signature(self) -> None:
+        source = dict(self.row)
+        source.update(
+            {
+                "rank": "1",
+                "candidate_source": "calibration_local_counterfactual",
+                "search_template": "BASE",
+                "bank_tiling_signature": ":".join(
+                    "2" for _ in range(23)
+                ),
+            }
+        )
+        record = PROFILE.profile_record(
+            source,
+            {
+                "success": "1",
+                "preflight_passed": "1",
+                "preflight_mode": "numeric_signed_axes_full_v3",
+                "median_ms": "0.25",
+                "stddev_ms": "0.001",
+            },
+            record_id="paired-record",
+            run_id="paired-run",
+            soc="Ascend910B3",
+            aic=20,
+            toolkit="8.1.RC1",
+        )
+        self.assertEqual(
+            record["bank_tiling_signature"],
+            source["bank_tiling_signature"],
+        )
+
     def test_summary_ranks_by_paired_ratio_not_cross_run_latency(
         self,
     ) -> None:
@@ -140,6 +172,7 @@ class ProfileIdentityTest(unittest.TestCase):
             summary["paired_outcome"],
             "faster_than_official_and_bank",
         )
+        self.assertEqual(summary["deployment_decision"], "custom_faster")
 
     def test_family_summary_reports_one_shot_speedups(self) -> None:
         rows = [

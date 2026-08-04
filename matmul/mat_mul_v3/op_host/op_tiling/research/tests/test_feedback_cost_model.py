@@ -238,6 +238,7 @@ class FeedbackCostModelTest(unittest.TestCase):
             "status_vs_official": "improved",
             "status_vs_bank": "improved",
             "record_id": "resume-success",
+            "run_id": "paired-run",
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "resume.csv"
@@ -268,6 +269,10 @@ class FeedbackCostModelTest(unittest.TestCase):
         self.assertEqual(len(observations), 1)
         self.assertTrue(observations[0].verified)
         self.assertFalse(observations[0].structured_verified)
+        self.assertEqual(
+            observations[0].record_id,
+            f"paired-run:{self.workload.workload_id}",
+        )
         self.assertEqual(len(exclusions), 1)
 
         row["preflight_mode"] = "numeric_signed_axes_full_v3"

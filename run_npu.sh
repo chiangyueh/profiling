@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESEARCH="${ROOT}/matmul/mat_mul_v3/op_host/op_tiling/research"
 MODE="full"
 WORKLOADS="${RESEARCH}/config/workloads.csv"
+CALIBRATION_WORKLOADS="${RESEARCH}/config/workloads_calibration.csv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -156,22 +157,29 @@ SUMMARY="${ROOT}/results/npu_full_summary.csv"
 FAMILY_SUMMARY="${ROOT}/results/npu_full_family_summary.csv"
 CANDIDATE_RESULTS="${ROOT}/results/npu_full_candidates.csv"
 RESUME="${ROOT}/results/npu_full_resume.csv"
+CALIBRATION_CANDIDATES="${ROOT}/results/npu_calibration_search_candidates.csv"
+CALIBRATION_ALL="${ROOT}/results/npu_calibration_search_all.csv"
+CALIBRATION_SUMMARY="${ROOT}/results/npu_calibration_summary.csv"
+CALIBRATION_FAMILY_SUMMARY="${ROOT}/results/npu_calibration_family_summary.csv"
+CALIBRATION_RESULTS="${ROOT}/results/npu_calibration_candidates.csv"
+CALIBRATION_RESUME="${ROOT}/results/npu_calibration_resume.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260804-hierarchical-template-delta-v1"
+echo "  script:     run_npu.sh 20260804-paired-calibration-oneshot-v1"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      one_shot_hierarchical_template_selection"
+echo "  scope:      paired_bank_relative_calibration_then_unseen_one_shot"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  summary:    ${SUMMARY}"
 echo "  families:   ${FAMILY_SUMMARY}"
 echo "  candidates: ${CANDIDATE_RESULTS}"
 echo "  resume:     ${RESUME}"
+echo "  calibration:${CALIBRATION_RESUME}"
 echo "  log:        ${RUN_LOG}"
 echo
 
-echo "[1/4] Build callback/bank/NPU tools ..."
+echo "[1/5] Build callback/bank/NPU tools ..."
 cmake -S "${RESEARCH}" -B "${BUILD_DIR}" \
     -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" \
     -DCMAKE_BUILD_TYPE=Release >/dev/null
@@ -187,7 +195,7 @@ print_acl_loader_diag() {
         sed 's/^/    /' || true
 }
 
-echo "[2/4] Detect NPU and platform ..."
+echo "[2/5] Detect NPU and platform ..."
 DETECT_TIMEOUT_SEC="${DETECT_TIMEOUT_SEC:-30}"
 PLATFORM_TIMEOUT_SEC="${PLATFORM_TIMEOUT_SEC:-60}"
 SOC_PROBE_LOG="${ROOT}/results/logs/soc_probe_${RUN_ID}.log"
@@ -282,19 +290,28 @@ if [[ "${TOOLKIT_VERSION}" != 8.5* ]]; then
 fi
 
 NPU_CANDIDATES=1
+CALIBRATION_NPU_CANDIDATES=16
 CALLBACK_CANDIDATES=192
+CALIBRATION_CALLBACK_CANDIDATES=128
 BEHAVIOR_CANDIDATES=512
 if [[ "${MODE}" == "smoke" ]]; then
+    CALIBRATION_NPU_CANDIDATES=6
     CALLBACK_CANDIDATES=48
+    CALIBRATION_CALLBACK_CANDIDATES=48
     BEHAVIOR_CANDIDATES=128
 fi
 
 generate_candidates() {
-    local output="$1"
-    local all_output="$2"
+    local workloads="$1"
+    local output="$2"
+    local all_output="$3"
+    local selection_mode="$4"
+    local npu_candidates="$5"
+    local callback_candidates="$6"
+    local resume_feedback="${7:-}"
     local command=(
         python3 "${RESEARCH}/generate.py"
-        --workloads "${WORKLOADS}"
+        --workloads "${workloads}"
         --output "${output}"
         --all-output "${all_output}"
         --source-root "${ROOT}/matmul/mat_mul_v3"
@@ -329,12 +346,17 @@ generate_candidates() {
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log22.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log23.csv"
         --exclusions "${RESEARCH}/config/measured_fingerprints_net_log24.csv"
-        --resume-feedback "${RESUME}"
-        --npu-candidates "${NPU_CANDIDATES}"
-        --callback-candidates "${CALLBACK_CANDIDATES}"
+        --npu-candidates "${npu_candidates}"
+        --callback-candidates "${callback_candidates}"
         --behavior-candidates "${BEHAVIOR_CANDIDATES}"
-        --selection-mode one-shot
+        --selection-mode "${selection_mode}"
     )
+    if [[ -n "${resume_feedback}" ]]; then
+        command+=(--resume-feedback "${resume_feedback}")
+    fi
+    if [[ "${selection_mode}" == "calibration" ]]; then
+        command+=(--skip-model-validation)
+    fi
     "${command[@]}"
 }
 
@@ -342,12 +364,15 @@ profile_stage() {
     local candidates="$1"
     local summary="$2"
     local results="$3"
+    local family_summary="$4"
+    local resume="$5"
+    local pair_block_size="$6"
     python3 "${RESEARCH}/profile.py" \
         --candidates "${candidates}" \
         --summary "${summary}" \
-        --family-summary "${FAMILY_SUMMARY}" \
+        --family-summary "${family_summary}" \
         --candidate-results "${results}" \
-        --resume "${RESUME}" \
+        --resume "${resume}" \
         --runner "${RUNNER}" \
         --probe "${PROBE}" \
         --cann-root "${CANN_ROOT}" \
@@ -362,18 +387,45 @@ profile_stage() {
         --baseline-samples "${BASELINE_SAMPLES:-9}" \
         --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-512}" \
         --baseline-drift-pct "${BASELINE_DRIFT_PCT:-3}" \
-        --pair-block-size 1
+        --pair-block-size "${pair_block_size}"
 }
 
-echo "[3/4] Generate one custom tiling per workload ..."
-generate_candidates "${CANDIDATES}" "${ALL_CANDIDATES}"
+echo "[3/5] Calibrate bank-relative effects with controlled candidates ..."
+generate_candidates \
+    "${CALIBRATION_WORKLOADS}" \
+    "${CALIBRATION_CANDIDATES}" \
+    "${CALIBRATION_ALL}" \
+    calibration \
+    "${CALIBRATION_NPU_CANDIDATES}" \
+    "${CALIBRATION_CALLBACK_CANDIDATES}"
+profile_stage \
+    "${CALIBRATION_CANDIDATES}" \
+    "${CALIBRATION_SUMMARY}" \
+    "${CALIBRATION_RESULTS}" \
+    "${CALIBRATION_FAMILY_SUMMARY}" \
+    "${CALIBRATION_RESUME}" \
+    4
 echo "  ok"
 
-echo "[4/4] Measure one-shot custom tiling against original MatMulV3 ..."
+echo "[4/5] Generate one-shot decisions for unseen workloads ..."
+generate_candidates \
+    "${WORKLOADS}" \
+    "${CANDIDATES}" \
+    "${ALL_CANDIDATES}" \
+    one-shot \
+    "${NPU_CANDIDATES}" \
+    "${CALLBACK_CANDIDATES}" \
+    "${CALIBRATION_RESUME}"
+echo "  ok"
+
+echo "[5/5] Measure one-shot decision against original MatMulV3 ..."
 profile_stage \
     "${CANDIDATES}" \
     "${SUMMARY}" \
-    "${CANDIDATE_RESULTS}"
+    "${CANDIDATE_RESULTS}" \
+    "${FAMILY_SUMMARY}" \
+    "${RESUME}" \
+    1
 echo "  ok"
 
 echo
@@ -382,4 +434,5 @@ echo "  Summary:    ${SUMMARY}"
 echo "  Families:   ${FAMILY_SUMMARY}"
 echo "  Candidates: ${CANDIDATE_RESULTS}"
 echo "  Resume:     ${RESUME}"
+echo "  Calibration:${CALIBRATION_RESULTS}"
 echo "  log:        ${RUN_LOG}"

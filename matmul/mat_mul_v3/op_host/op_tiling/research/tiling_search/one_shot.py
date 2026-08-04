@@ -16,15 +16,13 @@ from .behavior import (
 )
 from .contracts import template_of
 from .domain import (
-    INPUT_BYTES,
     KNOWLEDGE_FIELDS,
     Candidate,
     Hardware,
     MeasuredObservation,
-    Template,
+    Schedule,
     Workload,
 )
-from .ranking import PairwiseLatencyRanker
 
 
 @dataclass(frozen=True)
@@ -39,289 +37,636 @@ class OneShotDecision:
     selection_policy: str
 
 
-def _normalized_priors(
-    values: Sequence[float],
-) -> list[float]:
-    logs = [math.log1p(max(0.0, value)) for value in values]
-    low = min(logs)
-    span = max(1.0e-9, max(logs) - low)
-    return [(value - low) / span for value in logs]
-
-
 @dataclass(frozen=True)
-class _TransferEvidence:
-    samples: int
-    winners: int
-    robust_ratio: float
-    upper_ratio: float
-    nearest_distance: float
-
-
-@dataclass(frozen=True)
-class _CounterfactualPair:
-    workload: Workload
-    template: Template
-    field: str
-    low_value: int
-    high_value: int
-    high_over_low: float
-
-
-@dataclass(frozen=True)
-class CounterfactualEvidence:
+class BankRelativePrediction:
     samples: int
     robust_ratio: float
     upper_ratio: float
     nearest_distance: float
+    support: float
 
 
-class CounterfactualPolicyModel:
-    """Learn one-field schedule effects from paired NPU observations."""
+@dataclass(frozen=True)
+class BankRelativeValidation:
+    groups: int
+    oracle_opportunities: int
+    custom_selections: int
+    custom_winners: int
+    custom_regressions: int
+    severe_regressions: int
+    median_selected_ratio: float
+    p90_selected_ratio: float
+
+
+@dataclass(frozen=True)
+class _EffectRow:
+    observation: MeasuredObservation
+    candidate_vector: BehaviorVector
+    bank_vector: BehaviorVector
+    changed_fields: frozenset[int]
+
+
+def _changed_fields(
+    bank: Schedule,
+    candidate: Schedule,
+) -> frozenset[int]:
+    return frozenset(
+        index
+        for index, (bank_value, candidate_value) in enumerate(
+            zip(bank.values, candidate.values)
+        )
+        if bank_value != candidate_value
+    )
+
+
+def _effect_mask_distance(
+    left: frozenset[int],
+    right: frozenset[int],
+) -> float:
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left ^ right) / len(union)
+
+
+def _effect_vector_distance(left: _EffectRow, right: _EffectRow) -> float:
+    left_delta = tuple(
+        candidate - bank
+        for candidate, bank in zip(
+            left.candidate_vector.values,
+            left.bank_vector.values,
+        )
+    )
+    right_delta = tuple(
+        candidate - bank
+        for candidate, bank in zip(
+            right.candidate_vector.values,
+            right.bank_vector.values,
+        )
+    )
+    return sum(
+        abs(left_value - right_value)
+        for left_value, right_value in zip(left_delta, right_delta)
+    ) / max(1, len(left_delta))
+
+
+class BankRelativeEffectModel:
+    """Predict candidate/bank latency from paired, verified effects.
+
+    The model never treats an absolute candidate latency from another
+    workload as a deployment target. It compares the candidate and its bank
+    incumbent as a pair and requires independent workload support.
+    """
 
     def __init__(
         self,
         observations: Sequence[MeasuredObservation],
+        hardware: Hardware,
     ) -> None:
         grouped: dict[
             tuple[
                 tuple[int, int, int, str, bool, bool, int],
                 str,
+                tuple[int, ...],
             ],
-            dict[tuple[int, ...], list[MeasuredObservation]],
-        ] = defaultdict(lambda: defaultdict(list))
+            list[MeasuredObservation],
+        ] = defaultdict(list)
         for observation in observations:
             if (
                 observation.source == "runtime_rejected"
-                or not observation.structured_verified
+                or not observation.verified
+                or observation.bank_schedule is None
             ):
                 continue
             grouped[
                 (
                     observation.workload.identity(),
                     observation.record_id,
+                    observation.schedule.signature(),
                 )
-            ][
-                observation.schedule.signature()
             ].append(observation)
 
-        pairs = []
-        for signatures in grouped.values():
-            representatives = []
-            for items in signatures.values():
-                representatives.append(
-                    (
-                        items[0],
-                        median(item.measured_ratio for item in items),
-                    )
+        rows = []
+        for records in grouped.values():
+            best_trust = max(record.structured_verified for record in records)
+            trusted = [
+                record
+                for record in records
+                if record.structured_verified == best_trust
+            ]
+            representative = trusted[0]
+            ratio = median(record.measured_ratio for record in trusted)
+            observation = MeasuredObservation(
+                workload=representative.workload,
+                schedule=representative.schedule,
+                ratio_vs_official=ratio,
+                ratio_vs_bank=ratio,
+                source=representative.source,
+                record_id=representative.record_id,
+                status_vs_official=representative.status_vs_official,
+                status_vs_bank=representative.status_vs_bank,
+                verified=True,
+                structured_verified=bool(best_trust),
+                bank_schedule=representative.bank_schedule,
+            )
+            bank_vector = behavior_vector(
+                observation.workload,
+                observation.bank_schedule,
+                hardware,
+            )
+            candidate_vector = behavior_vector(
+                observation.workload,
+                observation.schedule,
+                hardware,
+            )
+            rows.append(
+                _EffectRow(
+                    observation=observation,
+                    candidate_vector=candidate_vector,
+                    bank_vector=bank_vector,
+                    changed_fields=_changed_fields(
+                        observation.bank_schedule,
+                        observation.schedule,
+                    ),
                 )
-            for index, (left, left_ratio) in enumerate(representatives):
-                for right, right_ratio in representatives[index + 1 :]:
-                    left_template = template_of(left.schedule)
-                    if left_template != template_of(right.schedule):
-                        continue
-                    changed = [
-                        field_index
-                        for field_index, (left_value, right_value) in enumerate(
-                            zip(
-                                left.schedule.values,
-                                right.schedule.values,
-                            )
-                        )
-                        if left_value != right_value
-                    ]
-                    if len(changed) != 1:
-                        continue
-                    field_index = changed[0]
-                    if (
-                        left.schedule.values[field_index]
-                        < right.schedule.values[field_index]
-                    ):
-                        low, low_ratio = left, left_ratio
-                        high, high_ratio = right, right_ratio
-                    else:
-                        low, low_ratio = right, right_ratio
-                        high, high_ratio = left, left_ratio
-                    pairs.append(
-                        _CounterfactualPair(
-                            workload=left.workload,
-                            template=left_template,
-                            field=KNOWLEDGE_FIELDS[field_index],
-                            low_value=low.schedule.values[field_index],
-                            high_value=high.schedule.values[field_index],
-                            high_over_low=high_ratio / low_ratio,
-                        )
-                    )
-        self.pairs = tuple(pairs)
+            )
+        self.rows = tuple(rows)
+        self.workloads = len(
+            {row.observation.workload.identity() for row in rows}
+        )
+        self.structured_rows = sum(
+            row.observation.structured_verified for row in rows
+        )
 
     def predict(
         self,
         workload: Workload,
-        incumbent: Candidate,
-        candidate: Candidate,
-    ) -> CounterfactualEvidence:
-        changed = [
-            index
-            for index, (incumbent_value, candidate_value) in enumerate(
-                zip(
-                    incumbent.schedule.values,
-                    candidate.schedule.values,
-                )
-            )
-            if incumbent_value != candidate_value
-        ]
-        if (
-            len(changed) != 1
-            or incumbent.template != candidate.template
-        ):
-            return CounterfactualEvidence(0, 1.0, 1.0, math.inf)
-        field_index = changed[0]
-        field = KNOWLEDGE_FIELDS[field_index]
-        incumbent_value = incumbent.schedule.values[field_index]
-        candidate_value = candidate.schedule.values[field_index]
-        target_low = min(incumbent_value, candidate_value)
-        target_high = max(incumbent_value, candidate_value)
-        neighbors = []
-        for pair in self.pairs:
+        bank: Schedule,
+        candidate: Schedule,
+        hardware: Hardware,
+        *,
+        exclude_workload: (
+            tuple[int, int, int, str, bool, bool, int] | None
+        ) = None,
+    ) -> BankRelativePrediction:
+        target_candidate_vector = behavior_vector(
+            workload, candidate, hardware
+        )
+        target_bank_vector = behavior_vector(workload, bank, hardware)
+        target = _EffectRow(
+            observation=MeasuredObservation(
+                workload=workload,
+                schedule=candidate,
+                ratio_vs_official=1.0,
+                ratio_vs_bank=1.0,
+                source="target",
+                record_id="target",
+                bank_schedule=bank,
+            ),
+            candidate_vector=target_candidate_vector,
+            bank_vector=target_bank_vector,
+            changed_fields=_changed_fields(bank, candidate),
+        )
+        bank_template = template_of(bank)
+        candidate_template = template_of(candidate)
+        nearest_by_workload: dict[
+            tuple[int, int, int, str, bool, bool, int],
+            tuple[float, float],
+        ] = {}
+        for row in self.rows:
+            observation = row.observation
+            identity = observation.workload.identity()
+            if identity == exclude_workload:
+                continue
             if (
-                pair.template != candidate.template
-                or pair.workload.dtype != workload.dtype
-                or pair.workload.trans_a != workload.trans_a
-                or pair.workload.trans_b != workload.trans_b
-                or pair.field != field
+                observation.workload.dtype != workload.dtype
+                or observation.workload.trans_a != workload.trans_a
+                or observation.workload.trans_b != workload.trans_b
+                or template_of(observation.bank_schedule) != bank_template
+                or template_of(observation.schedule) != candidate_template
             ):
                 continue
-            value_distance = abs(
-                math.log1p(pair.low_value) - math.log1p(target_low)
-            ) + abs(
-                math.log1p(pair.high_value) - math.log1p(target_high)
-            )
             distance = (
-                workload_distance(workload, pair.workload)
-                + 0.5 * value_distance
+                workload_distance(workload, observation.workload)
+                + 0.45
+                * behavior_distance(
+                    target_candidate_vector, row.candidate_vector
+                )
+                + 0.45
+                * behavior_distance(target_bank_vector, row.bank_vector)
+                + 0.60 * _effect_mask_distance(
+                    target.changed_fields, row.changed_fields
+                )
+                + 0.40 * _effect_vector_distance(target, row)
             )
-            effect = pair.high_over_low
-            if candidate_value < incumbent_value:
-                effect = 1.0 / effect
-            neighbors.append((distance, effect))
-        nearest = sorted(neighbors)[:12]
+            existing = nearest_by_workload.get(identity)
+            if existing is None or distance < existing[0]:
+                nearest_by_workload[identity] = (
+                    distance,
+                    observation.measured_ratio,
+                )
+
+        nearest = sorted(nearest_by_workload.values())[:8]
         if not nearest:
-            return CounterfactualEvidence(0, 1.0, 1.0, math.inf)
-        effects = sorted(effect for _, effect in nearest)
-        return CounterfactualEvidence(
-            samples=len(effects),
-            robust_ratio=median(effects),
-            upper_ratio=effects[int(0.75 * (len(effects) - 1))],
-            nearest_distance=nearest[0][0],
+            return BankRelativePrediction(0, 1.0, math.inf, math.inf, 0.0)
+        ratios = sorted(ratio for _, ratio in nearest)
+        nearest_distance = nearest[0][0]
+        sample_support = min(1.0, len(nearest) / 6.0)
+        distance_support = math.exp(-nearest_distance / 1.5)
+        return BankRelativePrediction(
+            samples=len(nearest),
+            robust_ratio=median(ratios),
+            upper_ratio=max(ratios),
+            nearest_distance=nearest_distance,
+            support=sample_support * distance_support,
         )
 
 
-def _is_direct_base(candidate: Candidate) -> bool:
-    schedule = candidate.schedule
+def _effect_is_deployable(
+    prediction: BankRelativePrediction,
+    *,
+    cross_template: bool,
+) -> bool:
+    if cross_template:
+        return (
+            prediction.samples >= 3
+            and prediction.robust_ratio <= 0.94
+            and prediction.upper_ratio <= 0.96
+            and prediction.nearest_distance <= 1.25
+            and prediction.support >= 0.20
+        )
     return (
-        candidate.template == Template.BASE
-        and schedule["singleCoreM"] == schedule["baseM"]
-        and schedule["singleCoreN"] == schedule["baseN"]
+        prediction.samples >= 3
+        and prediction.robust_ratio <= 0.98
+        and prediction.upper_ratio <= 0.99
+        and prediction.nearest_distance <= 1.50
+        and prediction.support >= 0.15
     )
 
 
-def _transfer_evidence(
-    workload: Workload,
-    candidate: Candidate,
-    observation_vectors: Sequence[
-        tuple[MeasuredObservation, BehaviorVector]
-    ],
+def validate_bank_relative_selector(
+    observations: Sequence[MeasuredObservation],
     hardware: Hardware,
-) -> _TransferEvidence:
-    target = behavior_vector(workload, candidate.schedule, hardware)
-    neighbors: list[tuple[float, MeasuredObservation]] = []
-    for observation, vector in observation_vectors:
+) -> BankRelativeValidation:
+    model = BankRelativeEffectModel(observations, hardware)
+    groups: dict[
+        tuple[
+            tuple[int, int, int, str, bool, bool, int],
+            str,
+        ],
+        list[MeasuredObservation],
+    ] = defaultdict(list)
+    for row in model.rows:
+        observation = row.observation
+        groups[
+            (observation.workload.identity(), observation.record_id)
+        ].append(observation)
+
+    selected_ratios = []
+    custom_ratios = []
+    oracle_opportunities = 0
+    for (identity, _), records in groups.items():
+        oracle_opportunities += min(
+            record.measured_ratio for record in records
+        ) <= 0.99
+        ranked = []
+        for record in records:
+            prediction = model.predict(
+                record.workload,
+                record.bank_schedule,
+                record.schedule,
+                hardware,
+                exclude_workload=identity,
+            )
+            if not _effect_is_deployable(
+                prediction,
+                cross_template=(
+                    template_of(record.bank_schedule)
+                    != template_of(record.schedule)
+                ),
+            ):
+                continue
+            ranked.append(
+                (
+                    prediction.upper_ratio,
+                    prediction.robust_ratio,
+                    record.schedule.signature(),
+                    record.measured_ratio,
+                )
+            )
+        if ranked:
+            measured = min(ranked)[3]
+            custom_ratios.append(measured)
+            selected_ratios.append(measured)
+        else:
+            selected_ratios.append(1.0)
+
+    ordered = sorted(selected_ratios) or [1.0]
+    return BankRelativeValidation(
+        groups=len(groups),
+        oracle_opportunities=oracle_opportunities,
+        custom_selections=len(custom_ratios),
+        custom_winners=sum(ratio <= 0.99 for ratio in custom_ratios),
+        custom_regressions=sum(ratio >= 1.01 for ratio in custom_ratios),
+        severe_regressions=sum(ratio >= 1.10 for ratio in custom_ratios),
+        median_selected_ratio=median(ordered),
+        p90_selected_ratio=ordered[
+            int(0.90 * (len(ordered) - 1))
+        ],
+    )
+
+
+def _is_runtime_safe(
+    prediction,
+) -> bool:
+    return not (
+        prediction.runtime_risk_support >= 0.10
+        and prediction.runtime_risk_score >= 0.35
+    )
+
+
+def _farthest_first(
+    workload: Workload,
+    candidates: Sequence[Candidate],
+    bank: Schedule,
+    hardware: Hardware,
+    budget: int,
+) -> list[Candidate]:
+    remaining = list(candidates)
+    selected: list[Candidate] = []
+    bank_vector = behavior_vector(workload, bank, hardware)
+    selected_vectors = [bank_vector]
+    while remaining and len(selected) < budget:
+        scored = []
+        for candidate in remaining:
+            vector = behavior_vector(workload, candidate.schedule, hardware)
+            novelty = min(
+                behavior_distance(vector, existing)
+                for existing in selected_vectors
+            )
+            changed = len(_changed_fields(bank, candidate.schedule))
+            scored.append(
+                (
+                    -novelty,
+                    changed,
+                    candidate.schedule.signature(),
+                    candidate,
+                    vector,
+                )
+            )
+        _, _, _, chosen, vector = min(scored)
+        selected.append(chosen)
+        selected_vectors.append(vector)
+        remaining = [
+            candidate
+            for candidate in remaining
+            if candidate.schedule.signature()
+            != chosen.schedule.signature()
+        ]
+    return selected
+
+
+def select_calibration_candidates(
+    workload: Workload,
+    candidates: Iterable[Candidate],
+    incumbent: Candidate,
+    observations: Sequence[MeasuredObservation],
+    hardware: Hardware,
+    budget: int,
+) -> list[Candidate]:
+    """Choose controlled bank-relative effects for one calibration run."""
+
+    model = FeedbackCostModel(observations, hardware)
+    rated: list[tuple[float, Candidate]] = []
+    seen: set[tuple[int, ...]] = set()
+    for candidate in candidates:
         if (
-            observation.workload.identity() == workload.identity()
-            or template_of(observation.schedule) != candidate.template
-            or observation.workload.dtype != workload.dtype
-            or observation.workload.trans_a != workload.trans_a
-            or observation.workload.trans_b != workload.trans_b
+            candidate.schedule.signature()
+            == incumbent.schedule.signature()
+            or candidate.source
+            not in {"local_bank_anchor", "contract_coupled_policy"}
         ):
             continue
-        distance = (
-            behavior_distance(target, vector)
-            + workload_distance(workload, observation.workload)
+        signature = candidate.schedule.signature()
+        if signature in seen:
+            continue
+        seen.add(signature)
+        vector = behavior_vector(workload, candidate.schedule, hardware)
+        runtime = model.predict(
+            workload,
+            vector,
+            exclude_workload=workload.identity(),
         )
-        neighbors.append((distance, observation))
-    nearest = sorted(
-        neighbors,
-        key=lambda item: (
-            item[0],
-            item[1].record_id,
-            item[1].schedule.signature(),
-        ),
-    )[:12]
-    if not nearest:
-        return _TransferEvidence(0, 0, 1.0, 1.0, math.inf)
-    ratios = sorted(
-        max(0.10, min(100.0, observation.measured_ratio))
-        for _, observation in nearest
-    )
-    upper_index = int(0.75 * (len(ratios) - 1))
-    middle = len(ratios) // 2
-    robust = (
-        ratios[middle]
-        if len(ratios) % 2
-        else 0.5 * (ratios[middle - 1] + ratios[middle])
-    )
-    return _TransferEvidence(
-        samples=len(nearest),
-        winners=sum(
-            observation.is_verified_winner
-            for _, observation in nearest
-        ),
-        robust_ratio=robust,
-        upper_ratio=ratios[upper_index],
-        nearest_distance=nearest[0][0],
-    )
+        risk = (
+            runtime.runtime_risk_support * runtime.runtime_risk_score
+        )
+        rated.append((risk, candidate))
 
+    # Calibration is where the runtime-risk model itself is corrected.
+    # Keep the least risky broad slice, but never let an uncertain model erase
+    # the entire exact-callback-accepted experiment.
+    retained = []
+    retained_per_stratum = max(budget * 2, budget)
+    strata = sorted(
+        {
+            (candidate.source, candidate.template)
+            for _, candidate in rated
+        },
+        key=lambda item: (item[0], item[1].value),
+    )
+    for source, template in strata:
+        retained.extend(
+            candidate
+            for _, candidate in sorted(
+                (
+                    item
+                    for item in rated
+                    if (
+                        item[1].source == source
+                        and item[1].template == template
+                    )
+                ),
+                key=lambda item: (
+                    item[0],
+                    item[1].schedule.signature(),
+                ),
+            )[:retained_per_stratum]
+        )
+    unique = {
+        candidate.schedule.signature(): candidate
+        for candidate in retained
+    }
 
-def _hardware_penalty(
-    candidate: Candidate,
-    metrics: dict[str, float],
-    workload: Workload,
-) -> float:
-    if candidate.template == Template.DETERMINISTIC_SPLIT_K:
-        preferred_base_k = 256 // INPUT_BYTES[workload.dtype]
-    else:
-        preferred_base_k = 64 if workload.dtype in {"fp16", "bf16"} else 32
-    base_k_penalty = abs(
-        math.log2(
-            candidate.schedule["baseK"] / max(1.0, preferred_base_k)
+    local = [
+        candidate
+        for candidate in unique.values()
+        if (
+            candidate.source == "local_bank_anchor"
+            and candidate.template == incumbent.template
+        )
+    ]
+    coupled = [
+        candidate
+        for candidate in unique.values()
+        if (
+            candidate.source == "contract_coupled_policy"
+            and candidate.template == incumbent.template
+        )
+    ]
+    cross_template = [
+        candidate
+        for candidate in unique.values()
+        if candidate.template != incumbent.template
+    ]
+    cross_budget = min(
+        len(cross_template),
+        max(1, budget // 3) if cross_template else 0,
+    )
+    same_template_budget = budget - cross_budget
+    local_budget = min(
+        len(local), max(1, same_template_budget // 2)
+    )
+    selected = _farthest_first(
+        workload,
+        local,
+        incumbent.schedule,
+        hardware,
+        local_budget,
+    )
+    selected_signatures = {
+        candidate.schedule.signature() for candidate in selected
+    }
+    selected.extend(
+        _farthest_first(
+            workload,
+            [
+                candidate
+                for candidate in coupled
+                if candidate.schedule.signature()
+                not in selected_signatures
+            ],
+            incumbent.schedule,
+            hardware,
+            same_template_budget - len(selected),
         )
     )
-    l0c_penalty = max(0.0, 1.0 - metrics.get("l0c_occupancy", 0.0))
-    input_occupancy = min(
-        metrics.get("l0a_occupancy", 0.0),
-        metrics.get("l0b_occupancy", 0.0),
-    )
-    input_penalty = max(0.0, 0.50 - input_occupancy)
-    l1_pipeline_penalty = max(
-        0.0, 0.90 - metrics.get("l1_pipeline_efficiency", 0.0)
-    )
-    l2_wave_penalty = max(
-        0.0, 0.90 - metrics.get("l2_wave_efficiency", 0.0)
-    )
-    l2_capacity_penalty = max(
-        0.0, metrics.get("l2_capacity_pressure", 0.0) - 1.0
-    )
-    alignment_penalty = max(
-        0.0, 0.95 - metrics.get("alignment_efficiency", 0.0)
-    )
-    return (
-        0.25 * base_k_penalty
-        + 0.40 * l0c_penalty
-        + 0.20 * input_penalty
-        + 1.00 * l1_pipeline_penalty
-        + 0.60 * l2_wave_penalty
-        + 0.50 * l2_capacity_penalty
-        + 0.15 * alignment_penalty
-    )
+    if len(selected) < same_template_budget:
+        selected_signatures = {
+            candidate.schedule.signature() for candidate in selected
+        }
+        selected.extend(
+            _farthest_first(
+                workload,
+                [
+                    candidate
+                    for candidate in unique.values()
+                    if (
+                        candidate.template == incumbent.template
+                        and candidate.schedule.signature()
+                        not in selected_signatures
+                    )
+                ],
+                incumbent.schedule,
+                hardware,
+                same_template_budget - len(selected),
+            )
+        )
+    if cross_budget:
+        cross_groups = {
+            template: [
+                candidate
+                for candidate in cross_template
+                if candidate.template == template
+            ]
+            for template in sorted(
+                {candidate.template for candidate in cross_template},
+                key=lambda item: item.value,
+            )
+        }
+        cross_quotas = {template: 0 for template in cross_groups}
+        templates = list(cross_groups)
+        for index in range(cross_budget):
+            cross_quotas[templates[index % len(templates)]] += 1
+        for template in templates:
+            selected.extend(
+                _farthest_first(
+                    workload,
+                    cross_groups[template],
+                    incumbent.schedule,
+                    hardware,
+                    cross_quotas[template],
+                )
+            )
+    if len(selected) < budget:
+        selected_signatures = {
+            candidate.schedule.signature() for candidate in selected
+        }
+        selected.extend(
+            _farthest_first(
+                workload,
+                [
+                    candidate
+                    for candidate in unique.values()
+                    if candidate.schedule.signature()
+                    not in selected_signatures
+                ],
+                incumbent.schedule,
+                hardware,
+                budget - len(selected),
+            )
+        )
+
+    result = []
+    for candidate in selected[:budget]:
+        vector = behavior_vector(workload, candidate.schedule, hardware)
+        runtime = model.predict(
+            workload,
+            vector,
+            exclude_workload=workload.identity(),
+        )
+        changed = _changed_fields(incumbent.schedule, candidate.schedule)
+        template_switch = candidate.template != incumbent.template
+        vector.metrics.update(
+            {
+                "bank_changed_fields": float(len(changed)),
+                "bank_template_switch": float(template_switch),
+                "bank_behavior_distance": behavior_distance(
+                    vector,
+                    behavior_vector(
+                        workload, incumbent.schedule, hardware
+                    ),
+                ),
+                "runtime_risk_score": runtime.runtime_risk_score,
+                "runtime_risk_support": runtime.runtime_risk_support,
+            }
+        )
+        result.append(
+            Candidate(
+                schedule=candidate.schedule,
+                template=candidate.template,
+                source=(
+                    "calibration_template_probe"
+                    if template_switch
+                    else (
+                        "calibration_local_counterfactual"
+                        if candidate.source == "local_bank_anchor"
+                        else "calibration_coupled_counterfactual"
+                    )
+                ),
+                rationale=(
+                    "paired bank-relative calibration effect; "
+                    f"generator={candidate.source}; changed="
+                    + ",".join(
+                        KNOWLEDGE_FIELDS[index] for index in sorted(changed)
+                    )
+                ),
+                acquisition=-vector.metrics["bank_behavior_distance"],
+                parent_signatures=(incumbent.schedule.signature(),),
+                behavior_key=behavior_key(vector),
+                metrics=dict(vector.metrics),
+            )
+        )
+    return result
 
 
 def select_one_shot_candidate(
@@ -332,18 +677,17 @@ def select_one_shot_candidate(
     hardware: Hardware,
     *,
     cost_model: FeedbackCostModel | None = None,
-    counterfactual_model: CounterfactualPolicyModel | None = None,
-    latency_ranker: PairwiseLatencyRanker | None = None,
+    effect_model: BankRelativeEffectModel | None = None,
+    **_ignored,
 ) -> OneShotDecision:
-    """Choose one deployment candidate without target-workload measurements.
+    """Select one tiling with a measured bank-relative safety criterion."""
 
-    Campaign selection intentionally rewards novelty and template coverage.
-    This selector does neither: it uses only leave-target-workload-out latency,
-    NPU rejection risk, and the hardware analytical prior.
-    """
     if incumbent.source != "bank_incumbent":
         raise ValueError("one-shot incumbent must be the bank control")
-
+    runtime_model = cost_model or FeedbackCostModel(observations, hardware)
+    relative_model = effect_model or BankRelativeEffectModel(
+        observations, hardware
+    )
     unique: dict[tuple[int, ...], Candidate] = {}
     for candidate in candidates:
         if candidate.source not in {
@@ -355,429 +699,143 @@ def select_one_shot_candidate(
             continue
         unique.setdefault(candidate.schedule.signature(), candidate)
 
-    model = cost_model or FeedbackCostModel(observations, hardware)
-    counterfactuals = counterfactual_model or CounterfactualPolicyModel(
-        observations
-    )
-    ranker = latency_ranker or PairwiseLatencyRanker(
-        observations, hardware
-    )
-    incumbent_vector = behavior_vector(
-        workload, incumbent.schedule, hardware
-    )
-    incumbent_prediction = model.predict(
-        workload,
-        incumbent_vector,
-        exclude_workload=workload.identity(),
-        cross_workload_latency_weight=1.0,
-    )
-    candidate_vectors = [
-        (
-            candidate,
-            behavior_vector(workload, candidate.schedule, hardware),
-        )
-        for candidate in unique.values()
-    ]
-    all_direct_base = [
-        item for item in candidate_vectors if _is_direct_base(item[0])
-    ]
-    direct_base = sorted(
-        all_direct_base,
-        key=lambda item: (
-            _hardware_penalty(item[0], item[1].metrics, workload)
-            + 0.03
-            * math.log1p(item[1].metrics["analytical_prior"]),
-            item[0].schedule.signature(),
-        ),
-    )
-    considered = sorted(
-        candidate_vectors,
-        key=lambda item: (
-            _hardware_penalty(item[0], item[1].metrics, workload)
-            + 0.03
-            * math.log1p(item[1].metrics["analytical_prior"]),
-            item[0].schedule.signature(),
-        ),
-    )
-    observation_vectors = [
-        (
-            observation,
-            behavior_vector(
-                observation.workload,
-                observation.schedule,
-                hardware,
-            ),
-        )
-        for observation in observations
-        if (
-            observation.source != "runtime_rejected"
-            and observation.structured_verified
-        )
-    ]
-    direct_base_history = [
-        observation
-        for observation in observations
-        if (
-            template_of(observation.schedule) == Template.BASE
-            and observation.schedule["singleCoreM"]
-            == observation.schedule["baseM"]
-            and observation.schedule["singleCoreN"]
-            == observation.schedule["baseN"]
-        )
-    ]
-    direct_base_rejections = sum(
-        observation.source == "runtime_rejected"
-        for observation in direct_base_history
-    )
-    direct_base_risk = (
-        direct_base_rejections + 1.0
-    ) / (len(direct_base_history) + 2.0)
-
     evaluated = []
-    for candidate, vector in considered:
-        prediction = model.predict(
+    for candidate in unique.values():
+        vector = behavior_vector(workload, candidate.schedule, hardware)
+        runtime = runtime_model.predict(
             workload,
             vector,
             exclude_workload=workload.identity(),
-            cross_workload_latency_weight=0.15,
         )
-        transfer = _transfer_evidence(
+        relative = relative_model.predict(
             workload,
-            candidate,
-            observation_vectors,
+            incumbent.schedule,
+            candidate.schedule,
             hardware,
-        )
-        broad_prediction = model.predict(
-            workload,
-            vector,
             exclude_workload=workload.identity(),
-            cross_workload_latency_weight=1.0,
         )
-        counterfactual = counterfactuals.predict(
-            workload, incumbent, candidate
-        )
-        pairwise = ranker.compare(
-            workload, incumbent, candidate, hardware
-        )
-        relative_prediction = (
-            broad_prediction.latency_ratio
-            / max(0.10, incumbent_prediction.latency_ratio)
-        )
-        effective_risk = (
-            min(prediction.runtime_risk_score, direct_base_risk)
-            if _is_direct_base(candidate)
-            else prediction.runtime_risk_score
-        )
-        effective_risk_support = (
-            max(
-                prediction.runtime_risk_support,
-                min(1.0, len(direct_base_history) / 32.0),
-            )
-            if _is_direct_base(candidate)
-            else prediction.runtime_risk_support
+        changed = _changed_fields(incumbent.schedule, candidate.schedule)
+        cross_template = candidate.template != incumbent.template
+        runtime_safe = _is_runtime_safe(runtime)
+        deployable = runtime_safe and _effect_is_deployable(
+            relative,
+            cross_template=cross_template,
         )
         vector.metrics.update(
             {
-                "predicted_latency_ratio": prediction.latency_ratio,
-                "latency_uncertainty": prediction.latency_uncertainty,
-                "latency_support": prediction.latency_support,
-                "runtime_risk_score": effective_risk,
-                "runtime_risk_support": effective_risk_support,
-                "model_runtime_risk_score": prediction.runtime_risk_score,
-                "direct_base_history": float(len(direct_base_history)),
-                "transfer_samples": float(transfer.samples),
-                "transfer_winners": float(transfer.winners),
-                "transfer_robust_ratio": transfer.robust_ratio,
-                "transfer_upper_ratio": transfer.upper_ratio,
-                "transfer_nearest_distance": transfer.nearest_distance,
-                "direct_base_geometry": float(_is_direct_base(candidate)),
-                "relative_model_ratio": relative_prediction,
-                "counterfactual_samples": float(counterfactual.samples),
-                "counterfactual_robust_ratio": (
-                    counterfactual.robust_ratio
+                "predicted_latency_ratio": relative.robust_ratio,
+                "bank_relative_upper_ratio": relative.upper_ratio,
+                "bank_relative_samples": float(relative.samples),
+                "bank_relative_nearest_distance": (
+                    relative.nearest_distance
                 ),
-                "counterfactual_upper_ratio": counterfactual.upper_ratio,
-                "counterfactual_nearest_distance": (
-                    counterfactual.nearest_distance
-                ),
-                "pairwise_rank_ratio": pairwise.relative_ratio,
-                "pairwise_rank_uncertainty": pairwise.uncertainty,
-                "pairwise_rank_support": pairwise.support,
-                "pairwise_rank_nearest_distance": (
-                    pairwise.nearest_workload_distance
-                ),
+                "bank_relative_support": relative.support,
+                "bank_changed_fields": float(len(changed)),
+                "runtime_risk_score": runtime.runtime_risk_score,
+                "runtime_risk_support": runtime.runtime_risk_support,
             }
         )
-        evaluated.append((candidate, vector, prediction, transfer))
+        evaluated.append(
+            (candidate, vector, relative, runtime_safe, deployable)
+        )
 
-    runtime_safe_candidates = [
-        item
+    eligible = [item for item in evaluated if item[4]]
+    runtime_safe_count = sum(item[3] for item in evaluated)
+    direct_base_count = sum(
+        item[0].template.value == "BASE"
+        and item[0].schedule["singleCoreM"] == item[0].schedule["baseM"]
+        and item[0].schedule["singleCoreN"] == item[0].schedule["baseN"]
         for item in evaluated
-        if not (
-            item[1].metrics["runtime_risk_support"] >= 0.10
-            and item[1].metrics["runtime_risk_score"] >= 0.45
-        )
-    ]
+    )
+    local_count = sum(
+        item[0].source == "local_bank_anchor" for item in evaluated
+    )
 
-    transfer_eligible = [
-        item
-        for item in evaluated
-        if item[3].samples >= 8
-        and item[3].winners >= 3
-        and item[3].robust_ratio <= 0.97
-        and item[3].upper_ratio <= 0.99
-        and item[3].nearest_distance <= 1.0
-        and item[2].latency_ratio <= 0.97
-        and item[2].latency_support >= 0.05
-        and not (
-            item[2].runtime_risk_support >= 0.10
-            and item[2].runtime_risk_score >= 0.25
-        )
-    ]
-    exploitation_pool = transfer_eligible
-
-    if not exploitation_pool:
-        local_pool = [
-            item
-            for item in runtime_safe_candidates
-            if (
-                item[0].source == "local_bank_anchor"
-                and item[0].template == incumbent.template
-                and item[1].metrics["counterfactual_samples"] >= 2
-                and item[1].metrics["counterfactual_upper_ratio"] <= 0.99
-                and item[1].metrics[
-                    "counterfactual_nearest_distance"
-                ]
-                <= 2.0
-            )
-        ]
-        coupled_policy_pool = [
-            item
-            for item in runtime_safe_candidates
-            if (
-                item[0].source == "contract_coupled_policy"
-                and item[0].template == incumbent.template
-            )
-        ]
-        local_signatures = {
-            item[0].schedule.signature() for item in local_pool
-        }
-        policy_pool = [
-            *local_pool,
-            *(
-                item
-                for item in coupled_policy_pool
-                if item[0].schedule.signature()
-                not in local_signatures
-            ),
-        ]
-        if not policy_pool:
-            coupled_count = sum(
-                item[0].source == "contract_coupled_policy"
-                for item in evaluated
-            )
-            same_template_count = sum(
-                item[0].source == "contract_coupled_policy"
-                and item[0].template == incumbent.template
-                for item in evaluated
-            )
-            raise ValueError(
-                "one-shot selection has no safe deployment-policy "
-                "candidate; broad or unsupported-local fallback is "
-                "disabled "
-                f"(evaluated={len(evaluated)} "
-                f"runtime_safe={len(runtime_safe_candidates)} "
-                f"coupled={coupled_count} "
-                f"same_template={same_template_count} "
-                f"incumbent_template={incumbent.template.name} "
-                f"evidence_local={len(local_pool)})"
-            )
-        exploration_pool = policy_pool
-        incumbent_hardware_penalty = _hardware_penalty(
-            incumbent, incumbent_vector.metrics, workload
-        )
-
-        def exploration_score(item) -> tuple[float, tuple[int, ...]]:
-            candidate, vector, prediction, _ = item
-            metrics = vector.metrics
-            counterfactual_support = min(
-                1.0, metrics["counterfactual_samples"] / 6.0
-            )
-            counterfactual_ratio = (
-                metrics["counterfactual_upper_ratio"]
-                if metrics["counterfactual_samples"] >= 2
-                else 1.0
-            )
-            score = (
-                0.30
-                * counterfactual_support
-                * math.log(max(0.10, counterfactual_ratio))
-                + 0.80
-                * math.log(
-                    max(0.10, metrics["pairwise_rank_ratio"])
-                )
-                + 0.15
-                * (1.0 - metrics["pairwise_rank_support"])
-                * metrics["pairwise_rank_uncertainty"]
-                + 0.05
-                * math.log(
-                    max(0.10, metrics["relative_model_ratio"])
-                )
-                + 0.10
-                * max(
-                    -0.25,
-                    _hardware_penalty(
-                        candidate, metrics, workload
-                    )
-                    - incumbent_hardware_penalty,
-                )
-                + 0.50
-                * metrics["runtime_risk_support"]
-                * max(0.0, metrics["runtime_risk_score"] - 0.10)
-                + 0.05 * prediction.latency_uncertainty
-            )
-            return score, candidate.schedule.signature()
-
-        selected_item = min(
-            exploration_pool,
-            key=exploration_score,
-        )
-        original, vector, _, _ = selected_item
-        score = exploration_score(selected_item)[0]
-        policy = (
-            "local_counterfactual"
-            if original.source == "local_bank_anchor"
-            else "coupled_policy_global"
+    if not eligible:
+        vector = behavior_vector(
+            workload, incumbent.schedule, hardware
         )
         vector.metrics.update(
             {
-                "one_shot_score": score,
-                "one_shot_target_observations": 0.0,
-                "one_shot_incumbent_fallback": 0.0,
+                "predicted_latency_ratio": 1.0,
+                "bank_relative_upper_ratio": 1.0,
+                "bank_relative_samples": 0.0,
+                "bank_relative_nearest_distance": math.inf,
+                "bank_relative_support": 0.0,
+                "bank_changed_fields": 0.0,
+                "runtime_risk_score": 0.0,
+                "runtime_risk_support": 1.0,
+                "one_shot_incumbent_fallback": 1.0,
             }
         )
         selected = Candidate(
-            schedule=original.schedule,
-            template=original.template,
-            source=(
-                "one_shot_local_exploration"
-                if original.source == "local_bank_anchor"
-                else "one_shot_coupled_policy"
-            ),
+            schedule=incumbent.schedule,
+            template=incumbent.template,
+            source="one_shot_bank_incumbent",
             rationale=(
-                "single custom deployment decision from bank-relative "
-                f"{policy}; generator={original.source}"
+                "no custom candidate has leave-workload-out paired "
+                "evidence sufficient to beat the bank safely"
             ),
-            acquisition=score,
-            parent_signatures=original.parent_signatures,
+            acquisition=0.0,
+            parent_signatures=(incumbent.schedule.signature(),),
             behavior_key=behavior_key(vector),
             metrics=dict(vector.metrics),
         )
         return OneShotDecision(
             candidate=selected,
             evaluated=len(evaluated),
-            safe_candidates=len(runtime_safe_candidates),
-            direct_base_candidates=len(direct_base),
+            safe_candidates=runtime_safe_count,
+            direct_base_candidates=direct_base_count,
             transfer_eligible_candidates=0,
             custom_eligible_candidates=0,
-            local_candidates=len(local_pool),
-            selection_policy=policy,
+            local_candidates=local_count,
+            selection_policy="bank_incumbent",
         )
 
-    prior_scores = _normalized_priors(
-        [
-            vector.metrics["analytical_prior"]
-            for _, vector, _, _ in exploitation_pool
-        ]
-    )
-    ranked = []
-    for (
-        candidate,
-        vector,
-        prediction,
-        transfer,
-    ), prior_score in zip(
-        exploitation_pool,
-        prior_scores,
-    ):
-        hardware_penalty = _hardware_penalty(
-            candidate, vector.metrics, workload
+    def score(item) -> tuple[float, float, tuple[int, ...]]:
+        candidate, _, prediction, _, _ = item
+        cross_template_penalty = (
+            0.02 if candidate.template != incumbent.template else 0.0
         )
-        risk_penalty = (
-            3.0
-            * vector.metrics["runtime_risk_support"]
-            * max(0.0, vector.metrics["runtime_risk_score"] - 0.10)
+        return (
+            prediction.upper_ratio + cross_template_penalty,
+            prediction.robust_ratio,
+            candidate.schedule.signature(),
         )
-        transfer_ratio = transfer.upper_ratio
-        score = (
-            math.log(
-                max(
-                    0.10,
-                    min(
-                        100.0,
-                        max(prediction.latency_ratio, transfer_ratio),
-                    ),
-                )
-            )
-            + 0.50
-            * math.log(
-                max(0.10, vector.metrics["pairwise_rank_ratio"])
-            )
-            + risk_penalty
-            + 0.15 * prior_score
-            + 0.75 * hardware_penalty
-            + 0.15 * prediction.latency_uncertainty
-        )
-        vector.metrics.update(
-            {
-                "one_shot_score": score,
-                "one_shot_prior_score": prior_score,
-                "one_shot_hardware_penalty": hardware_penalty,
-                "one_shot_target_observations": 0.0,
-            }
-        )
-        ranked.append((score, candidate, vector))
 
-    safe = [
-        item
-        for item in ranked
-        if not (
-            item[2].metrics["runtime_risk_support"] >= 0.10
-            and item[2].metrics["runtime_risk_score"] >= 0.45
-        )
-    ]
-    selection_pool = safe or ranked
-    score, original, vector = min(
-        selection_pool,
-        key=lambda item: (
-            item[0],
-            item[1].schedule.signature(),
-        ),
+    original, vector, prediction, _, _ = min(eligible, key=score)
+    acquisition = score(
+        (original, vector, prediction, True, True)
+    )[0]
+    vector.metrics.update(
+        {
+            "one_shot_score": acquisition,
+            "one_shot_incumbent_fallback": 0.0,
+        }
     )
     selected = Candidate(
         schedule=original.schedule,
         template=original.template,
-        source="one_shot_model",
+        source="one_shot_bank_relative",
         rationale=(
-            "single exploitation decision from independent contract pool; "
-            f"generator={original.source}"
+            "single deployment decision supported by paired "
+            f"candidate/bank effects; generator={original.source}"
         ),
-        acquisition=score,
-        parent_signatures=(),
+        acquisition=acquisition,
+        parent_signatures=(incumbent.schedule.signature(),),
         behavior_key=behavior_key(vector),
         metrics=dict(vector.metrics),
     )
-    selected.metrics["one_shot_incumbent_fallback"] = 0.0
     return OneShotDecision(
         candidate=selected,
-        evaluated=len(ranked),
-        safe_candidates=len(safe),
-        direct_base_candidates=len(direct_base),
-        transfer_eligible_candidates=len(transfer_eligible),
-        custom_eligible_candidates=len(exploitation_pool),
-        local_candidates=sum(
-            item[0].source == "local_bank_anchor"
+        evaluated=len(evaluated),
+        safe_candidates=runtime_safe_count,
+        direct_base_candidates=direct_base_count,
+        transfer_eligible_candidates=sum(
+            item[4] and item[0].template != incumbent.template
             for item in evaluated
         ),
-        selection_policy="cross_workload_evidence",
+        custom_eligible_candidates=len(eligible),
+        local_candidates=local_count,
+        selection_policy="paired_bank_relative_effect",
     )

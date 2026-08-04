@@ -65,6 +65,7 @@ MEASUREMENT_COLUMNS = [
     "search_acquisition",
     "search_behavior_metrics",
     "tiling_signature",
+    "bank_tiling_signature",
     "success",
     "preflight_passed",
     "preflight_mode",
@@ -128,6 +129,7 @@ SUMMARY_COLUMNS = [
     "status_vs_official",
     "status_vs_bank",
     "paired_outcome",
+    "deployment_decision",
     "optimization_result",
 ]
 
@@ -627,6 +629,7 @@ def profile_record(
         "search_acquisition",
         "search_behavior_metrics",
         "tiling_signature",
+        "bank_tiling_signature",
     ):
         row[column] = source.get(column, "")
     row.update(
@@ -780,6 +783,7 @@ def summarize(
         )
         if best is None:
             summary["paired_outcome"] = "failed"
+            summary["deployment_decision"] = "measurement_failed"
             summary["optimization_result"] = "no_successful_candidate"
         else:
             best_ms = float(best["median_ms"])
@@ -814,6 +818,22 @@ def summarize(
                         best["status_vs_official"],
                         best["status_vs_bank"],
                     ),
+                    "deployment_decision": (
+                        "retain_bank_no_supported_custom"
+                        if best["candidate_source"]
+                        == "one_shot_bank_incumbent"
+                        else (
+                            "custom_faster"
+                            if best["status_vs_official"] == "improved"
+                            and best["status_vs_bank"] == "improved"
+                            else (
+                                "custom_slower"
+                                if best["status_vs_official"] == "regressed"
+                                or best["status_vs_bank"] == "regressed"
+                                else "custom_within_noise"
+                            )
+                        )
+                    ),
                     "optimization_result": (
                         "improved"
                         if best["status_vs_official"] == "improved"
@@ -841,7 +861,8 @@ def summarize(
             f"status_vs_official={summary['status_vs_official'] or 'NA'} "
             f"status_vs_bank={summary['status_vs_bank'] or 'NA'} "
             f"best_source={summary['best_source'] or 'none'} "
-            f"paired_outcome={summary['paired_outcome']}"
+            f"paired_outcome={summary['paired_outcome']} "
+            f"deployment={summary['deployment_decision']}"
         )
     return summaries
 
@@ -1339,16 +1360,26 @@ def main() -> None:
         row["optimization_result"] == "no_successful_candidate"
         for row in summaries
     )
-    evidence_selected = sum(
-        row.get("best_source") == "one_shot_model"
+    deployed_custom = sum(
+        row.get("best_source") == "one_shot_bank_relative"
         for row in summaries
     )
-    local_exploration = sum(
-        row.get("best_source") == "one_shot_local_exploration"
+    retained_bank = sum(
+        row.get("best_source") == "one_shot_bank_incumbent"
         for row in summaries
     )
-    coupled_policy = sum(
-        row.get("best_source") == "one_shot_coupled_policy"
+    calibration_local = sum(
+        row.get("best_source")
+        == "calibration_local_counterfactual"
+        for row in summaries
+    )
+    calibration_coupled = sum(
+        row.get("best_source")
+        == "calibration_coupled_counterfactual"
+        for row in summaries
+    )
+    calibration_template_probe = sum(
+        row.get("best_source") == "calibration_template_probe"
         for row in summaries
     )
     print(
@@ -1358,9 +1389,11 @@ def main() -> None:
         f"vs_official_within_noise={official_within_noise} "
         f"vs_official_slower={official_slower} "
         f"failed={failed} "
-        f"evidence_selected={evidence_selected} "
-        f"local_exploration={local_exploration} "
-        f"coupled_policy={coupled_policy}"
+        f"deployed_custom={deployed_custom} "
+        f"retained_bank={retained_bank} "
+        f"calibration_local={calibration_local} "
+        f"calibration_coupled={calibration_coupled} "
+        f"calibration_template_probe={calibration_template_probe}"
     )
     print("FAMILY_RESULT_BEGIN")
     for row in family_summaries:

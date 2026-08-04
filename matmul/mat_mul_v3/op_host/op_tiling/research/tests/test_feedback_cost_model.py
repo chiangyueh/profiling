@@ -13,6 +13,7 @@ sys.path.insert(0, str(RESEARCH))
 
 from generate import (
     load_resume_feedback,
+    load_unpaired_one_shot_candidates,
     load_workloads,
     merge_candidate_rows,
 )
@@ -175,6 +176,56 @@ class FeedbackCostModelTest(unittest.TestCase):
         )
         self.assertEqual(incompatible, [])
         self.assertEqual(incompatible_exclusions, set())
+
+    def test_unpaired_one_shot_custom_is_remeasured_exactly(
+        self,
+    ) -> None:
+        row = {
+            "candidate_role": "searched",
+            "candidate_source": "one_shot_custom_policy",
+            "soc": "Ascend910B3",
+            "aic": "20",
+            "toolkit": "8.1.RC1",
+            "workload_id": self.workload.workload_id,
+            "m": str(self.workload.m),
+            "n": str(self.workload.n),
+            "k": str(self.workload.k),
+            "dtype": self.workload.dtype,
+            "trans_a": "0",
+            "trans_b": "0",
+            "tiling_signature": self.success_schedule.signature_text(),
+            "success": "1",
+            "preflight_mode": "numeric_signed_axes_full_v3",
+            "pair_validated": "0",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resume.csv"
+            with path.open("w", newline="", encoding="utf-8") as output:
+                writer = csv.DictWriter(output, fieldnames=tuple(row))
+                writer.writeheader()
+                writer.writerow(row)
+            pending = load_unpaired_one_shot_candidates(
+                path,
+                soc="Ascend910B3",
+                aic_cores=20,
+                toolkit="8.1.RC1",
+            )
+            row["pair_validated"] = "1"
+            with path.open("w", newline="", encoding="utf-8") as output:
+                writer = csv.DictWriter(output, fieldnames=tuple(row))
+                writer.writeheader()
+                writer.writerow(row)
+            completed = load_unpaired_one_shot_candidates(
+                path,
+                soc="Ascend910B3",
+                aic_cores=20,
+                toolkit="8.1.RC1",
+            )
+        self.assertEqual(
+            pending[self.workload.identity()],
+            self.success_schedule,
+        )
+        self.assertEqual(completed, {})
 
     def test_output_not_written_becomes_runtime_risk_evidence(
         self,

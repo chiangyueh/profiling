@@ -310,6 +310,7 @@ generate_candidates() {
     local npu_candidates="$5"
     local callback_candidates="$6"
     local resume_feedback="${7:-}"
+    local secondary_resume_feedback="${8:-}"
     local command=(
         python3 "${RESEARCH}/generate.py"
         --workloads "${workloads}"
@@ -355,6 +356,9 @@ generate_candidates() {
     )
     if [[ -n "${resume_feedback}" ]]; then
         command+=(--resume-feedback "${resume_feedback}")
+    fi
+    if [[ -n "${secondary_resume_feedback}" ]]; then
+        command+=(--resume-feedback "${secondary_resume_feedback}")
     fi
     if [[ "${selection_mode}" == "calibration" ||
           "${selection_mode}" == "one-shot" ]]; then
@@ -423,7 +427,8 @@ generate_candidates \
     one-shot \
     "${NPU_CANDIDATES}" \
     "${CALLBACK_CANDIDATES}" \
-    "${CALIBRATION_RESUME}"
+    "${CALIBRATION_RESUME}" \
+    "${RESUME}"
 echo "  ok"
 
 echo "[5/5] Measure one-shot decision against original MatMulV3 ..."

@@ -22,6 +22,7 @@ from tiling_search import (
     GenerationBudget,
     Hardware,
     MeasuredObservation,
+    OneShotDecision,
     SearchConfig,
     Workload,
     plan_template_race,
@@ -298,6 +299,59 @@ def load_resume_feedback(
     return observations, exclusions
 
 
+def load_unpaired_one_shot_candidates(
+    path: Path,
+    soc: str,
+    aic_cores: int,
+    toolkit: str | None = None,
+) -> dict[tuple[int, int, int, str, bool, bool, int], Schedule]:
+    """Recover executable one-shot customs whose paired latency was invalid."""
+
+    if not path.is_file():
+        return {}
+    pending = {}
+    with path.open(newline="", encoding="utf-8") as source:
+        rows = csv.DictReader(source)
+        for row in rows:
+            if (
+                row.get("candidate_role") != "searched"
+                or row.get("candidate_source")
+                not in {
+                    "one_shot_bank_relative",
+                    "one_shot_custom_policy",
+                }
+                or row.get("soc") != soc
+                or int(row.get("aic") or 0) != aic_cores
+                or (
+                    toolkit is not None
+                    and row.get("toolkit") != toolkit
+                )
+                or not truthy(row.get("success"))
+                or truthy(row.get("pair_validated"))
+                or row.get("preflight_mode")
+                not in STRICT_NUMERIC_PREFLIGHT_MODES
+            ):
+                continue
+            try:
+                workload = Workload(
+                    workload_id=row["workload_id"],
+                    m=int(row["m"]),
+                    n=int(row["n"]),
+                    k=int(row["k"]),
+                    dtype=row["dtype"],
+                    trans_a=truthy(row.get("trans_a")),
+                    trans_b=truthy(row.get("trans_b")),
+                    max_cores=aic_cores,
+                )
+                schedule = Schedule.from_signature(
+                    row["tiling_signature"]
+                )
+            except (KeyError, ValueError):
+                continue
+            pending[workload.identity()] = schedule
+    return pending
+
+
 def hydrate_bank_context(
     observations: list[MeasuredObservation],
 ) -> tuple[list[MeasuredObservation], int, int]:
@@ -510,12 +564,24 @@ def main() -> None:
         exclusion_paths=args.exclusions,
     )
     resume_completed: set[tuple] = set()
+    unpaired_one_shot: dict[
+        tuple[int, int, int, str, bool, bool, int],
+        Schedule,
+    ] = {}
     for resume_feedback in args.resume_feedback:
         resume_observations, resume_exclusions = load_resume_feedback(
             resume_feedback,
             args.soc,
             args.aic_cores,
             args.toolkit,
+        )
+        unpaired_one_shot.update(
+            load_unpaired_one_shot_candidates(
+                resume_feedback,
+                args.soc,
+                args.aic_cores,
+                args.toolkit,
+            )
         )
         observations.extend(resume_observations)
         exclusions.update(resume_exclusions)
@@ -789,6 +855,77 @@ def main() -> None:
                 effect_model=one_shot_effect_model,
                 safety_model=one_shot_safety_model,
             )
+            pending_schedule = unpaired_one_shot.get(
+                workload.identity()
+            )
+            if pending_schedule is not None:
+                pending_candidate = next(
+                    (
+                        candidate
+                        for candidate in callback_candidates
+                        if candidate.schedule == pending_schedule
+                    ),
+                    None,
+                )
+                if pending_candidate is not None:
+                    metrics = dict(pending_candidate.metrics)
+                    metrics.update(
+                        {
+                            "deployment_evidence_strong": 0.0,
+                            "deployment_recommended_custom": 1.0,
+                            "bank_execution_equivalent": 0.0,
+                            "bank_signature_exact": 0.0,
+                            "resume_unpaired_remeasurement": 1.0,
+                        }
+                    )
+                    selected = Candidate(
+                        schedule=pending_candidate.schedule,
+                        template=pending_candidate.template,
+                        source="one_shot_custom_policy",
+                        rationale=(
+                            "repeat the same numerically verified custom "
+                            "tiling because its paired latency was invalid; "
+                            f"generator={pending_candidate.source}"
+                        ),
+                        acquisition=pending_candidate.acquisition,
+                        parent_signatures=(
+                            incumbent.schedule.signature(),
+                        ),
+                        behavior_key=pending_candidate.behavior_key,
+                        metrics=metrics,
+                    )
+                    one_shot_decision = OneShotDecision(
+                        candidate=selected,
+                        deployment_candidate=selected,
+                        generator_source=pending_candidate.source,
+                        evaluated=one_shot_decision.evaluated,
+                        safe_candidates=one_shot_decision.safe_candidates,
+                        direct_base_candidates=(
+                            one_shot_decision.direct_base_candidates
+                        ),
+                        transfer_eligible_candidates=(
+                            one_shot_decision
+                            .transfer_eligible_candidates
+                        ),
+                        custom_eligible_candidates=(
+                            one_shot_decision
+                            .custom_eligible_candidates
+                        ),
+                        bank_equivalent_candidates=(
+                            one_shot_decision
+                            .bank_equivalent_candidates
+                        ),
+                        local_candidates=one_shot_decision.local_candidates,
+                        selection_policy=(
+                            "resume_unpaired_exact_remeasurement"
+                        ),
+                    )
+                else:
+                    print(
+                        "ONE_SHOT_REMEASURE_SKIPPED "
+                        f"{workload.workload_id} "
+                        "reason=prior_signature_not_regenerated"
+                    )
             if (
                 one_shot_decision.deployment_candidate.schedule
                 != one_shot_decision.candidate.schedule

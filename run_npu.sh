@@ -167,9 +167,9 @@ PAIRED_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log25_26.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260804-bank-structure-prior-oneshot-v5"
+echo "  script:     run_npu.sh 20260804-independent-custom-oneshot-v6"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      bank_structure_relative_unseen_one_shot"
+echo "  scope:      independent_custom_bank_relative_unseen_one_shot"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  summary:    ${SUMMARY}"

@@ -904,6 +904,7 @@ def main() -> None:
                 "strong_evidence="
                 f"{int(metrics.get('deployment_evidence_strong', 0.0))} "
                 f"local={one_shot_decision.local_candidates} "
+                f"generator={one_shot_decision.generator_source} "
                 f"policy={one_shot_decision.selection_policy} "
                 "deployment="
                 f"{'custom' if one_shot_decision.deployment_candidate.schedule == selected.schedule else 'bank'} "

@@ -35,6 +35,7 @@ from .domain import (
 class OneShotDecision:
     candidate: Candidate
     deployment_candidate: Candidate
+    generator_source: str
     evaluated: int
     safe_candidates: int
     direct_base_candidates: int
@@ -997,12 +998,14 @@ def select_one_shot_candidate(
     safety_model: BankRelativeSafetyModel | None = None,
     **_ignored,
 ) -> OneShotDecision:
-    """Select exactly one custom tiling using bank-relative evidence.
+    """Select exactly one independently generated custom tiling.
 
     The bank is an incumbent and paired measurement control, not a normal
-    deployment fallback. A candidate must pass the runtime-safety policy.
-    Strong latency evidence changes the confidence tier; it does not decide
-    whether the custom search is used at all.
+    deployment candidate or deployment seed. Bank-anchor mutations remain
+    calibration probes; one-shot deployment must come from an independent
+    contract solver or a mutation of measured custom evidence. A candidate
+    must pass the runtime-safety policy. Strong latency evidence changes the
+    confidence tier; it does not decide whether custom search is used at all.
     """
 
     if incumbent.source != "bank_incumbent":
@@ -1014,14 +1017,18 @@ def select_one_shot_candidate(
     relative_safety_model = safety_model or BankRelativeSafetyModel(
         observations, hardware
     )
+    candidate_list = list(candidates)
+    local_count = sum(
+        candidate.source == "local_bank_anchor"
+        for candidate in candidate_list
+    )
     unique: dict[tuple[int, ...], Candidate] = {}
-    for candidate in candidates:
+    for candidate in candidate_list:
         if candidate.source not in {
             "contract_coupled_policy",
             "contract_global",
             "feedback_regression_counterfactual",
             "feedback_winner_mutation",
-            "local_bank_anchor",
         }:
             continue
         if candidate.schedule.signature() == incumbent.schedule.signature():
@@ -1116,13 +1123,9 @@ def select_one_shot_candidate(
         and item[0].schedule["singleCoreN"] == item[0].schedule["baseN"]
         for item in evaluated
     )
-    local_count = sum(
-        item[0].source == "local_bank_anchor" for item in evaluated
-    )
-
     if not evaluated:
         raise ValueError(
-            "one-shot search produced no independent custom candidate; "
+            "one-shot search produced no solver-generated custom candidate; "
             "bank fallback is disabled"
         )
     if not eligible:
@@ -1270,6 +1273,7 @@ def select_one_shot_candidate(
     return OneShotDecision(
         candidate=selected,
         deployment_candidate=deployment_candidate,
+        generator_source=original.source,
         evaluated=len(evaluated),
         safe_candidates=runtime_safe_count,
         direct_base_candidates=direct_base_count,

@@ -142,8 +142,8 @@ class OneShotSelectionTest(unittest.TestCase):
         self.custom = Candidate(
             schedule=self.bank.replace(iterateOrder=0),
             template=Template.BASE,
-            source="local_bank_anchor",
-            rationale="one-field bank mutation",
+            source="contract_coupled_policy",
+            rationale="independently generated coupled schedule",
         )
 
     def _paired_effects(
@@ -303,11 +303,32 @@ class OneShotSelectionTest(unittest.TestCase):
             rationale="not part of the one-shot candidate layer",
         )
         with self.assertRaisesRegex(
-            ValueError, "no independent custom candidate"
+            ValueError, "no solver-generated custom candidate"
         ):
             select_one_shot_candidate(
                 self.workload,
                 [unsupported],
+                self.incumbent,
+                (),
+                self.hardware,
+                cost_model=_RuntimeModel(),
+            )
+
+    def test_bank_anchor_mutation_is_not_a_one_shot_deployment(
+        self,
+    ) -> None:
+        local = Candidate(
+            schedule=self.custom.schedule,
+            template=Template.BASE,
+            source="local_bank_anchor",
+            rationale="calibration-only bank mutation",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "no solver-generated custom candidate"
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [local],
                 self.incumbent,
                 (),
                 self.hardware,
@@ -427,7 +448,12 @@ class OneShotSelectionTest(unittest.TestCase):
     def test_calibration_separates_local_coupled_and_template_probes(
         self,
     ) -> None:
-        local = self.custom
+        local = Candidate(
+            schedule=self.custom.schedule,
+            template=Template.BASE,
+            source="local_bank_anchor",
+            rationale="calibration local mutation",
+        )
         coupled = Candidate(
             schedule=self.bank.replace(l2IterateOrder=1),
             template=Template.BASE,

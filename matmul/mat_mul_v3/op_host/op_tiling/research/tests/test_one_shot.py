@@ -30,6 +30,8 @@ from tiling_search.one_shot import (
     select_one_shot_candidate,
     validate_bank_relative_selector,
 )
+from tiling_search.behavior import behavior_vector
+from tiling_search.template_competition import compare_templates
 
 
 class _RuntimeModel:
@@ -107,6 +109,18 @@ class _UnsupportedDistantRatioModel:
             upper_ratio=1.30,
             nearest_distance=0.5,
             support=0.10,
+        )
+
+
+class _FalseOptimisticCrossTemplateModel:
+    def predict(self, workload, bank, candidate, hardware, **_):
+        del workload, bank, candidate, hardware
+        return BankRelativePrediction(
+            samples=8,
+            robust_ratio=0.29,
+            upper_ratio=0.49,
+            nearest_distance=0.20,
+            support=0.63,
         )
 
 
@@ -512,7 +526,10 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(strong_decision.candidate.schedule, split.schedule)
         self.assertEqual(
-            strong_decision.deployment_candidate.schedule, split.schedule
+            strong_decision.deployment_candidate.schedule, self.bank
+        )
+        self.assertEqual(
+            strong_decision.candidate.metrics["template_competitive"], 0.0
         )
 
     def test_research_measurement_uses_expected_latency_not_tighter_regression(
@@ -539,6 +556,178 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(
             decision.deployment_candidate.schedule, self.bank
+        )
+
+    def test_low_core_split_k_has_no_template_opportunity(self) -> None:
+        workload = Workload(
+            workload_id="net_log27_counterexample",
+            m=2911,
+            n=3809,
+            k=6273,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        bank = Schedule.from_signature(
+            "20:128:256:6273:128:256:64:16:8:1:1:0:"
+            "8:4:2:2:1:2:1:12:15:0:0"
+        )
+        split = Schedule.from_signature(
+            "2:384:128:384:128:128:128:9:6:3:1:1:"
+            "3:3:2:2:2:1:3:5:1:0:2"
+        )
+        competition = compare_templates(
+            workload,
+            bank,
+            split,
+            behavior_vector(workload, bank, self.hardware),
+            behavior_vector(workload, split, self.hardware),
+            self.hardware,
+            effect_samples=8,
+            effect_support=0.57,
+            effect_upper_ratio=4.23,
+        )
+        self.assertFalse(competition.competitive)
+        self.assertGreater(competition.compute_floor_ratio, 9.0)
+        self.assertEqual(
+            competition.reason, "no_cross_template_advantage"
+        )
+
+    def test_underfilled_bank_allows_split_k_parallelism_probe(self) -> None:
+        workload = Workload(
+            workload_id="underfilled_output",
+            m=128,
+            n=128,
+            k=32768,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        bank = Schedule.from_signature(
+            "1:128:128:32768:128:128:64:16:8:1:1:0:"
+            "8:4:2:2:1:1:1:1:1:0:0"
+        )
+        split = Schedule.from_signature(
+            "20:384:128:384:128:128:128:9:6:3:1:1:"
+            "3:3:2:2:2:1:1:1:1:0:3"
+        )
+        competition = compare_templates(
+            workload,
+            bank,
+            split,
+            behavior_vector(workload, bank, self.hardware),
+            behavior_vector(workload, split, self.hardware),
+            self.hardware,
+            effect_samples=0,
+            effect_support=0.0,
+            effect_upper_ratio=float("inf"),
+        )
+        self.assertTrue(competition.hardware_opportunity)
+        self.assertTrue(competition.competitive)
+        self.assertGreater(competition.active_core_gain, 10.0)
+
+    def test_same_template_candidate_beats_noncompetitive_split_probe(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="net_log27_selector_counterexample",
+            m=2911,
+            n=3809,
+            k=6273,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        bank = Schedule.from_signature(
+            "20:128:256:6273:128:256:64:16:8:1:1:0:"
+            "8:4:2:2:1:2:1:12:15:0:0"
+        )
+        incumbent = Candidate(
+            bank, Template.BASE, "bank_incumbent", "bank"
+        )
+        base = Candidate(
+            bank.replace(
+                l2MTileCnt=2,
+                l2NTileCnt=2,
+                l2MTileBlock=6,
+                l2NTileBlock=8,
+            ),
+            Template.BASE,
+            "feedback_winner_transfer",
+            "same-template L2 hypothesis",
+        )
+        split = Candidate(
+            Schedule.from_signature(
+                "2:384:128:384:128:128:128:9:6:3:1:1:"
+                "3:3:2:2:2:1:3:5:1:0:2"
+            ),
+            Template.SINGLE_CORE_SPLIT_K,
+            "feedback_regression_counterfactual",
+            "v9 failure structure",
+        )
+        decision = select_one_shot_candidate(
+            workload,
+            [split, base],
+            incumbent,
+            (),
+            self.hardware,
+            cost_model=_RuntimeModel(),
+        )
+        self.assertEqual(decision.candidate.schedule, base.schedule)
+        self.assertEqual(
+            decision.candidate.metrics["template_competitive"], 1.0
+        )
+
+    def test_cross_template_history_cannot_override_work_floor(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="unseen_dense_false_split_prediction",
+            m=3840,
+            n=4608,
+            k=6912,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        bank = Schedule.from_signature(
+            "20:128:256:6912:128:256:64:16:8:1:1:0:"
+            "8:4:2:2:1:2:1:15:18:0:0"
+        )
+        incumbent = Candidate(
+            bank, Template.BASE, "bank_incumbent", "bank"
+        )
+        base = Candidate(
+            bank.replace(l2IterateOrder=1),
+            Template.BASE,
+            "feedback_winner_transfer",
+            "same-template control",
+        )
+        split = Candidate(
+            Schedule.from_signature(
+                "18:384:4608:384:128:128:128:9:6:3:1:1:"
+                "3:3:2:2:2:1:1:1:12:1:3"
+            ),
+            Template.DETERMINISTIC_SPLIT_K,
+            "feedback_regression_counterfactual",
+            "false optimistic cross-template prediction",
+        )
+        decision = select_one_shot_candidate(
+            workload,
+            [split, base],
+            incumbent,
+            (),
+            self.hardware,
+            cost_model=_RuntimeModel(),
+            effect_model=_FalseOptimisticCrossTemplateModel(),
+        )
+        self.assertEqual(decision.candidate.schedule, base.schedule)
+        self.assertEqual(
+            decision.candidate.metrics["template_competitive"], 1.0
         )
 
     def test_calibration_separates_local_coupled_and_template_probes(

@@ -110,7 +110,14 @@ class SingleCoreSplitKSolver:
 
 class DeterministicSplitKSolver:
     template = Template.DETERMINISTIC_SPLIT_K
-    source = "contract_coupled_policy"
+
+    def __init__(self, *, explore_low_core: bool = False) -> None:
+        self.explore_low_core = explore_low_core
+        self.source = (
+            "contract_global"
+            if explore_low_core
+            else "contract_coupled_policy"
+        )
 
     def generate(
         self,
@@ -130,18 +137,23 @@ class DeterministicSplitKSolver:
             (384, max(128, align_up(workload.n, 16)), 3, 1, 9, 6, 1, 0),
             (max(128, align_up(workload.m, 16)), 384, 1, 3, 6, 9, 0, 1),
         )
-        core_values = [
-            core_limit,
-            *sorted(
-                {
-                1,
-                min(2, core_limit),
-                min(4, core_limit),
-                min(8, core_limit),
-                min(16, core_limit),
-                }
-            ),
-        ]
+        # Upstream assigns min(k_chunks, aicNum) cores. Arbitrary 1/2/4-core
+        # variants are legal but not equivalent deployment policies: each adds
+        # complete K rounds without reducing output traffic. Keep them reachable
+        # only in the explicit broad campaign solver.
+        core_values = [core_limit]
+        if self.explore_low_core:
+            core_values.extend(
+                sorted(
+                    {
+                        1,
+                        min(2, core_limit),
+                        min(4, core_limit),
+                        min(8, core_limit),
+                        min(16, core_limit),
+                    }
+                )
+            )
         core_values = list(dict.fromkeys(core_values))
         for (
             single_m,

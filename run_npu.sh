@@ -151,12 +151,12 @@ RUN_LOG="${ROOT}/results/logs/run_npu_${RUN_ID}.log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
 BUILD_DIR="${ROOT}/.build/matmul_v3_tiling_research"
-CANDIDATES="${ROOT}/results/npu_v9_feedback_search_candidates.csv"
-ALL_CANDIDATES="${ROOT}/results/npu_v9_feedback_search_all.csv"
-SUMMARY="${ROOT}/results/npu_v9_feedback_summary.csv"
-FAMILY_SUMMARY="${ROOT}/results/npu_v9_feedback_family_summary.csv"
-CANDIDATE_RESULTS="${ROOT}/results/npu_v9_feedback_candidates.csv"
-RESUME="${ROOT}/results/npu_v9_feedback_resume.csv"
+CANDIDATES="${ROOT}/results/npu_v10_template_risk_search_candidates.csv"
+ALL_CANDIDATES="${ROOT}/results/npu_v10_template_risk_search_all.csv"
+SUMMARY="${ROOT}/results/npu_v10_template_risk_summary.csv"
+FAMILY_SUMMARY="${ROOT}/results/npu_v10_template_risk_family_summary.csv"
+CANDIDATE_RESULTS="${ROOT}/results/npu_v10_template_risk_candidates.csv"
+RESUME="${ROOT}/results/npu_v10_template_risk_resume.csv"
 CALIBRATION_CANDIDATES="${ROOT}/results/npu_calibration_search_candidates.csv"
 CALIBRATION_ALL="${ROOT}/results/npu_calibration_search_all.csv"
 CALIBRATION_SUMMARY="${ROOT}/results/npu_calibration_summary.csv"
@@ -164,12 +164,13 @@ CALIBRATION_FAMILY_SUMMARY="${ROOT}/results/npu_calibration_family_summary.csv"
 CALIBRATION_RESULTS="${ROOT}/results/npu_calibration_candidates.csv"
 CALIBRATION_RESUME="${ROOT}/results/npu_calibration_resume.csv"
 PAIRED_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log25_26.csv"
+V9_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log27.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260805-feedback-active-challenger-v9"
+echo "  script:     run_npu.sh 20260805-template-competition-v10"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      feedback_generated_unseen_one_shot"
+echo "  scope:      template_aware_feedback_unseen_one_shot"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  summary:    ${SUMMARY}"
@@ -353,6 +354,7 @@ generate_candidates() {
         --behavior-candidates "${BEHAVIOR_CANDIDATES}"
         --selection-mode "${selection_mode}"
         --resume-feedback "${PAIRED_EVIDENCE}"
+        --resume-feedback "${V9_FEEDBACK}"
     )
     if [[ -n "${resume_feedback}" ]]; then
         command+=(--resume-feedback "${resume_feedback}")

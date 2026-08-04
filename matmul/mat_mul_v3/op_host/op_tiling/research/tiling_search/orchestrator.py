@@ -74,6 +74,7 @@ class CandidateEngine:
             )
             exploration_solvers = (
                 BaseExplorationSolver(),
+                DeterministicSplitKSolver(explore_low_core=True),
                 Al1FullLoadSolver(),
                 Bl1FullLoadSolver(),
             )

@@ -26,7 +26,11 @@ from tiling_search.behavior import behavior_vector
 from tiling_search.contracts import validate_schedule
 from tiling_search.feedback import fingerprint
 from tiling_search.racing import plan_template_race
-from tiling_search.solvers import BaseSolver, SingleCoreSplitKSolver
+from tiling_search.solvers import (
+    BaseSolver,
+    DeterministicSplitKSolver,
+    SingleCoreSplitKSolver,
+)
 
 
 class ContractSearchTest(unittest.TestCase):
@@ -191,6 +195,43 @@ class ContractSearchTest(unittest.TestCase):
         )
         self.assertTrue(
             validate_schedule(workload, bank, self.hardware).valid
+        )
+
+    def test_deterministic_deployment_solver_uses_all_k_parallel_cores(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="unseen_deterministic_probe",
+            m=384,
+            n=288,
+            k=15360,
+            dtype="fp32",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        deployment = list(
+            DeterministicSplitKSolver().generate(
+                workload, self.hardware
+            )
+        )
+        exploration = list(
+            DeterministicSplitKSolver(
+                explore_low_core=True
+            ).generate(workload, self.hardware)
+        )
+        self.assertTrue(deployment)
+        self.assertEqual(
+            {schedule["usedCoreNum"] for schedule in deployment},
+            {20},
+        )
+        self.assertTrue(
+            {1, 2, 4, 8, 16}.issubset(
+                {
+                    schedule["usedCoreNum"]
+                    for schedule in exploration
+                }
+            )
         )
 
     def test_coupled_solver_reconstructs_bank_without_local_source(

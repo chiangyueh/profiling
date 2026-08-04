@@ -597,10 +597,16 @@ def profitability_prior(
     occupancy_penalty = abs(l0_occupancy - 0.75) + 0.25 * abs(
         l1_occupancy - 0.65
     )
-    score = (
-        rounds
+    ideal_active_cores = max(
+        1.0, min(workload.max_cores, hardware.aic_cores)
+    )
+    compute_amplification = (
+        ideal_active_cores
+        / max(1.0, active)
         / max(0.05, padding_efficiency)
-        / max(0.05, core_utilization)
+    )
+    score = (
+        compute_amplification
         * (1.0 + 0.12 * occupancy_penalty)
         * (1.0 + 0.002 * k_passes)
         * (1.0 + 0.15 * max(0.0, traffic_amplification - 1.0))
@@ -625,6 +631,7 @@ def profitability_prior(
             "active_cores": float(active),
             "core_rounds": float(rounds),
             "core_utilization": core_utilization,
+            "compute_amplification": compute_amplification,
             "padding_efficiency": padding_efficiency,
             "k_passes": float(k_passes),
             "split_k_chunks": float(split_k_chunks),

@@ -30,6 +30,7 @@ from .domain import (
     Template,
     Workload,
 )
+from .template_competition import compare_templates
 
 
 @dataclass(frozen=True)
@@ -1019,6 +1020,9 @@ def select_one_shot_candidate(
     relative_safety_model = safety_model or BankRelativeSafetyModel(
         observations, hardware
     )
+    bank_vector = behavior_vector(
+        workload, incumbent.schedule, hardware
+    )
     candidate_list = list(candidates)
     local_count = sum(
         candidate.source == "local_bank_anchor"
@@ -1078,6 +1082,17 @@ def select_one_shot_candidate(
                 hardware,
                 exclude_workload=workload.identity(),
             )
+        competition = compare_templates(
+            workload,
+            incumbent.schedule,
+            candidate.schedule,
+            bank_vector,
+            vector,
+            hardware,
+            effect_samples=relative.samples,
+            effect_support=relative.support,
+            effect_upper_ratio=relative.upper_ratio,
+        )
         transition = bank_transition(
             incumbent.schedule, candidate.schedule
         )
@@ -1132,6 +1147,36 @@ def select_one_shot_candidate(
                 "bank_runtime_risk_samples": float(
                     relative_safety.samples
                 ),
+                "template_same_as_bank": float(
+                    competition.same_template
+                ),
+                "template_hardware_opportunity": float(
+                    competition.hardware_opportunity
+                ),
+                "template_evidence_opportunity": float(
+                    competition.evidence_opportunity
+                ),
+                "template_competitive": float(
+                    competition.competitive
+                ),
+                "template_bank_active_cores": (
+                    competition.bank_active_cores
+                ),
+                "template_candidate_active_cores": (
+                    competition.candidate_active_cores
+                ),
+                "template_active_core_gain": (
+                    competition.active_core_gain
+                ),
+                "template_compute_floor_ratio": (
+                    competition.compute_floor_ratio
+                ),
+                "template_output_overhead_ratio": (
+                    competition.output_overhead_ratio
+                ),
+                "template_conservative_floor_ratio": (
+                    competition.conservative_floor_ratio
+                ),
             }
         )
         evaluated.append(
@@ -1143,10 +1188,15 @@ def select_one_shot_candidate(
                 relative_safety,
                 runtime_safe,
                 deployable,
+                competition,
             )
         )
 
-    strong_evidence = [item for item in evaluated if item[6]]
+    strong_evidence = [
+        item
+        for item in evaluated
+        if item[6] and item[7].competitive
+    ]
     eligible = [item for item in evaluated if item[5]]
     runtime_safe_count = sum(item[5] for item in evaluated)
     direct_base_count = sum(
@@ -1167,7 +1217,7 @@ def select_one_shot_candidate(
         )
 
     def deployment_score(item) -> tuple:
-        candidate, _, prediction, _, _, _, _ = item
+        candidate, _, prediction, _, _, _, _, _ = item
         transition = bank_transition(
             incumbent.schedule, candidate.schedule
         )
@@ -1190,6 +1240,7 @@ def select_one_shot_candidate(
             relative_safety,
             runtime_safe,
             _,
+            competition,
         ) = item
         risk = (
             relative_safety.risk * relative_safety.support
@@ -1200,11 +1251,6 @@ def select_one_shot_candidate(
             )
         )
         predicted = prediction.robust_ratio
-        information_bonus = (
-            0.10 * (1.0 - prediction.support)
-            if prediction.samples
-            else 0.12
-        )
         cross_template = candidate.template != incumbent.template
         transition = bank_transition(
             incumbent.schedule, candidate.schedule
@@ -1213,38 +1259,45 @@ def select_one_shot_candidate(
         structural_penalty = min(
             0.03, 0.004 * max(0, changed_fields - 1)
         )
-        source_bonus = {
-            "feedback_winner_transfer": 0.10,
-            "feedback_winner_mutation": 0.08,
-            "feedback_regression_counterfactual": 0.07,
-            "contract_coupled_policy": 0.02,
-        }.get(candidate.source, 0.0)
-        upper_penalty = (
-            0.10 * max(0.0, prediction.upper_ratio - 1.0)
+        finite_upper = (
+            prediction.upper_ratio
             if math.isfinite(prediction.upper_ratio)
-            else 0.0
+            else 100.0
         )
-        unsupported_optimism_penalty = (
-            0.20
+        if competition.same_template:
+            conservative = predicted + 0.025 * math.log(
+                max(1.0, finite_upper)
+            )
             if (
                 prediction.samples
                 and prediction.support < 0.15
                 and prediction.robust_ratio < 0.95
+            ):
+                conservative += 0.25
+        else:
+            conservative = max(
+                predicted,
+                competition.conservative_floor_ratio,
             )
-            else 0.0
-        )
+            conservative += 0.20 * math.log(max(1.0, finite_upper))
+            if prediction.samples == 0:
+                conservative += 0.10
+        source_rank = {
+            "feedback_winner_transfer": 0,
+            "feedback_winner_mutation": 1,
+            "feedback_regression_counterfactual": 2,
+            "contract_coupled_policy": 3,
+            "contract_global": 4,
+        }.get(candidate.source, 5)
         return (
-            predicted
-            + upper_penalty
-            + unsupported_optimism_penalty
+            conservative
             + 0.25 * risk
-            + 0.04 * cross_template
             + structural_penalty
-            - information_bonus
-            - source_bonus,
+            + (0.0 if competition.competitive else 1.0),
+            not competition.competitive,
             transition.risk_tier,
-            cross_template and prediction.samples < 3,
-            predicted,
+            -prediction.support,
+            source_rank,
             changed_fields,
             vector.metrics.get("analytical_prior", math.inf),
             candidate.schedule.signature(),
@@ -1259,9 +1312,19 @@ def select_one_shot_candidate(
             _,
             _,
             _,
+            _,
         ) = min(strong_evidence, key=deployment_score)
         acquisition = deployment_score(
-            (original, vector, prediction, None, None, True, True)
+            (
+                original,
+                vector,
+                prediction,
+                None,
+                None,
+                True,
+                True,
+                None,
+            )
         )[0]
         deployment_candidate = original
         source = "one_shot_bank_relative"
@@ -1278,8 +1341,21 @@ def select_one_shot_candidate(
             if not schedules_execution_equivalent(
                 incumbent.schedule, item[0].schedule
             )
+            and item[7].competitive
         ]
-        selection_pool = research_pool or eligible
+        same_template_pool = [
+            item
+            for item in eligible
+            if (
+                not schedules_execution_equivalent(
+                    incumbent.schedule, item[0].schedule
+                )
+                and item[0].template == incumbent.template
+            )
+        ]
+        selection_pool = (
+            research_pool or same_template_pool or eligible
+        )
         (
             original,
             vector,
@@ -1288,6 +1364,7 @@ def select_one_shot_candidate(
             relative_safety,
             _,
             _,
+            competition,
         ) = min(selection_pool, key=research_score)
         acquisition = research_score(
             (
@@ -1302,6 +1379,7 @@ def select_one_shot_candidate(
                     else _is_runtime_safe(runtime)
                 ),
                 True,
+                competition,
             )
         )[0]
         if schedules_execution_equivalent(
@@ -1321,8 +1399,8 @@ def select_one_shot_candidate(
             rationale = (
                 "single runtime-safe non-bank challenger selected for paired "
                 "active-learning measurement from expected bank-relative "
-                "latency, information gain, structural transfer, and "
-                f"rejection risk; generator={original.source}"
+                "latency, template competition, hardware work floor, and "
+                f"runtime rejection risk; generator={original.source}"
             )
             selection_policy = "paired_feedback_active_challenger"
             deployment_recommended = 0.0
@@ -1353,7 +1431,9 @@ def select_one_shot_candidate(
         safe_candidates=runtime_safe_count,
         direct_base_candidates=direct_base_count,
         transfer_eligible_candidates=sum(
-            item[5] and item[0].template != incumbent.template
+            item[5]
+            and item[7].competitive
+            and item[0].template != incumbent.template
             for item in eligible
         ),
         custom_eligible_candidates=sum(

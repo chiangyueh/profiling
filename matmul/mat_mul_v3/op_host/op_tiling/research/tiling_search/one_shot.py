@@ -14,6 +14,11 @@ from .behavior import (
     behavior_vector,
     workload_distance,
 )
+from .bank_structure import (
+    BankTransition,
+    bank_transition,
+    subsystem_mask_distance,
+)
 from .contracts import template_of
 from .domain import (
     KNOWLEDGE_FIELDS,
@@ -108,6 +113,7 @@ class _EffectRow:
     candidate_vector: BehaviorVector
     bank_vector: BehaviorVector
     changed_fields: frozenset[int]
+    transition: BankTransition
 
 
 def _changed_fields(
@@ -170,6 +176,8 @@ def _bank_relative_distance(target: _EffectRow, row: _EffectRow) -> float:
         * _effect_mask_distance(
             target.changed_fields, row.changed_fields
         )
+        + 1.20
+        * subsystem_mask_distance(target.transition, row.transition)
         + 0.40 * _effect_vector_distance(target, row)
     )
 
@@ -252,6 +260,10 @@ class BankRelativeEffectModel:
                         observation.bank_schedule,
                         observation.schedule,
                     ),
+                    transition=bank_transition(
+                        observation.bank_schedule,
+                        observation.schedule,
+                    ),
                 )
             )
         self.rows = tuple(rows)
@@ -290,6 +302,7 @@ class BankRelativeEffectModel:
             candidate_vector=target_candidate_vector,
             bank_vector=target_bank_vector,
             changed_fields=_changed_fields(bank, candidate),
+            transition=bank_transition(bank, candidate),
         )
         bank_template = template_of(bank)
         candidate_template = template_of(candidate)
@@ -369,6 +382,10 @@ class BankRelativeSafetyModel:
                         observation.bank_schedule,
                         observation.schedule,
                     ),
+                    transition=bank_transition(
+                        observation.bank_schedule,
+                        observation.schedule,
+                    ),
                 )
             )
         self.rows = tuple(rows)
@@ -403,6 +420,7 @@ class BankRelativeSafetyModel:
             ),
             bank_vector=behavior_vector(workload, bank, hardware),
             changed_fields=_changed_fields(bank, candidate),
+            transition=bank_transition(bank, candidate),
         )
         bank_template = template_of(bank)
         candidate_template = template_of(candidate)
@@ -1033,6 +1051,9 @@ def select_one_shot_candidate(
             exclude_workload=workload.identity(),
         )
         changed = _changed_fields(incumbent.schedule, candidate.schedule)
+        transition = bank_transition(
+            incumbent.schedule, candidate.schedule
+        )
         cross_template = candidate.template != incumbent.template
         runtime_safe = (
             _is_bank_relative_runtime_safe(relative_safety)
@@ -1053,6 +1074,18 @@ def select_one_shot_candidate(
                 ),
                 "bank_relative_support": relative.support,
                 "bank_changed_fields": float(len(changed)),
+                "bank_changed_subsystems": float(
+                    len(transition.changed_subsystems)
+                ),
+                "bank_execution_structure_changes": float(
+                    len(transition.execution_subsystems)
+                ),
+                "bank_structure_preserved": float(
+                    transition.preserves_execution_structure
+                ),
+                "bank_transition_risk_tier": float(
+                    transition.risk_tier
+                ),
                 "runtime_risk_score": runtime.runtime_risk_score,
                 "runtime_risk_support": runtime.runtime_risk_support,
                 "bank_runtime_risk": relative_safety.risk,
@@ -1098,14 +1131,18 @@ def select_one_shot_candidate(
             "bank fallback is disabled"
         )
 
-    def deployment_score(item) -> tuple[float, float, tuple[int, ...]]:
+    def deployment_score(item) -> tuple:
         candidate, _, prediction, _, _, _, _ = item
+        transition = bank_transition(
+            incumbent.schedule, candidate.schedule
+        )
         cross_template_penalty = (
             0.02 if candidate.template != incumbent.template else 0.0
         )
         return (
             prediction.upper_ratio + cross_template_penalty,
             prediction.robust_ratio,
+            transition.risk_tier,
             candidate.schedule.signature(),
         )
 
@@ -1135,13 +1172,15 @@ def select_one_shot_candidate(
             else 0.18
         )
         cross_template = candidate.template != incumbent.template
-        changed_fields = len(
-            _changed_fields(incumbent.schedule, candidate.schedule)
+        transition = bank_transition(
+            incumbent.schedule, candidate.schedule
         )
+        changed_fields = len(transition.changed_fields)
         structural_penalty = min(
             0.03, 0.004 * max(0, changed_fields - 1)
         )
         return (
+            transition.risk_tier,
             cross_template and prediction.samples < 3,
             predicted
             + uncertainty
@@ -1199,7 +1238,7 @@ def select_one_shot_candidate(
                 ),
                 True,
             )
-        )[1]
+        )[2]
         deployment_candidate = original
         source = "one_shot_custom_policy"
         rationale = (

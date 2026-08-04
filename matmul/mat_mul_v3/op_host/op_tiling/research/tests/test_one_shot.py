@@ -9,6 +9,7 @@ RESEARCH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RESEARCH))
 
 from tiling_search.behavior import FeedbackPrediction
+from tiling_search.bank_structure import bank_transition
 from tiling_search.domain import (
     Candidate,
     Hardware,
@@ -83,6 +84,26 @@ class _ExpectedRatioModel:
             upper_ratio=3.00,
             nearest_distance=0.50,
             support=0.50,
+        )
+
+
+class _UnsupportedDistantRatioModel:
+    def predict(self, workload, bank, candidate, hardware, **_):
+        del workload, bank, hardware
+        if candidate["baseM"] != 208:
+            return BankRelativePrediction(
+                samples=2,
+                robust_ratio=0.80,
+                upper_ratio=1.20,
+                nearest_distance=1.0,
+                support=0.10,
+            )
+        return BankRelativePrediction(
+            samples=2,
+            robust_ratio=1.00,
+            upper_ratio=1.30,
+            nearest_distance=0.5,
+            support=0.10,
         )
 
 
@@ -211,6 +232,67 @@ class OneShotSelectionTest(unittest.TestCase):
         self.assertEqual(decision.candidate.schedule, broad.schedule)
         self.assertEqual(
             decision.deployment_candidate.schedule, broad.schedule
+        )
+
+    def test_bank_transition_groups_23_fields_by_execution_subsystem(
+        self,
+    ) -> None:
+        l2 = bank_transition(
+            self.bank,
+            self.bank.replace(
+                l2MTileCnt=2,
+                l2MTileBlock=2,
+                l2IterateOrder=1,
+            ),
+        )
+        self.assertEqual(l2.changed_subsystems, frozenset({"l2"}))
+        self.assertTrue(l2.preserves_execution_structure)
+        self.assertEqual(l2.risk_tier, 0)
+
+        broad = bank_transition(
+            self.bank,
+            self.bank.replace(
+                baseM=128,
+                depthA1=8,
+                tilingEnable=3,
+            ),
+        )
+        self.assertEqual(
+            broad.changed_subsystems,
+            frozenset({"template", "l0", "l1"}),
+        )
+        self.assertFalse(broad.preserves_execution_structure)
+        self.assertEqual(broad.risk_tier, 3)
+
+    def test_unsupported_distant_prediction_does_not_beat_bank_structure(
+        self,
+    ) -> None:
+        distant = Candidate(
+            schedule=self.bank.replace(
+                singleCoreM=128,
+                baseM=128,
+                depthA1=8,
+                stepKa=4,
+            ),
+            template=Template.BASE,
+            source="contract_global",
+            rationale="unsupported multi-subsystem change",
+        )
+        decision = select_one_shot_candidate(
+            self.workload,
+            [distant, self.custom],
+            self.incumbent,
+            (),
+            self.hardware,
+            cost_model=_RuntimeModel(),
+            effect_model=_UnsupportedDistantRatioModel(),
+        )
+        self.assertEqual(decision.candidate.schedule, self.custom.schedule)
+        self.assertEqual(
+            decision.candidate.metrics["bank_structure_preserved"], 1.0
+        )
+        self.assertEqual(
+            decision.candidate.metrics["bank_transition_risk_tier"], 0.0
         )
 
     def test_empty_custom_pool_fails_instead_of_using_bank(self) -> None:

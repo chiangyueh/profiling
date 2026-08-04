@@ -550,25 +550,10 @@ def select_one_shot_candidate(
                 <= 2.0
             )
         ]
-        coupled_base_pool = [
+        coupled_policy_pool = [
             item
             for item in runtime_safe_candidates
-            if (
-                item[0].source == "contract_coupled_policy"
-                and _is_direct_base(item[0])
-                and item[1].metrics.get(
-                    "l1_pipeline_efficiency", 0.0
-                )
-                >= 0.75
-                and item[1].metrics.get(
-                    "l2_wave_efficiency", 0.0
-                )
-                >= 0.70
-                and item[1].metrics.get(
-                    "l2_capacity_pressure", math.inf
-                )
-                <= 1.10
-            )
+            if item[0].source == "contract_coupled_policy"
         ]
         local_signatures = {
             item[0].schedule.signature() for item in local_pool
@@ -577,16 +562,24 @@ def select_one_shot_candidate(
             *local_pool,
             *(
                 item
-                for item in coupled_base_pool
+                for item in coupled_policy_pool
                 if item[0].schedule.signature()
                 not in local_signatures
             ),
         ]
         if not policy_pool:
+            coupled_count = sum(
+                item[0].source == "contract_coupled_policy"
+                for item in evaluated
+            )
             raise ValueError(
                 "one-shot selection has no safe deployment-policy "
                 "candidate; broad or unsupported-local fallback is "
-                "disabled"
+                "disabled "
+                f"(evaluated={len(evaluated)} "
+                f"runtime_safe={len(runtime_safe_candidates)} "
+                f"coupled={coupled_count} "
+                f"evidence_local={len(local_pool)})"
             )
         exploration_pool = policy_pool
         incumbent_hardware_penalty = _hardware_penalty(

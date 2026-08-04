@@ -190,6 +190,29 @@ class OneShotSelectionTest(unittest.TestCase):
             {call[1] for call in model.calls}, {0.15, 1.0}
         )
 
+    def test_one_shot_accepts_coupled_multiblock_partition(self) -> None:
+        coupled = Candidate(
+            schedule=self.schedule.replace(
+                singleCoreM=self.schedule["baseM"] * 2
+            ),
+            template=Template.BASE,
+            source="contract_coupled_policy",
+            rationale="coupled multi-block core partition",
+        )
+        decision = select_one_shot_candidate(
+            self.workload,
+            [coupled],
+            self.incumbent,
+            (),
+            self.hardware,
+            cost_model=_PredictionModel(),
+        )
+        self.assertEqual(decision.candidate.schedule, coupled.schedule)
+        self.assertEqual(
+            decision.selection_policy, "coupled_policy_global"
+        )
+        self.assertEqual(decision.direct_base_candidates, 0)
+
     def test_one_shot_selects_custom_only_with_cross_workload_evidence(
         self,
     ) -> None:

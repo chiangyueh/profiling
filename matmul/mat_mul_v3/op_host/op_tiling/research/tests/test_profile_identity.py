@@ -134,6 +134,20 @@ class ProfileIdentityTest(unittest.TestCase):
             "custom_measurement_failed",
         )
 
+    def test_bank_equivalent_is_not_reported_as_custom(self) -> None:
+        self.assertEqual(
+            PROFILE.deployment_decision(
+                "one_shot_bank_equivalent",
+                "improved",
+                "improved",
+            ),
+            "bank_equivalent_reconstructed",
+        )
+        self.assertEqual(
+            PROFILE.deployment_decision("one_shot_bank_equivalent"),
+            "bank_equivalent_measurement_failed",
+        )
+
     def test_summary_ranks_by_paired_ratio_not_cross_run_latency(
         self,
     ) -> None:
@@ -206,6 +220,54 @@ class ProfileIdentityTest(unittest.TestCase):
         )
         self.assertEqual(summary["deployment_decision"], "custom_faster")
 
+    def test_bank_equivalent_summary_never_claims_custom_improvement(
+        self,
+    ) -> None:
+        candidate = dict(self.row)
+        candidate.update(
+            {
+                "rank": "1",
+                "search_template": "DETERMINISTIC_SPLIT_K",
+                "candidate_source": "one_shot_bank_equivalent",
+                "tiling_signature": "equivalent",
+            }
+        )
+        key = PROFILE.measurement_key(
+            "Ascend910B3", 20, "8.1.RC1", candidate
+        )
+        records = {
+            key: {
+                **candidate,
+                "success": "1",
+                "preflight_mode": "numeric_signed_axes_full_v3",
+                "pair_validated": "1",
+                "median_ms": "0.9",
+                "official_ms": "1.0",
+                "bank_ms": "1.0",
+                "speedup_vs_official": "1.111",
+                "speedup_vs_bank": "1.111",
+                "status_vs_official": "improved",
+                "status_vs_bank": "improved",
+            }
+        }
+        with redirect_stdout(io.StringIO()):
+            summary = PROFILE.summarize(
+                [candidate],
+                records,
+                "Ascend910B3",
+                20,
+                "8.1.RC1",
+            )[0]
+        self.assertEqual(
+            summary["paired_outcome"],
+            "bank_equivalent_by_kernel_contract",
+        )
+        self.assertEqual(
+            summary["deployment_decision"],
+            "bank_equivalent_reconstructed",
+        )
+        self.assertEqual(summary["optimization_result"], "not_improved")
+
     def test_family_summary_reports_one_shot_speedups(self) -> None:
         rows = [
             {
@@ -264,7 +326,7 @@ class ProfileIdentityTest(unittest.TestCase):
         structured["preflight_mode"] = "numeric_signed_axes_full_v3"
         self.assertTrue(PROFILE.measurement_reusable(structured))
 
-    def test_unpaired_numeric_result_is_completed_but_not_rankable(
+    def test_unpaired_numeric_result_is_remeasured_and_not_rankable(
         self,
     ) -> None:
         unpaired = {
@@ -276,7 +338,7 @@ class ProfileIdentityTest(unittest.TestCase):
             "official_ms": "0.2",
             "bank_ms": "0.2",
         }
-        self.assertTrue(PROFILE.measurement_completed(unpaired))
+        self.assertFalse(PROFILE.measurement_completed(unpaired))
         self.assertFalse(PROFILE.measurement_reusable(unpaired))
 
     def test_interrupted_provisional_result_can_be_resumed(self) -> None:

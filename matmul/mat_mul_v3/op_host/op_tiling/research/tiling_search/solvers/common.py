@@ -150,13 +150,13 @@ def tile_specs(
                     if (
                         l0a > hardware.l0a_bytes
                         or l0b > hardware.l0b_bytes
-                        or l0c > hardware.l0c_bytes
+                        or l0c > hardware.l0c_capacity(db_c)
                     ):
                         continue
                     occupancy = max(
                         l0a / hardware.l0a_bytes,
                         l0b / hardware.l0b_bytes,
-                        l0c / hardware.l0c_bytes,
+                        l0c / hardware.l0c_capacity(db_c),
                     )
                     bucket = min(9, int(occupancy * 10))
                     aspect = min(

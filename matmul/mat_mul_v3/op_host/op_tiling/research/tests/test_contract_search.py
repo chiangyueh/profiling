@@ -228,6 +228,94 @@ class ContractSearchTest(unittest.TestCase):
             reconstructed[0].source, "contract_coupled_policy"
         )
 
+    def test_coupled_solver_reconstructs_single_buffer_l0c_banks(
+        self,
+    ) -> None:
+        cases = (
+            (
+                Workload(
+                    "unseen_large_deep",
+                    2368,
+                    2880,
+                    29696,
+                    "fp16",
+                    False,
+                    False,
+                    20,
+                ),
+                "2:256:256:29696:256:256:64:6:6:1:1:0:"
+                "3:3:2:2:1:10:6:1:2:0:0",
+            ),
+            (
+                Workload(
+                    "unseen_small_deep",
+                    640,
+                    448,
+                    28672,
+                    "fp16",
+                    False,
+                    False,
+                    20,
+                ),
+                "2:256:256:28672:256:256:64:6:6:1:1:0:"
+                "3:3:2:2:1:3:1:1:2:0:0",
+            ),
+            (
+                Workload(
+                    "unseen_bf16",
+                    4608,
+                    5632,
+                    7680,
+                    "bf16",
+                    False,
+                    False,
+                    20,
+                ),
+                "2:256:256:7680:256:256:64:6:6:1:1:0:"
+                "3:3:2:2:1:18:11:1:2:0:0",
+            ),
+            (
+                Workload(
+                    "unseen_fp32_nt",
+                    144,
+                    768,
+                    4864,
+                    "fp32",
+                    False,
+                    True,
+                    20,
+                ),
+                "2:144:256:4864:144:256:32:6:6:1:1:0:"
+                "3:3:2:2:1:1:2:1:2:0:0",
+            ),
+        )
+        engine = CandidateEngine(
+            config=SearchConfig(include_exploration=False)
+        )
+        for workload, signature in cases:
+            bank = Schedule.from_signature(signature)
+            with self.subTest(workload=workload.workload_id):
+                self.assertTrue(
+                    validate_schedule(
+                        workload, bank, self.hardware
+                    ).valid
+                )
+                result = engine.generate(
+                    workload,
+                    self.hardware,
+                    local_anchor=bank,
+                )
+                reconstructed = [
+                    candidate
+                    for candidate in result.callback_candidates
+                    if candidate.schedule == bank
+                ]
+                self.assertEqual(len(reconstructed), 1)
+                self.assertEqual(
+                    reconstructed[0].source,
+                    "contract_coupled_policy",
+                )
+
     def test_unseen_name_generates_multiple_templates(self) -> None:
         workload = Workload(
             workload_id="name_has_no_search_semantics",

@@ -95,6 +95,7 @@ STRICT_NUMERIC_PREFLIGHT_MODES = {
     "numeric_ones_full_v2",
     "numeric_signed_axes_full_v3",
 }
+MEASUREMENT_PROTOCOL_VERSION = "paired_equal_sampling_v2"
 
 SUMMARY_COLUMNS = [
     "workload_id",
@@ -532,6 +533,10 @@ def deployment_decision(
     status_official: str = "",
     status_bank: str = "",
 ) -> str:
+    if candidate_source == "one_shot_bank_equivalent":
+        if not status_official or not status_bank:
+            return "bank_equivalent_measurement_failed"
+        return "bank_equivalent_reconstructed"
     if candidate_source == "one_shot_bank_incumbent":
         return "retain_bank_no_supported_custom"
     if candidate_source == "one_shot_research_candidate":
@@ -570,14 +575,10 @@ def measurement_reusable(row: dict[str, str]) -> bool:
 
 
 def measurement_completed(row: dict[str, str]) -> bool:
-    """Return whether an exact fingerprint must never be measured again."""
+    """Return whether an exact fingerprint has a final reusable result."""
     if not truthy(row.get("success")):
         return measurement_reusable(row)
-    return (
-        truthy(row.get("preflight_passed"))
-        and row.get("preflight_mode") in STRICT_NUMERIC_PREFLIGHT_MODES
-        and bool(row.get("median_ms"))
-    )
+    return measurement_reusable(row)
 
 
 def baseline_drift_pct(
@@ -607,6 +608,7 @@ def measurement_key(
 ) -> str:
     value = "|".join(
         (
+            MEASUREMENT_PROTOCOL_VERSION,
             soc,
             str(aic),
             toolkit,
@@ -814,6 +816,7 @@ def summarize(
                 "one_shot_bank_incumbent",
                 "one_shot_bank_relative",
                 "one_shot_custom_policy",
+                "one_shot_bank_equivalent",
             }:
                 summary["best_source"] = source["candidate_source"]
                 summary["deployment_decision"] = deployment_decision(
@@ -826,6 +829,9 @@ def summarize(
             best_ms = float(best["median_ms"])
             official_ms = float(best["official_ms"])
             bank_ms = float(best["bank_ms"])
+            bank_equivalent = (
+                best["candidate_source"] == "one_shot_bank_equivalent"
+            )
             summary.update(
                 {
                     "best_rank": best["rank"],
@@ -851,9 +857,13 @@ def summarize(
                     ),
                     "status_vs_official": best["status_vs_official"],
                     "status_vs_bank": best["status_vs_bank"],
-                    "paired_outcome": paired_outcome(
-                        best["status_vs_official"],
-                        best["status_vs_bank"],
+                    "paired_outcome": (
+                        "bank_equivalent_by_kernel_contract"
+                        if bank_equivalent
+                        else paired_outcome(
+                            best["status_vs_official"],
+                            best["status_vs_bank"],
+                        )
                     ),
                     "deployment_decision": deployment_decision(
                         best["candidate_source"],
@@ -862,7 +872,8 @@ def summarize(
                     ),
                     "optimization_result": (
                         "improved"
-                        if best["status_vs_official"] == "improved"
+                        if not bank_equivalent
+                        and best["status_vs_official"] == "improved"
                         and best["status_vs_bank"] == "improved"
                         else "not_improved"
                     ),
@@ -1015,6 +1026,14 @@ def main() -> None:
         raise ProfileError("--pair-block-size must be positive")
     if args.baseline_repeat <= 0 or args.baseline_samples <= 0:
         raise ProfileError("baseline repeat and samples must be positive")
+    if (
+        args.baseline_repeat != args.repeat
+        or args.baseline_samples != args.samples
+    ):
+        raise ProfileError(
+            "paired controls and candidates require identical repeat/sample "
+            "budgets"
+        )
     env = os.environ.copy()
     args.summary.parent.mkdir(parents=True, exist_ok=True)
     rows = read_csv(args.candidates)
@@ -1406,8 +1425,10 @@ def main() -> None:
             if measurement_key(args.soc, args.aic, args.toolkit, row) in records
         ],
     )
-    improved = sum(
-        row["optimization_result"] == "improved" for row in summaries
+    accepted_custom = sum(
+        row["optimization_result"] == "improved"
+        and row.get("best_source") != "one_shot_bank_equivalent"
+        for row in summaries
     )
     official_faster = sum(
         row.get("status_vs_official") == "improved"
@@ -1425,10 +1446,31 @@ def main() -> None:
         row["optimization_result"] == "no_successful_candidate"
         for row in summaries
     )
-    deployed_custom = sum(
-        row.get("deployment_decision", "").startswith("custom_")
-        and row.get("best_source")
+    custom_attempted = sum(
+        row.get("best_source")
         in {"one_shot_bank_relative", "one_shot_custom_policy"}
+        for row in summaries
+    )
+    custom_measured = sum(
+        row.get("best_source")
+        in {"one_shot_bank_relative", "one_shot_custom_policy"}
+        and bool(row.get("best_ms"))
+        for row in summaries
+    )
+    custom_faster = sum(
+        row.get("best_source")
+        in {"one_shot_bank_relative", "one_shot_custom_policy"}
+        and row.get("optimization_result") == "improved"
+        for row in summaries
+    )
+    reconstructed_bank = sum(
+        row.get("best_source") == "one_shot_bank_equivalent"
+        and bool(row.get("best_ms"))
+        for row in summaries
+    )
+    bank_measurement_failed = sum(
+        row.get("best_source") == "one_shot_bank_equivalent"
+        and not row.get("best_ms")
         for row in summaries
     )
     retained_bank = sum(
@@ -1451,12 +1493,16 @@ def main() -> None:
     )
     print(
         f"RESULT_TOTAL workloads={len(summaries)} "
-        f"accepted_vs_official_and_bank={improved} "
+        f"accepted_custom_vs_official_and_bank={accepted_custom} "
         f"vs_official_faster={official_faster} "
         f"vs_official_within_noise={official_within_noise} "
         f"vs_official_slower={official_slower} "
         f"failed={failed} "
-        f"deployed_custom={deployed_custom} "
+        f"custom_attempted={custom_attempted} "
+        f"custom_measured={custom_measured} "
+        f"custom_faster={custom_faster} "
+        f"bank_equivalent_measured={reconstructed_bank} "
+        f"bank_equivalent_failed={bank_measurement_failed} "
         f"retained_bank={retained_bank} "
         f"calibration_local={calibration_local} "
         f"calibration_coupled={calibration_coupled} "

@@ -167,7 +167,7 @@ PAIRED_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log25_26.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260804-bank-reconstructible-oneshot-v7"
+echo "  script:     run_npu.sh 20260805-paired-bank-reconstructible-v8"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      independent_bank_reconstructible_unseen_one_shot"
 echo "  mode:       ${MODE}"
@@ -386,8 +386,8 @@ profile_stage() {
         --warmup "${WARMUP:-10}" \
         --repeat "${REPEAT:-50}" \
         --samples "${SAMPLES:-15}" \
-        --baseline-repeat "${BASELINE_REPEAT:-30}" \
-        --baseline-samples "${BASELINE_SAMPLES:-9}" \
+        --baseline-repeat "${BASELINE_REPEAT:-${REPEAT:-50}}" \
+        --baseline-samples "${BASELINE_SAMPLES:-${SAMPLES:-15}}" \
         --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-512}" \
         --baseline-drift-pct "${BASELINE_DRIFT_PCT:-3}" \
         --pair-block-size "${pair_block_size}"

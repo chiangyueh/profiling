@@ -179,11 +179,12 @@ def common_hardware_contract(
         * 4
         * schedule["dbL0C"]
     )
+    l0c_capacity = hardware.l0c_capacity(schedule["dbL0C"])
     if l0a > hardware.l0a_bytes:
         violations.append("l0a_capacity")
     if l0b > hardware.l0b_bytes:
         violations.append("l0b_capacity")
-    if l0c > hardware.l0c_bytes:
+    if l0c > l0c_capacity:
         violations.append("l0c_capacity")
 
     one_a = schedule["stepM"] * schedule["stepKa"]
@@ -224,7 +225,7 @@ def common_hardware_contract(
         "l1_bytes": float(a1 + b1),
         "l0a_occupancy": l0a / max(1.0, hardware.l0a_bytes),
         "l0b_occupancy": l0b / max(1.0, hardware.l0b_bytes),
-        "l0c_occupancy": l0c / max(1.0, hardware.l0c_bytes),
+        "l0c_occupancy": l0c / max(1.0, l0c_capacity),
         "l1_occupancy": (a1 + b1) / max(1.0, hardware.effective_l1_bytes),
     }
     return ContractReport(not violations, tuple(violations), metrics)

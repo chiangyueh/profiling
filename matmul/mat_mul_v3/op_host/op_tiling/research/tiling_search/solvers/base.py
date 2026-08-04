@@ -14,7 +14,7 @@ from .common import (
 from .base_policy import (
     base_geometry_variants,
     core_partition_variants,
-    l1_pipeline_variant,
+    l1_pipeline_variants,
     l2_policy_variants,
 )
 
@@ -39,57 +39,55 @@ class BaseSolver:
             db_b,
             db_c,
         ) in base_geometry_variants(workload, hardware):
-            l1 = l1_pipeline_variant(
+            l1_policies = l1_pipeline_variants(
                 workload,
                 hardware,
                 base_m=base_m,
                 base_n=base_n,
                 base_k=base_k,
             )
-            if l1 is None:
-                continue
-            (
-                depth_a,
-                depth_b,
-                step_m,
-                step_n,
-                step_ka,
-                step_kb,
-            ) = l1
             geometries = core_partition_variants(
                 workload,
                 hardware,
                 minimum_m=base_m,
                 minimum_n=base_n,
             )
-            for single_m, single_n, cores in geometries[:2]:
-                l2 = l2_policy_variants(
-                    workload,
-                    hardware,
-                    single_m=single_m,
-                    single_n=single_n,
-                    used_cores=cores,
-                )
-                variants.append(
-                    (
-                        base_m,
-                        base_n,
-                        base_k,
-                        db_a,
-                        db_b,
-                        db_c,
-                        depth_a,
-                        depth_b,
-                        step_m,
-                        step_n,
-                        step_ka,
-                        step_kb,
-                        single_m,
-                        single_n,
-                        cores,
-                        l2,
+            for (
+                depth_a,
+                depth_b,
+                step_m,
+                step_n,
+                step_ka,
+                step_kb,
+            ) in l1_policies:
+                for single_m, single_n, cores in geometries[:3]:
+                    l2 = l2_policy_variants(
+                        workload,
+                        hardware,
+                        single_m=single_m,
+                        single_n=single_n,
+                        used_cores=cores,
                     )
-                )
+                    variants.append(
+                        (
+                            base_m,
+                            base_n,
+                            base_k,
+                            db_a,
+                            db_b,
+                            db_c,
+                            depth_a,
+                            depth_b,
+                            step_m,
+                            step_n,
+                            step_ka,
+                            step_kb,
+                            single_m,
+                            single_n,
+                            cores,
+                            l2,
+                        )
+                    )
 
         # Interleave L2 policies across L0/L1/core geometries. A lazy prefix
         # must cover several coherent structures instead of exhausting every

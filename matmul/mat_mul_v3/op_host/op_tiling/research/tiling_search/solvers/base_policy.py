@@ -53,6 +53,7 @@ def base_geometry_variants(
         (256, 64),
         (128, tail_n),
         (tail_m, 128),
+        (tail_m, tail_n),
         (tail_m, 32),
         (64, 64),
         (32, tail_n),
@@ -69,6 +70,7 @@ def base_geometry_variants(
     supplemental = {
         (128, tail_n),
         (tail_m, 128),
+        (tail_m, tail_n),
         (tail_m, 32),
         (64, 64),
         (32, tail_n),
@@ -132,7 +134,7 @@ def base_geometry_variants(
                 * base_n
                 * 4
                 * candidate_db_c
-                > hardware.l0c_bytes
+                > hardware.l0c_capacity(candidate_db_c)
             ):
                 continue
             result.append(spec)
@@ -213,6 +215,51 @@ def l1_pipeline_variant(
     return depth_a, depth_b, 1, 1, step_ka, step_kb
 
 
+def l1_pipeline_variants(
+    workload: Workload,
+    hardware: Hardware,
+    *,
+    base_m: int,
+    base_n: int,
+    base_k: int,
+) -> tuple[tuple[int, int, int, int, int, int], ...]:
+    """Return the L1 policies implemented by the two BASE kernel paths.
+
+    The V200 path uses depth 6 and stepK 3 for ND inputs. Newer paths
+    derive the depth from available L1. Both records occur in the 910B3
+    RuntimeKb, so the independent solver must expose both without using
+    workload-family gates.
+    """
+
+    capacity_policy = l1_pipeline_variant(
+        workload,
+        hardware,
+        base_m=base_m,
+        base_n=base_n,
+        base_k=base_k,
+    )
+    kernel_policies = []
+    if capacity_policy is not None:
+        kernel_policies.append(capacity_policy)
+    kernel_policies.append((6, 6, 1, 1, 3, 3))
+
+    result = []
+    seen = set()
+    in_bytes = INPUT_BYTES[workload.dtype]
+    for policy in kernel_policies:
+        if policy in seen:
+            continue
+        seen.add(policy)
+        depth_a, depth_b, _, _, _, _ = policy
+        if (
+            depth_a * base_m * base_k * in_bytes
+            + depth_b * base_n * base_k * in_bytes
+            <= hardware.effective_l1_bytes
+        ):
+            result.append(policy)
+    return tuple(result)
+
+
 def core_partition_variants(
     workload: Workload,
     hardware: Hardware,
@@ -285,13 +332,20 @@ def core_partition_variants(
         ),
     )
     ordered = [direct]
+    paired_l2_direct = (
+        minimum_m,
+        minimum_n,
+        min(core_limit, 2, direct[2]),
+    )
+    if paired_l2_direct != direct:
+        ordered.append(paired_l2_direct)
     full_core_direct = (minimum_m, minimum_n, core_limit)
-    if full_core_direct != direct:
+    if full_core_direct not in ordered:
         ordered.append(full_core_direct)
     ordered.extend(
         value
         for value in sorted(values, key=score)
-        if value not in {direct, full_core_direct}
+        if value not in {direct, paired_l2_direct, full_core_direct}
     )
     return tuple(ordered)
 
@@ -393,6 +447,13 @@ def l2_policy_variants(
         balanced_n,
         0,
     )
+    paired_n_partition = (
+        m_total,
+        ceil_div(n_total, min(2, n_total)),
+        1,
+        min(2, n_total),
+        0,
+    )
     whole = (1, 1, m_total, n_total, 0)
     if working_set(m_total, n_total) <= target_bytes:
         ordered = [balanced_partition]
@@ -400,6 +461,8 @@ def l2_policy_variants(
     else:
         ordered = [value for _, value in sorted(candidates)]
         ordered.append(balanced_partition)
+    if core_count == 2:
+        ordered.insert(0, paired_n_partition)
     ordered.append(whole)
 
     result = []

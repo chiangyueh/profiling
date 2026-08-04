@@ -83,6 +83,16 @@ class Hardware:
     def effective_l1_bytes(self) -> int:
         return ((self.l1_bytes + 1023) // 1024) * 1024
 
+    def l0c_capacity(self, db_l0c: int) -> int:
+        """Return the BASE kernel's logical L0C tile capacity.
+
+        MatMulV3 exposes a 256 KiB logical tile when L0C is single buffered
+        on this architecture. Double buffering uses the two 128 KiB regions
+        reported by the platform interface.
+        """
+
+        return self.l0c_bytes * (2 if db_l0c == 1 else 1)
+
 
 @dataclass(frozen=True)
 class Schedule:

@@ -130,6 +130,16 @@ class ProfileIdentityTest(unittest.TestCase):
         self.assertEqual(
             summary["best_source"], "feedback_winner_mutation"
         )
+        self.assertAlmostEqual(
+            float(summary["delta_ms_vs_official"]), -0.9
+        )
+        self.assertAlmostEqual(
+            float(summary["delta_pct_vs_official"]), -45.0
+        )
+        self.assertEqual(
+            summary["paired_outcome"],
+            "faster_than_official_and_bank",
+        )
 
     def test_family_summary_reports_one_shot_speedups(self) -> None:
         rows = [

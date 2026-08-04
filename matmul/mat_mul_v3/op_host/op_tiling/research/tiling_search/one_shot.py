@@ -514,8 +514,8 @@ def select_one_shot_candidate(
         item
         for item in evaluated
         if not (
-            item[2].runtime_risk_support >= 0.10
-            and item[2].runtime_risk_score >= 0.45
+            item[1].metrics["runtime_risk_support"] >= 0.10
+            and item[1].metrics["runtime_risk_score"] >= 0.45
         )
     ]
 
@@ -542,6 +542,7 @@ def select_one_shot_candidate(
             for item in runtime_safe_candidates
             if (
                 item[0].source == "local_bank_anchor"
+                and item[0].template == incumbent.template
                 and item[1].metrics["counterfactual_samples"] >= 2
                 and item[1].metrics["counterfactual_upper_ratio"] <= 0.99
                 and item[1].metrics[
@@ -553,7 +554,10 @@ def select_one_shot_candidate(
         coupled_policy_pool = [
             item
             for item in runtime_safe_candidates
-            if item[0].source == "contract_coupled_policy"
+            if (
+                item[0].source == "contract_coupled_policy"
+                and item[0].template == incumbent.template
+            )
         ]
         local_signatures = {
             item[0].schedule.signature() for item in local_pool
@@ -572,6 +576,11 @@ def select_one_shot_candidate(
                 item[0].source == "contract_coupled_policy"
                 for item in evaluated
             )
+            same_template_count = sum(
+                item[0].source == "contract_coupled_policy"
+                and item[0].template == incumbent.template
+                for item in evaluated
+            )
             raise ValueError(
                 "one-shot selection has no safe deployment-policy "
                 "candidate; broad or unsupported-local fallback is "
@@ -579,6 +588,8 @@ def select_one_shot_candidate(
                 f"(evaluated={len(evaluated)} "
                 f"runtime_safe={len(runtime_safe_candidates)} "
                 f"coupled={coupled_count} "
+                f"same_template={same_template_count} "
+                f"incumbent_template={incumbent.template.name} "
                 f"evidence_local={len(local_pool)})"
             )
         exploration_pool = policy_pool

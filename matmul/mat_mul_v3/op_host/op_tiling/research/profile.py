@@ -77,6 +77,10 @@ MEASUREMENT_COLUMNS = [
     "bank_stddev_ms",
     "speedup_vs_official",
     "speedup_vs_bank",
+    "delta_ms_vs_official",
+    "delta_pct_vs_official",
+    "delta_ms_vs_bank",
+    "delta_pct_vs_bank",
     "status_vs_official",
     "status_vs_bank",
     "pair_validated",
@@ -117,8 +121,13 @@ SUMMARY_COLUMNS = [
     "bank_ms",
     "speedup_vs_official",
     "speedup_vs_bank",
+    "delta_ms_vs_official",
+    "delta_pct_vs_official",
+    "delta_ms_vs_bank",
+    "delta_pct_vs_bank",
     "status_vs_official",
     "status_vs_bank",
+    "paired_outcome",
     "optimization_result",
 ]
 
@@ -129,6 +138,9 @@ FAMILY_SUMMARY_COLUMNS = [
     "measured",
     "improved",
     "not_improved",
+    "faster_vs_official",
+    "within_noise_vs_official",
+    "slower_vs_official",
     "runtime_rejected",
     "geomean_speedup_vs_official",
     "geomean_speedup_vs_bank",
@@ -494,6 +506,25 @@ def comparison(
     return speedup, "within_noise"
 
 
+def paired_outcome(
+    status_official: str,
+    status_bank: str,
+) -> str:
+    if status_official == "improved" and status_bank == "improved":
+        return "faster_than_official_and_bank"
+    if status_official == "improved":
+        return "faster_than_official_only"
+    if status_bank == "improved":
+        return "faster_than_bank_only"
+    if status_official == "regressed" and status_bank == "regressed":
+        return "slower_than_official_and_bank"
+    if status_official == "regressed":
+        return "slower_than_official"
+    if status_bank == "regressed":
+        return "slower_than_bank"
+    return "within_noise"
+
+
 def measurement_reusable(row: dict[str, str]) -> bool:
     if not truthy(row.get("success")):
         return row.get("preflight_mode") not in {
@@ -657,6 +688,18 @@ def profile_record(
                 "bank_stddev_ms": f"{bank_std:.12g}",
                 "speedup_vs_official": f"{speedup_official:.12g}",
                 "speedup_vs_bank": f"{speedup_bank:.12g}",
+                "delta_ms_vs_official": (
+                    f"{candidate_ms - official_ms:.12g}"
+                ),
+                "delta_pct_vs_official": (
+                    f"{100.0 * (candidate_ms / official_ms - 1.0):.12g}"
+                ),
+                "delta_ms_vs_bank": (
+                    f"{candidate_ms - bank_ms:.12g}"
+                ),
+                "delta_pct_vs_bank": (
+                    f"{100.0 * (candidate_ms / bank_ms - 1.0):.12g}"
+                ),
                 "status_vs_official": status_official,
                 "status_vs_bank": status_bank,
             }
@@ -736,8 +779,12 @@ def summarize(
             }
         )
         if best is None:
+            summary["paired_outcome"] = "failed"
             summary["optimization_result"] = "no_successful_candidate"
         else:
+            best_ms = float(best["median_ms"])
+            official_ms = float(best["official_ms"])
+            bank_ms = float(best["bank_ms"])
             summary.update(
                 {
                     "best_rank": best["rank"],
@@ -749,8 +796,24 @@ def summarize(
                     "bank_ms": best["bank_ms"],
                     "speedup_vs_official": best["speedup_vs_official"],
                     "speedup_vs_bank": best["speedup_vs_bank"],
+                    "delta_ms_vs_official": (
+                        f"{best_ms - official_ms:.12g}"
+                    ),
+                    "delta_pct_vs_official": (
+                        f"{100.0 * (best_ms / official_ms - 1.0):.12g}"
+                    ),
+                    "delta_ms_vs_bank": (
+                        f"{best_ms - bank_ms:.12g}"
+                    ),
+                    "delta_pct_vs_bank": (
+                        f"{100.0 * (best_ms / bank_ms - 1.0):.12g}"
+                    ),
                     "status_vs_official": best["status_vs_official"],
                     "status_vs_bank": best["status_vs_bank"],
+                    "paired_outcome": paired_outcome(
+                        best["status_vs_official"],
+                        best["status_vs_bank"],
+                    ),
                     "optimization_result": (
                         "improved"
                         if best["status_vs_official"] == "improved"
@@ -769,8 +832,16 @@ def summarize(
             f"bank_ms={summary['bank_ms'] or 'NA'} "
             f"speedup={summary['speedup_vs_official'] or 'NA'} "
             f"speedup_vs_bank={summary['speedup_vs_bank'] or 'NA'} "
+            "delta_vs_official="
+            f"{summary['delta_pct_vs_official'] or 'NA'}%/"
+            f"{summary['delta_ms_vs_official'] or 'NA'}ms "
+            "delta_vs_bank="
+            f"{summary['delta_pct_vs_bank'] or 'NA'}%/"
+            f"{summary['delta_ms_vs_bank'] or 'NA'}ms "
+            f"status_vs_official={summary['status_vs_official'] or 'NA'} "
+            f"status_vs_bank={summary['status_vs_bank'] or 'NA'} "
             f"best_source={summary['best_source'] or 'none'} "
-            f"optimization_result={summary['optimization_result']}"
+            f"paired_outcome={summary['paired_outcome']}"
         )
     return summaries
 
@@ -819,6 +890,25 @@ def summarize_families(
                     "not_improved": str(
                         sum(
                             row["optimization_result"] == "not_improved"
+                            for row in rows
+                        )
+                    ),
+                    "faster_vs_official": str(
+                        sum(
+                            row.get("status_vs_official") == "improved"
+                            for row in rows
+                        )
+                    ),
+                    "within_noise_vs_official": str(
+                        sum(
+                            row.get("status_vs_official")
+                            == "within_noise"
+                            for row in rows
+                        )
+                    ),
+                    "slower_vs_official": str(
+                        sum(
+                            row.get("status_vs_official") == "regressed"
                             for row in rows
                         )
                     ),
@@ -1233,8 +1323,21 @@ def main() -> None:
     improved = sum(
         row["optimization_result"] == "improved" for row in summaries
     )
-    not_improved = sum(
-        row["optimization_result"] == "not_improved" for row in summaries
+    official_faster = sum(
+        row.get("status_vs_official") == "improved"
+        for row in summaries
+    )
+    official_within_noise = sum(
+        row.get("status_vs_official") == "within_noise"
+        for row in summaries
+    )
+    official_slower = sum(
+        row.get("status_vs_official") == "regressed"
+        for row in summaries
+    )
+    failed = sum(
+        row["optimization_result"] == "no_successful_candidate"
+        for row in summaries
     )
     evidence_selected = sum(
         row.get("best_source") == "one_shot_model"
@@ -1249,9 +1352,12 @@ def main() -> None:
         for row in summaries
     )
     print(
-        f"RESULT_TOTAL workloads={len(summaries)} improved={improved} "
-        f"not_improved={not_improved} "
-        f"other={len(summaries) - improved - not_improved} "
+        f"RESULT_TOTAL workloads={len(summaries)} "
+        f"accepted_vs_official_and_bank={improved} "
+        f"vs_official_faster={official_faster} "
+        f"vs_official_within_noise={official_within_noise} "
+        f"vs_official_slower={official_slower} "
+        f"failed={failed} "
         f"evidence_selected={evidence_selected} "
         f"local_exploration={local_exploration} "
         f"coupled_policy={coupled_policy}"
@@ -1261,8 +1367,10 @@ def main() -> None:
         print(
             f"FAMILY_RESULT axis={row['axis']} family={row['family']} "
             f"workloads={row['workloads']} measured={row['measured']} "
-            f"improved={row['improved']} "
-            f"not_improved={row['not_improved']} "
+            f"vs_official_faster={row['faster_vs_official']} "
+            "vs_official_within_noise="
+            f"{row['within_noise_vs_official']} "
+            f"vs_official_slower={row['slower_vs_official']} "
             f"runtime_rejected={row['runtime_rejected']} "
             "geomean_speedup="
             f"{row['geomean_speedup_vs_official'] or 'NA'} "

@@ -213,6 +213,72 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.direct_base_candidates, 0)
 
+    def test_cross_template_policy_requires_transfer_evidence(self) -> None:
+        split_k = Candidate(
+            schedule=self.schedule.replace(tilingEnable=3),
+            template=Template.DETERMINISTIC_SPLIT_K,
+            source="contract_coupled_policy",
+            rationale="cross-template policy",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "same_template=0.*incumbent_template=BASE"
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [split_k],
+                self.incumbent,
+                (),
+                self.hardware,
+                cost_model=_PredictionModel(),
+            )
+
+    def test_runtime_gate_uses_calibrated_direct_base_risk(self) -> None:
+        candidate = Candidate(
+            schedule=self.schedule.replace(usedCoreNum=19),
+            template=Template.BASE,
+            source="contract_coupled_policy",
+            rationale="direct BASE with execution history",
+        )
+        observations = [
+            MeasuredObservation(
+                workload=Workload(
+                    workload_id=f"direct_base_history_{index}",
+                    m=3968 + index * 16,
+                    n=128,
+                    k=16384,
+                    dtype="fp16",
+                    trans_a=False,
+                    trans_b=False,
+                    max_cores=20,
+                ),
+                schedule=candidate.schedule,
+                ratio_vs_official=1.0,
+                ratio_vs_bank=1.0,
+                source="paired_evidence",
+                record_id=f"direct_base_{index}",
+                verified=True,
+                structured_verified=True,
+            )
+            for index in range(4)
+        ]
+        decision = select_one_shot_candidate(
+            self.workload,
+            [candidate],
+            self.incumbent,
+            observations,
+            self.hardware,
+            cost_model=_PredictionModel(),
+        )
+        self.assertEqual(decision.candidate.schedule, candidate.schedule)
+        self.assertEqual(decision.safe_candidates, 1)
+        self.assertGreater(
+            decision.candidate.metrics["model_runtime_risk_score"],
+            0.45,
+        )
+        self.assertLess(
+            decision.candidate.metrics["runtime_risk_score"], 0.45
+        )
+
     def test_one_shot_selects_custom_only_with_cross_workload_evidence(
         self,
     ) -> None:

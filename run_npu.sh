@@ -166,7 +166,7 @@ CALIBRATION_RESUME="${ROOT}/results/npu_calibration_resume.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260804-paired-calibration-oneshot-v1"
+echo "  script:     run_npu.sh 20260804-adaptive-paired-oneshot-v2"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      paired_bank_relative_calibration_then_unseen_one_shot"
 echo "  mode:       ${MODE}"
@@ -354,7 +354,8 @@ generate_candidates() {
     if [[ -n "${resume_feedback}" ]]; then
         command+=(--resume-feedback "${resume_feedback}")
     fi
-    if [[ "${selection_mode}" == "calibration" ]]; then
+    if [[ "${selection_mode}" == "calibration" ||
+          "${selection_mode}" == "one-shot" ]]; then
         command+=(--skip-model-validation)
     fi
     "${command[@]}"
@@ -397,7 +398,8 @@ generate_candidates \
     "${CALIBRATION_ALL}" \
     calibration \
     "${CALIBRATION_NPU_CANDIDATES}" \
-    "${CALIBRATION_CALLBACK_CANDIDATES}"
+    "${CALIBRATION_CALLBACK_CANDIDATES}" \
+    "${CALIBRATION_RESUME}"
 profile_stage \
     "${CALIBRATION_CANDIDATES}" \
     "${CALIBRATION_SUMMARY}" \

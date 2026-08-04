@@ -229,6 +229,7 @@ class FeedbackCostModelTest(unittest.TestCase):
             "trans_a": "0",
             "trans_b": "0",
             "tiling_signature": self.success_schedule.signature_text(),
+            "bank_tiling_signature": self.success_schedule.signature_text(),
             "success": "1",
             "preflight_mode": "zero_coverage_grid9_v1",
             "pair_validated": "1",
@@ -303,7 +304,12 @@ class FeedbackCostModelTest(unittest.TestCase):
                 aic_cores=20,
                 toolkit="8.1.RC1",
             )
-        self.assertEqual(observations, [])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].source, "runtime_verified")
+        self.assertFalse(observations[0].verified)
+        self.assertEqual(
+            observations[0].bank_schedule, self.success_schedule
+        )
         self.assertEqual(len(exclusions), 1)
 
     def test_structured_measurement_overrides_provisional_duplicate(

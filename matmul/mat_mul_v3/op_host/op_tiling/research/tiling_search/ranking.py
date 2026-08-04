@@ -221,7 +221,8 @@ def _training_groups(
     ] = defaultdict(lambda: defaultdict(list))
     for observation in observations:
         if (
-            observation.source == "runtime_rejected"
+            observation.source
+            in {"runtime_rejected", "runtime_verified"}
             or observation.workload.identity() in excluded_workloads
         ):
             continue

@@ -1026,8 +1026,18 @@ def main() -> None:
             ) not in records
             for row in searched
         )
+        pending_workloads = sum(
+            any(
+                measurement_key(
+                    args.soc, args.aic, args.toolkit, row
+                ) not in records
+                for row in workload_rows
+            )
+            for workload_rows in by_workload.values()
+        )
         print(
             f"profile_plan: workloads={len(by_workload)} "
+            f"pending_workloads={pending_workloads} "
             f"searched_candidates={len(searched)} "
             f"npu_searched_pending={pending_total} "
             f"resume_exact={len(records)} "
@@ -1036,6 +1046,7 @@ def main() -> None:
             f"{args.baseline_samples} numeric_preflight=full"
         )
 
+        blocked_workloads = 0
         for workload_id, workload_rows in by_workload.items():
             pending = [
                 row
@@ -1088,10 +1099,14 @@ def main() -> None:
                     )
                 official = official_before
                 if not truthy(official.get("success")):
-                    raise ProfileError(
-                        f"{workload_id}: official baseline failed: "
-                        f"{official.get('error')}"
+                    blocked_workloads += 1
+                    print(
+                        f"workload_blocked {workload_id} "
+                        "stage=official_pre "
+                        f"reason={official.get('error', '')[:240]} "
+                        "action=retain_resume_and_continue"
                     )
+                    break
                 if bank_before is None:
                     bank_before = run_runner(
                         args.runner,
@@ -1108,10 +1123,14 @@ def main() -> None:
                     )
                 bank = bank_before
                 if not truthy(bank.get("success")):
-                    raise ProfileError(
-                        f"{workload_id}: bank control failed: "
-                        f"{bank.get('error')}"
+                    blocked_workloads += 1
+                    print(
+                        f"workload_blocked {workload_id} "
+                        "stage=bank_pre "
+                        f"reason={bank.get('error', '')[:240]} "
+                        "action=retain_resume_and_continue"
                     )
+                    break
 
                 block_measurements: list[
                     tuple[dict[str, str], dict[str, str], str, int]
@@ -1205,15 +1224,23 @@ def main() -> None:
                     True,
                 )
                 if not truthy(official_post.get("success")):
-                    raise ProfileError(
-                        f"{workload_id}: post official baseline failed: "
-                        f"{official_post.get('error')}"
+                    blocked_workloads += 1
+                    print(
+                        f"workload_blocked {workload_id} "
+                        "stage=official_post "
+                        f"reason={official_post.get('error', '')[:240]} "
+                        "action=retain_numeric_preflight_and_continue"
                     )
+                    break
                 if not truthy(bank_post.get("success")):
-                    raise ProfileError(
-                        f"{workload_id}: post bank control failed: "
-                        f"{bank_post.get('error')}"
+                    blocked_workloads += 1
+                    print(
+                        f"workload_blocked {workload_id} "
+                        "stage=bank_post "
+                        f"reason={bank_post.get('error', '')[:240]} "
+                        "action=retain_numeric_preflight_and_continue"
                     )
+                    break
                 # The post controls are already the nearest measurements
                 # before the next block. Reusing them avoids an immediate
                 # duplicate control run without weakening the bracket.
@@ -1320,6 +1347,18 @@ def main() -> None:
                     MEASUREMENT_COLUMNS,
                     list(records.values()),
                 )
+        if blocked_workloads:
+            print(
+                "profile_blocked_workloads "
+                f"count={blocked_workloads} action=continued"
+            )
+        if (
+            pending_workloads
+            and blocked_workloads == pending_workloads
+        ):
+            raise ProfileError(
+                "all pending workloads were blocked by baseline failures"
+            )
 
     summaries = summarize(
         rows, records, args.soc, args.aic, args.toolkit

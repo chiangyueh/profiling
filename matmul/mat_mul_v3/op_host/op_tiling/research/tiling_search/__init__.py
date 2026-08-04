@@ -17,6 +17,8 @@ from .orchestrator import CandidateEngine, SearchConfig
 from .one_shot import (
     BankRelativeEffectModel,
     BankRelativePrediction,
+    BankRelativeSafetyModel,
+    BankRelativeSafetyPrediction,
     BankRelativeValidation,
     OneShotDecision,
     select_calibration_candidates,
@@ -31,6 +33,8 @@ __all__ = [
     "BehaviorTarget",
     "BankRelativeEffectModel",
     "BankRelativePrediction",
+    "BankRelativeSafetyModel",
+    "BankRelativeSafetyPrediction",
     "BankRelativeValidation",
     "Candidate",
     "CandidateEngine",

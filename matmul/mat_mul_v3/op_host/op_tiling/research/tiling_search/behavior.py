@@ -851,7 +851,8 @@ class FeedbackCostModel:
             successful_records = [
                 record
                 for record in records
-                if record.source != "runtime_rejected"
+                if record.source
+                not in {"runtime_rejected", "runtime_verified"}
             ]
             structured = [
                 record.measured_ratio

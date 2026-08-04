@@ -21,6 +21,7 @@ from .domain import (
     Hardware,
     MeasuredObservation,
     Schedule,
+    Template,
     Workload,
 )
 
@@ -28,6 +29,7 @@ from .domain import (
 @dataclass(frozen=True)
 class OneShotDecision:
     candidate: Candidate
+    deployment_candidate: Candidate
     evaluated: int
     safe_candidates: int
     direct_base_candidates: int
@@ -47,6 +49,15 @@ class BankRelativePrediction:
 
 
 @dataclass(frozen=True)
+class BankRelativeSafetyPrediction:
+    samples: int
+    rejected: int
+    risk: float
+    nearest_distance: float
+    support: float
+
+
+@dataclass(frozen=True)
 class BankRelativeValidation:
     groups: int
     oracle_opportunities: int
@@ -56,6 +67,39 @@ class BankRelativeValidation:
     severe_regressions: int
     median_selected_ratio: float
     p90_selected_ratio: float
+
+
+@dataclass(frozen=True)
+class TemplateCalibrationEvidence:
+    successful: int
+    rejected: int
+    winners: int
+    regressions: int
+    workload_support: int
+    median_ratio: float
+
+    @property
+    def attempts(self) -> int:
+        return self.successful + self.rejected
+
+    @property
+    def supported(self) -> bool:
+        return (
+            self.successful >= 3
+            and self.workload_support >= 3
+            and self.winners >= 2
+            and self.median_ratio <= 0.98
+        )
+
+    @property
+    def negative(self) -> bool:
+        return (
+            self.attempts >= 6
+            and self.winners == 0
+            and (
+                self.regressions + self.rejected
+            ) / self.attempts >= 0.50
+        )
 
 
 @dataclass(frozen=True)
@@ -108,6 +152,26 @@ def _effect_vector_distance(left: _EffectRow, right: _EffectRow) -> float:
         abs(left_value - right_value)
         for left_value, right_value in zip(left_delta, right_delta)
     ) / max(1, len(left_delta))
+
+
+def _bank_relative_distance(target: _EffectRow, row: _EffectRow) -> float:
+    return (
+        workload_distance(
+            target.observation.workload,
+            row.observation.workload,
+        )
+        + 0.45
+        * behavior_distance(
+            target.candidate_vector, row.candidate_vector
+        )
+        + 0.45
+        * behavior_distance(target.bank_vector, row.bank_vector)
+        + 0.60
+        * _effect_mask_distance(
+            target.changed_fields, row.changed_fields
+        )
+        + 0.40 * _effect_vector_distance(target, row)
+    )
 
 
 class BankRelativeEffectModel:
@@ -246,19 +310,7 @@ class BankRelativeEffectModel:
                 or template_of(observation.schedule) != candidate_template
             ):
                 continue
-            distance = (
-                workload_distance(workload, observation.workload)
-                + 0.45
-                * behavior_distance(
-                    target_candidate_vector, row.candidate_vector
-                )
-                + 0.45
-                * behavior_distance(target_bank_vector, row.bank_vector)
-                + 0.60 * _effect_mask_distance(
-                    target.changed_fields, row.changed_fields
-                )
-                + 0.40 * _effect_vector_distance(target, row)
-            )
+            distance = _bank_relative_distance(target, row)
             existing = nearest_by_workload.get(identity)
             if existing is None or distance < existing[0]:
                 nearest_by_workload[identity] = (
@@ -279,6 +331,128 @@ class BankRelativeEffectModel:
             upper_ratio=max(ratios),
             nearest_distance=nearest_distance,
             support=sample_support * distance_support,
+        )
+
+
+class BankRelativeSafetyModel:
+    """Predict NPU rejection from candidate-to-bank structural effects."""
+
+    def __init__(
+        self,
+        observations: Sequence[MeasuredObservation],
+        hardware: Hardware,
+    ) -> None:
+        rows = []
+        for observation in observations:
+            if observation.bank_schedule is None:
+                continue
+            if (
+                observation.source
+                not in {"runtime_rejected", "runtime_verified"}
+                and not observation.verified
+            ):
+                continue
+            rows.append(
+                _EffectRow(
+                    observation=observation,
+                    candidate_vector=behavior_vector(
+                        observation.workload,
+                        observation.schedule,
+                        hardware,
+                    ),
+                    bank_vector=behavior_vector(
+                        observation.workload,
+                        observation.bank_schedule,
+                        hardware,
+                    ),
+                    changed_fields=_changed_fields(
+                        observation.bank_schedule,
+                        observation.schedule,
+                    ),
+                )
+            )
+        self.rows = tuple(rows)
+        self.rejected_rows = sum(
+            row.observation.source == "runtime_rejected"
+            for row in rows
+        )
+
+    def predict(
+        self,
+        workload: Workload,
+        bank: Schedule,
+        candidate: Schedule,
+        hardware: Hardware,
+        *,
+        exclude_workload: (
+            tuple[int, int, int, str, bool, bool, int] | None
+        ) = None,
+    ) -> BankRelativeSafetyPrediction:
+        target = _EffectRow(
+            observation=MeasuredObservation(
+                workload=workload,
+                schedule=candidate,
+                ratio_vs_official=1.0,
+                ratio_vs_bank=1.0,
+                source="target",
+                record_id="target",
+                bank_schedule=bank,
+            ),
+            candidate_vector=behavior_vector(
+                workload, candidate, hardware
+            ),
+            bank_vector=behavior_vector(workload, bank, hardware),
+            changed_fields=_changed_fields(bank, candidate),
+        )
+        bank_template = template_of(bank)
+        candidate_template = template_of(candidate)
+        nearest_by_workload = {}
+        for row in self.rows:
+            observation = row.observation
+            identity = observation.workload.identity()
+            if identity == exclude_workload:
+                continue
+            if (
+                observation.workload.dtype != workload.dtype
+                or observation.workload.trans_a != workload.trans_a
+                or observation.workload.trans_b != workload.trans_b
+                or template_of(observation.bank_schedule) != bank_template
+                or template_of(observation.schedule) != candidate_template
+            ):
+                continue
+            distance = _bank_relative_distance(target, row)
+            existing = nearest_by_workload.get(identity)
+            if existing is None or distance < existing[0]:
+                nearest_by_workload[identity] = (
+                    distance,
+                    observation.source == "runtime_rejected",
+                )
+
+        nearest = sorted(nearest_by_workload.values())[:8]
+        if not nearest:
+            return BankRelativeSafetyPrediction(
+                0, 0, 0.5, math.inf, 0.0
+            )
+        weights = [
+            math.exp(-distance / 1.25)
+            for distance, _ in nearest
+        ]
+        weight_sum = sum(weights)
+        risk = sum(
+            weight * float(rejected)
+            for weight, (_, rejected) in zip(weights, nearest)
+        ) / max(1.0e-9, weight_sum)
+        nearest_distance = nearest[0][0]
+        support = (
+            min(1.0, len(nearest) / 6.0)
+            * math.exp(-nearest_distance / 1.5)
+        )
+        return BankRelativeSafetyPrediction(
+            samples=len(nearest),
+            rejected=sum(rejected for _, rejected in nearest),
+            risk=risk,
+            nearest_distance=nearest_distance,
+            support=support,
         )
 
 
@@ -385,6 +559,15 @@ def _is_runtime_safe(
     )
 
 
+def _is_bank_relative_runtime_safe(
+    prediction: BankRelativeSafetyPrediction,
+) -> bool:
+    return not (
+        prediction.support >= 0.15
+        and prediction.risk >= 0.35
+    )
+
+
 def _farthest_first(
     workload: Workload,
     candidates: Sequence[Candidate],
@@ -424,6 +607,88 @@ def _farthest_first(
             != chosen.schedule.signature()
         ]
     return selected
+
+
+def _template_calibration_evidence(
+    workload: Workload,
+    incumbent: Candidate,
+    observations: Sequence[MeasuredObservation],
+    templates: set[Template],
+) -> dict[Template, TemplateCalibrationEvidence]:
+    """Summarize paired template switches without shape-family gates."""
+
+    samples = {
+        template: {
+            "ratios": [],
+            "rejected": 0,
+            "workloads": set(),
+        }
+        for template in templates
+    }
+    for observation in observations:
+        candidate_template = template_of(observation.schedule)
+        if candidate_template not in samples:
+            continue
+        if (
+            observation.workload.dtype != workload.dtype
+            or observation.workload.trans_a != workload.trans_a
+            or observation.workload.trans_b != workload.trans_b
+            or observation.bank_schedule is None
+            or template_of(observation.bank_schedule)
+            != incumbent.template
+            or candidate_template
+            == template_of(observation.bank_schedule)
+        ):
+            continue
+        item = samples[candidate_template]
+        if observation.source == "runtime_rejected":
+            item["workloads"].add(observation.workload.identity())
+            item["rejected"] += 1
+            continue
+        if not observation.verified:
+            continue
+        item["workloads"].add(observation.workload.identity())
+        item["ratios"].append(observation.measured_ratio)
+
+    result = {}
+    for template, item in samples.items():
+        ratios = tuple(item["ratios"])
+        result[template] = TemplateCalibrationEvidence(
+            successful=len(ratios),
+            rejected=item["rejected"],
+            winners=sum(ratio <= 0.99 for ratio in ratios),
+            regressions=sum(ratio >= 1.01 for ratio in ratios),
+            workload_support=len(item["workloads"]),
+            median_ratio=median(ratios) if ratios else 1.0,
+        )
+    return result
+
+
+def _cross_template_budget(
+    budget: int,
+    evidence: dict[Template, TemplateCalibrationEvidence],
+) -> int:
+    if not evidence or budget <= 1:
+        return 0
+    if any(item.supported for item in evidence.values()):
+        return min(budget // 3, max(2, round(budget * 0.25)))
+    attempted = [item for item in evidence.values() if item.attempts]
+    if attempted and all(item.negative for item in attempted):
+        return 1
+    return max(1, min(budget // 4, round(budget * 0.20)))
+
+
+def _template_evidence_order(item) -> tuple:
+    template, evidence = item
+    state = 0 if evidence.supported else (2 if evidence.negative else 1)
+    reject_rate = evidence.rejected / max(1, evidence.attempts)
+    return (
+        state,
+        reject_rate,
+        evidence.median_ratio,
+        -evidence.workload_support,
+        template.value,
+    )
 
 
 def select_calibration_candidates(
@@ -518,9 +783,15 @@ def select_calibration_candidates(
         for candidate in unique.values()
         if candidate.template != incumbent.template
     ]
+    cross_evidence = _template_calibration_evidence(
+        workload,
+        incumbent,
+        observations,
+        {candidate.template for candidate in cross_template},
+    )
     cross_budget = min(
         len(cross_template),
-        max(1, budget // 3) if cross_template else 0,
+        _cross_template_budget(budget, cross_evidence),
     )
     same_template_budget = budget - cross_budget
     local_budget = min(
@@ -584,7 +855,13 @@ def select_calibration_candidates(
             )
         }
         cross_quotas = {template: 0 for template in cross_groups}
-        templates = list(cross_groups)
+        templates = [
+            template
+            for template, _ in sorted(
+                cross_evidence.items(),
+                key=_template_evidence_order,
+            )
+        ]
         for index in range(cross_budget):
             cross_quotas[templates[index % len(templates)]] += 1
         for template in templates:
@@ -626,6 +903,7 @@ def select_calibration_candidates(
         )
         changed = _changed_fields(incumbent.schedule, candidate.schedule)
         template_switch = candidate.template != incumbent.template
+        template_evidence = cross_evidence.get(candidate.template)
         vector.metrics.update(
             {
                 "bank_changed_fields": float(len(changed)),
@@ -638,6 +916,26 @@ def select_calibration_candidates(
                 ),
                 "runtime_risk_score": runtime.runtime_risk_score,
                 "runtime_risk_support": runtime.runtime_risk_support,
+                "template_evidence_attempts": float(
+                    template_evidence.attempts
+                    if template_evidence is not None
+                    else 0
+                ),
+                "template_evidence_winners": float(
+                    template_evidence.winners
+                    if template_evidence is not None
+                    else 0
+                ),
+                "template_evidence_regressions": float(
+                    template_evidence.regressions
+                    if template_evidence is not None
+                    else 0
+                ),
+                "template_evidence_rejected": float(
+                    template_evidence.rejected
+                    if template_evidence is not None
+                    else 0
+                ),
             }
         )
         result.append(
@@ -678,6 +976,7 @@ def select_one_shot_candidate(
     *,
     cost_model: FeedbackCostModel | None = None,
     effect_model: BankRelativeEffectModel | None = None,
+    safety_model: BankRelativeSafetyModel | None = None,
     **_ignored,
 ) -> OneShotDecision:
     """Select one tiling with a measured bank-relative safety criterion."""
@@ -686,6 +985,9 @@ def select_one_shot_candidate(
         raise ValueError("one-shot incumbent must be the bank control")
     runtime_model = cost_model or FeedbackCostModel(observations, hardware)
     relative_model = effect_model or BankRelativeEffectModel(
+        observations, hardware
+    )
+    relative_safety_model = safety_model or BankRelativeSafetyModel(
         observations, hardware
     )
     unique: dict[tuple[int, ...], Candidate] = {}
@@ -714,9 +1016,20 @@ def select_one_shot_candidate(
             hardware,
             exclude_workload=workload.identity(),
         )
+        relative_safety = relative_safety_model.predict(
+            workload,
+            incumbent.schedule,
+            candidate.schedule,
+            hardware,
+            exclude_workload=workload.identity(),
+        )
         changed = _changed_fields(incumbent.schedule, candidate.schedule)
         cross_template = candidate.template != incumbent.template
-        runtime_safe = _is_runtime_safe(runtime)
+        runtime_safe = (
+            _is_bank_relative_runtime_safe(relative_safety)
+            if relative_safety.support >= 0.15
+            else _is_runtime_safe(runtime)
+        )
         deployable = runtime_safe and _effect_is_deployable(
             relative,
             cross_template=cross_template,
@@ -733,14 +1046,27 @@ def select_one_shot_candidate(
                 "bank_changed_fields": float(len(changed)),
                 "runtime_risk_score": runtime.runtime_risk_score,
                 "runtime_risk_support": runtime.runtime_risk_support,
+                "bank_runtime_risk": relative_safety.risk,
+                "bank_runtime_risk_support": relative_safety.support,
+                "bank_runtime_risk_samples": float(
+                    relative_safety.samples
+                ),
             }
         )
         evaluated.append(
-            (candidate, vector, relative, runtime_safe, deployable)
+            (
+                candidate,
+                vector,
+                relative,
+                runtime,
+                relative_safety,
+                runtime_safe,
+                deployable,
+            )
         )
 
-    eligible = [item for item in evaluated if item[4]]
-    runtime_safe_count = sum(item[3] for item in evaluated)
+    eligible = [item for item in evaluated if item[6]]
+    runtime_safe_count = sum(item[5] for item in evaluated)
     direct_base_count = sum(
         item[0].template.value == "BASE"
         and item[0].schedule["singleCoreM"] == item[0].schedule["baseM"]
@@ -751,7 +1077,7 @@ def select_one_shot_candidate(
         item[0].source == "local_bank_anchor" for item in evaluated
     )
 
-    if not eligible:
+    if not evaluated:
         vector = behavior_vector(
             workload, incumbent.schedule, hardware
         )
@@ -783,6 +1109,7 @@ def select_one_shot_candidate(
         )
         return OneShotDecision(
             candidate=selected,
+            deployment_candidate=incumbent,
             evaluated=len(evaluated),
             safe_candidates=runtime_safe_count,
             direct_base_candidates=direct_base_count,
@@ -792,8 +1119,8 @@ def select_one_shot_candidate(
             selection_policy="bank_incumbent",
         )
 
-    def score(item) -> tuple[float, float, tuple[int, ...]]:
-        candidate, _, prediction, _, _ = item
+    def deployment_score(item) -> tuple[float, float, tuple[int, ...]]:
+        candidate, _, prediction, _, _, _, _ = item
         cross_template_penalty = (
             0.02 if candidate.template != incumbent.template else 0.0
         )
@@ -803,24 +1130,106 @@ def select_one_shot_candidate(
             candidate.schedule.signature(),
         )
 
-    original, vector, prediction, _, _ = min(eligible, key=score)
-    acquisition = score(
-        (original, vector, prediction, True, True)
-    )[0]
+    def research_score(item) -> tuple:
+        (
+            candidate,
+            vector,
+            prediction,
+            runtime,
+            relative_safety,
+            runtime_safe,
+            _,
+        ) = item
+        risk = (
+            relative_safety.risk * relative_safety.support
+            if relative_safety.support >= 0.15
+            else (
+                runtime.runtime_risk_score
+                * runtime.runtime_risk_support
+            )
+        )
+        predicted = (
+            prediction.upper_ratio
+            if math.isfinite(prediction.upper_ratio)
+            else 1.0
+        )
+        cross_template = candidate.template != incumbent.template
+        return (
+            not runtime_safe,
+            cross_template and prediction.samples < 3,
+            predicted + 0.20 * risk + 0.05 * cross_template,
+            vector.metrics.get("analytical_prior", math.inf),
+            candidate.schedule.signature(),
+        )
+
+    if eligible:
+        (
+            original,
+            vector,
+            prediction,
+            _,
+            _,
+            _,
+            _,
+        ) = min(eligible, key=deployment_score)
+        acquisition = deployment_score(
+            (original, vector, prediction, None, None, True, True)
+        )[0]
+        deployment_candidate = original
+        source = "one_shot_bank_relative"
+        rationale = (
+            "single deployment decision supported by paired "
+            f"candidate/control effects; generator={original.source}"
+        )
+        selection_policy = "paired_control_relative_effect"
+        deployment_recommended = 1.0
+    else:
+        (
+            original,
+            vector,
+            prediction,
+            runtime,
+            relative_safety,
+            _,
+            _,
+        ) = min(evaluated, key=research_score)
+        acquisition = research_score(
+            (
+                original,
+                vector,
+                prediction,
+                runtime,
+                relative_safety,
+                (
+                    _is_bank_relative_runtime_safe(relative_safety)
+                    if relative_safety.support >= 0.15
+                    else _is_runtime_safe(runtime)
+                ),
+                False,
+            )
+        )[2]
+        deployment_candidate = incumbent
+        source = "one_shot_research_candidate"
+        rationale = (
+            "one custom counterfactual retained for paired NPU learning; "
+            "deployment remains on the bank because independent effect "
+            f"support is insufficient; generator={original.source}"
+        )
+        selection_policy = "research_measurement_bank_deployment"
+        deployment_recommended = 0.0
+
     vector.metrics.update(
         {
             "one_shot_score": acquisition,
             "one_shot_incumbent_fallback": 0.0,
+            "deployment_recommended_custom": deployment_recommended,
         }
     )
     selected = Candidate(
         schedule=original.schedule,
         template=original.template,
-        source="one_shot_bank_relative",
-        rationale=(
-            "single deployment decision supported by paired "
-            f"candidate/bank effects; generator={original.source}"
-        ),
+        source=source,
+        rationale=rationale,
         acquisition=acquisition,
         parent_signatures=(incumbent.schedule.signature(),),
         behavior_key=behavior_key(vector),
@@ -828,14 +1237,15 @@ def select_one_shot_candidate(
     )
     return OneShotDecision(
         candidate=selected,
+        deployment_candidate=deployment_candidate,
         evaluated=len(evaluated),
         safe_candidates=runtime_safe_count,
         direct_base_candidates=direct_base_count,
         transfer_eligible_candidates=sum(
-            item[4] and item[0].template != incumbent.template
+            item[6] and item[0].template != incumbent.template
             for item in evaluated
         ),
         custom_eligible_candidates=len(eligible),
         local_candidates=local_count,
-        selection_policy="paired_bank_relative_effect",
+        selection_policy=selection_policy,
     )

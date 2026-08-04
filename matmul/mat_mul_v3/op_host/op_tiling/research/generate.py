@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from callback import CallbackError, exact_roundtrip, invoke
 from tiling_search import (
     BankRelativeEffectModel,
+    BankRelativeSafetyModel,
     CandidateEngine,
     GenerationBudget,
     Hardware,
@@ -230,6 +231,9 @@ def load_resume_feedback(
                     record_id=row.get("record_id", path.stem),
                     status_vs_official="runtime_rejected",
                     status_vs_bank="runtime_rejected",
+                    bank_schedule=optional_schedule(
+                        row.get("bank_tiling_signature")
+                    ),
                 )
             )
             continue
@@ -245,6 +249,20 @@ def load_resume_feedback(
             and preflight_mode in STRICT_NUMERIC_PREFLIGHT_MODES
         )
         if not verified:
+            if preflight_mode in STRICT_NUMERIC_PREFLIGHT_MODES:
+                observations.append(
+                    MeasuredObservation(
+                        workload=workload,
+                        schedule=schedule,
+                        ratio_vs_official=1.0,
+                        ratio_vs_bank=1.0,
+                        source="runtime_verified",
+                        record_id=row.get("record_id", path.stem),
+                        bank_schedule=optional_schedule(
+                            row.get("bank_tiling_signature")
+                        ),
+                    )
+                )
             continue
         if not row.get("official_ms") or not row.get("bank_ms"):
             continue
@@ -479,6 +497,7 @@ def main() -> None:
         observation_paths=args.observations,
         exclusion_paths=args.exclusions,
     )
+    resume_completed: set[tuple] = set()
     if args.resume_feedback is not None:
         resume_observations, resume_exclusions = load_resume_feedback(
             args.resume_feedback,
@@ -488,6 +507,7 @@ def main() -> None:
         )
         observations.extend(resume_observations)
         exclusions.update(resume_exclusions)
+        resume_completed.update(resume_exclusions)
     if args.selection_mode == "one-shot":
         # A deployment decision must not learn from an earlier measurement of
         # the target shape. This also makes a resumed run regenerate the same
@@ -518,15 +538,24 @@ def main() -> None:
             "source=current_RuntimeKb_callback"
         )
     latency_observations = sum(
-        observation.source != "runtime_rejected"
+        observation.source
+        not in {"runtime_rejected", "runtime_verified"}
         for observation in observations
     )
-    runtime_rejections = len(observations) - latency_observations
+    runtime_rejections = sum(
+        observation.source == "runtime_rejected"
+        for observation in observations
+    )
+    runtime_verified_only = sum(
+        observation.source == "runtime_verified"
+        for observation in observations
+    )
     print(
         "COST_MODEL_EVIDENCE "
         f"records={len(observations)} "
         f"latency={latency_observations} "
-        f"runtime_rejected={runtime_rejections}"
+        f"runtime_rejected={runtime_rejections} "
+        f"runtime_verified_only={runtime_verified_only}"
     )
     if not args.skip_model_validation and args.selection_mode != "calibration":
         for leave_workload_out in (False, True):
@@ -592,30 +621,44 @@ def main() -> None:
         if args.selection_mode == "one-shot"
         else None
     )
+    one_shot_safety_model = (
+        BankRelativeSafetyModel(observations, hardware)
+        if args.selection_mode == "one-shot"
+        else None
+    )
     if one_shot_effect_model is not None:
-        relative_validation = validate_bank_relative_selector(
-            observations, hardware
-        )
         print(
             "BANK_RELATIVE_MODEL "
             f"rows={len(one_shot_effect_model.rows)} "
             f"workloads={one_shot_effect_model.workloads} "
-            f"structured_rows={one_shot_effect_model.structured_rows}"
+            f"structured_rows={one_shot_effect_model.structured_rows} "
+            f"safety_rows={len(one_shot_safety_model.rows)} "
+            f"safety_rejected={one_shot_safety_model.rejected_rows}"
         )
-        print(
-            "BANK_RELATIVE_VALIDATION "
-            "mode=leave_workload_out_with_bank_incumbent "
-            f"groups={relative_validation.groups} "
-            "oracle_opportunities="
-            f"{relative_validation.oracle_opportunities} "
-            f"custom_selections={relative_validation.custom_selections} "
-            f"custom_winners={relative_validation.custom_winners} "
-            f"custom_regressions={relative_validation.custom_regressions} "
-            f"severe_regressions={relative_validation.severe_regressions} "
-            "median_selected_ratio="
-            f"{relative_validation.median_selected_ratio:.6g} "
-            f"p90_selected_ratio={relative_validation.p90_selected_ratio:.6g}"
-        )
+        if args.skip_model_validation:
+            print(
+                "BANK_RELATIVE_VALIDATION "
+                "skipped=1 reason=bounded_full_run_cpu_budget"
+            )
+        else:
+            relative_validation = validate_bank_relative_selector(
+                observations, hardware
+            )
+            print(
+                "BANK_RELATIVE_VALIDATION "
+                "mode=leave_workload_out_with_bank_incumbent "
+                f"groups={relative_validation.groups} "
+                "oracle_opportunities="
+                f"{relative_validation.oracle_opportunities} "
+                f"custom_selections={relative_validation.custom_selections} "
+                f"custom_winners={relative_validation.custom_winners} "
+                f"custom_regressions={relative_validation.custom_regressions} "
+                f"severe_regressions={relative_validation.severe_regressions} "
+                "median_selected_ratio="
+                f"{relative_validation.median_selected_ratio:.6g} "
+                f"p90_selected_ratio="
+                f"{relative_validation.p90_selected_ratio:.6g}"
+            )
 
     output_rows: list[dict[str, str]] = []
     all_rows: list[dict[str, str]] = []
@@ -623,6 +666,28 @@ def main() -> None:
     template_counts: Counter[str] = Counter()
     print("SEARCH_FRONTIER_BEGIN")
     for workload in workloads:
+        calibration_completed = sum(
+            item[:6] == workload.identity()[:6]
+            for item in resume_completed
+        )
+        calibration_budget = max(
+            0, args.npu_candidates - calibration_completed
+        )
+        if (
+            args.selection_mode == "calibration"
+            and calibration_budget == 0
+        ):
+            print(
+                "SEARCH_WORKLOAD "
+                f"{workload.workload_id} "
+                f"shape={workload.m}x{workload.n}x{workload.k} "
+                f"dtype={workload.dtype} "
+                f"trans={int(workload.trans_a)}"
+                f"{int(workload.trans_b)} selected=0 "
+                f"resume_completed={calibration_completed} "
+                "action=skip_completed_calibration_before_host_generation"
+            )
+            continue
         official = invoke(workload)
         bank = exact_roundtrip(workload, official.schedule)
         control_row = candidate_row(
@@ -710,6 +775,7 @@ def main() -> None:
                 hardware,
                 cost_model=one_shot_cost_model,
                 effect_model=one_shot_effect_model,
+                safety_model=one_shot_safety_model,
             )
             selected_candidates = [one_shot_decision.candidate]
             racing_plan = None
@@ -720,7 +786,7 @@ def main() -> None:
                 incumbent,
                 observations,
                 hardware,
-                args.npu_candidates,
+                calibration_budget,
             )
             racing_plan = None
         elif args.search_stage == "stage2":
@@ -817,6 +883,10 @@ def main() -> None:
                 f"{one_shot_decision.custom_eligible_candidates} "
                 f"local={one_shot_decision.local_candidates} "
                 f"policy={one_shot_decision.selection_policy} "
+                "deployment="
+                f"{'custom' if one_shot_decision.deployment_candidate.schedule == selected.schedule else 'bank'} "
+                "deployment_signature="
+                f"{one_shot_decision.deployment_candidate.schedule.signature_text()} "
                 f"score={selected.acquisition:.6g} "
                 "predicted_ratio="
                 f"{metrics.get('predicted_latency_ratio', 1.0):.6g} "
@@ -861,7 +931,7 @@ def main() -> None:
             )
             expected_candidates = racing_plan.budget
         else:
-            expected_candidates = args.npu_candidates
+            expected_candidates = calibration_budget
             local = sum(
                 candidate.source
                 == "calibration_local_counterfactual"
@@ -874,6 +944,8 @@ def main() -> None:
             print(
                 "CALIBRATION_PLAN "
                 f"{workload.workload_id} selected={len(accepted)} "
+                f"resume_completed={calibration_completed} "
+                f"remaining={calibration_budget} "
                 f"local={local} "
                 "coupled="
                 f"{len(accepted) - local - template_probes} "

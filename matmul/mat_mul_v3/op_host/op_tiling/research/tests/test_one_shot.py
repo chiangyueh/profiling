@@ -20,6 +20,7 @@ from tiling_search.domain import (
 from tiling_search.families import classify_workload
 from tiling_search.one_shot import (
     BankRelativeEffectModel,
+    BankRelativeSafetyPrediction,
     select_calibration_candidates,
     select_one_shot_candidate,
     validate_bank_relative_selector,
@@ -50,6 +51,18 @@ class _AlwaysRiskyModel:
     def predict(self, workload, vector, **_):
         del workload, vector
         return FeedbackPrediction(1.0, 1.0, 0.0, 0.90, 1.0)
+
+
+class _UnsafeRelativeSafetyModel:
+    def predict(self, workload, bank, candidate, hardware, **_):
+        del workload, bank, candidate, hardware
+        return BankRelativeSafetyPrediction(
+            samples=4,
+            rejected=4,
+            risk=1.0,
+            nearest_distance=0.1,
+            support=1.0,
+        )
 
 
 class OneShotSelectionTest(unittest.TestCase):
@@ -133,7 +146,9 @@ class OneShotSelectionTest(unittest.TestCase):
             )
         return evidence
 
-    def test_no_paired_effect_evidence_keeps_bank(self) -> None:
+    def test_no_paired_effect_evidence_measures_custom_but_deploys_bank(
+        self,
+    ) -> None:
         decision = select_one_shot_candidate(
             self.workload,
             [self.custom],
@@ -142,11 +157,17 @@ class OneShotSelectionTest(unittest.TestCase):
             self.hardware,
             cost_model=_RuntimeModel(),
         )
-        self.assertEqual(decision.candidate.schedule, self.bank)
+        self.assertEqual(decision.candidate.schedule, self.custom.schedule)
         self.assertEqual(
-            decision.candidate.source, "one_shot_bank_incumbent"
+            decision.candidate.source, "one_shot_research_candidate"
         )
-        self.assertEqual(decision.selection_policy, "bank_incumbent")
+        self.assertEqual(
+            decision.deployment_candidate.schedule, self.bank
+        )
+        self.assertEqual(
+            decision.selection_policy,
+            "research_measurement_bank_deployment",
+        )
 
     def test_broad_candidates_cannot_force_a_deployment(self) -> None:
         broad = Candidate(
@@ -164,6 +185,7 @@ class OneShotSelectionTest(unittest.TestCase):
             cost_model=_RuntimeModel(),
         )
         self.assertEqual(decision.candidate.schedule, self.bank)
+        self.assertEqual(decision.deployment_candidate.schedule, self.bank)
         self.assertEqual(decision.evaluated, 0)
 
     def test_repeated_bank_relative_effect_selects_custom(self) -> None:
@@ -183,7 +205,10 @@ class OneShotSelectionTest(unittest.TestCase):
             decision.candidate.source, "one_shot_bank_relative"
         )
         self.assertEqual(
-            decision.selection_policy, "paired_bank_relative_effect"
+            decision.selection_policy, "paired_control_relative_effect"
+        )
+        self.assertEqual(
+            decision.deployment_candidate.schedule, self.custom.schedule
         )
         self.assertGreaterEqual(
             decision.candidate.metrics["bank_relative_samples"], 3
@@ -200,8 +225,10 @@ class OneShotSelectionTest(unittest.TestCase):
             observations,
             self.hardware,
             cost_model=_AlwaysRiskyModel(),
+            safety_model=_UnsafeRelativeSafetyModel(),
         )
-        self.assertEqual(decision.candidate.schedule, self.bank)
+        self.assertEqual(decision.candidate.schedule, self.custom.schedule)
+        self.assertEqual(decision.deployment_candidate.schedule, self.bank)
 
     def test_cross_template_requires_stronger_independent_support(self) -> None:
         split = Candidate(
@@ -219,7 +246,10 @@ class OneShotSelectionTest(unittest.TestCase):
             self.hardware,
             cost_model=_RuntimeModel(),
         )
-        self.assertEqual(weak_decision.candidate.schedule, self.bank)
+        self.assertEqual(weak_decision.candidate.schedule, split.schedule)
+        self.assertEqual(
+            weak_decision.deployment_candidate.schedule, self.bank
+        )
 
         strong = self._paired_effects(split, ratio=0.80, count=3)
         strong_decision = select_one_shot_candidate(
@@ -231,6 +261,9 @@ class OneShotSelectionTest(unittest.TestCase):
             cost_model=_RuntimeModel(),
         )
         self.assertEqual(strong_decision.candidate.schedule, split.schedule)
+        self.assertEqual(
+            strong_decision.deployment_candidate.schedule, split.schedule
+        )
 
     def test_calibration_separates_local_coupled_and_template_probes(
         self,
@@ -268,6 +301,57 @@ class OneShotSelectionTest(unittest.TestCase):
                 "calibration_coupled_counterfactual",
                 "calibration_template_probe",
             },
+        )
+
+    def test_negative_template_evidence_reduces_probe_budget(self) -> None:
+        same_template = [
+            Candidate(
+                schedule=self.bank.replace(
+                    l2MTileCnt=5 + index,
+                    l2MTileBlock=4 + index,
+                ),
+                template=Template.BASE,
+                source=(
+                    "local_bank_anchor"
+                    if index % 2 == 0
+                    else "contract_coupled_policy"
+                ),
+                rationale="same-template counterfactual",
+            )
+            for index in range(12)
+        ]
+        split_candidates = [
+            Candidate(
+                schedule=self.bank.replace(
+                    tilingEnable=3,
+                    l2MTileCnt=1 + index,
+                ),
+                template=Template.DETERMINISTIC_SPLIT_K,
+                source="contract_coupled_policy",
+                rationale="split probe",
+            )
+            for index in range(4)
+        ]
+        negative = self._paired_effects(
+            split_candidates[0],
+            ratio=2.0,
+            count=6,
+        )
+        selected = select_calibration_candidates(
+            self.workload,
+            [*same_template, *split_candidates],
+            self.incumbent,
+            negative,
+            self.hardware,
+            budget=12,
+        )
+        self.assertEqual(len(selected), 12)
+        self.assertEqual(
+            sum(
+                candidate.template == Template.DETERMINISTIC_SPLIT_K
+                for candidate in selected
+            ),
+            1,
         )
 
     def test_leave_workload_out_validation_includes_bank_fallback(self) -> None:

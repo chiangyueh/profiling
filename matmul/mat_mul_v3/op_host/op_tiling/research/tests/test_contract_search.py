@@ -172,6 +172,62 @@ class ContractSearchTest(unittest.TestCase):
             )
         )
 
+    def test_single_split_k_contract_uses_kernel_l2_semantics(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="saved_bank_single_split_k",
+            m=2560,
+            n=3072,
+            k=30720,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        bank = Schedule.from_signature(
+            "20:256:1536:512:128:128:128:8:8:2:1:1:"
+            "4:4:2:2:2:4:3:5:4:0:2"
+        )
+        self.assertTrue(
+            validate_schedule(workload, bank, self.hardware).valid
+        )
+
+    def test_coupled_solver_reconstructs_bank_without_local_source(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="unseen_fp32_nt_reconstruction",
+            m=112,
+            n=640,
+            k=4352,
+            dtype="fp32",
+            trans_a=False,
+            trans_b=True,
+            max_cores=20,
+        )
+        bank = Schedule.from_signature(
+            "20:64:64:4352:64:64:128:8:8:1:1:0:"
+            "4:4:2:2:1:1:1:2:10:0:0"
+        )
+        engine = CandidateEngine(
+            config=SearchConfig(include_exploration=False)
+        )
+        result = engine.generate(
+            workload,
+            self.hardware,
+            local_anchor=bank,
+        )
+        reconstructed = [
+            candidate
+            for candidate in result.callback_candidates
+            if candidate.schedule == bank
+        ]
+        self.assertEqual(len(reconstructed), 1)
+        self.assertEqual(
+            reconstructed[0].source, "contract_coupled_policy"
+        )
+
     def test_unseen_name_generates_multiple_templates(self) -> None:
         workload = Workload(
             workload_id="name_has_no_search_semantics",

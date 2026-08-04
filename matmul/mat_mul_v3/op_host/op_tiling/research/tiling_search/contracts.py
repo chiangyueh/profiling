@@ -278,10 +278,11 @@ def _single_core_split_k_contract(
         violations.append("split_k_inner_m")
     if schedule["singleCoreN"] < schedule["stepN"] * schedule["baseN"]:
         violations.append("split_k_inner_n")
+    # MatmulSingleCoreSplitKBaseBlock reads only calOrder from
+    # L2cacheTilePara. The count/block fields are carried by the common
+    # record, but do not describe singleCoreM/N coverage in this kernel.
     if schedule["l2MTileBlock"] <= 0 or schedule["l2NTileBlock"] <= 0:
         violations.append("split_k_l2_block")
-    elif not _l2_schedule_valid(workload, schedule):
-        violations.append("split_k_l2_coverage")
     return violations
 
 
@@ -328,10 +329,11 @@ def _deterministic_split_k_contract(
         violations.append("det_k_chunks")
     if schedule["usedCoreNum"] > k_chunks:
         violations.append("det_core_chunks")
+    # Deterministic split-K does not consume L2cacheTilePara. Keep nonzero
+    # block values for callback compatibility without imposing BASE-kernel
+    # coverage semantics on this template.
     if schedule["l2MTileBlock"] <= 0 or schedule["l2NTileBlock"] <= 0:
         violations.append("det_l2_block")
-    elif not _l2_schedule_valid(workload, schedule):
-        violations.append("det_l2_coverage")
     return violations
 
 

@@ -43,27 +43,59 @@ def base_geometry_variants(
         elif large_m or (not large_n and workload.m > workload.n):
             preferred = (256, 128)
 
+    tail_m = max(16, align_up(min(workload.m, 256), 16))
+    tail_n = max(16, align_up(min(workload.n, 256), 16))
     geometries = [
         preferred,
         (preferred[1], preferred[0]),
         (128, 128),
         (64, 256),
         (256, 64),
+        (128, tail_n),
+        (tail_m, 128),
+        (tail_m, 32),
+        (64, 64),
+        (32, tail_n),
     ]
+    geometry_seen = set()
+    unique_geometries = []
+    for geometry in geometries:
+        if geometry in geometry_seen:
+            continue
+        geometry_seen.add(geometry)
+        unique_geometries.append(geometry)
+    geometries = unique_geometries
+
+    supplemental = {
+        (128, tail_n),
+        (tail_m, 128),
+        (tail_m, 32),
+        (64, 64),
+        (32, tail_n),
+    }
+    geometry_k = [
+        *((geometry, base_k) for geometry in geometries),
+        *(
+            (geometry, candidate_k)
+            for geometry in geometries
+            if geometry in supplemental
+            for candidate_k in (2 * base_k, 4 * base_k)
+        ),
+    ]
+
     result = []
     seen = set()
-    for base_m, base_n in geometries:
-        if (base_m, base_n) in seen:
-            continue
-        seen.add((base_m, base_n))
+    for (base_m, base_n), candidate_k in geometry_k:
         db_a = (
             2
-            if base_m * base_k * in_bytes * 2 <= hardware.l0a_bytes
+            if base_m * candidate_k * in_bytes * 2
+            <= hardware.l0a_bytes
             else 1
         )
         db_b = (
             2
-            if base_n * base_k * in_bytes * 2 <= hardware.l0b_bytes
+            if base_n * candidate_k * in_bytes * 2
+            <= hardware.l0b_bytes
             else 1
         )
         db_c = (
@@ -71,13 +103,39 @@ def base_geometry_variants(
             if base_m * base_n * 4 * 2 <= hardware.l0c_bytes
             else 1
         )
-        if (
-            base_m * base_k * in_bytes * db_a > hardware.l0a_bytes
-            or base_n * base_k * in_bytes * db_b > hardware.l0b_bytes
-            or base_m * base_n * 4 * db_c > hardware.l0c_bytes
+        for buffering in (
+            (db_a, db_b, db_c),
+            (db_a, db_b, 1),
         ):
-            continue
-        result.append((base_m, base_n, base_k, db_a, db_b, db_c))
+            spec = (
+                base_m,
+                base_n,
+                candidate_k,
+                *buffering,
+            )
+            if spec in seen:
+                continue
+            seen.add(spec)
+            candidate_db_a, candidate_db_b, candidate_db_c = buffering
+            if (
+                base_m
+                * candidate_k
+                * in_bytes
+                * candidate_db_a
+                > hardware.l0a_bytes
+                or base_n
+                * candidate_k
+                * in_bytes
+                * candidate_db_b
+                > hardware.l0b_bytes
+                or base_m
+                * base_n
+                * 4
+                * candidate_db_c
+                > hardware.l0c_bytes
+            ):
+                continue
+            result.append(spec)
     return tuple(result)
 
 
@@ -227,10 +285,13 @@ def core_partition_variants(
         ),
     )
     ordered = [direct]
+    full_core_direct = (minimum_m, minimum_n, core_limit)
+    if full_core_direct != direct:
+        ordered.append(full_core_direct)
     ordered.extend(
         value
         for value in sorted(values, key=score)
-        if value != direct
+        if value not in {direct, full_core_direct}
     )
     return tuple(ordered)
 
@@ -348,6 +409,6 @@ def l2_policy_variants(
             continue
         seen.add(value)
         result.append(value)
-        if len(result) >= 16:
+        if len(result) >= 64:
             break
     return tuple(result)

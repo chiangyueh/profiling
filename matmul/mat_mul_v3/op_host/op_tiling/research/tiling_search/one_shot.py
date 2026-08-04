@@ -17,6 +17,7 @@ from .behavior import (
 from .bank_structure import (
     BankTransition,
     bank_transition,
+    schedules_execution_equivalent,
     subsystem_mask_distance,
 )
 from .contracts import template_of
@@ -41,6 +42,7 @@ class OneShotDecision:
     direct_base_candidates: int
     transfer_eligible_candidates: int
     custom_eligible_candidates: int
+    bank_equivalent_candidates: int
     local_candidates: int
     selection_policy: str
 
@@ -998,14 +1000,13 @@ def select_one_shot_candidate(
     safety_model: BankRelativeSafetyModel | None = None,
     **_ignored,
 ) -> OneShotDecision:
-    """Select exactly one independently generated custom tiling.
+    """Select exactly one independently generated tiling.
 
     The bank is an incumbent and paired measurement control, not a normal
-    deployment candidate or deployment seed. Bank-anchor mutations remain
-    calibration probes; one-shot deployment must come from an independent
-    contract solver or a mutation of measured custom evidence. A candidate
-    must pass the runtime-safety policy. Strong latency evidence changes the
-    confidence tier; it does not decide whether custom search is used at all.
+    candidate source or deployment seed. An independent solver is allowed to
+    reconstruct the same effective kernel schedule; equality is evidence of
+    coverage, not bank fallback. Bank-anchor mutations remain calibration
+    probes. Other candidates must pass the runtime-safety policy.
     """
 
     if incumbent.source != "bank_incumbent":
@@ -1031,8 +1032,6 @@ def select_one_shot_candidate(
             "feedback_winner_mutation",
         }:
             continue
-        if candidate.schedule.signature() == incumbent.schedule.signature():
-            continue
         unique.setdefault(candidate.schedule.signature(), candidate)
 
     evaluated = []
@@ -1043,33 +1042,57 @@ def select_one_shot_candidate(
             vector,
             exclude_workload=workload.identity(),
         )
-        relative = relative_model.predict(
-            workload,
+        execution_equivalent = schedules_execution_equivalent(
             incumbent.schedule,
             candidate.schedule,
-            hardware,
-            exclude_workload=workload.identity(),
         )
-        relative_safety = relative_safety_model.predict(
-            workload,
-            incumbent.schedule,
-            candidate.schedule,
-            hardware,
-            exclude_workload=workload.identity(),
-        )
-        changed = _changed_fields(incumbent.schedule, candidate.schedule)
+        if execution_equivalent:
+            relative = BankRelativePrediction(
+                samples=1,
+                robust_ratio=1.0,
+                upper_ratio=1.0,
+                nearest_distance=0.0,
+                support=1.0,
+            )
+            relative_safety = BankRelativeSafetyPrediction(
+                samples=1,
+                rejected=0,
+                risk=0.0,
+                nearest_distance=0.0,
+                support=1.0,
+            )
+        else:
+            relative = relative_model.predict(
+                workload,
+                incumbent.schedule,
+                candidate.schedule,
+                hardware,
+                exclude_workload=workload.identity(),
+            )
+            relative_safety = relative_safety_model.predict(
+                workload,
+                incumbent.schedule,
+                candidate.schedule,
+                hardware,
+                exclude_workload=workload.identity(),
+            )
         transition = bank_transition(
             incumbent.schedule, candidate.schedule
         )
+        changed = transition.changed_fields
         cross_template = candidate.template != incumbent.template
-        runtime_safe = (
+        runtime_safe = execution_equivalent or (
             _is_bank_relative_runtime_safe(relative_safety)
             if relative_safety.support >= 0.15
             else _is_runtime_safe(runtime)
         )
-        deployable = runtime_safe and _effect_is_deployable(
-            relative,
-            cross_template=cross_template,
+        deployable = (
+            not execution_equivalent
+            and runtime_safe
+            and _effect_is_deployable(
+                relative,
+                cross_template=cross_template,
+            )
         )
         vector.metrics.update(
             {
@@ -1092,6 +1115,13 @@ def select_one_shot_candidate(
                 ),
                 "bank_transition_risk_tier": float(
                     transition.risk_tier
+                ),
+                "bank_execution_equivalent": float(
+                    execution_equivalent
+                ),
+                "bank_signature_exact": float(
+                    candidate.schedule.signature()
+                    == incumbent.schedule.signature()
                 ),
                 "runtime_risk_score": runtime.runtime_risk_score,
                 "runtime_risk_support": runtime.runtime_risk_support,
@@ -1125,13 +1155,13 @@ def select_one_shot_candidate(
     )
     if not evaluated:
         raise ValueError(
-            "one-shot search produced no solver-generated custom candidate; "
-            "bank fallback is disabled"
+            "one-shot search produced no independently generated candidate; "
+            "bank record injection is disabled"
         )
     if not eligible:
         raise ValueError(
-            "one-shot search produced no runtime-safe custom candidate; "
-            "bank fallback is disabled"
+            "one-shot search produced no runtime-safe independent candidate; "
+            "bank record injection is disabled"
         )
 
     def deployment_score(item) -> tuple:
@@ -1243,14 +1273,25 @@ def select_one_shot_candidate(
             )
         )[2]
         deployment_candidate = original
-        source = "one_shot_custom_policy"
-        rationale = (
-            "single runtime-safe custom deployment chosen by expected "
-            "bank-relative latency, uncertainty, structural distance, "
-            f"and rejection risk; generator={original.source}"
-        )
-        selection_policy = "risk_bounded_custom_first"
-        deployment_recommended = 1.0
+        if schedules_execution_equivalent(
+            incumbent.schedule, original.schedule
+        ):
+            source = "one_shot_bank_equivalent"
+            rationale = (
+                "independent solver reconstructed the bank kernel "
+                f"execution schedule; generator={original.source}"
+            )
+            selection_policy = "independent_bank_reconstruction"
+            deployment_recommended = 0.0
+        else:
+            source = "one_shot_custom_policy"
+            rationale = (
+                "single runtime-safe custom deployment chosen by expected "
+                "bank-relative latency, uncertainty, structural distance, "
+                f"and rejection risk; generator={original.source}"
+            )
+            selection_policy = "risk_bounded_custom_first"
+            deployment_recommended = 1.0
 
     vector.metrics.update(
         {
@@ -1281,7 +1322,19 @@ def select_one_shot_candidate(
             item[5] and item[0].template != incumbent.template
             for item in eligible
         ),
-        custom_eligible_candidates=len(eligible),
+        custom_eligible_candidates=sum(
+            item[5]
+            and not schedules_execution_equivalent(
+                incumbent.schedule, item[0].schedule
+            )
+            for item in evaluated
+        ),
+        bank_equivalent_candidates=sum(
+            schedules_execution_equivalent(
+                incumbent.schedule, item[0].schedule
+            )
+            for item in evaluated
+        ),
         local_candidates=local_count,
         selection_policy=selection_policy,
     )

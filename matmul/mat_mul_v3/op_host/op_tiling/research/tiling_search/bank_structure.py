@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .domain import KNOWLEDGE_FIELDS, Schedule
+from .contracts import template_of
+from .domain import KNOWLEDGE_FIELDS, Schedule, Template
 
 
 BANK_SUBSYSTEM_FIELDS = {
@@ -53,6 +54,25 @@ _FIELD_TO_SUBSYSTEM = {
     for field in fields
 }
 
+# These fields are encoded in the common 23-field record but are not consumed
+# by the selected kernel implementation. The single-core split-K block reads
+# only calOrder from L2cacheTilePara; deterministic split-K does not read that
+# structure at all.
+_SINGLE_CORE_SPLIT_K_IGNORED = frozenset(
+    {
+        "l2MTileCnt",
+        "l2NTileCnt",
+        "l2MTileBlock",
+        "l2NTileBlock",
+    }
+)
+_DETERMINISTIC_SPLIT_K_IGNORED = frozenset(
+    {
+        *_SINGLE_CORE_SPLIT_K_IGNORED,
+        "l2IterateOrder",
+    }
+)
+
 if set(_FIELD_TO_SUBSYSTEM) != set(KNOWLEDGE_FIELDS):
     missing = set(KNOWLEDGE_FIELDS) - set(_FIELD_TO_SUBSYSTEM)
     duplicate_or_unknown = set(_FIELD_TO_SUBSYSTEM) - set(KNOWLEDGE_FIELDS)
@@ -90,7 +110,38 @@ class BankTransition:
         return 3
 
 
+def kernel_ignored_fields(schedule: Schedule) -> frozenset[str]:
+    template = template_of(schedule)
+    if template == Template.SINGLE_CORE_SPLIT_K:
+        return _SINGLE_CORE_SPLIT_K_IGNORED
+    if template == Template.DETERMINISTIC_SPLIT_K:
+        return _DETERMINISTIC_SPLIT_K_IGNORED
+    return frozenset()
+
+
+def schedules_execution_equivalent(
+    left: Schedule,
+    right: Schedule,
+) -> bool:
+    if template_of(left) != template_of(right):
+        return False
+    ignored = kernel_ignored_fields(left)
+    return all(
+        left_value == right_value or field in ignored
+        for field, left_value, right_value in zip(
+            KNOWLEDGE_FIELDS,
+            left.values,
+            right.values,
+        )
+    )
+
+
 def bank_transition(bank: Schedule, candidate: Schedule) -> BankTransition:
+    ignored = (
+        kernel_ignored_fields(bank)
+        if template_of(bank) == template_of(candidate)
+        else frozenset()
+    )
     changed_fields = frozenset(
         field
         for field, bank_value, candidate_value in zip(
@@ -98,7 +149,7 @@ def bank_transition(bank: Schedule, candidate: Schedule) -> BankTransition:
             bank.values,
             candidate.values,
         )
-        if bank_value != candidate_value
+        if bank_value != candidate_value and field not in ignored
     )
     return BankTransition(
         changed_fields=changed_fields,

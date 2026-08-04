@@ -30,6 +30,7 @@ class BaseSolver:
         targets: Sequence[BehaviorTarget] = (),
     ) -> Iterator[Schedule]:
         del targets
+        variants = []
         for (
             base_m,
             base_n,
@@ -61,45 +62,91 @@ class BaseSolver:
                 minimum_m=base_m,
                 minimum_n=base_n,
             )
-            for single_m, single_n, cores in geometries[:4]:
-                for (
-                    l2_m_count,
-                    l2_n_count,
-                    l2_m_block,
-                    l2_n_block,
-                    l2_order,
-                ) in l2_policy_variants(
+            for single_m, single_n, cores in geometries[:2]:
+                l2 = l2_policy_variants(
                     workload,
                     hardware,
                     single_m=single_m,
                     single_n=single_n,
                     used_cores=cores,
-                )[:8]:
-                    yield make_schedule(
-                        usedCoreNum=cores,
-                        singleCoreM=single_m,
-                        singleCoreN=single_n,
-                        singleCoreK=workload.k,
-                        baseM=base_m,
-                        baseN=base_n,
-                        baseK=base_k,
-                        depthA1=depth_a,
-                        depthB1=depth_b,
-                        stepM=step_m,
-                        stepN=step_n,
-                        iterateOrder=0,
-                        stepKa=step_ka,
-                        stepKb=step_kb,
-                        dbL0A=db_a,
-                        dbL0B=db_b,
-                        dbL0C=db_c,
-                        l2MTileCnt=l2_m_count,
-                        l2NTileCnt=l2_n_count,
-                        l2MTileBlock=l2_m_block,
-                        l2NTileBlock=l2_n_block,
-                        l2IterateOrder=l2_order,
-                        tilingEnable=0,
+                )
+                variants.append(
+                    (
+                        base_m,
+                        base_n,
+                        base_k,
+                        db_a,
+                        db_b,
+                        db_c,
+                        depth_a,
+                        depth_b,
+                        step_m,
+                        step_n,
+                        step_ka,
+                        step_kb,
+                        single_m,
+                        single_n,
+                        cores,
+                        l2,
                     )
+                )
+
+        # Interleave L2 policies across L0/L1/core geometries. A lazy prefix
+        # must cover several coherent structures instead of exhausting every
+        # L2 variant of the first upstream geometry.
+        for l2_index in range(64):
+            for (
+                base_m,
+                base_n,
+                base_k,
+                db_a,
+                db_b,
+                db_c,
+                depth_a,
+                depth_b,
+                step_m,
+                step_n,
+                step_ka,
+                step_kb,
+                single_m,
+                single_n,
+                cores,
+                l2,
+            ) in variants:
+                if l2_index >= len(l2):
+                    continue
+                (
+                    l2_m_count,
+                    l2_n_count,
+                    l2_m_block,
+                    l2_n_block,
+                    l2_order,
+                ) = l2[l2_index]
+                yield make_schedule(
+                    usedCoreNum=cores,
+                    singleCoreM=single_m,
+                    singleCoreN=single_n,
+                    singleCoreK=workload.k,
+                    baseM=base_m,
+                    baseN=base_n,
+                    baseK=base_k,
+                    depthA1=depth_a,
+                    depthB1=depth_b,
+                    stepM=step_m,
+                    stepN=step_n,
+                    iterateOrder=0,
+                    stepKa=step_ka,
+                    stepKb=step_kb,
+                    dbL0A=db_a,
+                    dbL0B=db_b,
+                    dbL0C=db_c,
+                    l2MTileCnt=l2_m_count,
+                    l2NTileCnt=l2_n_count,
+                    l2MTileBlock=l2_m_block,
+                    l2NTileBlock=l2_n_block,
+                    l2IterateOrder=l2_order,
+                    tilingEnable=0,
+                )
 
 
 class BaseExplorationSolver:

@@ -9,7 +9,10 @@ RESEARCH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RESEARCH))
 
 from tiling_search.behavior import FeedbackPrediction
-from tiling_search.bank_structure import bank_transition
+from tiling_search.bank_structure import (
+    bank_transition,
+    schedules_execution_equivalent,
+)
 from tiling_search.domain import (
     Candidate,
     Hardware,
@@ -234,6 +237,40 @@ class OneShotSelectionTest(unittest.TestCase):
             decision.deployment_candidate.schedule, broad.schedule
         )
 
+    def test_independent_bank_reconstruction_is_not_discarded(
+        self,
+    ) -> None:
+        reconstructed = Candidate(
+            schedule=self.bank,
+            template=Template.BASE,
+            source="contract_coupled_policy",
+            rationale="independently reconstructed schedule",
+        )
+        decision = select_one_shot_candidate(
+            self.workload,
+            [reconstructed],
+            self.incumbent,
+            (),
+            self.hardware,
+            cost_model=_RuntimeModel(),
+        )
+        self.assertEqual(decision.candidate.schedule, self.bank)
+        self.assertEqual(
+            decision.selection_policy,
+            "independent_bank_reconstruction",
+        )
+        self.assertEqual(decision.custom_eligible_candidates, 0)
+        self.assertEqual(decision.bank_equivalent_candidates, 1)
+        self.assertEqual(
+            decision.candidate.metrics["bank_execution_equivalent"], 1.0
+        )
+        self.assertEqual(
+            decision.candidate.metrics["bank_signature_exact"], 1.0
+        )
+        self.assertEqual(
+            decision.candidate.metrics["one_shot_incumbent_fallback"], 0.0
+        )
+
     def test_bank_transition_groups_23_fields_by_execution_subsystem(
         self,
     ) -> None:
@@ -263,6 +300,26 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertFalse(broad.preserves_execution_structure)
         self.assertEqual(broad.risk_tier, 3)
+
+    def test_split_k_ignores_l2_fields_not_read_by_kernel(self) -> None:
+        split = self.bank.replace(tilingEnable=2)
+        same_execution = split.replace(
+            l2MTileCnt=7,
+            l2NTileCnt=9,
+            l2MTileBlock=11,
+            l2NTileBlock=13,
+        )
+        self.assertTrue(
+            schedules_execution_equivalent(split, same_execution)
+        )
+        self.assertEqual(
+            bank_transition(split, same_execution).changed_fields,
+            frozenset(),
+        )
+        changed_order = same_execution.replace(l2IterateOrder=1)
+        self.assertFalse(
+            schedules_execution_equivalent(split, changed_order)
+        )
 
     def test_unsupported_distant_prediction_does_not_beat_bank_structure(
         self,
@@ -303,7 +360,7 @@ class OneShotSelectionTest(unittest.TestCase):
             rationale="not part of the one-shot candidate layer",
         )
         with self.assertRaisesRegex(
-            ValueError, "no solver-generated custom candidate"
+            ValueError, "no independently generated candidate"
         ):
             select_one_shot_candidate(
                 self.workload,
@@ -324,7 +381,7 @@ class OneShotSelectionTest(unittest.TestCase):
             rationale="calibration-only bank mutation",
         )
         with self.assertRaisesRegex(
-            ValueError, "no solver-generated custom candidate"
+            ValueError, "no independently generated candidate"
         ):
             select_one_shot_candidate(
                 self.workload,
@@ -368,7 +425,7 @@ class OneShotSelectionTest(unittest.TestCase):
             self.custom, ratio=0.82, count=4
         )
         with self.assertRaisesRegex(
-            ValueError, "no runtime-safe custom candidate"
+            ValueError, "no runtime-safe independent candidate"
         ):
             select_one_shot_candidate(
                 self.workload,

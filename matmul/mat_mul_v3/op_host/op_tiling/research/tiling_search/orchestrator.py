@@ -9,6 +9,7 @@ from .behavior import (
     draft_behavior_coverage,
     select_behavior_coverage,
 )
+from .bank_structure import schedules_execution_equivalent
 from .contracts import (
     common_hardware_contract,
     template_kernel_contract,
@@ -245,21 +246,49 @@ class CandidateEngine:
             allow_risky_template_probes=True,
             cost_model=cost_model,
         )
+        protected_reproductions = [
+            candidate
+            for candidate in filtered
+            if (
+                local_anchor is not None
+                and candidate.source != "local_bank_anchor"
+                and schedules_execution_equivalent(
+                    local_anchor, candidate.schedule
+                )
+            )
+        ][:1]
+        protected_signatures = {
+            candidate.schedule.signature()
+            for candidate in protected_reproductions
+        }
         protected_local = [
             candidate
             for candidate in filtered
-            if candidate.source == "local_bank_anchor"
+            if (
+                candidate.source == "local_bank_anchor"
+                and candidate.schedule.signature()
+                not in protected_signatures
+            )
         ][: max(1, budget.callback_candidates // 4)]
+        protected_signatures.update(
+            candidate.schedule.signature()
+            for candidate in protected_local
+        )
         protected_policy = [
             candidate
             for candidate in filtered
-            if candidate.source == "contract_coupled_policy"
+            if (
+                candidate.source == "contract_coupled_policy"
+                and candidate.schedule.signature()
+                not in protected_signatures
+            )
         ][: max(1, budget.callback_candidates // 2)]
-        protected_signatures = {
+        protected_signatures.update(
             candidate.schedule.signature()
-            for candidate in (*protected_local, *protected_policy)
-        }
+            for candidate in protected_policy
+        )
         selected = [
+            *protected_reproductions,
             *protected_local,
             *protected_policy,
             *(

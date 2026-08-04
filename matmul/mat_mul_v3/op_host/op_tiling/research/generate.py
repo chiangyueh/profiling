@@ -794,8 +794,8 @@ def main() -> None:
                 != one_shot_decision.candidate.schedule
             ):
                 raise ValueError(
-                    "one-shot deployment must use the selected custom "
-                    "candidate; bank fallback is disabled"
+                    "one-shot deployment must use the independently "
+                    "generated selection; bank record injection is disabled"
                 )
             selected_candidates = [one_shot_decision.candidate]
             racing_plan = None
@@ -901,13 +901,17 @@ def main() -> None:
                 f"{one_shot_decision.transfer_eligible_candidates} "
                 "custom_eligible="
                 f"{one_shot_decision.custom_eligible_candidates} "
+                "bank_equivalent="
+                f"{one_shot_decision.bank_equivalent_candidates} "
                 "strong_evidence="
                 f"{int(metrics.get('deployment_evidence_strong', 0.0))} "
                 f"local={one_shot_decision.local_candidates} "
                 f"generator={one_shot_decision.generator_source} "
                 f"policy={one_shot_decision.selection_policy} "
                 "deployment="
-                f"{'custom' if one_shot_decision.deployment_candidate.schedule == selected.schedule else 'bank'} "
+                f"{'bank_equivalent' if metrics.get('bank_execution_equivalent', 0.0) else 'custom'} "
+                "bank_signature_exact="
+                f"{int(metrics.get('bank_signature_exact', 0.0))} "
                 "deployment_signature="
                 f"{one_shot_decision.deployment_candidate.schedule.signature_text()} "
                 f"score={selected.acquisition:.6g} "

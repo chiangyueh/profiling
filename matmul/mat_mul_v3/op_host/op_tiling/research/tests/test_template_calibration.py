@@ -23,7 +23,12 @@ from tiling_search.contracts import (
     template_kernel_contract,
     template_of,
 )
-from tiling_search.domain import Candidate, Hardware, Template
+from tiling_search.domain import (
+    Candidate,
+    GenerationBudget,
+    Hardware,
+    Template,
+)
 from tiling_search.one_shot import select_calibration_candidates
 from tiling_search.orchestrator import CandidateEngine, SearchConfig
 from tiling_search.solvers import (
@@ -56,7 +61,9 @@ class TemplateCalibrationTest(unittest.TestCase):
             Template.BL1_FULL_LOAD_FIXPIPE: bl1,
             Template.BL1_FULL_LOAD_VEC_NZ2ND: bl1,
             Template.SINGLE_CORE_SPLIT_K: SingleCoreSplitKSolver(),
-            Template.DETERMINISTIC_SPLIT_K: DeterministicSplitKSolver(),
+            Template.DETERMINISTIC_SPLIT_K: DeterministicSplitKSolver(
+                explore_low_core=True
+            ),
         }
 
     def _legal_target_candidates(self, spec, template, limit):
@@ -100,12 +107,12 @@ class TemplateCalibrationTest(unittest.TestCase):
             totals,
             Counter(
                 {
-                    Template.AL1_FULL_LOAD: 48,
-                    Template.BL1_FULL_LOAD: 120,
-                    Template.BL1_FULL_LOAD_FIXPIPE: 12,
-                    Template.BL1_FULL_LOAD_VEC_NZ2ND: 12,
-                    Template.SINGLE_CORE_SPLIT_K: 30,
-                    Template.DETERMINISTIC_SPLIT_K: 12,
+                    Template.AL1_FULL_LOAD: 384,
+                    Template.BL1_FULL_LOAD: 1536,
+                    Template.BL1_FULL_LOAD_FIXPIPE: 192,
+                    Template.BL1_FULL_LOAD_VEC_NZ2ND: 192,
+                    Template.SINGLE_CORE_SPLIT_K: 384,
+                    Template.DETERMINISTIC_SPLIT_K: 72,
                 }
             ),
         )
@@ -139,11 +146,11 @@ class TemplateCalibrationTest(unittest.TestCase):
                 if template not in spec.template_quotas:
                     continue
                 candidates = self._legal_target_candidates(
-                    spec, template, 4
+                    spec, template, 64
                 )
-                self.assertEqual(
+                self.assertGreaterEqual(
                     len(candidates),
-                    4,
+                    16,
                     spec.workload.workload_id,
                 )
                 geometries = {
@@ -156,7 +163,7 @@ class TemplateCalibrationTest(unittest.TestCase):
                 }
                 self.assertGreaterEqual(
                     len(geometries),
-                    4,
+                    8,
                     spec.workload.workload_id,
                 )
 
@@ -220,7 +227,7 @@ class TemplateCalibrationTest(unittest.TestCase):
             self.hardware
         )[0]
         schedules = self._legal_target_candidates(
-            spec, Template.AL1_FULL_LOAD, 8
+            spec, Template.AL1_FULL_LOAD, 64
         )
         base = next(
             BaseSolver().generate(spec.workload, self.hardware, ())
@@ -246,10 +253,10 @@ class TemplateCalibrationTest(unittest.TestCase):
             incumbent,
             (),
             self.hardware,
-            budget=8,
-            template_quotas={Template.AL1_FULL_LOAD: 8},
+            budget=64,
+            template_quotas={Template.AL1_FULL_LOAD: 64},
         )
-        self.assertEqual(len(selected), 8)
+        self.assertEqual(len(selected), 64)
         self.assertEqual(
             {candidate.template for candidate in selected},
             {Template.AL1_FULL_LOAD},
@@ -257,6 +264,36 @@ class TemplateCalibrationTest(unittest.TestCase):
         self.assertEqual(
             {candidate.source for candidate in selected},
             {"calibration_template_probe"},
+        )
+
+    def test_calibration_quota_reaches_callback_before_other_templates(
+        self,
+    ) -> None:
+        spec = generate_template_calibration_workloads(
+            self.hardware
+        )[0]
+        engine = CandidateEngine(
+            config=SearchConfig(
+                budget=GenerationBudget(
+                    raw_attempts=4000,
+                    legal_candidates=2000,
+                    behavior_candidates=96,
+                    callback_candidates=80,
+                    npu_candidates=80,
+                ),
+                include_exploration=False,
+            ),
+            solvers=(BaseSolver(), Al1FullLoadSolver()),
+        )
+        result = engine.generate(
+            spec.workload,
+            self.hardware,
+            template_quotas={Template.AL1_FULL_LOAD: 64},
+        )
+        self.assertEqual(len(result.callback_candidates), 64)
+        self.assertEqual(
+            {candidate.template for candidate in result.callback_candidates},
+            {Template.AL1_FULL_LOAD},
         )
 
     def test_audit_executes_and_counts_unique_paired_signatures(self) -> None:

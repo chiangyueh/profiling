@@ -108,7 +108,7 @@ def generate_template_calibration_workloads(
                     layout,
                     hardware,
                 ),
-                template_quotas={Template.AL1_FULL_LOAD: 8},
+                template_quotas={Template.AL1_FULL_LOAD: 64},
                 design_axis="a_l1_resident_ratio",
                 design_value=actual,
             )
@@ -170,8 +170,8 @@ def generate_template_calibration_workloads(
                     hardware,
                 ),
                 template_quotas={
-                    Template.BL1_FULL_LOAD: 5,
-                    Template.BL1_FULL_LOAD_FIXPIPE: 1,
+                    Template.BL1_FULL_LOAD: 64,
+                    Template.BL1_FULL_LOAD_FIXPIPE: 16,
                 },
                 design_axis="b_l1_resident_ratio_fixpipe",
                 design_value=actual,
@@ -217,8 +217,8 @@ def generate_template_calibration_workloads(
                     hardware,
                 ),
                 template_quotas={
-                    Template.BL1_FULL_LOAD: 5,
-                    Template.BL1_FULL_LOAD_VEC_NZ2ND: 1,
+                    Template.BL1_FULL_LOAD: 64,
+                    Template.BL1_FULL_LOAD_VEC_NZ2ND: 16,
                 },
                 design_axis="b_l1_resident_ratio_vec_nz2nd",
                 design_value=actual,
@@ -289,7 +289,7 @@ def generate_template_calibration_workloads(
                     layout,
                     hardware,
                 ),
-                template_quotas={Template.DETERMINISTIC_SPLIT_K: 2},
+                template_quotas={Template.DETERMINISTIC_SPLIT_K: 12},
                 design_axis="output_parallelism_per_aic",
                 design_value=(
                     output_tiles / max(1, hardware.aic_cores)
@@ -335,7 +335,7 @@ def generate_template_calibration_workloads(
                     layout,
                     hardware,
                 ),
-                template_quotas={Template.SINGLE_CORE_SPLIT_K: 5},
+                template_quotas={Template.SINGLE_CORE_SPLIT_K: 64},
                 design_axis="single_split_output_waves",
                 design_value=(
                     output_tiles / max(1, hardware.aic_cores)

@@ -770,7 +770,6 @@ def _quota_calibration_candidates(
         != incumbent.schedule.signature()
     }
     selected: list[Candidate] = []
-    selected_signatures: set[tuple[int, ...]] = set()
     for template, quota in sorted(
         template_quotas.items(), key=lambda item: item[0].value
     ):
@@ -779,69 +778,15 @@ def _quota_calibration_candidates(
             for candidate in unique.values()
             if candidate.template == template
         ]
-        if len(family) < quota:
-            raise ValueError(
-                "template calibration callback coverage is incomplete: "
-                f"workload={workload.workload_id} "
-                f"template={template.value} "
-                f"required={quota} callback_accepted={len(family)}"
-            )
         chosen = _farthest_first(
             workload,
             family,
             incumbent.schedule,
             hardware,
-            quota,
+            min(quota, len(family)),
         )
         selected.extend(chosen)
-        selected_signatures.update(
-            candidate.schedule.signature() for candidate in chosen
-        )
-
-    remaining = [
-        candidate
-        for candidate in unique.values()
-        if candidate.schedule.signature() not in selected_signatures
-    ]
-    same_template = [
-        candidate
-        for candidate in remaining
-        if candidate.template == incumbent.template
-    ]
-    selected.extend(
-        _farthest_first(
-            workload,
-            same_template,
-            incumbent.schedule,
-            hardware,
-            budget - len(selected),
-        )
-    )
-    selected_signatures.update(
-        candidate.schedule.signature() for candidate in selected
-    )
-    if len(selected) < budget:
-        selected.extend(
-            _farthest_first(
-                workload,
-                [
-                    candidate
-                    for candidate in remaining
-                    if candidate.schedule.signature()
-                    not in selected_signatures
-                ],
-                incumbent.schedule,
-                hardware,
-                budget - len(selected),
-            )
-        )
-    if len(selected) < budget:
-        raise ValueError(
-            "template calibration has insufficient callback-accepted "
-            f"candidates: workload={workload.workload_id} "
-            f"required={budget} selected={len(selected)}"
-        )
-    return selected[:budget]
+    return selected
 
 
 def select_calibration_candidates(

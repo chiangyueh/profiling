@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from .behavior import (
     FeedbackCostModel,
@@ -23,6 +23,7 @@ from .domain import (
     Schedule,
     SearchResult,
     SolverReport,
+    Template,
     Workload,
 )
 from .feedback import (
@@ -94,6 +95,7 @@ class CandidateEngine:
         hardware: Hardware,
         *,
         local_anchor: Schedule | None = None,
+        template_quotas: Mapping[Template, int] | None = None,
     ) -> SearchResult:
         budget = self.config.budget
         cost_model = self._cost_models.get(hardware)
@@ -226,13 +228,22 @@ class CandidateEngine:
                 continue
             filtered.append(candidate)
 
+        coverage_candidates = (
+            [
+                candidate
+                for candidate in filtered
+                if candidate.template in template_quotas
+            ]
+            if template_quotas is not None
+            else filtered
+        )
         draft_limit = max(
             budget.behavior_candidates,
             budget.callback_candidates * 4,
         )
         draft_pool = draft_behavior_coverage(
             workload,
-            filtered,
+            coverage_candidates,
             hardware,
             draft_limit,
         )
@@ -243,6 +254,7 @@ class CandidateEngine:
             hardware,
             budget.behavior_candidates,
             template_probe_floor=8,
+            template_quotas=template_quotas,
             allow_risky_template_probes=True,
             cost_model=cost_model,
         )
@@ -253,9 +265,36 @@ class CandidateEngine:
             hardware,
             budget.callback_candidates,
             template_probe_floor=8,
+            template_quotas=template_quotas,
             allow_risky_template_probes=True,
             cost_model=cost_model,
         )
+        if template_quotas is not None:
+            reports = tuple(
+                SolverReport(
+                    template=item["template"],
+                    raw_generated=item["raw"],
+                    common_legal=item["common"],
+                    template_legal=item["template_legal"],
+                    emitted=item["emitted"],
+                    failure_reasons=tuple(
+                        sorted(item["failures"].items())
+                    ),
+                )
+                for item in stats
+            )
+            return SearchResult(
+                candidates=tuple(behavior_pool),
+                callback_candidates=tuple(selected),
+                reports=reports,
+                excluded_fingerprints=excluded,
+                observation_count=len(self.observations),
+                behavior_bins=len(
+                    {candidate.behavior_key for candidate in selected}
+                ),
+                legal_candidates=len(coverage_candidates),
+                draft_candidates=len(draft_pool),
+            )
         protected_reproductions = [
             candidate
             for candidate in filtered

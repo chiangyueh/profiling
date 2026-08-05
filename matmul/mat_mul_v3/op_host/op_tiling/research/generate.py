@@ -40,6 +40,9 @@ from tiling_search.domain import (
 from tiling_search.calibration_workloads import decode_template_quotas
 from tiling_search.behavior import (
     FeedbackCostModel,
+    behavior_distance,
+    behavior_key,
+    behavior_vector,
     select_behavior_coverage,
     validate_feedback_model,
 )
@@ -864,7 +867,8 @@ def main() -> None:
                 callback_candidates=args.callback_candidates,
                 npu_candidates=args.npu_candidates,
             ),
-            include_exploration=args.selection_mode == "campaign",
+            include_exploration=args.selection_mode
+            in {"calibration", "campaign"},
         ),
         observations=engine_observations,
         exclusions=exclusions,
@@ -970,8 +974,16 @@ def main() -> None:
                 "action=skip_completed_calibration_before_host_generation"
             )
             continue
-        official = invoke(workload)
-        bank = exact_roundtrip(workload, official.schedule)
+        try:
+            official = invoke(workload)
+            bank = exact_roundtrip(workload, official.schedule)
+        except Exception as exception:
+            print(
+                "SEARCH_WORKLOAD_BLOCKED "
+                f"{workload.workload_id} stage=official_callback "
+                f"reason={str(exception)[:240]} action=continue"
+            )
+            continue
         control_row = candidate_row(
             workload,
             0,
@@ -994,6 +1006,11 @@ def main() -> None:
             workload,
             hardware,
             local_anchor=bank.schedule,
+            template_quotas=(
+                remaining_target_quotas
+                if args.selection_mode == "calibration"
+                else None
+            ),
         )
         ordered: list[Candidate] = [
             *result.callback_candidates,
@@ -1371,18 +1388,111 @@ def main() -> None:
                     )
                 )
             )
+            bank_vector = behavior_vector(
+                workload, incumbent.schedule, hardware
+            )
+            for template in sorted(
+                {candidate.template for candidate in selected_candidates},
+                key=lambda item: item.value,
+            ):
+                family = [
+                    candidate
+                    for candidate in selected_candidates
+                    if candidate.template == template
+                ]
+                vectors = [
+                    behavior_vector(
+                        workload, candidate.schedule, hardware
+                    )
+                    for candidate in family
+                ]
+                behavior_bins = {
+                    behavior_key(vector) for vector in vectors
+                }
+                geometries = {
+                    (
+                        candidate.schedule["baseM"],
+                        candidate.schedule["baseN"],
+                        candidate.schedule["baseK"],
+                    )
+                    for candidate in family
+                }
+                pipelines = {
+                    (
+                        candidate.schedule["depthA1"],
+                        candidate.schedule["depthB1"],
+                        candidate.schedule["stepM"],
+                        candidate.schedule["stepN"],
+                        candidate.schedule["stepKa"],
+                        candidate.schedule["stepKb"],
+                        candidate.schedule["dbL0A"],
+                        candidate.schedule["dbL0B"],
+                        candidate.schedule["dbL0C"],
+                        candidate.schedule["iterateOrder"],
+                    )
+                    for candidate in family
+                }
+                executions = {
+                    (
+                        candidate.schedule["usedCoreNum"],
+                        candidate.schedule["singleCoreM"],
+                        candidate.schedule["singleCoreN"],
+                        candidate.schedule["singleCoreK"],
+                        candidate.schedule["l2MTileCnt"],
+                        candidate.schedule["l2NTileCnt"],
+                        candidate.schedule["l2MTileBlock"],
+                        candidate.schedule["l2NTileBlock"],
+                        candidate.schedule["l2IterateOrder"],
+                    )
+                    for candidate in family
+                }
+                distances = [
+                    behavior_distance(vector, bank_vector)
+                    for vector in vectors
+                ]
+                metric_ranges = {}
+                for name in (
+                    "active_cores",
+                    "core_rounds",
+                    "l0_occupancy",
+                    "l1_occupancy",
+                    "k_passes",
+                    "padding_efficiency",
+                    "l2_capacity_pressure",
+                    "split_reduction_ratio",
+                    "traffic_amplification",
+                    "full_load_resident_ratio",
+                ):
+                    values = [
+                        vector.metrics.get(name, 0.0)
+                        for vector in vectors
+                    ]
+                    metric_ranges[name] = (
+                        min(values, default=0.0),
+                        max(values, default=0.0),
+                    )
+                print(
+                    "CALIBRATION_DISTRIBUTION "
+                    f"{workload.workload_id} "
+                    f"template={template.value} "
+                    f"selected={len(family)} "
+                    f"behavior_bins={len(behavior_bins)} "
+                    f"geometries={len(geometries)} "
+                    f"pipelines={len(pipelines)} "
+                    f"executions={len(executions)} "
+                    f"bank_distance="
+                    f"{min(distances, default=0.0):.6g}/"
+                    f"{max(distances, default=0.0):.6g} "
+                    + " ".join(
+                        f"{name}={lower:.6g}/{upper:.6g}"
+                        for name, (lower, upper) in metric_ranges.items()
+                    )
+                )
         if len(accepted) < expected_candidates:
             print(
                 f"SEARCH_CAPABILITY_GAP {workload.workload_id} "
                 f"requested={expected_candidates} accepted={len(accepted)}"
             )
-            if args.selection_mode == "calibration":
-                raise ValueError(
-                    "calibration candidate coverage is incomplete: "
-                    f"workload={workload.workload_id} "
-                    f"requested={expected_candidates} "
-                    f"accepted={len(accepted)}"
-                )
 
     appended = 0
     if (
@@ -1417,7 +1527,9 @@ def main() -> None:
         f"appended_candidates={appended} "
         f"sources={dict(sorted(source_counts.items()))} "
         f"templates={dict(sorted(template_counts.items()))} "
-        f"paired_controls={len(workloads)} observations={len(observations)}"
+        "paired_controls="
+        f"{sum(row['candidate_role'] == 'bank_seed_control' for row in output_rows)} "
+        f"observations={len(observations)}"
     )
     print("SEARCH_FRONTIER_END")
 

@@ -6,6 +6,7 @@ import sys
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 
 RESEARCH = Path(__file__).resolve().parents[1]
@@ -36,6 +37,18 @@ class ProfileIdentityTest(unittest.TestCase):
     def test_runtime_kb_input_is_exactly_183_bytes(self) -> None:
         info = PROFILE.make_info(self.row)
         self.assertEqual(len(PROFILE.pack_info(info)), 183)
+
+    def test_runner_exception_is_isolated_as_failed_measurement(self) -> None:
+        with patch.object(
+            PROFILE,
+            "run_runner",
+            side_effect=PROFILE.ProfileError("isolated probe failure"),
+        ):
+            result = PROFILE.safe_run_runner()
+        self.assertEqual(result["success"], "0")
+        self.assertEqual(result["preflight_passed"], "0")
+        self.assertEqual(result["preflight_mode"], "runner_exception")
+        self.assertIn("isolated probe failure", result["error"])
 
     def test_resume_identity_covers_runtime_shape_role_and_schedule(self) -> None:
         base = PROFILE.measurement_key(

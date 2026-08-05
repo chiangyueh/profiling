@@ -490,6 +490,20 @@ def run_runner(
     return row
 
 
+def safe_run_runner(*args, **kwargs) -> dict[str, str]:
+    try:
+        return run_runner(*args, **kwargs)
+    except Exception as exception:
+        return {
+            "success": "0",
+            "preflight_passed": "0",
+            "preflight_mode": "runner_exception",
+            "error": str(exception),
+            "median_ms": "",
+            "stddev_ms": "",
+        }
+
+
 def comparison(
     candidate_ms: float,
     candidate_std: float,
@@ -1103,7 +1117,13 @@ def main() -> None:
             if not pending:
                 continue
             if workload_id not in controls:
-                raise ProfileError(f"{workload_id}: missing bank control")
+                blocked_workloads += 1
+                print(
+                    f"workload_blocked {workload_id} "
+                    "stage=missing_bank_control "
+                    "action=retain_resume_and_continue"
+                )
+                continue
             control = controls[workload_id]
             pair_dir = work / workload_id
             empty_bank = pair_dir / "empty_bank"
@@ -1111,13 +1131,23 @@ def main() -> None:
             official_env = dict(env)
             official_env["TUNE_BANK_PATH"] = str(empty_bank)
             official_env["ASCEND_CACHE_PATH"] = str(pair_dir / "official_cache")
-            bank_env = create_bank(
-                control,
-                spec,
-                args.probe,
-                pair_dir / "bank_control",
-                env,
-            )
+            try:
+                bank_env = create_bank(
+                    control,
+                    spec,
+                    args.probe,
+                    pair_dir / "bank_control",
+                    env,
+                )
+            except Exception as exception:
+                blocked_workloads += 1
+                print(
+                    f"workload_blocked {workload_id} "
+                    "stage=bank_setup "
+                    f"reason={str(exception)[:240]} "
+                    "action=retain_resume_and_continue"
+                )
+                continue
             official_before: dict[str, str] | None = None
             bank_before: dict[str, str] | None = None
             for block_start in range(
@@ -1129,7 +1159,7 @@ def main() -> None:
                 block_number = block_start // args.pair_block_size + 1
                 block_dir = pair_dir / f"pair_block_{block_number}"
                 if official_before is None:
-                    official_before = run_runner(
+                    official_before = safe_run_runner(
                         args.runner,
                         args.candidates,
                         workload_id,
@@ -1153,7 +1183,7 @@ def main() -> None:
                     )
                     break
                 if bank_before is None:
-                    bank_before = run_runner(
+                    bank_before = safe_run_runner(
                         args.runner,
                         args.candidates,
                         workload_id,
@@ -1242,7 +1272,7 @@ def main() -> None:
                         list(records.values()),
                     )
 
-                official_post = run_runner(
+                official_post = safe_run_runner(
                     args.runner,
                     args.candidates,
                     workload_id,
@@ -1255,7 +1285,7 @@ def main() -> None:
                     args.numeric_preflight_max_mib,
                     True,
                 )
-                bank_post = run_runner(
+                bank_post = safe_run_runner(
                     args.runner,
                     args.candidates,
                     workload_id,

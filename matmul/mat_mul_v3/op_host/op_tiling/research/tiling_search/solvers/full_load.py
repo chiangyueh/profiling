@@ -25,6 +25,19 @@ from .common import (
 )
 
 
+def _capacity_fraction_values(maximum: int) -> tuple[int, ...]:
+    values = (
+        maximum * numerator // denominator // 16 * 16
+        for numerator, denominator in (
+            (1, 1),
+            (3, 4),
+            (1, 2),
+            (1, 4),
+        )
+    )
+    return tuple(dict.fromkeys(value for value in values if value >= 16))
+
+
 class Al1FullLoadSolver:
     template = Template.AL1_FULL_LOAD
     source = "contract_global"
@@ -190,13 +203,7 @@ class Bl1FullLoadSolver:
                 // 16
                 * 16,
             )
-            base_m_values = tuple(
-                dict.fromkeys(
-                    value // 16 * 16
-                    for value in (max_base_m, max_base_m // 2)
-                    if value >= 16
-                )
-            )
+            base_m_values = _capacity_fraction_values(max_base_m)
             for fix_base_m in base_m_values:
                 l0c_base_n = (
                     hardware.l0c_bytes
@@ -205,16 +212,7 @@ class Bl1FullLoadSolver:
                     * 16
                 )
                 capped_base_n = min(max_base_n, l0c_base_n)
-                base_n_values = tuple(
-                    dict.fromkeys(
-                        value // 16 * 16
-                        for value in (
-                            capped_base_n,
-                            capped_base_n // 2,
-                        )
-                        if value >= 16
-                    )
-                )
+                base_n_values = _capacity_fraction_values(capped_base_n)
                 for fix_base_n in base_n_values:
                     step_n = ceil_div(workload.n, fix_base_n)
                     step_k = ceil_div(workload.k, fix_base_k)
@@ -226,31 +224,37 @@ class Bl1FullLoadSolver:
                     for fix, mode in ((1, 1020), (2, 2020)):
                         if not bl1_fix_mode_supported(workload, fix):
                             continue
-                        yield make_schedule(
-                            usedCoreNum=max(1, cores),
-                            singleCoreM=fix_base_m,
-                            singleCoreN=align_up(workload.n, 16),
-                            singleCoreK=workload.k,
-                            baseM=fix_base_m,
-                            baseN=fix_base_n,
-                            baseK=fix_base_k,
-                            depthA1=step_k,
-                            depthB1=step_n * step_k,
-                            stepM=1,
-                            stepN=step_n,
-                            iterateOrder=0,
-                            stepKa=step_k,
-                            stepKb=step_k,
-                            dbL0A=2,
-                            dbL0B=2,
-                            dbL0C=1,
-                            l2MTileCnt=1,
-                            l2NTileCnt=1,
-                            l2MTileBlock=0,
-                            l2NTileBlock=0,
-                            l2IterateOrder=0,
-                            tilingEnable=mode,
-                        )
+                        for a_depth_factor in (1, 2):
+                            for b_depth_factor in (1, 2):
+                                yield make_schedule(
+                                    usedCoreNum=max(1, cores),
+                                    singleCoreM=fix_base_m,
+                                    singleCoreN=align_up(workload.n, 16),
+                                    singleCoreK=workload.k,
+                                    baseM=fix_base_m,
+                                    baseN=fix_base_n,
+                                    baseK=fix_base_k,
+                                    depthA1=step_k * a_depth_factor,
+                                    depthB1=(
+                                        step_n
+                                        * step_k
+                                        * b_depth_factor
+                                    ),
+                                    stepM=1,
+                                    stepN=step_n,
+                                    iterateOrder=0,
+                                    stepKa=step_k,
+                                    stepKb=step_k,
+                                    dbL0A=2,
+                                    dbL0B=2,
+                                    dbL0C=1,
+                                    l2MTileCnt=1,
+                                    l2NTileCnt=1,
+                                    l2MTileBlock=0,
+                                    l2NTileBlock=0,
+                                    l2IterateOrder=0,
+                                    tilingEnable=mode,
+                                )
 
         n_alignment = 16 if workload.trans_b else 32 // in_bytes
         for index, (

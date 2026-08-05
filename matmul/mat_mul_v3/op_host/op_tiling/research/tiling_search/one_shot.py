@@ -4,7 +4,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass
 from statistics import median
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from .behavior import (
     BehaviorVector,
@@ -12,7 +12,6 @@ from .behavior import (
     behavior_distance,
     behavior_key,
     behavior_vector,
-    workload_distance,
 )
 from .bank_structure import (
     BankTransition,
@@ -164,18 +163,63 @@ def _effect_vector_distance(left: _EffectRow, right: _EffectRow) -> float:
     ) / max(1, len(left_delta))
 
 
+def _relative_compatibility_distance(
+    target: _EffectRow,
+    row: _EffectRow,
+) -> float:
+    """Penalize, rather than discard, neighboring workload evidence."""
+
+    target_workload = target.observation.workload
+    row_workload = row.observation.workload
+    categorical = (
+        (0.0 if target_workload.dtype == row_workload.dtype else 0.80)
+        + (
+            0.0
+            if target_workload.trans_a == row_workload.trans_a
+            else 0.30
+        )
+        + (
+            0.0
+            if target_workload.trans_b == row_workload.trans_b
+            else 0.30
+        )
+        + (
+            0.0
+            if template_of(target.observation.bank_schedule)
+            == template_of(row.observation.bank_schedule)
+            else 0.90
+        )
+    )
+    shape = math.sqrt(
+        sum(
+            (
+                math.log2(max(1, left))
+                - math.log2(max(1, right))
+            )
+            ** 2
+            for left, right in (
+                (target_workload.m, row_workload.m),
+                (target_workload.n, row_workload.n),
+                (target_workload.k, row_workload.k),
+            )
+        )
+    ) / 4.0
+    return categorical + shape
+
+
 def _bank_relative_distance(target: _EffectRow, row: _EffectRow) -> float:
     return (
-        workload_distance(
-            target.observation.workload,
-            row.observation.workload,
+        _relative_compatibility_distance(target, row)
+        + 0.30
+        * math.dist(
+            target.candidate_vector.values,
+            row.candidate_vector.values,
         )
-        + 0.45
-        * behavior_distance(
-            target.candidate_vector, row.candidate_vector
+        + 0.30
+        * math.dist(
+            target.bank_vector.values,
+            row.bank_vector.values,
         )
-        + 0.45
-        * behavior_distance(target.bank_vector, row.bank_vector)
         + 0.60
         * _effect_mask_distance(
             target.changed_fields, row.changed_fields
@@ -308,7 +352,6 @@ class BankRelativeEffectModel:
             changed_fields=_changed_fields(bank, candidate),
             transition=bank_transition(bank, candidate),
         )
-        bank_template = template_of(bank)
         candidate_template = template_of(candidate)
         nearest_by_workload: dict[
             tuple[int, int, int, str, bool, bool, int],
@@ -320,11 +363,8 @@ class BankRelativeEffectModel:
             if identity == exclude_workload:
                 continue
             if (
-                observation.workload.dtype != workload.dtype
-                or observation.workload.trans_a != workload.trans_a
-                or observation.workload.trans_b != workload.trans_b
-                or template_of(observation.bank_schedule) != bank_template
-                or template_of(observation.schedule) != candidate_template
+                template_of(observation.schedule)
+                != candidate_template
             ):
                 continue
             distance = _bank_relative_distance(target, row)
@@ -426,7 +466,6 @@ class BankRelativeSafetyModel:
             changed_fields=_changed_fields(bank, candidate),
             transition=bank_transition(bank, candidate),
         )
-        bank_template = template_of(bank)
         candidate_template = template_of(candidate)
         nearest_by_workload = {}
         for row in self.rows:
@@ -435,11 +474,8 @@ class BankRelativeSafetyModel:
             if identity == exclude_workload:
                 continue
             if (
-                observation.workload.dtype != workload.dtype
-                or observation.workload.trans_a != workload.trans_a
-                or observation.workload.trans_b != workload.trans_b
-                or template_of(observation.bank_schedule) != bank_template
-                or template_of(observation.schedule) != candidate_template
+                template_of(observation.schedule)
+                != candidate_template
             ):
                 continue
             distance = _bank_relative_distance(target, row)
@@ -713,6 +749,101 @@ def _template_evidence_order(item) -> tuple:
     )
 
 
+def _quota_calibration_candidates(
+    workload: Workload,
+    candidates: Sequence[Candidate],
+    incumbent: Candidate,
+    hardware: Hardware,
+    budget: int,
+    template_quotas: Mapping[Template, int],
+) -> list[Candidate]:
+    required = sum(template_quotas.values())
+    if required > budget:
+        raise ValueError(
+            "template calibration quota exceeds NPU budget: "
+            f"required={required} budget={budget}"
+        )
+    unique = {
+        candidate.schedule.signature(): candidate
+        for candidate in candidates
+        if candidate.schedule.signature()
+        != incumbent.schedule.signature()
+    }
+    selected: list[Candidate] = []
+    selected_signatures: set[tuple[int, ...]] = set()
+    for template, quota in sorted(
+        template_quotas.items(), key=lambda item: item[0].value
+    ):
+        family = [
+            candidate
+            for candidate in unique.values()
+            if candidate.template == template
+        ]
+        if len(family) < quota:
+            raise ValueError(
+                "template calibration callback coverage is incomplete: "
+                f"workload={workload.workload_id} "
+                f"template={template.value} "
+                f"required={quota} callback_accepted={len(family)}"
+            )
+        chosen = _farthest_first(
+            workload,
+            family,
+            incumbent.schedule,
+            hardware,
+            quota,
+        )
+        selected.extend(chosen)
+        selected_signatures.update(
+            candidate.schedule.signature() for candidate in chosen
+        )
+
+    remaining = [
+        candidate
+        for candidate in unique.values()
+        if candidate.schedule.signature() not in selected_signatures
+    ]
+    same_template = [
+        candidate
+        for candidate in remaining
+        if candidate.template == incumbent.template
+    ]
+    selected.extend(
+        _farthest_first(
+            workload,
+            same_template,
+            incumbent.schedule,
+            hardware,
+            budget - len(selected),
+        )
+    )
+    selected_signatures.update(
+        candidate.schedule.signature() for candidate in selected
+    )
+    if len(selected) < budget:
+        selected.extend(
+            _farthest_first(
+                workload,
+                [
+                    candidate
+                    for candidate in remaining
+                    if candidate.schedule.signature()
+                    not in selected_signatures
+                ],
+                incumbent.schedule,
+                hardware,
+                budget - len(selected),
+            )
+        )
+    if len(selected) < budget:
+        raise ValueError(
+            "template calibration has insufficient callback-accepted "
+            f"candidates: workload={workload.workload_id} "
+            f"required={budget} selected={len(selected)}"
+        )
+    return selected[:budget]
+
+
 def select_calibration_candidates(
     workload: Workload,
     candidates: Iterable[Candidate],
@@ -720,13 +851,95 @@ def select_calibration_candidates(
     observations: Sequence[MeasuredObservation],
     hardware: Hardware,
     budget: int,
+    template_quotas: Mapping[Template, int] | None = None,
 ) -> list[Candidate]:
     """Choose controlled bank-relative effects for one calibration run."""
+
+    candidate_list = list(candidates)
+    if template_quotas is not None:
+        selected = _quota_calibration_candidates(
+            workload,
+            candidate_list,
+            incumbent,
+            hardware,
+            budget,
+            template_quotas,
+        )
+        model = FeedbackCostModel(observations, hardware)
+        result = []
+        target_templates = set(template_quotas)
+        for candidate in selected:
+            vector = behavior_vector(
+                workload, candidate.schedule, hardware
+            )
+            runtime = model.predict(
+                workload,
+                vector,
+                exclude_workload=workload.identity(),
+            )
+            changed = _changed_fields(
+                incumbent.schedule, candidate.schedule
+            )
+            template_switch = candidate.template != incumbent.template
+            vector.metrics.update(
+                {
+                    "bank_changed_fields": float(len(changed)),
+                    "bank_template_switch": float(template_switch),
+                    "bank_behavior_distance": behavior_distance(
+                        vector,
+                        behavior_vector(
+                            workload, incumbent.schedule, hardware
+                        ),
+                    ),
+                    "runtime_risk_score": runtime.runtime_risk_score,
+                    "runtime_risk_support": runtime.runtime_risk_support,
+                    "calibration_target_template": float(
+                        candidate.template in target_templates
+                    ),
+                    "calibration_target_quota": float(
+                        template_quotas.get(candidate.template, 0)
+                    ),
+                }
+            )
+            result.append(
+                Candidate(
+                    schedule=candidate.schedule,
+                    template=candidate.template,
+                    source=(
+                        "calibration_template_probe"
+                        if template_switch
+                        else (
+                            "calibration_local_counterfactual"
+                            if candidate.source == "local_bank_anchor"
+                            else "calibration_coupled_counterfactual"
+                        )
+                    ),
+                    rationale=(
+                        "paired quota-controlled template calibration; "
+                        f"generator={candidate.source}; target="
+                        f"{int(candidate.template in target_templates)}; "
+                        "changed="
+                        + ",".join(
+                            KNOWLEDGE_FIELDS[index]
+                            for index in sorted(changed)
+                        )
+                    ),
+                    acquisition=-vector.metrics[
+                        "bank_behavior_distance"
+                    ],
+                    parent_signatures=(
+                        incumbent.schedule.signature(),
+                    ),
+                    behavior_key=behavior_key(vector),
+                    metrics=dict(vector.metrics),
+                )
+            )
+        return result
 
     model = FeedbackCostModel(observations, hardware)
     rated: list[tuple[float, Candidate]] = []
     seen: set[tuple[int, ...]] = set()
-    for candidate in candidates:
+    for candidate in candidate_list:
         if (
             candidate.schedule.signature()
             == incumbent.schedule.signature()

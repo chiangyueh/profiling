@@ -31,7 +31,13 @@ from tiling_search import (
     validate_bank_relative_selector,
 )
 from tiling_search.contracts import template_of
-from tiling_search.domain import KNOWLEDGE_FIELDS, Candidate, Schedule
+from tiling_search.domain import (
+    KNOWLEDGE_FIELDS,
+    Candidate,
+    Schedule,
+    Template,
+)
+from tiling_search.calibration_workloads import decode_template_quotas
 from tiling_search.behavior import (
     FeedbackCostModel,
     select_behavior_coverage,
@@ -132,6 +138,123 @@ def load_workloads(path: Path, aic_cores: int) -> list[Workload]:
             )
         )
     return workloads
+
+
+def load_calibration_quotas(
+    path: Path,
+) -> dict[str, dict[Template, int]]:
+    with path.open(newline="", encoding="utf-8") as source:
+        rows = list(csv.DictReader(source))
+    return {
+        row.get("workload_id") or row["id"]: decode_template_quotas(
+            row.get("template_quotas", "")
+        )
+        for row in rows
+        if row.get("template_quotas")
+    }
+
+
+def load_strict_paired_template_counts(
+    paths: list[Path],
+    soc: str,
+    aic_cores: int,
+    toolkit: str | None,
+) -> Counter[tuple[str, Template]]:
+    counts: Counter[tuple[str, Template]] = Counter()
+    seen: set[tuple[str, tuple[int, ...]]] = set()
+    for path in paths:
+        if not path.is_file():
+            continue
+        with path.open(newline="", encoding="utf-8") as source:
+            rows = csv.DictReader(source)
+            for row in rows:
+                if (
+                    row.get("candidate_role") != "searched"
+                    or row.get("soc") != soc
+                    or int(row.get("aic") or 0) != aic_cores
+                    or (
+                        toolkit is not None
+                        and row.get("toolkit") != toolkit
+                    )
+                    or not truthy(row.get("success"))
+                    or not truthy(row.get("pair_validated"))
+                    or row.get("preflight_mode")
+                    not in STRICT_NUMERIC_PREFLIGHT_MODES
+                    or not row.get("official_ms")
+                    or not row.get("bank_ms")
+                ):
+                    continue
+                schedule = optional_schedule(
+                    row.get("tiling_signature")
+                )
+                workload_id = row.get("workload_id", "")
+                if schedule is None or not workload_id:
+                    continue
+                identity = (workload_id, schedule.signature())
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                counts[(workload_id, template_of(schedule))] += 1
+    return counts
+
+
+def load_retryable_unpaired_fingerprints(
+    paths: list[Path],
+    workload_ids: set[str],
+    soc: str,
+    aic_cores: int,
+    toolkit: str | None,
+) -> set[tuple]:
+    """Return executable calibration fingerprints that still need pairing."""
+
+    unpaired: set[tuple] = set()
+    completed: set[tuple] = set()
+    for path in paths:
+        if not path.is_file():
+            continue
+        with path.open(newline="", encoding="utf-8") as source:
+            rows = csv.DictReader(source)
+            for row in rows:
+                if (
+                    row.get("candidate_role") != "searched"
+                    or row.get("workload_id") not in workload_ids
+                    or row.get("soc") != soc
+                    or int(row.get("aic") or 0) != aic_cores
+                    or (
+                        toolkit is not None
+                        and row.get("toolkit") != toolkit
+                    )
+                    or not truthy(row.get("success"))
+                    or row.get("preflight_mode")
+                    not in STRICT_NUMERIC_PREFLIGHT_MODES
+                ):
+                    continue
+                try:
+                    workload = Workload(
+                        workload_id=row["workload_id"],
+                        m=int(row["m"]),
+                        n=int(row["n"]),
+                        k=int(row["k"]),
+                        dtype=row["dtype"],
+                        trans_a=truthy(row.get("trans_a")),
+                        trans_b=truthy(row.get("trans_b")),
+                        max_cores=aic_cores,
+                    )
+                    schedule = Schedule.from_signature(
+                        row["tiling_signature"]
+                    )
+                except (KeyError, ValueError):
+                    continue
+                item = fingerprint(workload, schedule)
+                if (
+                    truthy(row.get("pair_validated"))
+                    and row.get("official_ms")
+                    and row.get("bank_ms")
+                ):
+                    completed.add(item)
+                else:
+                    unpaired.add(item)
+    return unpaired - completed
 
 
 def merge_candidate_rows(
@@ -556,15 +679,37 @@ def main() -> None:
         hbm_bytes_per_cycle_per_core=args.hbm_bpc,
     )
     workloads = load_workloads(args.workloads, args.aic_cores)
+    calibration_quotas = (
+        load_calibration_quotas(args.workloads)
+        if args.selection_mode == "calibration"
+        else {}
+    )
     if args.workload_limit > 0:
         workloads = workloads[: args.workload_limit]
+    if args.selection_mode == "calibration":
+        missing_quotas = [
+            workload.workload_id
+            for workload in workloads
+            if workload.workload_id not in calibration_quotas
+        ]
+        if missing_quotas:
+            raise ValueError(
+                "template calibration requires an explicit non-legacy "
+                "template quota for every workload: "
+                + ",".join(missing_quotas)
+            )
     observations, exclusions = load_feedback(
         soc=args.soc,
         aic_cores=args.aic_cores,
         observation_paths=args.observations,
         exclusion_paths=args.exclusions,
     )
-    resume_completed: set[tuple] = set()
+    strict_paired_counts = load_strict_paired_template_counts(
+        args.resume_feedback,
+        args.soc,
+        args.aic_cores,
+        args.toolkit,
+    )
     unpaired_one_shot: dict[
         tuple[int, int, int, str, bool, bool, int],
         Schedule,
@@ -586,7 +731,19 @@ def main() -> None:
         )
         observations.extend(resume_observations)
         exclusions.update(resume_exclusions)
-        resume_completed.update(resume_exclusions)
+    if args.selection_mode == "calibration":
+        retryable_unpaired = load_retryable_unpaired_fingerprints(
+            args.resume_feedback,
+            set(calibration_quotas),
+            args.soc,
+            args.aic_cores,
+            args.toolkit,
+        )
+        exclusions.difference_update(retryable_unpaired)
+        print(
+            "CALIBRATION_RETRYABLE_UNPAIRED "
+            f"fingerprints={len(retryable_unpaired)}"
+        )
     if args.selection_mode == "one-shot":
         # A deployment decision must not learn from an earlier measurement of
         # the target shape. This also makes a resumed run regenerate the same
@@ -747,12 +904,34 @@ def main() -> None:
     template_counts: Counter[str] = Counter()
     print("SEARCH_FRONTIER_BEGIN")
     for workload in workloads:
+        completed_by_template = {
+            template: strict_paired_counts[
+                (workload.workload_id, template)
+            ]
+            for template in Template
+        }
         calibration_completed = sum(
-            item[:6] == workload.identity()[:6]
-            for item in resume_completed
+            completed_by_template.values()
         )
-        calibration_budget = max(
-            0, args.npu_candidates - calibration_completed
+        target_quotas = calibration_quotas.get(
+            workload.workload_id
+        )
+        remaining_target_quotas = (
+            {
+                template: max(
+                    0,
+                    quota - completed_by_template[template],
+                )
+                for template, quota in target_quotas.items()
+                if quota > completed_by_template[template]
+            }
+            if target_quotas is not None
+            else None
+        )
+        calibration_budget = (
+            sum(remaining_target_quotas.values())
+            if remaining_target_quotas is not None
+            else max(0, args.npu_candidates - calibration_completed)
         )
         if (
             args.selection_mode == "calibration"
@@ -766,6 +945,8 @@ def main() -> None:
                 f"trans={int(workload.trans_a)}"
                 f"{int(workload.trans_b)} selected=0 "
                 f"resume_completed={calibration_completed} "
+                "target_quotas="
+                f"{target_quotas or {}} "
                 "action=skip_completed_calibration_before_host_generation"
             )
             continue
@@ -959,6 +1140,7 @@ def main() -> None:
                 observations,
                 hardware,
                 calibration_budget,
+                template_quotas=remaining_target_quotas,
             )
             racing_plan = None
         elif args.search_stage == "stage2":
@@ -1127,6 +1309,10 @@ def main() -> None:
             expected_candidates = racing_plan.budget
         else:
             expected_candidates = calibration_budget
+            selected_templates = Counter(
+                candidate.template.value
+                for candidate in selected_candidates
+            )
             local = sum(
                 candidate.source
                 == "calibration_local_counterfactual"
@@ -1145,13 +1331,38 @@ def main() -> None:
                 "coupled="
                 f"{len(accepted) - local - template_probes} "
                 f"template_probes={template_probes} "
-                f"bank_template={incumbent.template.value}"
+                f"bank_template={incumbent.template.value} "
+                "target_quotas="
+                + (
+                    ",".join(
+                        f"{template.value}:{quota}"
+                        for template, quota in sorted(
+                            (target_quotas or {}).items(),
+                            key=lambda item: item[0].value,
+                        )
+                    )
+                    or "none"
+                )
+                + " selected_templates="
+                + ",".join(
+                    f"{template}:{count}"
+                    for template, count in sorted(
+                        selected_templates.items()
+                    )
+                )
             )
         if len(accepted) < expected_candidates:
             print(
                 f"SEARCH_CAPABILITY_GAP {workload.workload_id} "
                 f"requested={expected_candidates} accepted={len(accepted)}"
             )
+            if args.selection_mode == "calibration":
+                raise ValueError(
+                    "calibration candidate coverage is incomplete: "
+                    f"workload={workload.workload_id} "
+                    f"requested={expected_candidates} "
+                    f"accepted={len(accepted)}"
+                )
 
     appended = 0
     if (

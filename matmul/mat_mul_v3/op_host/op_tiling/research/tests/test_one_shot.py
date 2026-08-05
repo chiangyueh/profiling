@@ -9,9 +9,16 @@ RESEARCH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RESEARCH))
 
 from tiling_search.behavior import FeedbackPrediction
+from tiling_search.calibration_workloads import (
+    generate_template_calibration_workloads,
+)
 from tiling_search.bank_structure import (
     bank_transition,
     schedules_execution_equivalent,
+)
+from tiling_search.contracts import (
+    common_hardware_contract,
+    template_kernel_contract,
 )
 from tiling_search.domain import (
     Candidate,
@@ -25,6 +32,7 @@ from tiling_search.families import classify_workload
 from tiling_search.one_shot import (
     BankRelativeEffectModel,
     BankRelativePrediction,
+    BankRelativeSafetyModel,
     BankRelativeSafetyPrediction,
     select_calibration_candidates,
     select_one_shot_candidate,
@@ -32,6 +40,7 @@ from tiling_search.one_shot import (
 )
 from tiling_search.behavior import behavior_vector
 from tiling_search.template_competition import compare_templates
+from tiling_search.solvers import Al1FullLoadSolver
 
 
 class _RuntimeModel:
@@ -466,6 +475,173 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(
             decision.deployment_candidate.schedule, self.custom.schedule
+        )
+        self.assertGreaterEqual(
+            decision.candidate.metrics["bank_relative_samples"], 3
+        )
+
+    def test_relative_models_pool_neighbor_layouts_but_not_templates(
+        self,
+    ) -> None:
+        evidence = []
+        layouts = ((False, True), (True, False), (True, True))
+        for index, (trans_a, trans_b) in enumerate(layouts):
+            workload = Workload(
+                workload_id=f"neighbor_layout_{index}",
+                m=3968 + index * 16,
+                n=128,
+                k=16384,
+                dtype="fp16",
+                trans_a=trans_a,
+                trans_b=trans_b,
+                max_cores=20,
+            )
+            evidence.append(
+                MeasuredObservation(
+                    workload=workload,
+                    schedule=self.custom.schedule,
+                    ratio_vs_official=0.80,
+                    ratio_vs_bank=0.80,
+                    source="calibration_coupled_counterfactual",
+                    record_id=f"neighbor_layout_{index}",
+                    verified=True,
+                    structured_verified=True,
+                    bank_schedule=self.bank,
+                )
+            )
+        effect = BankRelativeEffectModel(evidence, self.hardware).predict(
+            self.workload,
+            self.bank,
+            self.custom.schedule,
+            self.hardware,
+        )
+        self.assertEqual(effect.samples, 3)
+        self.assertGreaterEqual(effect.support, 0.20)
+        self.assertAlmostEqual(effect.robust_ratio, 0.80)
+
+        rejected = [
+            MeasuredObservation(
+                workload=observation.workload,
+                schedule=observation.schedule,
+                ratio_vs_official=1.0,
+                ratio_vs_bank=1.0,
+                source="runtime_rejected",
+                record_id=observation.record_id,
+                bank_schedule=observation.bank_schedule,
+            )
+            for observation in evidence
+        ]
+        safety = BankRelativeSafetyModel(
+            rejected, self.hardware
+        ).predict(
+            self.workload,
+            self.bank,
+            self.custom.schedule,
+            self.hardware,
+        )
+        self.assertEqual(safety.samples, 3)
+        self.assertEqual(safety.rejected, 3)
+        self.assertGreaterEqual(safety.support, 0.20)
+
+        split = self.custom.schedule.replace(tilingEnable=3)
+        isolated = BankRelativeEffectModel(
+            [
+                MeasuredObservation(
+                    workload=observation.workload,
+                    schedule=split,
+                    ratio_vs_official=0.50,
+                    ratio_vs_bank=0.50,
+                    source="calibration_template_probe",
+                    record_id=observation.record_id,
+                    verified=True,
+                    structured_verified=True,
+                    bank_schedule=self.bank,
+                )
+                for observation in evidence
+            ],
+            self.hardware,
+        ).predict(
+            self.workload,
+            self.bank,
+            self.custom.schedule,
+            self.hardware,
+        )
+        self.assertEqual(isolated.samples, 0)
+
+    def test_paired_full_load_evidence_can_change_one_shot_template(
+        self,
+    ) -> None:
+        workload = generate_template_calibration_workloads(
+            self.hardware
+        )[0].workload
+        bank = Schedule.from_signature(
+            "20:96:128:1024:96:128:128:8:8:1:1:0:"
+            "4:4:2:2:1:1:1:1:41:0:0"
+        )
+        incumbent = Candidate(
+            bank, Template.BASE, "bank_incumbent", "bank"
+        )
+        schedule = next(
+            schedule
+            for schedule in Al1FullLoadSolver().generate(
+                workload, self.hardware, ()
+            )
+            if (
+                schedule["usedCoreNum"] == 20
+                and common_hardware_contract(
+                    workload, schedule, self.hardware
+                ).valid
+                and template_kernel_contract(
+                    workload, schedule, self.hardware
+                ).valid
+            )
+        )
+        candidate = Candidate(
+            schedule,
+            Template.AL1_FULL_LOAD,
+            "contract_global",
+            "independent AL1 solver",
+        )
+        evidence = []
+        for index in range(4):
+            evidence_workload = Workload(
+                workload_id=f"al1_evidence_{index}",
+                m=workload.m,
+                n=workload.n + index * 16,
+                k=workload.k,
+                dtype=workload.dtype,
+                trans_a=workload.trans_a,
+                trans_b=workload.trans_b,
+                max_cores=20,
+            )
+            evidence.append(
+                MeasuredObservation(
+                    workload=evidence_workload,
+                    schedule=schedule,
+                    ratio_vs_official=0.80,
+                    ratio_vs_bank=0.80,
+                    source="calibration_template_probe",
+                    record_id=f"al1_evidence_{index}",
+                    verified=True,
+                    structured_verified=True,
+                    bank_schedule=bank,
+                )
+            )
+        decision = select_one_shot_candidate(
+            workload,
+            [candidate],
+            incumbent,
+            evidence,
+            self.hardware,
+            cost_model=_RuntimeModel(),
+        )
+        self.assertEqual(
+            decision.selection_policy,
+            "paired_control_relative_effect",
+        )
+        self.assertEqual(
+            decision.deployment_candidate.template,
+            Template.AL1_FULL_LOAD,
         )
         self.assertGreaterEqual(
             decision.candidate.metrics["bank_relative_samples"], 3

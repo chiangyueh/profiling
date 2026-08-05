@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESEARCH="${ROOT}/matmul/mat_mul_v3/op_host/op_tiling/research"
 MODE="full"
 WORKLOADS="${RESEARCH}/config/workloads.csv"
-CALIBRATION_WORKLOADS="${RESEARCH}/config/workloads_calibration.csv"
+CALIBRATION_WORKLOADS="${ROOT}/results/npu_v11_template_calibration_workloads.csv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -151,26 +151,26 @@ RUN_LOG="${ROOT}/results/logs/run_npu_${RUN_ID}.log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
 BUILD_DIR="${ROOT}/.build/matmul_v3_tiling_research"
-CANDIDATES="${ROOT}/results/npu_v10_template_risk_search_candidates.csv"
-ALL_CANDIDATES="${ROOT}/results/npu_v10_template_risk_search_all.csv"
-SUMMARY="${ROOT}/results/npu_v10_template_risk_summary.csv"
-FAMILY_SUMMARY="${ROOT}/results/npu_v10_template_risk_family_summary.csv"
-CANDIDATE_RESULTS="${ROOT}/results/npu_v10_template_risk_candidates.csv"
-RESUME="${ROOT}/results/npu_v10_template_risk_resume.csv"
-CALIBRATION_CANDIDATES="${ROOT}/results/npu_calibration_search_candidates.csv"
-CALIBRATION_ALL="${ROOT}/results/npu_calibration_search_all.csv"
-CALIBRATION_SUMMARY="${ROOT}/results/npu_calibration_summary.csv"
-CALIBRATION_FAMILY_SUMMARY="${ROOT}/results/npu_calibration_family_summary.csv"
-CALIBRATION_RESULTS="${ROOT}/results/npu_calibration_candidates.csv"
-CALIBRATION_RESUME="${ROOT}/results/npu_calibration_resume.csv"
+CANDIDATES="${ROOT}/results/npu_v11_template_coverage_search_candidates.csv"
+ALL_CANDIDATES="${ROOT}/results/npu_v11_template_coverage_search_all.csv"
+SUMMARY="${ROOT}/results/npu_v11_template_coverage_summary.csv"
+FAMILY_SUMMARY="${ROOT}/results/npu_v11_template_coverage_family_summary.csv"
+CANDIDATE_RESULTS="${ROOT}/results/npu_v11_template_coverage_candidates.csv"
+RESUME="${ROOT}/results/npu_v11_template_coverage_resume.csv"
+CALIBRATION_CANDIDATES="${ROOT}/results/npu_v11_template_calibration_search_candidates.csv"
+CALIBRATION_ALL="${ROOT}/results/npu_v11_template_calibration_search_all.csv"
+CALIBRATION_SUMMARY="${ROOT}/results/npu_v11_template_calibration_summary.csv"
+CALIBRATION_FAMILY_SUMMARY="${ROOT}/results/npu_v11_template_calibration_family_summary.csv"
+CALIBRATION_RESULTS="${ROOT}/results/npu_v11_template_calibration_candidates.csv"
+CALIBRATION_RESUME="${ROOT}/results/npu_v11_template_calibration_resume.csv"
 PAIRED_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log25_26.csv"
 V9_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log27.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260805-template-competition-v10"
+echo "  script:     run_npu.sh 20260805-complete-template-coverage-v11"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      template_aware_feedback_unseen_one_shot"
+echo "  scope:      complete_template_calibration_then_unseen_one_shot"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  summary:    ${SUMMARY}"
@@ -290,6 +290,17 @@ if [[ "${TOOLKIT_VERSION}" != 8.5* ]]; then
     echo "  compatibility: source baseline is 8.5.0; execution uses installed ${TOOLKIT_VERSION}"
     echo "  compatibility: exact callback roundtrip and RuntimeKb preflight remain mandatory"
 fi
+
+python3 "${RESEARCH}/build_template_calibration.py" \
+    --output "${CALIBRATION_WORKLOADS}" \
+    --aic-cores "${AIC}" \
+    --l0a-bytes "${L0A}" \
+    --l0b-bytes "${L0B}" \
+    --l0c-bytes "${L0C}" \
+    --l1-bytes "${L1}" \
+    --l2-bytes "${L2}" \
+    --l2-bpc "${L2_BPC:-1}" \
+    --hbm-bpc "${HBM_BPC:-1}"
 
 NPU_CANDIDATES=1
 CALIBRATION_NPU_CANDIDATES=16
@@ -419,6 +430,12 @@ if [[ "$(wc -l < "${CALIBRATION_CANDIDATES}")" -gt 1 ]]; then
 else
     echo "  calibration_profile: skipped; tracked paired evidence is complete"
 fi
+python3 "${RESEARCH}/audit_template_calibration.py" \
+    --workloads "${CALIBRATION_WORKLOADS}" \
+    --resume "${CALIBRATION_RESUME}" \
+    --soc "${SOC}" \
+    --aic "${AIC}" \
+    --toolkit "${TOOLKIT_VERSION}"
 echo "  ok"
 
 echo "[4/5] Generate one-shot decisions for unseen workloads ..."

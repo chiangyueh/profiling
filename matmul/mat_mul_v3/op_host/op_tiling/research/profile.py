@@ -1218,9 +1218,9 @@ def main() -> None:
                             "median_ms": "",
                             "stddev_ms": "",
                         }
-                    # Persist exact correctness/executability immediately. If
-                    # the process is interrupted before post controls, this
-                    # fingerprint remains completed but is never rankable.
+                    # Persist exact correctness/executability immediately.
+                    # It is not reusable until post controls validate the
+                    # paired latency, so an interrupted block is remeasured.
                     provisional = profile_record(
                         candidate,
                         measured,

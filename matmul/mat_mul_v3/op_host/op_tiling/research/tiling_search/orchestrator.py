@@ -71,12 +71,12 @@ class CandidateEngine:
                 BaseSolver(),
                 SingleCoreSplitKSolver(),
                 DeterministicSplitKSolver(),
+                Al1FullLoadSolver(),
+                Bl1FullLoadSolver(),
             )
             exploration_solvers = (
                 BaseExplorationSolver(),
                 DeterministicSplitKSolver(explore_low_core=True),
-                Al1FullLoadSolver(),
-                Bl1FullLoadSolver(),
             )
             selected_solvers = (
                 *deployment_solvers,
@@ -252,7 +252,7 @@ class CandidateEngine:
             self.observations,
             hardware,
             budget.callback_candidates,
-            template_probe_floor=3,
+            template_probe_floor=8,
             allow_risky_template_probes=True,
             cost_model=cost_model,
         )
@@ -271,6 +271,31 @@ class CandidateEngine:
             candidate.schedule.signature()
             for candidate in protected_reproductions
         }
+        protected_template_coverage = []
+        for template in sorted(
+            {candidate.template for candidate in filtered}, key=str
+        ):
+            protected_template_coverage.extend(
+                draft_behavior_coverage(
+                    workload,
+                    [
+                        candidate
+                        for candidate in filtered
+                        if (
+                            candidate.template == template
+                            and candidate.schedule.signature()
+                            not in protected_signatures
+                        )
+                    ],
+                    hardware,
+                    8,
+                    representatives_per_bin=1,
+                )
+            )
+        protected_signatures.update(
+            candidate.schedule.signature()
+            for candidate in protected_template_coverage
+        )
         protected_local = [
             candidate
             for candidate in filtered
@@ -317,6 +342,7 @@ class CandidateEngine:
         )
         selected = [
             *protected_reproductions,
+            *protected_template_coverage,
             *protected_feedback,
             *protected_local,
             *protected_policy,

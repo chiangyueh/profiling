@@ -12,7 +12,9 @@ RESEARCH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RESEARCH))
 
 from generate import (
+    load_retryable_unpaired_fingerprints,
     load_resume_feedback,
+    load_strict_paired_template_counts,
     load_unpaired_one_shot_candidates,
     load_workloads,
     merge_candidate_rows,
@@ -226,6 +228,81 @@ class FeedbackCostModelTest(unittest.TestCase):
             self.success_schedule,
         )
         self.assertEqual(completed, {})
+
+    def test_calibration_pairing_counts_unique_schedules_and_retries_drift(
+        self,
+    ) -> None:
+        row = {
+            "candidate_role": "searched",
+            "candidate_source": "calibration_template_probe",
+            "soc": "Ascend910B3",
+            "aic": "20",
+            "toolkit": "8.1.RC1",
+            "workload_id": self.workload.workload_id,
+            "m": str(self.workload.m),
+            "n": str(self.workload.n),
+            "k": str(self.workload.k),
+            "dtype": self.workload.dtype,
+            "trans_a": "0",
+            "trans_b": "0",
+            "tiling_signature": self.success_schedule.signature_text(),
+            "success": "1",
+            "preflight_mode": "numeric_signed_axes_full_v3",
+            "pair_validated": "0",
+            "official_ms": "1",
+            "bank_ms": "1",
+            "record_id": "first",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            unpaired_path = Path(directory) / "unpaired.csv"
+            paired_path = Path(directory) / "paired.csv"
+            with unpaired_path.open(
+                "w", newline="", encoding="utf-8"
+            ) as output:
+                writer = csv.DictWriter(output, fieldnames=tuple(row))
+                writer.writeheader()
+                writer.writerow(row)
+            retryable = load_retryable_unpaired_fingerprints(
+                [unpaired_path],
+                {self.workload.workload_id},
+                "Ascend910B3",
+                20,
+                "8.1.RC1",
+            )
+            self.assertEqual(len(retryable), 1)
+
+            row["pair_validated"] = "1"
+            with paired_path.open(
+                "w", newline="", encoding="utf-8"
+            ) as output:
+                writer = csv.DictWriter(output, fieldnames=tuple(row))
+                writer.writeheader()
+                writer.writerow(row)
+                row["record_id"] = "duplicate-record-id"
+                writer.writerow(row)
+            counts = load_strict_paired_template_counts(
+                [paired_path],
+                "Ascend910B3",
+                20,
+                "8.1.RC1",
+            )
+            self.assertEqual(
+                counts[
+                    (
+                        self.workload.workload_id,
+                        Template.BASE,
+                    )
+                ],
+                1,
+            )
+            retryable = load_retryable_unpaired_fingerprints(
+                [unpaired_path, paired_path],
+                {self.workload.workload_id},
+                "Ascend910B3",
+                20,
+                "8.1.RC1",
+            )
+            self.assertEqual(retryable, set())
 
     def test_output_not_written_becomes_runtime_risk_evidence(
         self,

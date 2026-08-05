@@ -428,7 +428,7 @@ class ContractSearchTest(unittest.TestCase):
             2,
         )
 
-    def test_deployment_engine_excludes_broad_and_full_load_solvers(
+    def test_deployment_engine_keeps_complete_template_solver_set(
         self,
     ) -> None:
         workload = Workload(
@@ -454,22 +454,30 @@ class ContractSearchTest(unittest.TestCase):
             )
         )
         result = engine.generate(workload, self.hardware)
-        allowed_templates = {
+        deployment_templates = {
             Template.BASE,
             Template.SINGLE_CORE_SPLIT_K,
             Template.DETERMINISTIC_SPLIT_K,
+            Template.AL1_FULL_LOAD,
+            Template.BL1_FULL_LOAD,
         }
         self.assertTrue(result.callback_candidates)
-        self.assertLessEqual(
+        self.assertEqual(
             {report.template for report in result.reports},
-            allowed_templates,
+            deployment_templates,
         )
+        # Full-load candidates are absent here because neither operand fits
+        # L1, not because the deployment path omitted their solvers.
         self.assertLessEqual(
             {
                 candidate.template
                 for candidate in result.callback_candidates
             },
-            allowed_templates,
+            {
+                Template.BASE,
+                Template.SINGLE_CORE_SPLIT_K,
+                Template.DETERMINISTIC_SPLIT_K,
+            },
         )
         self.assertEqual(
             {

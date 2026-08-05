@@ -34,6 +34,7 @@ from tiling_search.one_shot import (
     BankRelativePrediction,
     BankRelativeSafetyModel,
     BankRelativeSafetyPrediction,
+    select_adaptive_calibration_candidates,
     select_calibration_candidates,
     select_one_shot_candidate,
     validate_bank_relative_selector,
@@ -130,6 +131,37 @@ class _FalseOptimisticCrossTemplateModel:
             upper_ratio=0.49,
             nearest_distance=0.20,
             support=0.63,
+        )
+
+
+class _AdaptiveEffectModel:
+    def predict(self, workload, bank, candidate, hardware, **_):
+        del workload, bank, candidate, hardware
+        return BankRelativePrediction(
+            samples=6,
+            robust_ratio=0.97,
+            upper_ratio=1.03,
+            nearest_distance=0.25,
+            support=0.70,
+            behavior_samples=18,
+            uncertainty=0.08,
+        )
+
+
+class _AdaptiveSafetyModel:
+    def __init__(self, unsafe_signature=None) -> None:
+        self.unsafe_signature = unsafe_signature
+
+    def predict(self, workload, bank, candidate, hardware, **_):
+        del workload, bank, hardware
+        unsafe = candidate.signature() == self.unsafe_signature
+        return BankRelativeSafetyPrediction(
+            samples=6,
+            rejected=6 if unsafe else 0,
+            risk=0.90 if unsafe else 0.05,
+            nearest_distance=0.20,
+            support=0.80,
+            behavior_samples=18,
         )
 
 
@@ -567,6 +599,194 @@ class OneShotSelectionTest(unittest.TestCase):
             self.hardware,
         )
         self.assertEqual(isolated.samples, 0)
+
+    def test_relative_models_use_multiple_bins_without_double_counting_workloads(
+        self,
+    ) -> None:
+        evidence = []
+        for workload_index in range(2):
+            workload = Workload(
+                workload_id=f"hierarchical_{workload_index}",
+                m=3968 + workload_index * 64,
+                n=128,
+                k=16384,
+                dtype="fp16",
+                trans_a=False,
+                trans_b=False,
+                max_cores=20,
+            )
+            for variant in range(3):
+                schedule = self.custom.schedule.replace(
+                    l2MTileCnt=5 + variant,
+                    l2MTileBlock=3 + variant,
+                )
+                evidence.append(
+                    MeasuredObservation(
+                        workload=workload,
+                        schedule=schedule,
+                        ratio_vs_official=0.80 + 0.02 * variant,
+                        ratio_vs_bank=0.80 + 0.02 * variant,
+                        source="calibration_coupled_counterfactual",
+                        record_id=f"hierarchical_{workload_index}_{variant}",
+                        verified=True,
+                        structured_verified=True,
+                        bank_schedule=self.bank,
+                    )
+                )
+        effect = BankRelativeEffectModel(
+            evidence, self.hardware
+        ).predict(
+            self.workload,
+            self.bank,
+            self.custom.schedule,
+            self.hardware,
+        )
+        self.assertEqual(effect.samples, 2)
+        self.assertGreater(effect.behavior_samples, effect.samples)
+        self.assertTrue(effect.uncertainty < float("inf"))
+
+        rejected = [
+            MeasuredObservation(
+                workload=observation.workload,
+                schedule=observation.schedule,
+                ratio_vs_official=1.0,
+                ratio_vs_bank=1.0,
+                source="runtime_rejected",
+                record_id=observation.record_id,
+                bank_schedule=observation.bank_schedule,
+            )
+            for observation in evidence
+        ]
+        safety = BankRelativeSafetyModel(
+            rejected, self.hardware
+        ).predict(
+            self.workload,
+            self.bank,
+            self.custom.schedule,
+            self.hardware,
+        )
+        self.assertEqual(safety.samples, 2)
+        self.assertGreater(safety.behavior_samples, safety.samples)
+        self.assertGreater(safety.risk, 0.50)
+
+    def test_adaptive_calibration_uses_feedback_and_behavior_quotas(
+        self,
+    ) -> None:
+        candidates = []
+        origins = (
+            ("feedback_winner_transfer", "iterateOrder"),
+            ("feedback_winner_mutation", "l2IterateOrder"),
+            ("contract_coupled_policy", "l2MTileCnt"),
+            ("contract_coupled_policy", "l2NTileCnt"),
+            ("feedback_regression_counterfactual", "baseM"),
+            ("feedback_regression_counterfactual", "baseN"),
+            ("contract_coupled_policy", "depthA1"),
+            ("contract_coupled_policy", "depthB1"),
+            ("contract_coupled_policy", "stepM"),
+            ("contract_coupled_policy", "stepN"),
+            ("contract_coupled_policy", "stepKa"),
+            ("contract_coupled_policy", "stepKb"),
+        )
+        for index, (source, field) in enumerate(origins, 1):
+            schedule = self.bank.replace(
+                **{field: self.bank[field] + index}
+            )
+            candidates.append(
+                Candidate(
+                    schedule=schedule,
+                    template=Template.BASE,
+                    source=source,
+                    rationale=f"adaptive candidate {index}",
+                )
+            )
+        selected = select_adaptive_calibration_candidates(
+            self.workload,
+            [self.incumbent, *candidates],
+            self.incumbent,
+            (),
+            self.hardware,
+            budget=10,
+            cost_model=_RuntimeModel(),
+            effect_model=_AdaptiveEffectModel(),
+            safety_model=_AdaptiveSafetyModel(),
+            observed_bins=frozenset(),
+        )
+        self.assertEqual(len(selected), 10)
+        self.assertNotIn(
+            self.bank.signature(),
+            {candidate.schedule.signature() for candidate in selected},
+        )
+        sources = {candidate.source for candidate in selected}
+        self.assertIn("adaptive_winner_transfer", sources)
+        self.assertIn("adaptive_one_subsystem", sources)
+        self.assertIn("adaptive_regression_boundary", sources)
+        self.assertIn("adaptive_unexplored_behavior", sources)
+
+    def test_safety_model_aggregates_conflicting_bin_evidence(
+        self,
+    ) -> None:
+        success = MeasuredObservation(
+            workload=self.workload,
+            schedule=self.custom.schedule,
+            ratio_vs_official=1.0,
+            ratio_vs_bank=1.0,
+            source="calibration_coupled_counterfactual",
+            record_id="success",
+            verified=True,
+            structured_verified=True,
+            bank_schedule=self.bank,
+        )
+        rejection = MeasuredObservation(
+            workload=self.workload,
+            schedule=self.custom.schedule,
+            ratio_vs_official=1.0,
+            ratio_vs_bank=1.0,
+            source="runtime_rejected",
+            record_id="rejection",
+            bank_schedule=self.bank,
+        )
+        risks = []
+        for evidence in ([success, rejection], [rejection, success]):
+            prediction = BankRelativeSafetyModel(
+                evidence, self.hardware
+            ).predict(
+                self.workload,
+                self.bank,
+                self.custom.schedule,
+                self.hardware,
+            )
+            risks.append(prediction.risk)
+        self.assertEqual(risks[0], risks[1])
+        self.assertAlmostEqual(risks[0], 0.5)
+
+    def test_adaptive_calibration_does_not_spend_budget_on_known_unsafe(
+        self,
+    ) -> None:
+        safe = self.custom
+        unsafe = Candidate(
+            schedule=self.bank.replace(baseM=192),
+            template=Template.BASE,
+            source="feedback_winner_mutation",
+            rationale="known unsafe transition",
+        )
+        selected = select_adaptive_calibration_candidates(
+            self.workload,
+            [safe, unsafe],
+            self.incumbent,
+            (),
+            self.hardware,
+            budget=2,
+            cost_model=_RuntimeModel(),
+            effect_model=_AdaptiveEffectModel(),
+            safety_model=_AdaptiveSafetyModel(
+                unsafe.schedule.signature()
+            ),
+            observed_bins=frozenset(),
+        )
+        self.assertEqual(
+            [candidate.schedule for candidate in selected],
+            [safe.schedule],
+        )
 
     def test_paired_full_load_evidence_can_change_one_shot_template(
         self,

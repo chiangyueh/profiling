@@ -54,6 +54,8 @@ class BankRelativePrediction:
     upper_ratio: float
     nearest_distance: float
     support: float
+    behavior_samples: int = 0
+    uncertainty: float = math.inf
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,7 @@ class BankRelativeSafetyPrediction:
     risk: float
     nearest_distance: float
     support: float
+    behavior_samples: int = 0
 
 
 @dataclass(frozen=True)
@@ -230,6 +233,70 @@ def _bank_relative_distance(target: _EffectRow, row: _EffectRow) -> float:
     )
 
 
+def _weighted_quantile(
+    values: Sequence[tuple[float, float]], quantile: float
+) -> float:
+    ordered = sorted(values)
+    total = sum(weight for _, weight in ordered)
+    if not ordered or total <= 0:
+        return 0.0
+    threshold = max(0.0, min(1.0, quantile)) * total
+    cumulative = 0.0
+    for value, weight in ordered:
+        cumulative += weight
+        if cumulative >= threshold:
+            return value
+    return ordered[-1][0]
+
+
+def _hierarchical_bins(
+    target: _EffectRow,
+    rows: Sequence[_EffectRow],
+    *,
+    limit_per_workload: int = 6,
+) -> list[
+    tuple[
+        tuple[int, int, int, str, bool, bool, int],
+        list[tuple[float, tuple[_EffectRow, ...]]],
+    ]
+]:
+    """Group all evidence by workload and hardware-behavior bin."""
+
+    grouped: dict[
+        tuple[int, int, int, str, bool, bool, int],
+        dict[tuple[object, ...], list[tuple[float, _EffectRow]]],
+    ] = defaultdict(dict)
+    target_template = template_of(target.observation.schedule)
+    for row in rows:
+        if template_of(row.observation.schedule) != target_template:
+            continue
+        distance = _bank_relative_distance(target, row)
+        bin_key = (
+            behavior_key(row.candidate_vector),
+            tuple(sorted(row.transition.changed_subsystems)),
+        )
+        identity = row.observation.workload.identity()
+        grouped[identity].setdefault(bin_key, []).append(
+            (distance, row)
+        )
+    return [
+        (
+            identity,
+            sorted(
+                (
+                    (
+                        min(distance for distance, _ in members),
+                        tuple(row for _, row in members),
+                    )
+                    for members in bins.values()
+                ),
+                key=lambda item: item[0],
+            )[:limit_per_workload],
+        )
+        for identity, bins in grouped.items()
+    ]
+
+
 class BankRelativeEffectModel:
     """Predict candidate/bank latency from paired, verified effects.
 
@@ -246,7 +313,7 @@ class BankRelativeEffectModel:
         grouped: dict[
             tuple[
                 tuple[int, int, int, str, bool, bool, int],
-                str,
+                tuple[int, ...],
                 tuple[int, ...],
             ],
             list[MeasuredObservation],
@@ -261,8 +328,8 @@ class BankRelativeEffectModel:
             grouped[
                 (
                     observation.workload.identity(),
-                    observation.record_id,
                     observation.schedule.signature(),
+                    observation.bank_schedule.signature(),
                 )
             ].append(observation)
 
@@ -352,42 +419,149 @@ class BankRelativeEffectModel:
             changed_fields=_changed_fields(bank, candidate),
             transition=bank_transition(bank, candidate),
         )
-        candidate_template = template_of(candidate)
-        nearest_by_workload: dict[
-            tuple[int, int, int, str, bool, bool, int],
-            tuple[float, float],
-        ] = {}
-        for row in self.rows:
-            observation = row.observation
-            identity = observation.workload.identity()
-            if identity == exclude_workload:
-                continue
-            if (
-                template_of(observation.schedule)
-                != candidate_template
-            ):
-                continue
-            distance = _bank_relative_distance(target, row)
-            existing = nearest_by_workload.get(identity)
-            if existing is None or distance < existing[0]:
-                nearest_by_workload[identity] = (
-                    distance,
-                    observation.measured_ratio,
+        grouped = [
+            item
+            for item in _hierarchical_bins(target, self.rows)
+            if item[0] != exclude_workload
+        ]
+        workload_estimates = []
+        for _, bins in grouped:
+            nearest_distance = bins[0][0]
+            weighted_logs = []
+            within_bin_spreads = []
+            behavior_samples = 0
+            for distance, rows in bins:
+                bin_values = [
+                    (
+                        math.log(
+                            max(
+                                0.1,
+                                min(
+                                    10.0,
+                                    row.observation.measured_ratio,
+                                ),
+                            )
+                        ),
+                        (
+                            1.0
+                            if row.observation.structured_verified
+                            else 0.75
+                        ),
+                    )
+                    for row in rows
+                ]
+                bin_center = _weighted_quantile(bin_values, 0.50)
+                bin_spread = _weighted_quantile(
+                    [
+                        (abs(value - bin_center), weight)
+                        for value, weight in bin_values
+                    ],
+                    0.50,
                 )
+                weight = (
+                    math.exp(-(distance - nearest_distance) / 0.50)
+                )
+                weighted_logs.append(
+                    (bin_center, weight)
+                )
+                within_bin_spreads.append((bin_spread, weight))
+                behavior_samples += len(rows)
+            center = _weighted_quantile(weighted_logs, 0.50)
+            between_bins = _weighted_quantile(
+                [
+                    (abs(value - center), weight)
+                    for value, weight in weighted_logs
+                ],
+                0.50,
+            )
+            within_bins = _weighted_quantile(
+                within_bin_spreads, 0.50
+            )
+            workload_estimates.append(
+                (
+                    nearest_distance,
+                    center,
+                    max(between_bins, within_bins),
+                    behavior_samples,
+                )
+            )
 
-        nearest = sorted(nearest_by_workload.values())[:8]
+        nearest = sorted(workload_estimates)[:8]
         if not nearest:
-            return BankRelativePrediction(0, 1.0, math.inf, math.inf, 0.0)
-        ratios = sorted(ratio for _, ratio in nearest)
+            return BankRelativePrediction(
+                0, 1.0, math.inf, math.inf, 0.0
+            )
+        workload_weights = [
+            math.exp(-distance / 1.5)
+            for distance, _, _, _ in nearest
+        ]
+        center = _weighted_quantile(
+            [
+                (log_ratio, weight)
+                for weight, (_, log_ratio, _, _) in zip(
+                    workload_weights, nearest
+                )
+            ],
+            0.50,
+        )
+        upper_center = _weighted_quantile(
+            [
+                (log_ratio, weight)
+                for weight, (_, log_ratio, _, _) in zip(
+                    workload_weights, nearest
+                )
+            ],
+            0.80,
+        )
+        between = _weighted_quantile(
+            [
+                (abs(log_ratio - center), weight)
+                for weight, (_, log_ratio, _, _) in zip(
+                    workload_weights, nearest
+                )
+            ],
+            0.50,
+        )
+        within = _weighted_quantile(
+            [
+                (spread, weight)
+                for weight, (_, _, spread, _) in zip(
+                    workload_weights, nearest
+                )
+            ],
+            0.50,
+        )
+        weight_sum = sum(workload_weights)
+        effective_workloads = (
+            weight_sum * weight_sum
+            / max(
+                1.0e-12,
+                sum(weight * weight for weight in workload_weights),
+            )
+        )
+        uncertainty = math.sqrt(
+            (1.4826 * between) ** 2 / max(1.0, effective_workloads)
+            + within * within / max(1.0, effective_workloads)
+        )
         nearest_distance = nearest[0][0]
+        behavior_samples = sum(item[3] for item in nearest)
         sample_support = min(1.0, len(nearest) / 6.0)
         distance_support = math.exp(-nearest_distance / 1.5)
+        behavior_support = min(
+            1.0, behavior_samples / max(1.0, 2.0 * len(nearest))
+        )
         return BankRelativePrediction(
             samples=len(nearest),
-            robust_ratio=median(ratios),
-            upper_ratio=max(ratios),
+            robust_ratio=math.exp(center),
+            upper_ratio=math.exp(
+                max(center, upper_center) + 1.645 * uncertainty
+            ),
             nearest_distance=nearest_distance,
-            support=sample_support * distance_support,
+            support=sample_support
+            * distance_support
+            * (0.75 + 0.25 * behavior_support),
+            behavior_samples=behavior_samples,
+            uncertainty=uncertainty,
         )
 
 
@@ -466,51 +640,95 @@ class BankRelativeSafetyModel:
             changed_fields=_changed_fields(bank, candidate),
             transition=bank_transition(bank, candidate),
         )
-        candidate_template = template_of(candidate)
-        nearest_by_workload = {}
-        for row in self.rows:
-            observation = row.observation
-            identity = observation.workload.identity()
-            if identity == exclude_workload:
-                continue
-            if (
-                template_of(observation.schedule)
-                != candidate_template
-            ):
-                continue
-            distance = _bank_relative_distance(target, row)
-            existing = nearest_by_workload.get(identity)
-            if existing is None or distance < existing[0]:
-                nearest_by_workload[identity] = (
-                    distance,
-                    observation.source == "runtime_rejected",
+        grouped = [
+            item
+            for item in _hierarchical_bins(target, self.rows)
+            if item[0] != exclude_workload
+        ]
+        workload_estimates = []
+        for _, bins in grouped:
+            nearest_distance = bins[0][0]
+            weights = []
+            bin_risks = []
+            rejected = 0
+            behavior_samples = 0
+            for distance, rows in bins:
+                by_schedule: dict[
+                    tuple[int, ...], list[float]
+                ] = defaultdict(list)
+                for row in rows:
+                    by_schedule[
+                        row.observation.schedule.signature()
+                    ].append(
+                        float(
+                            row.observation.source
+                            == "runtime_rejected"
+                        )
+                    )
+                schedule_risks = [
+                    sum(outcomes) / len(outcomes)
+                    for outcomes in by_schedule.values()
+                ]
+                bin_risks.append(
+                    (0.5 + sum(schedule_risks))
+                    / (1.0 + len(schedule_risks))
                 )
+                weights.append(
+                    math.exp(
+                        -(distance - nearest_distance) / 0.50
+                    )
+                )
+                rejected += sum(
+                    risk >= 0.5 for risk in schedule_risks
+                )
+                behavior_samples += len(schedule_risks)
+            weight_sum = sum(weights)
+            workload_estimates.append(
+                (
+                    nearest_distance,
+                    sum(
+                        weight * bin_risk
+                        for weight, bin_risk in zip(
+                            weights, bin_risks
+                        )
+                    )
+                    / max(1.0e-9, weight_sum),
+                    rejected,
+                    behavior_samples,
+                )
+            )
 
-        nearest = sorted(nearest_by_workload.values())[:8]
+        nearest = sorted(workload_estimates)[:8]
         if not nearest:
             return BankRelativeSafetyPrediction(
                 0, 0, 0.5, math.inf, 0.0
             )
         weights = [
             math.exp(-distance / 1.25)
-            for distance, _ in nearest
+            for distance, _, _, _ in nearest
         ]
         weight_sum = sum(weights)
         risk = sum(
-            weight * float(rejected)
-            for weight, (_, rejected) in zip(weights, nearest)
+            weight * workload_risk
+            for weight, (_, workload_risk, _, _) in zip(weights, nearest)
         ) / max(1.0e-9, weight_sum)
         nearest_distance = nearest[0][0]
+        behavior_samples = sum(item[3] for item in nearest)
         support = (
-            min(1.0, len(nearest) / 6.0)
+            min(1.0, len(nearest) / 4.0)
             * math.exp(-nearest_distance / 1.5)
+            * min(
+                1.0,
+                behavior_samples / max(1.0, 2.0 * len(nearest)),
+            )
         )
         return BankRelativeSafetyPrediction(
             samples=len(nearest),
-            rejected=sum(rejected for _, rejected in nearest),
+            rejected=sum(item[2] for item in nearest),
             risk=risk,
             nearest_distance=nearest_distance,
             support=support,
+            behavior_samples=behavior_samples,
         )
 
 
@@ -1147,6 +1365,300 @@ def select_calibration_candidates(
     return result
 
 
+def select_adaptive_calibration_candidates(
+    workload: Workload,
+    candidates: Iterable[Candidate],
+    incumbent: Candidate,
+    observations: Sequence[MeasuredObservation],
+    hardware: Hardware,
+    budget: int,
+    *,
+    cost_model: FeedbackCostModel | None = None,
+    effect_model: BankRelativeEffectModel | None = None,
+    safety_model: BankRelativeSafetyModel | None = None,
+    observed_bins: frozenset[tuple[object, ...]] | None = None,
+) -> list[Candidate]:
+    """Select a measured-feedback refinement batch without shape gates.
+
+    The broad pass establishes coverage. This pass spends its budget on
+    transferred winners, regression counterfactuals, one-subsystem changes,
+    and still-unobserved hardware behavior. Predicted-unsafe structures do
+    not consume another NPU measurement.
+    """
+
+    if budget <= 0:
+        return []
+    runtime_model = cost_model or FeedbackCostModel(
+        observations, hardware
+    )
+    relative_model = effect_model or BankRelativeEffectModel(
+        observations, hardware
+    )
+    relative_safety_model = safety_model or BankRelativeSafetyModel(
+        observations, hardware
+    )
+    if observed_bins is None:
+        observed_bins = frozenset(
+            behavior_key(
+                behavior_vector(
+                    observation.workload,
+                    observation.schedule,
+                    hardware,
+                )
+            )
+            for observation in observations
+        )
+
+    unique: dict[tuple[int, ...], Candidate] = {}
+    for candidate in candidates:
+        if schedules_execution_equivalent(
+            incumbent.schedule, candidate.schedule
+        ):
+            continue
+        unique.setdefault(candidate.schedule.signature(), candidate)
+
+    rated = []
+    unsafe_filtered = 0
+    bank_vector = behavior_vector(
+        workload, incumbent.schedule, hardware
+    )
+    for candidate in unique.values():
+        vector = behavior_vector(workload, candidate.schedule, hardware)
+        runtime = runtime_model.predict(workload, vector)
+        relative = relative_model.predict(
+            workload,
+            incumbent.schedule,
+            candidate.schedule,
+            hardware,
+        )
+        relative_safety = relative_safety_model.predict(
+            workload,
+            incumbent.schedule,
+            candidate.schedule,
+            hardware,
+        )
+        if relative_safety.support >= 0.15:
+            risk = relative_safety.risk
+            risk_support = relative_safety.support
+        else:
+            risk = runtime.runtime_risk_score
+            risk_support = runtime.runtime_risk_support
+        if risk_support >= 0.10 and risk >= 0.35:
+            unsafe_filtered += 1
+            continue
+        transition = bank_transition(
+            incumbent.schedule, candidate.schedule
+        )
+        key = behavior_key(vector)
+        unexplored = key not in observed_bins
+        feedback_winner = candidate.source in {
+            "feedback_winner_transfer",
+            "feedback_winner_mutation",
+        }
+        regression = (
+            candidate.source == "feedback_regression_counterfactual"
+        )
+        one_subsystem = len(transition.changed_subsystems) == 1
+        novelty = behavior_distance(vector, bank_vector)
+        uncertainty = (
+            relative.uncertainty
+            if math.isfinite(relative.uncertainty)
+            else 1.0
+        )
+        score = (
+            relative.robust_ratio
+            + 0.30 * risk * max(0.25, risk_support)
+            + 0.015 * transition.risk_tier
+            - 0.03 * min(4.0, novelty)
+            - 0.02 * min(1.0, uncertainty)
+        )
+        metrics = dict(vector.metrics)
+        metrics.update(
+            {
+                "predicted_latency_ratio": relative.robust_ratio,
+                "bank_relative_upper_ratio": relative.upper_ratio,
+                "bank_relative_samples": float(relative.samples),
+                "bank_relative_behavior_samples": float(
+                    relative.behavior_samples
+                ),
+                "bank_relative_uncertainty": uncertainty,
+                "bank_relative_support": relative.support,
+                "runtime_risk_score": risk,
+                "runtime_risk_support": risk_support,
+                "adaptive_unexplored_bin": float(unexplored),
+                "adaptive_one_subsystem": float(one_subsystem),
+                "adaptive_feedback_winner": float(feedback_winner),
+                "adaptive_regression_counterfactual": float(regression),
+                "adaptive_bank_behavior_distance": novelty,
+                "bank_behavior_distance": novelty,
+                "bank_changed_fields": float(
+                    len(_changed_fields(
+                        incumbent.schedule, candidate.schedule
+                    ))
+                ),
+                "adaptive_score": score,
+            }
+        )
+        rated_candidate = Candidate(
+            schedule=candidate.schedule,
+            template=candidate.template,
+            source=candidate.source,
+            rationale=candidate.rationale,
+            acquisition=score,
+            parent_signatures=(
+                *candidate.parent_signatures,
+                incumbent.schedule.signature(),
+            ),
+            behavior_key=key,
+            metrics=metrics,
+        )
+        rated.append(
+            (
+                rated_candidate,
+                feedback_winner,
+                regression,
+                one_subsystem,
+                unexplored,
+            )
+        )
+
+    def take(
+        members: Sequence[tuple[Candidate, bool, bool, bool, bool]],
+        count: int,
+        source: str,
+        selected: list[Candidate],
+        selected_signatures: set[tuple[int, ...]],
+    ) -> None:
+        if count <= 0:
+            return
+        ordered = sorted(
+            members,
+            key=lambda item: (
+                item[0].acquisition,
+                -item[0].metrics.get(
+                    "adaptive_bank_behavior_distance", 0.0
+                ),
+                item[0].schedule.signature(),
+            ),
+        )
+        deferred = []
+        seen_bins = {
+            candidate.behavior_key for candidate in selected
+        }
+        for item in ordered:
+            candidate = item[0]
+            if candidate.schedule.signature() in selected_signatures:
+                continue
+            if candidate.behavior_key in seen_bins:
+                deferred.append(candidate)
+                continue
+            metrics = dict(candidate.metrics)
+            metrics.update(
+                {
+                    "adaptive_evaluated": float(len(unique)),
+                    "adaptive_safe_pool": float(len(rated)),
+                    "adaptive_unsafe_filtered": float(
+                        unsafe_filtered
+                    ),
+                }
+            )
+            selected.append(
+                Candidate(
+                    schedule=candidate.schedule,
+                    template=candidate.template,
+                    source=source,
+                    rationale=(
+                        "adaptive paired-feedback refinement; "
+                        f"generator={candidate.source}; "
+                        f"{candidate.rationale}"
+                    ),
+                    acquisition=candidate.acquisition,
+                    parent_signatures=candidate.parent_signatures,
+                    behavior_key=candidate.behavior_key,
+                    metrics=metrics,
+                )
+            )
+            selected_signatures.add(candidate.schedule.signature())
+            seen_bins.add(candidate.behavior_key)
+            if len(selected) >= count:
+                return
+        for candidate in deferred:
+            if candidate.schedule.signature() in selected_signatures:
+                continue
+            metrics = dict(candidate.metrics)
+            metrics.update(
+                {
+                    "adaptive_evaluated": float(len(unique)),
+                    "adaptive_safe_pool": float(len(rated)),
+                    "adaptive_unsafe_filtered": float(
+                        unsafe_filtered
+                    ),
+                }
+            )
+            selected.append(
+                Candidate(
+                    schedule=candidate.schedule,
+                    template=candidate.template,
+                    source=source,
+                    rationale=(
+                        "adaptive paired-feedback refinement; "
+                        f"generator={candidate.source}; "
+                        f"{candidate.rationale}"
+                    ),
+                    acquisition=candidate.acquisition,
+                    parent_signatures=candidate.parent_signatures,
+                    behavior_key=candidate.behavior_key,
+                    metrics=metrics,
+                )
+            )
+            selected_signatures.add(candidate.schedule.signature())
+            if len(selected) >= count:
+                return
+
+    quotas = (
+        ("adaptive_winner_transfer", 0.40, lambda item: item[1]),
+        (
+            "adaptive_one_subsystem",
+            0.30,
+            lambda item: item[3] and not item[1] and not item[2],
+        ),
+        (
+            "adaptive_regression_boundary",
+            0.20,
+            lambda item: item[2],
+        ),
+        (
+            "adaptive_unexplored_behavior",
+            0.10,
+            lambda item: item[4],
+        ),
+    )
+    selected: list[Candidate] = []
+    selected_signatures: set[tuple[int, ...]] = set()
+    cumulative = 0
+    for index, (source, fraction, predicate) in enumerate(quotas):
+        cumulative += (
+            budget - cumulative
+            if index == len(quotas) - 1
+            else max(1, round(budget * fraction))
+        )
+        take(
+            [item for item in rated if predicate(item)],
+            min(budget, cumulative),
+            source,
+            selected,
+            selected_signatures,
+        )
+    take(
+        rated,
+        budget,
+        "adaptive_safe_frontier",
+        selected,
+        selected_signatures,
+    )
+    return selected[:budget]
+
+
 def select_one_shot_candidate(
     workload: Workload,
     candidates: Iterable[Candidate],
@@ -1274,6 +1786,10 @@ def select_one_shot_candidate(
                 "predicted_latency_ratio": relative.robust_ratio,
                 "bank_relative_upper_ratio": relative.upper_ratio,
                 "bank_relative_samples": float(relative.samples),
+                "bank_relative_behavior_samples": float(
+                    relative.behavior_samples
+                ),
+                "bank_relative_uncertainty": relative.uncertainty,
                 "bank_relative_nearest_distance": (
                     relative.nearest_distance
                 ),
@@ -1304,6 +1820,9 @@ def select_one_shot_candidate(
                 "bank_runtime_risk_support": relative_safety.support,
                 "bank_runtime_risk_samples": float(
                     relative_safety.samples
+                ),
+                "bank_runtime_behavior_samples": float(
+                    relative_safety.behavior_samples
                 ),
                 "template_same_as_bank": float(
                     competition.same_template

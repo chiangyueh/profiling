@@ -26,6 +26,7 @@ from tiling_search import (
     SearchConfig,
     Workload,
     plan_template_race,
+    select_adaptive_calibration_candidates,
     select_calibration_candidates,
     select_one_shot_candidate,
     validate_bank_relative_selector,
@@ -676,7 +677,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--selection-mode",
-        choices=("calibration", "campaign", "one-shot"),
+        choices=(
+            "adaptive-calibration",
+            "calibration",
+            "campaign",
+            "one-shot",
+        ),
         default="campaign",
     )
     return parser.parse_args()
@@ -855,7 +861,8 @@ def main() -> None:
             )
     engine_observations = (
         observations
-        if args.selection_mode in {"campaign", "one-shot"}
+        if args.selection_mode
+        in {"adaptive-calibration", "campaign", "one-shot"}
         else ()
     )
     engine = CandidateEngine(
@@ -868,7 +875,7 @@ def main() -> None:
                 npu_candidates=args.npu_candidates,
             ),
             include_exploration=args.selection_mode
-            in {"calibration", "campaign"},
+            in {"adaptive-calibration", "calibration", "campaign"},
         ),
         observations=engine_observations,
         exclusions=exclusions,
@@ -888,6 +895,44 @@ def main() -> None:
         if args.selection_mode == "one-shot"
         else None
     )
+    adaptive_cost_model = (
+        FeedbackCostModel(observations, hardware)
+        if args.selection_mode == "adaptive-calibration"
+        else None
+    )
+    adaptive_effect_model = (
+        BankRelativeEffectModel(observations, hardware)
+        if args.selection_mode == "adaptive-calibration"
+        else None
+    )
+    adaptive_safety_model = (
+        BankRelativeSafetyModel(observations, hardware)
+        if args.selection_mode == "adaptive-calibration"
+        else None
+    )
+    adaptive_observed_bins = (
+        frozenset(
+            behavior_key(
+                behavior_vector(
+                    observation.workload,
+                    observation.schedule,
+                    hardware,
+                )
+            )
+            for observation in observations
+        )
+        if args.selection_mode == "adaptive-calibration"
+        else frozenset()
+    )
+    if adaptive_effect_model is not None:
+        print(
+            "ADAPTIVE_FEEDBACK_MODEL "
+            f"effect_rows={len(adaptive_effect_model.rows)} "
+            f"effect_workloads={adaptive_effect_model.workloads} "
+            f"safety_rows={len(adaptive_safety_model.rows)} "
+            f"safety_rejected={adaptive_safety_model.rejected_rows} "
+            f"observed_behavior_bins={len(adaptive_observed_bins)}"
+        )
     if one_shot_effect_model is not None:
         print(
             "BANK_RELATIVE_MODEL "
@@ -1169,6 +1214,20 @@ def main() -> None:
                 )
             selected_candidates = [one_shot_decision.candidate]
             racing_plan = None
+        elif args.selection_mode == "adaptive-calibration":
+            selected_candidates = select_adaptive_calibration_candidates(
+                workload,
+                callback_candidates,
+                incumbent,
+                observations,
+                hardware,
+                args.npu_candidates,
+                cost_model=adaptive_cost_model,
+                effect_model=adaptive_effect_model,
+                safety_model=adaptive_safety_model,
+                observed_bins=adaptive_observed_bins,
+            )
+            racing_plan = None
         elif args.selection_mode == "calibration":
             selected_candidates = select_calibration_candidates(
                 workload,
@@ -1292,8 +1351,14 @@ def main() -> None:
                 f"{metrics.get('bank_relative_upper_ratio', 1.0):.6g} "
                 "effect_samples="
                 f"{metrics.get('bank_relative_samples', 0.0):.6g} "
+                "effect_behaviors="
+                f"{metrics.get('bank_relative_behavior_samples', 0.0):.6g} "
+                "effect_uncertainty="
+                f"{metrics.get('bank_relative_uncertainty', 1.0):.6g} "
                 "effect_support="
                 f"{metrics.get('bank_relative_support', 0.0):.6g} "
+                "safety_behaviors="
+                f"{metrics.get('bank_runtime_behavior_samples', 0.0):.6g} "
                 "bank_structure_preserved="
                 f"{int(metrics.get('bank_structure_preserved', 0.0))} "
                 "bank_subsystems_changed="
@@ -1344,6 +1409,50 @@ def main() -> None:
                 f"quotas={quotas or 'none'} evidence={evidence}"
             )
             expected_candidates = racing_plan.budget
+        elif args.selection_mode == "adaptive-calibration":
+            expected_candidates = args.npu_candidates
+            selected_templates = Counter(
+                candidate.template.value
+                for candidate in selected_candidates
+            )
+            selected_sources = Counter(
+                candidate.source for candidate in selected_candidates
+            )
+            selected_bins = {
+                candidate.behavior_key
+                for candidate in selected_candidates
+            }
+            adaptive_metrics = (
+                selected_candidates[0].metrics
+                if selected_candidates
+                else {}
+            )
+            print(
+                "ADAPTIVE_PLAN "
+                f"{workload.workload_id} selected={len(accepted)} "
+                f"requested={args.npu_candidates} "
+                "evaluated="
+                f"{int(adaptive_metrics.get('adaptive_evaluated', 0.0))} "
+                "safe_pool="
+                f"{int(adaptive_metrics.get('adaptive_safe_pool', 0.0))} "
+                "unsafe_filtered="
+                f"{int(adaptive_metrics.get('adaptive_unsafe_filtered', 0.0))} "
+                f"behavior_bins={len(selected_bins)} "
+                "sources="
+                + ",".join(
+                    f"{source}:{count}"
+                    for source, count in sorted(
+                        selected_sources.items()
+                    )
+                )
+                + " templates="
+                + ",".join(
+                    f"{template}:{count}"
+                    for template, count in sorted(
+                        selected_templates.items()
+                    )
+                )
+            )
         else:
             expected_candidates = calibration_budget
             selected_templates = Counter(

@@ -159,6 +159,7 @@ def load_strict_paired_template_counts(
     soc: str,
     aic_cores: int,
     toolkit: str | None,
+    workloads: dict[str, Workload],
 ) -> Counter[tuple[str, Template]]:
     counts: Counter[tuple[str, Template]] = Counter()
     seen: set[tuple[str, tuple[int, ...]]] = set()
@@ -188,7 +189,23 @@ def load_strict_paired_template_counts(
                     row.get("tiling_signature")
                 )
                 workload_id = row.get("workload_id", "")
-                if schedule is None or not workload_id:
+                workload = workloads.get(workload_id)
+                try:
+                    row_shape = (
+                        int(row.get("m") or -1),
+                        int(row.get("n") or -1),
+                        int(row.get("k") or -1),
+                    )
+                except ValueError:
+                    continue
+                if (
+                    schedule is None
+                    or workload is None
+                    or row_shape != (workload.m, workload.n, workload.k)
+                    or row.get("dtype") != workload.dtype
+                    or truthy(row.get("trans_a")) != workload.trans_a
+                    or truthy(row.get("trans_b")) != workload.trans_b
+                ):
                     continue
                 identity = (workload_id, schedule.signature())
                 if identity in seen:
@@ -631,6 +648,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--l0b-bytes", type=int, required=True)
     parser.add_argument("--l0c-bytes", type=int, required=True)
     parser.add_argument("--l1-bytes", type=int, required=True)
+    parser.add_argument("--ub-bytes", type=int, required=True)
     parser.add_argument("--l2-bytes", type=int, required=True)
     parser.add_argument("--l2-bpc", type=float, default=1.0)
     parser.add_argument("--hbm-bpc", type=float, default=1.0)
@@ -677,6 +695,7 @@ def main() -> None:
         l2_bytes=args.l2_bytes,
         l2_bytes_per_cycle_per_core=args.l2_bpc,
         hbm_bytes_per_cycle_per_core=args.hbm_bpc,
+        ub_bytes=args.ub_bytes,
     )
     workloads = load_workloads(args.workloads, args.aic_cores)
     calibration_quotas = (
@@ -709,6 +728,7 @@ def main() -> None:
         args.soc,
         args.aic_cores,
         args.toolkit,
+        {workload.workload_id: workload for workload in workloads},
     )
     unpaired_one_shot: dict[
         tuple[int, int, int, str, bool, bool, int],

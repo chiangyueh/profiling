@@ -84,6 +84,8 @@ int main(int argc, char **argv)
                     platform, platform_ascendc::CoreMemType::L0_C)
                 << " L1=" << ReadSize(
                     platform, platform_ascendc::CoreMemType::L1)
+                << " UB=" << ReadSize(
+                    platform, platform_ascendc::CoreMemType::UB)
                 << " L2=" << ReadSize(
                     platform, platform_ascendc::CoreMemType::L2)
                 << " L2_Bpc_per_core=" << l2Bw

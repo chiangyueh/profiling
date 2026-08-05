@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESEARCH="${ROOT}/matmul/mat_mul_v3/op_host/op_tiling/research"
 MODE="full"
 WORKLOADS="${RESEARCH}/config/workloads.csv"
-CALIBRATION_WORKLOADS="${ROOT}/results/npu_v11_template_calibration_workloads.csv"
+CALIBRATION_WORKLOADS="${ROOT}/results/npu_v12_template_calibration_workloads.csv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -151,26 +151,27 @@ RUN_LOG="${ROOT}/results/logs/run_npu_${RUN_ID}.log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
 BUILD_DIR="${ROOT}/.build/matmul_v3_tiling_research"
-CANDIDATES="${ROOT}/results/npu_v11_template_coverage_search_candidates.csv"
-ALL_CANDIDATES="${ROOT}/results/npu_v11_template_coverage_search_all.csv"
-SUMMARY="${ROOT}/results/npu_v11_template_coverage_summary.csv"
-FAMILY_SUMMARY="${ROOT}/results/npu_v11_template_coverage_family_summary.csv"
-CANDIDATE_RESULTS="${ROOT}/results/npu_v11_template_coverage_candidates.csv"
-RESUME="${ROOT}/results/npu_v11_template_coverage_resume.csv"
-CALIBRATION_CANDIDATES="${ROOT}/results/npu_v11_template_calibration_search_candidates.csv"
-CALIBRATION_ALL="${ROOT}/results/npu_v11_template_calibration_search_all.csv"
-CALIBRATION_SUMMARY="${ROOT}/results/npu_v11_template_calibration_summary.csv"
-CALIBRATION_FAMILY_SUMMARY="${ROOT}/results/npu_v11_template_calibration_family_summary.csv"
-CALIBRATION_RESULTS="${ROOT}/results/npu_v11_template_calibration_candidates.csv"
-CALIBRATION_RESUME="${ROOT}/results/npu_v11_template_calibration_resume.csv"
+CANDIDATES="${ROOT}/results/npu_v12_kernel_regime_search_candidates.csv"
+ALL_CANDIDATES="${ROOT}/results/npu_v12_kernel_regime_search_all.csv"
+SUMMARY="${ROOT}/results/npu_v12_kernel_regime_summary.csv"
+FAMILY_SUMMARY="${ROOT}/results/npu_v12_kernel_regime_family_summary.csv"
+CANDIDATE_RESULTS="${ROOT}/results/npu_v12_kernel_regime_candidates.csv"
+RESUME="${ROOT}/results/npu_v12_kernel_regime_resume.csv"
+CALIBRATION_CANDIDATES="${ROOT}/results/npu_v12_template_calibration_search_candidates.csv"
+CALIBRATION_ALL="${ROOT}/results/npu_v12_template_calibration_search_all.csv"
+CALIBRATION_SUMMARY="${ROOT}/results/npu_v12_template_calibration_summary.csv"
+CALIBRATION_FAMILY_SUMMARY="${ROOT}/results/npu_v12_template_calibration_family_summary.csv"
+CALIBRATION_RESULTS="${ROOT}/results/npu_v12_template_calibration_candidates.csv"
+CALIBRATION_RESUME="${ROOT}/results/npu_v12_template_calibration_resume.csv"
 PAIRED_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log25_26.csv"
 V9_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log27.csv"
+V11_TEMPLATE_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log28.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260805-complete-template-coverage-v11"
+echo "  script:     run_npu.sh 20260805-kernel-regime-template-coverage-v12"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      complete_template_calibration_then_unseen_one_shot"
+echo "  scope:      upstream_kernel_regime_calibration_then_unseen_one_shot"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  summary:    ${SUMMARY}"
@@ -275,10 +276,11 @@ L0A="$(platform_field L0A)"
 L0B="$(platform_field L0B)"
 L0C="$(platform_field L0C)"
 L1="$(platform_field L1)"
+UB="$(platform_field UB)"
 L2="$(platform_field L2)"
 L2_BPC="$(platform_field L2_Bpc_per_core)"
 HBM_BPC="$(platform_field HBM_Bpc_per_core)"
-for value in "${AIC}" "${L0A}" "${L0B}" "${L0C}" "${L1}" "${L2}"; do
+for value in "${AIC}" "${L0A}" "${L0B}" "${L0C}" "${L1}" "${UB}" "${L2}"; do
     if [[ -z "${value}" ]]; then
         echo "fatal: incomplete platform capability record: ${PLATFORM}" >&2
         exit 1
@@ -298,6 +300,7 @@ python3 "${RESEARCH}/build_template_calibration.py" \
     --l0b-bytes "${L0B}" \
     --l0c-bytes "${L0C}" \
     --l1-bytes "${L1}" \
+    --ub-bytes "${UB}" \
     --l2-bytes "${L2}" \
     --l2-bpc "${L2_BPC:-1}" \
     --hbm-bpc "${HBM_BPC:-1}"
@@ -336,6 +339,7 @@ generate_candidates() {
         --l0b-bytes "${L0B}"
         --l0c-bytes "${L0C}"
         --l1-bytes "${L1}"
+        --ub-bytes "${UB}"
         --l2-bytes "${L2}"
         --l2-bpc "${L2_BPC:-1}"
         --hbm-bpc "${HBM_BPC:-1}"
@@ -366,6 +370,7 @@ generate_candidates() {
         --selection-mode "${selection_mode}"
         --resume-feedback "${PAIRED_EVIDENCE}"
         --resume-feedback "${V9_FEEDBACK}"
+        --resume-feedback "${V11_TEMPLATE_EVIDENCE}"
     )
     if [[ -n "${resume_feedback}" ]]; then
         command+=(--resume-feedback "${resume_feedback}")
@@ -411,31 +416,52 @@ profile_stage() {
 }
 
 echo "[3/5] Calibrate bank-relative effects with controlled candidates ..."
-generate_candidates \
-    "${CALIBRATION_WORKLOADS}" \
-    "${CALIBRATION_CANDIDATES}" \
-    "${CALIBRATION_ALL}" \
-    calibration \
-    "${CALIBRATION_NPU_CANDIDATES}" \
-    "${CALIBRATION_CALLBACK_CANDIDATES}" \
-    "${CALIBRATION_RESUME}"
-if [[ "$(wc -l < "${CALIBRATION_CANDIDATES}")" -gt 1 ]]; then
-    profile_stage \
+CALIBRATION_AUDIT_PASSES="${CALIBRATION_AUDIT_PASSES:-3}"
+CALIBRATION_AUDIT_RC=3
+for ((calibration_pass = 1; calibration_pass <= CALIBRATION_AUDIT_PASSES; calibration_pass++)); do
+    echo "  calibration_pass=${calibration_pass}/${CALIBRATION_AUDIT_PASSES}"
+    generate_candidates \
+        "${CALIBRATION_WORKLOADS}" \
         "${CALIBRATION_CANDIDATES}" \
-        "${CALIBRATION_SUMMARY}" \
-        "${CALIBRATION_RESULTS}" \
-        "${CALIBRATION_FAMILY_SUMMARY}" \
-        "${CALIBRATION_RESUME}" \
-        4
-else
-    echo "  calibration_profile: skipped; tracked paired evidence is complete"
+        "${CALIBRATION_ALL}" \
+        calibration \
+        "${CALIBRATION_NPU_CANDIDATES}" \
+        "${CALIBRATION_CALLBACK_CANDIDATES}" \
+        "${CALIBRATION_RESUME}"
+    if [[ "$(wc -l < "${CALIBRATION_CANDIDATES}")" -gt 1 ]]; then
+        profile_stage \
+            "${CALIBRATION_CANDIDATES}" \
+            "${CALIBRATION_SUMMARY}" \
+            "${CALIBRATION_RESULTS}" \
+            "${CALIBRATION_FAMILY_SUMMARY}" \
+            "${CALIBRATION_RESUME}" \
+            4
+    else
+        echo "  calibration_profile: skipped; tracked paired evidence is complete"
+    fi
+    set +e
+    python3 "${RESEARCH}/audit_template_calibration.py" \
+        --workloads "${CALIBRATION_WORKLOADS}" \
+        --evidence "${V11_TEMPLATE_EVIDENCE}" \
+        --resume "${CALIBRATION_RESUME}" \
+        --soc "${SOC}" \
+        --aic "${AIC}" \
+        --toolkit "${TOOLKIT_VERSION}"
+    CALIBRATION_AUDIT_RC=$?
+    set -e
+    if [[ "${CALIBRATION_AUDIT_RC}" -eq 0 ]]; then
+        break
+    fi
+    if [[ "${CALIBRATION_AUDIT_RC}" -ne 3 ]]; then
+        echo "fatal: template calibration audit failed rc=${CALIBRATION_AUDIT_RC}" >&2
+        exit "${CALIBRATION_AUDIT_RC}"
+    fi
+done
+if [[ "${CALIBRATION_AUDIT_RC}" -ne 0 ]]; then
+    echo "fatal: template calibration still has strict paired gaps after ${CALIBRATION_AUDIT_PASSES} bounded passes" >&2
+    echo "fatal: completed evidence is retained in ${CALIBRATION_RESUME}" >&2
+    exit 1
 fi
-python3 "${RESEARCH}/audit_template_calibration.py" \
-    --workloads "${CALIBRATION_WORKLOADS}" \
-    --resume "${CALIBRATION_RESUME}" \
-    --soc "${SOC}" \
-    --aic "${AIC}" \
-    --toolkit "${TOOLKIT_VERSION}"
 echo "  ok"
 
 echo "[4/5] Generate one-shot decisions for unseen workloads ..."

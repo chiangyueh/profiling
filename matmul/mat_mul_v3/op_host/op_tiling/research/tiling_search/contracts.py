@@ -28,6 +28,90 @@ def base_k_alignment(workload: Workload) -> int:
     return 16
 
 
+def bl1_fix_mode_supported(workload: Workload, mode: int) -> bool:
+    """Return whether the compiled kernel key supports this fix-output mode."""
+
+    if mode == 1:
+        return workload.dtype in {"fp16", "bf16"}
+    if mode != 2:
+        return False
+    return workload.dtype == "fp32" and not workload.trans_a
+
+
+def bl1_official_fix_applicable(workload: Workload, mode: int) -> bool:
+    """Mirror the shape portion of upstream NeedSolveFixBound.
+
+    This is used to emit the official constructor anchor. It is not a kernel
+    legality gate: NPU evidence shows that the compiled kernels support a
+    broader BL1-resident schedule space.
+    """
+
+    if not bl1_fix_mode_supported(workload, mode):
+        return False
+    if workload.trans_a or workload.k > 256:
+        return False
+    output_alignment = 256 // OUTPUT_BYTES[workload.dtype]
+    fixpipe_bound = (
+        workload.n < 256
+        and workload.n % output_alignment != 0
+        and output_alignment % workload.n != 0
+    )
+    if not fixpipe_bound:
+        return False
+    if mode == 2:
+        c0 = 32 // INPUT_BYTES[workload.dtype]
+        return (
+            workload.k % c0 == 0
+            and workload.n <= 192
+        )
+    return True
+
+
+def bl1_fix_geometry(
+    workload: Workload,
+    hardware: Hardware,
+) -> dict[str, int] | None:
+    """Reconstruct DoBL1FullloadWithFixpipeTiling without bank geometry."""
+
+    in_bytes = INPUT_BYTES[workload.dtype]
+    base_n = align_up(workload.n, 16)
+    if base_n <= 0:
+        return None
+    base_m_l0c = hardware.l0c_bytes // max(1, base_n * 4)
+    ub_bytes = hardware.ub_bytes or hardware.l0c_bytes
+    base_m_ub = ub_bytes // max(1, 256 * OUTPUT_BYTES[workload.dtype])
+    base_m = min(base_m_l0c, base_m_ub)
+    base_m = base_m // 128 * 128
+    if base_m < 128:
+        return None
+    base_ka = hardware.l0a_bytes // max(1, 2 * in_bytes * base_m)
+    base_kb = hardware.l0b_bytes // max(1, 2 * in_bytes * base_n)
+    base_k = min(base_ka, base_kb) // 16 * 16
+    if base_k < 16:
+        return None
+    depth_b = ceil_div(workload.k, base_k)
+    depth_a = (
+        hardware.effective_l1_bytes // in_bytes
+        - depth_b * base_n * base_k
+    ) // max(1, base_m * base_k)
+    depth_a = min(depth_a, depth_b)
+    if depth_a <= 0:
+        return None
+    step_ka = depth_a
+    if depth_a >= 8:
+        depth_a = 8
+        step_ka = 4
+    return {
+        "baseM": base_m,
+        "baseN": base_n,
+        "baseK": base_k,
+        "depthA1": depth_a,
+        "depthB1": depth_b,
+        "stepKa": step_ka,
+        "stepKb": depth_b,
+    }
+
+
 def split_mode(schedule: Schedule) -> int:
     return schedule["tilingEnable"] % 10
 
@@ -384,6 +468,92 @@ def _bl1_contract(
 ) -> list[str]:
     violations: list[str] = []
     in_bytes = INPUT_BYTES[workload.dtype]
+    fix = fix_mode(schedule)
+    if fix:
+        if not bl1_fix_mode_supported(workload, fix):
+            violations.append("bl1_fix_kernel_regime")
+        expected_cores = min(
+            workload.max_cores,
+            hardware.aic_cores,
+            ceil_div(workload.m, schedule["singleCoreM"]),
+        )
+        if (
+            schedule["singleCoreM"],
+            schedule["singleCoreN"],
+            schedule["singleCoreK"],
+        ) != (
+            schedule["baseM"],
+            align_up(workload.n, 16),
+            workload.k,
+        ):
+            violations.append("bl1_fix_output_geometry")
+        if schedule["usedCoreNum"] != expected_cores:
+            violations.append("bl1_fix_core_contract")
+        expected_step_n = ceil_div(workload.n, schedule["baseN"])
+        expected_step_k = ceil_div(workload.k, schedule["baseK"])
+        regular_a_pipeline = (
+            schedule["stepKa"] == expected_step_k
+            and schedule["depthA1"]
+            in (expected_step_k, 2 * expected_step_k)
+        )
+        official_large_k_pipeline = (
+            expected_step_k >= 8
+            and schedule["stepKa"] == 4
+            and schedule["depthA1"] == 8
+        )
+        if (
+            schedule["iterateOrder"],
+            schedule["dbL0A"],
+            schedule["dbL0B"],
+            schedule["dbL0C"],
+            schedule["l2IterateOrder"],
+        ) != (
+            0,
+            2,
+            2,
+            1,
+            0,
+        ):
+            violations.append("bl1_fix_pipeline_contract")
+        if (
+            schedule["stepM"],
+            schedule["stepN"],
+            schedule["stepKb"],
+        ) != (
+            1,
+            expected_step_n,
+            expected_step_k,
+        ):
+            violations.append("bl1_fix_step_contract")
+        if not regular_a_pipeline and not official_large_k_pipeline:
+            violations.append("bl1_fix_a_pipeline")
+        if schedule["depthB1"] not in (
+            expected_step_n * expected_step_k,
+            2 * expected_step_n * expected_step_k,
+        ):
+            violations.append("bl1_fix_b_pipeline")
+        resident_b = (
+            align_up(workload.k, base_k_alignment(workload))
+            * align_up(workload.n, 32 // in_bytes)
+            * in_bytes
+        )
+        staged_a = (
+            schedule["baseM"]
+            * schedule["baseK"]
+            * schedule["depthA1"]
+            * in_bytes
+        )
+        if resident_b + staged_a > hardware.effective_l1_bytes:
+            violations.append("bl1_fix_resident_capacity")
+        if (
+            schedule["l2MTileCnt"],
+            schedule["l2NTileCnt"],
+            schedule["l2MTileBlock"],
+            schedule["l2NTileBlock"],
+        ) != (1, 1, 0, 0):
+            violations.append("bl1_fix_l2_contract")
+        return violations
+
     if schedule["singleCoreK"] < workload.k:
         violations.append("bl1_k_extent")
     if schedule["singleCoreN"] < workload.n:
@@ -417,72 +587,35 @@ def _bl1_contract(
     )
     if resident_b + staged_a > hardware.effective_l1_bytes:
         violations.append("bl1_resident_capacity")
-    fix = fix_mode(schedule)
-    if fix == 2 and (workload.dtype != "fp32" or workload.trans_a):
-        violations.append("bl1_vec_nz2nd_kernel_type")
-    if fix:
-        expected_base_m = (
-            hardware.l0a_bytes
-            // max(1, 64 * in_bytes * 2)
-            // 16
-            * 16
-        )
-        expected_base_m = min(
-            expected_base_m, align_up(workload.m, 16)
-        )
-        expected_base_n_limit = min(
-            hardware.l0b_bytes // max(1, 64 * in_bytes * 2),
-            hardware.l0c_bytes // max(1, expected_base_m * 4),
-        )
-        expected_base_n = min(
-            expected_base_n_limit // 16 * 16,
-            align_up(workload.n, 16),
-        )
-        expected_cores = min(
-            workload.max_cores,
-            hardware.aic_cores,
-            ceil_div(workload.m, expected_base_m),
-        )
-        if (
-            schedule["baseM"],
-            schedule["baseN"],
-            schedule["baseK"],
-            schedule["singleCoreM"],
-            schedule["singleCoreN"],
-            schedule["singleCoreK"],
-        ) != (
-            expected_base_m,
-            expected_base_n,
-            64,
-            expected_base_m,
-            align_up(workload.n, 16),
-            workload.k,
-        ):
-            violations.append("bl1_fix_static_geometry")
-        if schedule["usedCoreNum"] != expected_cores:
-            violations.append("bl1_fix_core_contract")
-        if (
-            schedule["depthA1"],
-            schedule["depthB1"],
-            schedule["iterateOrder"],
-            schedule["dbL0A"],
-            schedule["dbL0B"],
-            schedule["dbL0C"],
-            schedule["l2IterateOrder"],
-        ) != (
-            expected_step_k,
-            expected_step_n * expected_step_k,
-            0,
-            2,
-            2,
-            1,
-            0,
-        ):
-            violations.append("bl1_fix_pipeline_contract")
-        if schedule["l2MTileBlock"] or schedule["l2NTileBlock"]:
-            violations.append("bl1_fix_l2_contract")
-    elif not _l2_schedule_valid(workload, schedule):
-        violations.append("bl1_l2_coverage")
+    expected_cores = min(
+        workload.max_cores,
+        hardware.aic_cores,
+        ceil_div(workload.m, 2 * schedule["baseM"]),
+    )
+    if schedule["singleCoreM"] != 2 * schedule["baseM"]:
+        violations.append("bl1_standard_single_m")
+    if schedule["singleCoreN"] != workload.n:
+        violations.append("bl1_standard_single_n")
+    if schedule["depthA1"] != 2 * schedule["stepKa"]:
+        violations.append("bl1_standard_a_pipeline")
+    if schedule["depthB1"] != schedule["stepN"] * schedule["stepKb"]:
+        violations.append("bl1_standard_b_pipeline")
+    if schedule["usedCoreNum"] != expected_cores:
+        violations.append("bl1_standard_core_contract")
+    if (
+        schedule["l2MTileCnt"],
+        schedule["l2NTileCnt"],
+        schedule["l2MTileBlock"],
+        schedule["l2NTileBlock"],
+        schedule["l2IterateOrder"],
+    ) != (
+        1,
+        1,
+        ceil_div(workload.m, schedule["singleCoreM"]),
+        1,
+        1,
+    ):
+        violations.append("bl1_standard_l2_contract")
     return violations
 
 

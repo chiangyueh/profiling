@@ -285,6 +285,7 @@ class FeedbackCostModelTest(unittest.TestCase):
                 "Ascend910B3",
                 20,
                 "8.1.RC1",
+                {self.workload.workload_id: self.workload},
             )
             self.assertEqual(
                 counts[
@@ -295,6 +296,23 @@ class FeedbackCostModelTest(unittest.TestCase):
                 ],
                 1,
             )
+            stale_path = Path(directory) / "stale-shape.csv"
+            row["m"] = str(self.workload.m + 1)
+            with stale_path.open(
+                "w", newline="", encoding="utf-8"
+            ) as output:
+                writer = csv.DictWriter(output, fieldnames=tuple(row))
+                writer.writeheader()
+                writer.writerow(row)
+            stale_counts = load_strict_paired_template_counts(
+                [stale_path],
+                "Ascend910B3",
+                20,
+                "8.1.RC1",
+                {self.workload.workload_id: self.workload},
+            )
+            self.assertFalse(stale_counts)
+            row["m"] = str(self.workload.m)
             retryable = load_retryable_unpaired_fingerprints(
                 [unpaired_path, paired_path],
                 {self.workload.workload_id},

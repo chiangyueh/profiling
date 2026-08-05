@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workloads", type=Path, required=True)
     parser.add_argument("--resume", type=Path, required=True)
+    parser.add_argument(
+        "--evidence",
+        type=Path,
+        action="append",
+        default=[],
+    )
     parser.add_argument("--soc", required=True)
     parser.add_argument("--aic", type=int, required=True)
     parser.add_argument("--toolkit", required=True)
@@ -47,10 +53,23 @@ def main() -> None:
         for row in workload_rows
         if row.get("template_quotas")
     }
+    workload_identities = {
+        row.get("workload_id") or row["id"]: (
+            int(row["m"]),
+            int(row["n"]),
+            int(row["k"]),
+            row["dtype"],
+            truthy(row.get("trans_a")),
+            truthy(row.get("trans_b")),
+        )
+        for row in workload_rows
+        if row.get("template_quotas")
+    }
     rows = []
-    if args.resume.is_file():
-        with args.resume.open(newline="", encoding="utf-8") as source:
-            rows = list(csv.DictReader(source))
+    for path in [*args.evidence, args.resume]:
+        if path.is_file():
+            with path.open(newline="", encoding="utf-8") as source:
+                rows.extend(csv.DictReader(source))
 
     states: dict[tuple[str, Template, tuple[int, ...]], str] = {}
     priority = {"unpaired": 1, "runtime_rejected": 2, "paired": 3}
@@ -68,7 +87,23 @@ def main() -> None:
         except (KeyError, ValueError):
             continue
         workload_id = row.get("workload_id", "")
-        if workload_id not in targets:
+        identity = workload_identities.get(workload_id)
+        try:
+            row_identity = (
+                int(row.get("m") or -1),
+                int(row.get("n") or -1),
+                int(row.get("k") or -1),
+                row.get("dtype", ""),
+                truthy(row.get("trans_a")),
+                truthy(row.get("trans_b")),
+            )
+        except ValueError:
+            continue
+        if (
+            workload_id not in targets
+            or template not in targets[workload_id]
+            or row_identity != identity
+        ):
             continue
         key = (workload_id, template, schedule.signature())
         if (
@@ -150,18 +185,14 @@ def main() -> None:
             f"required={required_totals[template]}"
         )
     if gaps:
-        has_runtime_rejection = any(runtime_rejected.values())
-        recovery = (
-            "solver/template contract requires revision before another run"
-            if has_runtime_rejection
-            else "rerun the same full command to remeasure unpaired gaps"
+        print(
+            "TEMPLATE_CALIBRATION_AUDIT status=retryable "
+            f"gaps={len(gaps)} "
+            f"runtime_rejected={sum(runtime_rejected.values())} "
+            f"unpaired={sum(unpaired.values())}"
         )
-        raise SystemExit(
-            "fatal: strict paired template calibration coverage "
-            f"is incomplete; {recovery} ("
-            + ",".join(gaps)
-            + ")"
-        )
+        print("TEMPLATE_CALIBRATION_GAPS " + ",".join(gaps))
+        raise SystemExit(3)
     print(
         "TEMPLATE_CALIBRATION_AUDIT status=passed "
         f"workloads={len(targets)} "

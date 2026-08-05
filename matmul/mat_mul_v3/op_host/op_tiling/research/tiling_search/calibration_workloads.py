@@ -11,7 +11,7 @@ class CalibrationWorkload:
     workload: Workload
     template_quotas: dict[Template, int]
     design_axis: str
-    resident_ratio: float
+    design_value: float
 
 
 def _aligned_resident_dimension(
@@ -110,10 +110,13 @@ def generate_template_calibration_workloads(
                 ),
                 template_quotas={Template.AL1_FULL_LOAD: 8},
                 design_axis="a_l1_resident_ratio",
-                resident_ratio=actual,
+                design_value=actual,
             )
         )
 
+    # The official NeedSolveFixBound gate is a profitability policy, not the
+    # kernel contract. Retain the v11 hardware-derived shapes because NPU data
+    # proves that the fix-output kernels execute beyond that constructor gate.
     bl1_ratios = (
         0.30,
         0.34,
@@ -171,7 +174,7 @@ def generate_template_calibration_workloads(
                     Template.BL1_FULL_LOAD_FIXPIPE: 1,
                 },
                 design_axis="b_l1_resident_ratio_fixpipe",
-                resident_ratio=actual,
+                design_value=actual,
             )
         )
 
@@ -218,13 +221,13 @@ def generate_template_calibration_workloads(
                     Template.BL1_FULL_LOAD_VEC_NZ2ND: 1,
                 },
                 design_axis="b_l1_resident_ratio_vec_nz2nd",
-                resident_ratio=actual,
+                design_value=actual,
             )
         )
 
     cube = 128
     reduction_unit = hardware.aic_cores * 1024
-    split_shapes = (
+    deterministic_shapes = (
         (
             2 * cube - cube // 2,
             cube,
@@ -269,7 +272,7 @@ def generate_template_calibration_workloads(
         ),
     )
     for index, (m, n, k, dtype, layout) in enumerate(
-        split_shapes, 1
+        deterministic_shapes, 1
     ):
         output_tiles = (
             (m + 127) // 128
@@ -286,12 +289,55 @@ def generate_template_calibration_workloads(
                     layout,
                     hardware,
                 ),
-                template_quotas={
-                    Template.SINGLE_CORE_SPLIT_K: 5,
-                    Template.DETERMINISTIC_SPLIT_K: 2,
-                },
+                template_quotas={Template.DETERMINISTIC_SPLIT_K: 2},
                 design_axis="output_parallelism_per_aic",
-                resident_ratio=(
+                design_value=(
+                    output_tiles / max(1, hardware.aic_cores)
+                ),
+            )
+        )
+
+    # Single-core split-K partitions output M/N across AICs and loops over K
+    # inside each output tile. Calibrating it on the low-output deterministic
+    # workloads made its serial reduction overhead dominate by construction.
+    # These dimensions provide at least one full output wave while varying K,
+    # layout, dtype, aspect ratio, and tail behavior.
+    single_shapes = (
+        (12 * cube, 24 * cube, reduction_unit * 4 // 5, "fp16", (False, False)),
+        (16 * cube, 20 * cube, reduction_unit * 6 // 5, "fp16", (False, True)),
+        (24 * cube, 12 * cube, reduction_unit * 8 // 5, "bf16", (True, False)),
+        (10 * cube, 32 * cube, reduction_unit * 12 // 5, "fp16", (True, True)),
+        (
+            14 * cube + 1,
+            22 * cube + 1,
+            reduction_unit + 1,
+            "bf16",
+            (False, False),
+        ),
+        (
+            14 * cube,
+            18 * cube,
+            reduction_unit * 3 // 4,
+            "fp32",
+            (False, False),
+        ),
+    )
+    for index, (m, n, k, dtype, layout) in enumerate(single_shapes, 1):
+        output_tiles = ((m + 127) // 128) * ((n + 127) // 128)
+        specs.append(
+            CalibrationWorkload(
+                workload=_workload(
+                    f"template_v3_single_{index:02d}",
+                    m,
+                    n,
+                    k,
+                    dtype,
+                    layout,
+                    hardware,
+                ),
+                template_quotas={Template.SINGLE_CORE_SPLIT_K: 5},
+                design_axis="single_split_output_waves",
+                design_value=(
                     output_tiles / max(1, hardware.aic_cores)
                 ),
             )

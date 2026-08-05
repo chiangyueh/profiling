@@ -18,6 +18,7 @@ from tiling_search.calibration_workloads import (
     generate_template_calibration_workloads,
 )
 from tiling_search.contracts import (
+    bl1_fix_mode_supported,
     common_hardware_contract,
     template_kernel_contract,
     template_of,
@@ -87,12 +88,14 @@ class TemplateCalibrationTest(unittest.TestCase):
         totals = Counter()
         for spec in specs:
             totals.update(spec.template_quotas)
-            self.assertLess(spec.resident_ratio, 1.0)
+            self.assertGreater(spec.design_value, 0.0)
+            if "resident_ratio" in spec.design_axis:
+                self.assertLess(spec.design_value, 1.0)
             encoded = encode_template_quotas(spec.template_quotas)
             self.assertEqual(
                 decode_template_quotas(encoded), spec.template_quotas
             )
-        self.assertEqual(len(specs), 36)
+        self.assertEqual(len(specs), 42)
         self.assertEqual(
             totals,
             Counter(
@@ -105,6 +108,89 @@ class TemplateCalibrationTest(unittest.TestCase):
                     Template.DETERMINISTIC_SPLIT_K: 12,
                 }
             ),
+        )
+
+    def test_special_full_load_design_matches_upstream_kernel_regime(
+        self,
+    ) -> None:
+        specs = generate_template_calibration_workloads(self.hardware)
+        for spec in specs:
+            quotas = spec.template_quotas
+            if Template.BL1_FULL_LOAD_FIXPIPE in quotas:
+                self.assertTrue(
+                    bl1_fix_mode_supported(spec.workload, 1),
+                    spec.workload.workload_id,
+                )
+            if Template.BL1_FULL_LOAD_VEC_NZ2ND in quotas:
+                self.assertTrue(
+                    bl1_fix_mode_supported(spec.workload, 2),
+                    spec.workload.workload_id,
+                )
+
+    def test_special_full_load_has_independent_replacement_geometries(
+        self,
+    ) -> None:
+        specs = generate_template_calibration_workloads(self.hardware)
+        for spec in specs:
+            for template in (
+                Template.BL1_FULL_LOAD_FIXPIPE,
+                Template.BL1_FULL_LOAD_VEC_NZ2ND,
+            ):
+                if template not in spec.template_quotas:
+                    continue
+                candidates = self._legal_target_candidates(
+                    spec, template, 4
+                )
+                self.assertEqual(
+                    len(candidates),
+                    4,
+                    spec.workload.workload_id,
+                )
+                geometries = {
+                    (
+                        candidate["baseM"],
+                        candidate["baseN"],
+                        candidate["baseK"],
+                    )
+                    for candidate in candidates
+                }
+                self.assertGreaterEqual(
+                    len(geometries),
+                    4,
+                    spec.workload.workload_id,
+                )
+
+    def test_split_templates_use_separate_execution_regimes(self) -> None:
+        specs = generate_template_calibration_workloads(self.hardware)
+        deterministic = [
+            spec
+            for spec in specs
+            if Template.DETERMINISTIC_SPLIT_K in spec.template_quotas
+        ]
+        single = [
+            spec
+            for spec in specs
+            if Template.SINGLE_CORE_SPLIT_K in spec.template_quotas
+        ]
+        self.assertEqual(len(deterministic), 6)
+        self.assertEqual(len(single), 6)
+        self.assertTrue(
+            all(spec.design_value < 1.0 for spec in deterministic)
+        )
+        self.assertTrue(all(spec.design_value >= 1.0 for spec in single))
+        self.assertTrue(
+            all(
+                Template.SINGLE_CORE_SPLIT_K
+                not in spec.template_quotas
+                for spec in deterministic
+            )
+        )
+        self.assertTrue(
+            all(
+                Template.DETERMINISTIC_SPLIT_K
+                not in spec.template_quotas
+                for spec in single
+            )
         )
 
     def test_every_target_quota_exists_without_bank_geometry(self) -> None:
@@ -180,6 +266,12 @@ class TemplateCalibrationTest(unittest.TestCase):
             resume = root / "resume.csv"
             workload_row = {
                 "id": "audit_probe",
+                "m": "128",
+                "n": "128",
+                "k": "128",
+                "dtype": "fp16",
+                "trans_a": "0",
+                "trans_b": "0",
                 "template_quotas": "BASE:1",
             }
             with workloads.open(
@@ -196,6 +288,12 @@ class TemplateCalibrationTest(unittest.TestCase):
                 "aic": "20",
                 "toolkit": "8.1.RC1",
                 "workload_id": "audit_probe",
+                "m": "128",
+                "n": "128",
+                "k": "128",
+                "dtype": "fp16",
+                "trans_a": "0",
+                "trans_b": "0",
                 "tiling_signature": (
                     "20:128:128:128:128:128:64:8:8:1:1:0:"
                     "4:4:2:2:1:1:1:1:1:0:0"

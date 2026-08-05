@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--l0b-bytes", type=int, required=True)
     parser.add_argument("--l0c-bytes", type=int, required=True)
     parser.add_argument("--l1-bytes", type=int, required=True)
+    parser.add_argument("--ub-bytes", type=int, required=True)
     parser.add_argument("--l2-bytes", type=int, required=True)
     parser.add_argument("--l2-bpc", type=float, default=1.0)
     parser.add_argument("--hbm-bpc", type=float, default=1.0)
@@ -42,6 +43,7 @@ def main() -> None:
         l2_bytes=args.l2_bytes,
         l2_bytes_per_cycle_per_core=args.l2_bpc,
         hbm_bytes_per_cycle_per_core=args.hbm_bpc,
+        ub_bytes=args.ub_bytes,
     )
     specs = generate_template_calibration_workloads(hardware)
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -56,7 +58,7 @@ def main() -> None:
         "max_cores",
         "template_quotas",
         "design_axis",
-        "resident_ratio",
+        "design_value",
     )
     with args.output.open("w", newline="", encoding="utf-8") as target:
         writer = csv.DictWriter(target, fieldnames=columns)
@@ -77,7 +79,7 @@ def main() -> None:
                         spec.template_quotas
                     ),
                     "design_axis": spec.design_axis,
-                    "resident_ratio": f"{spec.resident_ratio:.8f}",
+                    "design_value": f"{spec.design_value:.8f}",
                 }
             )
     totals: dict[str, int] = {}

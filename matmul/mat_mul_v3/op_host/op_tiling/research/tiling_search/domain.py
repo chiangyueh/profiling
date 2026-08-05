@@ -78,6 +78,7 @@ class Hardware:
     l2_bytes: int
     l2_bytes_per_cycle_per_core: float
     hbm_bytes_per_cycle_per_core: float
+    ub_bytes: int = 0
 
     @property
     def effective_l1_bytes(self) -> int:

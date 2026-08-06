@@ -21,6 +21,7 @@ from tiling_search import (
     BankRelativeEffectModel,
     BankRelativeSafetyModel,
     CandidateEngine,
+    DirectBaseEvidence,
     GenerationBudget,
     Hardware,
     MeasuredObservation,
@@ -28,6 +29,7 @@ from tiling_search import (
     SearchConfig,
     Workload,
     direct_base_candidate,
+    fit_direct_base_evidence,
     plan_template_race,
     select_adaptive_calibration_candidates,
     select_calibration_candidates,
@@ -747,8 +749,28 @@ def main() -> None:
                 + ",".join(missing_quotas)
             )
     history_load_start = time.perf_counter_ns()
+    direct_base_evidence: DirectBaseEvidence | None = None
     if direct_deployment:
-        observations = []
+        direct_observations = []
+        for resume_feedback in args.resume_feedback:
+            resume_observations, _ = load_resume_feedback(
+                resume_feedback,
+                args.soc,
+                args.aic_cores,
+                args.toolkit,
+            )
+            direct_observations.extend(resume_observations)
+        target_identities = {
+            workload.identity() for workload in workloads
+        }
+        observations = [
+            observation
+            for observation in direct_observations
+            if observation.workload.identity() not in target_identities
+        ]
+        direct_base_evidence = fit_direct_base_evidence(
+            observations, hardware
+        )
         exclusions = set()
         strict_paired_counts = Counter()
     else:
@@ -841,6 +863,28 @@ def main() -> None:
         f"history_records={len(observations)} "
         f"ms={history_load_ms:.6f}"
     )
+    if direct_base_evidence is not None:
+        print(
+            "DIRECT_BASE_EVIDENCE "
+            f"paired_base={direct_base_evidence.paired_base_records} "
+            f"unique_base={direct_base_evidence.unique_base_records} "
+            f"workloads={direct_base_evidence.base_workloads} "
+            f"winner_workloads={direct_base_evidence.winner_workloads} "
+            "bank_base_workloads="
+            f"{direct_base_evidence.bank_base_workloads} "
+            "geometry_matches="
+            f"{direct_base_evidence.geometry_policy_matches} "
+            "l1_matches="
+            f"{direct_base_evidence.l1_policy_matches} "
+            "core_matches="
+            f"{direct_base_evidence.core_policy_matches} "
+            "whole_l2="
+            f"{direct_base_evidence.whole_l2_bank_workloads} "
+            "partitioned_l2="
+            f"{direct_base_evidence.partitioned_l2_bank_workloads} "
+            "resident_threshold_mib="
+            f"{direct_base_evidence.resident_l2_threshold_bytes / (1024 * 1024):.6f}"
+        )
     latency_observations = sum(
         observation.source
         not in {"runtime_rejected", "runtime_verified"}
@@ -1152,7 +1196,9 @@ def main() -> None:
         if direct_deployment:
             try:
                 direct_candidate = direct_base_candidate(
-                    workload, hardware
+                    workload,
+                    hardware,
+                    direct_base_evidence,
                 )
             except Exception as exception:
                 print(

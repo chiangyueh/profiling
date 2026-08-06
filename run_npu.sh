@@ -173,16 +173,16 @@ V14_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log31.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260807-dual-deployment-v15"
+echo "  script:     run_npu.sh 20260807-history-distilled-base-v16"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      dual_compact_model_vs_direct_base"
+echo "  scope:      dual_compact_model_vs_history_distilled_base"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  strategy_A: compact_data_driven"
 echo "    summary:  ${MODEL_SUMMARY}"
 echo "    resume:   ${MODEL_RESUME}"
 echo "    log:      ${MODEL_LOG}"
-echo "  strategy_B: direct_base_policy"
+echo "  strategy_B: history_distilled_direct_base"
 echo "    summary:  ${BASE_SUMMARY}"
 echo "    resume:   ${BASE_RESUME}"
 echo "    log:      ${BASE_LOG}"
@@ -480,8 +480,8 @@ run_strategy \
 MODEL_RC="$?"
 
 run_strategy \
-    "[4/4] Strategy B: direct analytical BASE ..." \
-    direct_base_policy \
+    "[4/4] Strategy B: history-distilled direct BASE ..." \
+    history_distilled_direct_base \
     direct-base \
     "${BASE_CANDIDATES}" \
     "${BASE_ALL}" \

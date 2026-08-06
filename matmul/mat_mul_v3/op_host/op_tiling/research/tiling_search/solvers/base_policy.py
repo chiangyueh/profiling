@@ -3,12 +3,319 @@ from __future__ import annotations
 import math
 from functools import lru_cache
 
-from ..contracts import align_up, ceil_div
-from ..domain import INPUT_BYTES, Hardware, Workload
+from ..contracts import align_up, base_k_alignment, ceil_div
+from ..domain import INPUT_BYTES, OUTPUT_BYTES, Hardware, Workload
 
 
 _REFERENCE_L2_BYTES = 192 * 1024 * 1024
 _REFERENCE_L2_WORKING_SET = 100 * 1024 * 1024
+_CALC_M_BASIC = (
+    (128, 256, 128),
+    (128, 128, 256),
+    (64, 512, 64),
+)
+_CALC_MN_BASIC = (
+    (64, 64, 512),
+    (128, 128, 256),
+    (128, 256, 128),
+)
+
+
+def _cal_base_size(
+    count: int,
+    total_cores: int,
+    size: int,
+    maximum: int,
+) -> int:
+    cores = max(1, total_cores // count) if count else 1
+    return min(align_up(max(1, size // cores), 16), maximum)
+
+
+def _cal_base_mn(
+    workload: Workload,
+    hardware: Hardware,
+    base_m: int,
+    base_n: int,
+    maximum_m: int,
+    maximum_n: int,
+) -> tuple[int, int]:
+    m_cores = ceil_div(workload.m, maximum_m)
+    n_cores = ceil_div(workload.n, maximum_n)
+    if m_cores < n_cores:
+        n_cores = max(1, hardware.aic_cores // m_cores)
+        base_n = min(
+            align_up(max(1, workload.n // n_cores), 16),
+            maximum_n,
+        )
+    else:
+        m_cores = max(1, hardware.aic_cores // n_cores)
+        base_m = min(
+            align_up(max(1, workload.m // m_cores), 16),
+            maximum_m,
+        )
+    return (
+        align_up(min(workload.m, base_m), 16),
+        align_up(min(workload.n, base_n), 16),
+    )
+
+
+def _select_formulaic_base(
+    workload: Workload,
+    hardware: Hardware,
+    options: tuple[tuple[int, int, int], ...],
+    *,
+    balance_m_only: bool,
+) -> tuple[int, int, int]:
+    selected = None
+    for maximum_m, maximum_n, base_k_bytes in options:
+        if balance_m_only:
+            n_cores = ceil_div(workload.n, maximum_n)
+            base_m = _cal_base_size(
+                n_cores,
+                hardware.aic_cores,
+                workload.m,
+                maximum_m,
+            )
+            base_n = maximum_n
+        else:
+            base_m, base_n = _cal_base_mn(
+                workload,
+                hardware,
+                maximum_m,
+                maximum_n,
+                maximum_m,
+                maximum_n,
+            )
+        m_cores = ceil_div(workload.m, base_m)
+        n_cores = ceil_div(workload.n, base_n)
+        tail = m_cores * n_cores % hardware.aic_cores
+        load = (
+            (base_m + base_n)
+            * (m_cores * n_cores // hardware.aic_cores)
+            + ((base_m + base_n) if tail else 0)
+        )
+        value = (load, base_m, base_n, base_k_bytes)
+        if selected is None or value[0] < selected[0]:
+            selected = value
+    if selected is None:
+        raise ValueError("formulaic BASE policy has no geometry")
+    return selected[1], selected[2], selected[3]
+
+
+def _balance_base_geometry(
+    workload: Workload,
+    hardware: Hardware,
+    basic_block_m: int,
+) -> tuple[int, int, int]:
+    in_bytes = INPUT_BYTES[workload.dtype]
+    if workload.m >= basic_block_m:
+        m_cores = max(1, ceil_div(workload.m, basic_block_m))
+        n_cores = max(1, hardware.aic_cores // m_cores)
+        base_m = basic_block_m
+        base_n = min(
+            align_up(ceil_div(workload.n, n_cores), 16),
+            256,
+        )
+        base_k_a = (
+            hardware.l0a_bytes // 2 // in_bytes // 256
+        )
+        base_k_b = (
+            hardware.l0b_bytes // (2 * in_bytes * base_n)
+        )
+    else:
+        maximum_n_floor = (
+            basic_block_m if workload.m >= 64 else 1024
+        )
+        base_m = align_up(workload.m, 16)
+        n_tile = max(1, workload.n // hardware.aic_cores)
+        base_n = max(align_up(n_tile, 16), maximum_n_floor)
+        maximum_n = (
+            hardware.l0c_bytes // (4 * base_m) // 16 * 16
+        )
+        base_n = min(base_n, maximum_n)
+        n_cores = ceil_div(workload.n, base_n)
+        tail_cores = (
+            ceil_div(workload.n, 256) % hardware.aic_cores
+            if base_n > 256
+            else 0
+        )
+        if n_cores % hardware.aic_cores < tail_cores:
+            base_n = 256
+        base_k_a = (
+            hardware.l0a_bytes // (2 * in_bytes * base_m)
+        )
+        base_k_b = (
+            hardware.l0b_bytes // (2 * in_bytes * base_n)
+        )
+    base_k = min(base_k_a, base_k_b) // 16 * 16
+    if (
+        min(base_m, base_n, base_k) <= 0
+        or base_m % 16
+        or base_n % 16
+        or base_k % 16
+    ):
+        return 128, 256, 128 // in_bytes
+    return base_m, base_n, base_k
+
+
+def upstream_base_geometry_policy(
+    workload: Workload,
+    hardware: Hardware,
+) -> tuple[int, int, int, int, int, int]:
+    """Port the coupled 8.5 BASE and small-shape geometry policy.
+
+    The formulas correspond to SetBaseBlockTiling, CalBase,
+    CalBaseMBaseN, BalanceBaseBlockTiling, and DoSmallShapeTiling.
+    They depend on shape, layout, dtype, core count, and L0 capacity,
+    not on a RuntimeKb record or a hand-written workload family.
+    """
+
+    in_bytes = INPUT_BYTES[workload.dtype]
+    base_k = 128 // in_bytes
+    base_m, base_n = 128, 256
+    if hardware.l0c_bytes >= 256 * 1024:
+        base_m = 256
+    elif workload.trans_a and workload.trans_b:
+        base_m, base_n = 256, 128
+    elif workload.trans_a or workload.trans_b:
+        large_m = (
+            workload.m >= (hardware.aic_cores // 2) * 256
+        )
+        large_n = (
+            workload.n >= (hardware.aic_cores // 2) * 256
+        )
+        if large_m and large_n:
+            cost_m_large = (
+                ceil_div(workload.m, 256) * workload.n
+                + ceil_div(workload.n, 128) * workload.m
+            )
+            cost_n_large = (
+                ceil_div(workload.m, 128) * workload.n
+                + ceil_div(workload.n, 256) * workload.m
+            )
+            if cost_m_large < cost_n_large:
+                base_m, base_n = 256, 128
+        elif large_m or (
+            not large_n and workload.m > workload.n
+        ):
+            base_m, base_n = 256, 128
+
+    basic_block_m = (
+        256 if hardware.l0c_bytes >= 256 * 1024 else 128
+    )
+    aligned_m = align_up(workload.m, basic_block_m)
+    aligned_n = align_up(workload.n, 256)
+    small_block_count = (
+        aligned_m // base_m * (aligned_n // base_n)
+        < hardware.aic_cores
+    )
+    if small_block_count or workload.m < 256 or workload.n < 256:
+        m_aligned = workload.m * in_bytes % 256 == 0
+        k_aligned = workload.k * in_bytes % 256 == 0
+        n_aligned = workload.n * in_bytes % 256 == 0
+        if not workload.trans_a and not workload.trans_b:
+            base_m, base_n, base_k_bytes = _select_formulaic_base(
+                workload,
+                hardware,
+                _CALC_M_BASIC,
+                balance_m_only=True,
+            )
+            base_k = base_k_bytes // in_bytes
+            if not k_aligned and not n_aligned:
+                base_m, base_n, base_k = _balance_base_geometry(
+                    workload, hardware, basic_block_m
+                )
+            elif not k_aligned:
+                base_n = 256
+                base_k = 128 // in_bytes
+                base_m = _cal_base_size(
+                    ceil_div(workload.n, 256),
+                    hardware.aic_cores,
+                    workload.m,
+                    basic_block_m,
+                )
+            elif not n_aligned:
+                base_k = 128 // in_bytes
+                base_m, base_n = _cal_base_mn(
+                    workload,
+                    hardware,
+                    base_m,
+                    base_n,
+                    128,
+                    256,
+                )
+        elif workload.trans_a and not workload.trans_b:
+            m_cores = ceil_div(workload.m, base_m)
+            n_cores = ceil_div(workload.n, base_n)
+            if not m_aligned and not n_aligned:
+                base_m, base_n, base_k = _balance_base_geometry(
+                    workload, hardware, basic_block_m
+                )
+            elif not m_aligned:
+                base_m = _cal_base_size(
+                    n_cores,
+                    hardware.aic_cores,
+                    workload.m,
+                    basic_block_m,
+                )
+            elif not n_aligned:
+                base_n = _cal_base_size(
+                    m_cores,
+                    hardware.aic_cores,
+                    workload.n,
+                    256,
+                )
+        elif not workload.trans_a and workload.trans_b:
+            base_m, base_n, base_k_bytes = _select_formulaic_base(
+                workload,
+                hardware,
+                _CALC_MN_BASIC,
+                balance_m_only=False,
+            )
+            base_k = base_k_bytes // in_bytes
+            if not k_aligned:
+                base_m, base_n, base_k = _balance_base_geometry(
+                    workload, hardware, basic_block_m
+                )
+        else:
+            m_cores = ceil_div(workload.m, base_m)
+            base_n = _cal_base_size(
+                m_cores,
+                hardware.aic_cores,
+                workload.n,
+                256,
+            )
+            if not m_aligned and k_aligned:
+                base_m, base_n, base_k = _balance_base_geometry(
+                    workload, hardware, basic_block_m
+                )
+            elif not m_aligned:
+                base_m, base_n = _cal_base_mn(
+                    workload,
+                    hardware,
+                    base_m,
+                    base_n,
+                    128,
+                    256,
+                )
+
+        if 128 < workload.m < 256 and base_n > 128:
+            base_n = 128
+        elif 128 < workload.n < 256 and base_m > 128:
+            base_m = 128
+        elif base_m * base_n > 32768:
+            if 128 < base_m < 256:
+                base_m = 128
+            if 128 < base_n < 256:
+                base_n = 128
+        if base_m * base_n > 32768:
+            base_m = 32768 // base_n
+
+    base_k = min(
+        base_k,
+        align_up(workload.k, base_k_alignment(workload)),
+    )
+    return base_m, base_n, base_k, 2, 2, 1
 
 
 def base_geometry_variants(
@@ -23,6 +330,7 @@ def base_geometry_variants(
 
     in_bytes = INPUT_BYTES[workload.dtype]
     base_k = 128 // in_bytes
+    policy = upstream_base_geometry_policy(workload, hardware)
     preferred = (128, 256)
     if workload.trans_a and workload.trans_b:
         preferred = (256, 128)
@@ -76,6 +384,7 @@ def base_geometry_variants(
         (32, tail_n),
     }
     geometry_k = [
+        ((policy[0], policy[1]), policy[2]),
         *((geometry, base_k) for geometry in geometries),
         *(
             (geometry, candidate_k)
@@ -85,8 +394,8 @@ def base_geometry_variants(
         ),
     ]
 
-    result = []
-    seen = set()
+    result = [policy]
+    seen = {policy}
     for (base_m, base_n), candidate_k in geometry_k:
         db_a = (
             2
@@ -357,6 +666,169 @@ def _l2_target_bytes(hardware: Hardware) -> float:
         / _REFERENCE_L2_BYTES
     )
     return max(1.0, min(float(hardware.l2_bytes), scaled))
+
+
+def upstream_base_l2_policy(
+    workload: Workload,
+    hardware: Hardware,
+    *,
+    base_m: int,
+    base_n: int,
+    resident_threshold_bytes: float | None = None,
+) -> tuple[tuple[int, int, int, int, int], str]:
+    """Reconstruct the coupled 8.5 BASE L2 policy for a 20-AIC target.
+
+    This is the integer policy implemented by InitL2SplitParams, CalcTile,
+    and DoL2CacheTiling. A BASE-only request keeps the whole output grid in
+    one L2 group while its working set fits. Larger problems use CalcTile;
+    the 4-by-(AIC/4) layout is only the final fallback when CalcTile cannot
+    find a capacity- and tail-valid split.
+    """
+
+    in_bytes = INPUT_BYTES[workload.dtype]
+    out_bytes = OUTPUT_BYTES[workload.dtype]
+    threshold = (
+        _l2_target_bytes(hardware)
+        if resident_threshold_bytes is None
+        else max(
+            1.0,
+            min(float(hardware.l2_bytes), resident_threshold_bytes),
+        )
+    )
+    m_tasks = ceil_div(workload.m, base_m)
+    n_tasks = ceil_div(workload.n, base_n)
+    whole = (1, 1, m_tasks, n_tasks, 0)
+    total_bytes = (
+        workload.m * workload.k * in_bytes
+        + workload.k * workload.n * in_bytes
+        + workload.m * workload.n * out_bytes
+    )
+    if total_bytes <= threshold:
+        return whole, "whole_resident"
+
+    if base_n >= base_m:
+        out_base, inner_base = base_n, base_m
+        out_value, inner_value = workload.n, workload.m
+        inner_bad = workload.trans_a
+        output_is_n = True
+    else:
+        out_base, inner_base = base_m, base_n
+        out_value, inner_value = workload.m, workload.n
+        inner_bad = not workload.trans_b
+        output_is_n = False
+
+    if hardware.aic_cores == 20:
+        max_conflict_dim = 5
+        min_conflict_dim = 4
+    else:
+        max_conflict_dim = min(hardware.aic_cores, 6)
+        min_conflict_dim = min(hardware.aic_cores, 3)
+    inner_max_conflict = (
+        min_conflict_dim if inner_bad else max_conflict_dim
+    )
+    outer_min_use_dim = max(
+        1, hardware.aic_cores // max(1, max_conflict_dim)
+    )
+    inner_min_use_dim = max(
+        1, hardware.aic_cores // max(1, inner_max_conflict)
+    )
+
+    selected: tuple[int, int, int, int] | None = None
+    out_conflict = 0
+    inner_conflict = 0
+    for outer_use_dim in range(
+        hardware.aic_cores, outer_min_use_dim - 1, -1
+    ):
+        for inner_use_dim in range(
+            hardware.aic_cores, inner_min_use_dim - 1, -1
+        ):
+            out_tile = max(
+                1, out_value // (out_base * outer_use_dim)
+            )
+            inner_tile = max(
+                1, inner_value // (inner_base * inner_use_dim)
+            )
+            out_split = align_up(
+                ceil_div(out_value, out_tile), out_base
+            )
+            inner_split = align_up(
+                ceil_div(inner_value, inner_tile), inner_base
+            )
+            split_bytes = (
+                out_split * workload.k * in_bytes
+                + workload.k * inner_split * in_bytes
+                + out_split * inner_split * out_bytes
+            )
+            if split_bytes > threshold:
+                continue
+
+            out_tail_value = (
+                (out_value + out_split - 1) % out_split
+            ) + 1
+            inner_tail_value = (
+                (inner_value + inner_split - 1) % inner_split
+            ) + 1
+            out_tail_count = ceil_div(out_tail_value, out_base)
+            inner_tail_count = ceil_div(
+                inner_tail_value, inner_base
+            )
+            if (
+                out_tail_count * max_conflict_dim
+                < hardware.aic_cores
+                or inner_tail_count * inner_max_conflict
+                < hardware.aic_cores
+            ):
+                continue
+
+            next_out_conflict = ceil_div(
+                hardware.aic_cores, out_tail_count
+            )
+            next_inner_conflict = ceil_div(
+                hardware.aic_cores, inner_tail_count
+            )
+            if (
+                selected is None
+                or (
+                    out_conflict >= next_out_conflict
+                    and inner_conflict >= next_inner_conflict
+                )
+            ):
+                selected = (
+                    out_tile,
+                    inner_tile,
+                    out_split,
+                    inner_split,
+                )
+                out_conflict = next_out_conflict
+                inner_conflict = next_inner_conflict
+
+    if selected is None:
+        m_block = min(4, m_tasks)
+        n_block = min(
+            max(1, hardware.aic_cores // 4), n_tasks
+        )
+        return (
+            ceil_div(m_tasks, m_block),
+            ceil_div(n_tasks, n_block),
+            m_block,
+            n_block,
+            0,
+        ), "fixed_fallback"
+
+    _, _, out_split, inner_split = selected
+    if output_is_n:
+        n_split, m_split = out_split, inner_split
+    else:
+        m_split, n_split = out_split, inner_split
+    m_block = ceil_div(m_split, base_m)
+    n_block = ceil_div(n_split, base_n)
+    return (
+        ceil_div(workload.m, m_block * base_m),
+        ceil_div(workload.n, n_block * base_n),
+        m_block,
+        n_block,
+        0,
+    ), "cache_partitioned"
 
 
 @lru_cache(maxsize=4096)

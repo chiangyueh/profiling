@@ -13,7 +13,11 @@ from .domain import (
     Template,
     Workload,
 )
-from .deployment import direct_base_candidate
+from .deployment import (
+    DirectBaseEvidence,
+    direct_base_candidate,
+    fit_direct_base_evidence,
+)
 from .orchestrator import CandidateEngine, SearchConfig
 from .one_shot import (
     AdaptiveCalibrationEvidence,
@@ -43,6 +47,7 @@ __all__ = [
     "BankRelativeValidation",
     "Candidate",
     "CandidateEngine",
+    "DirectBaseEvidence",
     "GenerationBudget",
     "Hardware",
     "MeasuredObservation",
@@ -64,4 +69,5 @@ __all__ = [
     "select_one_shot_candidate",
     "validate_bank_relative_selector",
     "direct_base_candidate",
+    "fit_direct_base_evidence",
 ]

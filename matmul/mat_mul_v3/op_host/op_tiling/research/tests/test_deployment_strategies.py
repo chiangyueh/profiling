@@ -17,8 +17,11 @@ from tiling_search import (
     Template,
     Workload,
     direct_base_candidate,
+    fit_direct_base_evidence,
 )
-from tiling_search.contracts import validate_schedule
+from generate import load_resume_feedback
+from tiling_search.contracts import template_of, validate_schedule
+from tiling_search.solvers.base_policy import upstream_base_l2_policy
 
 
 class DeploymentStrategiesTest(unittest.TestCase):
@@ -35,7 +38,7 @@ class DeploymentStrategiesTest(unittest.TestCase):
             ub_bytes=262144,
         )
 
-    def test_direct_base_is_one_analytical_legal_record(self) -> None:
+    def test_direct_base_is_one_coupled_legal_record(self) -> None:
         workload = Workload(
             workload_id="direct_dense",
             m=3584,
@@ -81,8 +84,130 @@ class DeploymentStrategiesTest(unittest.TestCase):
                 candidate.schedule["l2MTileBlock"],
                 candidate.schedule["l2NTileBlock"],
             ),
-            (7, 4, 4, 5),
+            (2, 1, 14, 17),
         )
+        self.assertEqual(
+            candidate.metrics["policy_l2_mode_cache"], 1.0
+        )
+
+    def test_direct_base_keeps_small_working_set_resident(self) -> None:
+        workload = Workload(
+            workload_id="direct_small",
+            m=512,
+            n=512,
+            k=512,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        candidate = direct_base_candidate(workload, self.hardware)
+
+        self.assertEqual(
+            (
+                candidate.schedule["l2MTileCnt"],
+                candidate.schedule["l2NTileCnt"],
+                candidate.schedule["l2MTileBlock"],
+                candidate.schedule["l2NTileBlock"],
+            ),
+            (1, 1, 5, 4),
+        )
+        self.assertEqual(
+            candidate.metrics["policy_l2_mode_whole"], 1.0
+        )
+
+    def test_history_distillation_reconstructs_all_base_banks(
+        self,
+    ) -> None:
+        names = (
+            "paired_measurements_net_log25_26.csv",
+            "paired_measurements_net_log27.csv",
+            "paired_measurements_net_log28.csv",
+            "paired_measurements_net_log30.csv",
+            "paired_measurements_net_log31.csv",
+        )
+        config = RESEARCH / "config"
+        observations = []
+        for name in names:
+            loaded, _ = load_resume_feedback(
+                config / name,
+                "Ascend910B3",
+                20,
+                "8.1.RC1+toolkit-7.7.0.1.225",
+            )
+            observations.extend(loaded)
+
+        evidence = fit_direct_base_evidence(
+            observations, self.hardware
+        )
+        self.assertEqual(evidence.paired_base_records, 498)
+        self.assertEqual(evidence.unique_base_records, 373)
+        self.assertEqual(evidence.base_workloads, 78)
+        self.assertEqual(evidence.bank_base_workloads, 58)
+        self.assertEqual(evidence.geometry_policy_matches, 58)
+        self.assertEqual(evidence.l1_policy_matches, 58)
+        self.assertEqual(evidence.core_policy_matches, 58)
+        self.assertEqual(evidence.whole_l2_bank_workloads, 36)
+        self.assertEqual(
+            evidence.partitioned_l2_bank_workloads, 22
+        )
+        self.assertGreater(
+            evidence.resident_l2_threshold_bytes,
+            94.625 * 1024 * 1024,
+        )
+        self.assertLess(
+            evidence.resident_l2_threshold_bytes,
+            101.553 * 1024 * 1024,
+        )
+
+        banks = {}
+        for observation in observations:
+            bank = observation.bank_schedule
+            if (
+                observation.verified
+                and bank is not None
+                and template_of(bank) == Template.BASE
+            ):
+                banks[observation.workload.identity()] = (
+                    observation.workload,
+                    bank,
+                )
+        self.assertEqual(len(banks), 58)
+        for workload, bank in banks.values():
+            reconstructed, _ = upstream_base_l2_policy(
+                workload,
+                self.hardware,
+                base_m=bank["baseM"],
+                base_n=bank["baseN"],
+                resident_threshold_bytes=(
+                    evidence.resident_l2_threshold_bytes
+                ),
+            )
+            expected = tuple(
+                bank[field]
+                for field in (
+                    "l2MTileCnt",
+                    "l2NTileCnt",
+                    "l2MTileBlock",
+                    "l2NTileBlock",
+                    "l2IterateOrder",
+                )
+            )
+            self.assertEqual(
+                reconstructed,
+                expected,
+                workload.workload_id,
+            )
+            candidate = direct_base_candidate(
+                workload,
+                self.hardware,
+                evidence,
+            )
+            self.assertEqual(
+                candidate.schedule.signature(),
+                bank.signature(),
+                workload.workload_id,
+            )
 
     def test_direct_base_covers_dtype_and_layout_variants(self) -> None:
         cases = (
@@ -90,6 +215,8 @@ class DeploymentStrategiesTest(unittest.TestCase):
             ("fp32_nt", 144, 768, 4864, "fp32", False, True),
             ("fp32_tn", 1152, 1664, 2304, "fp32", True, False),
             ("fp32_tt", 896, 1280, 1792, "fp32", True, True),
+            ("fp16_shallow_k", 160, 255, 31, "fp16", False, False),
+            ("fp32_nt_shallow_k", 80, 129, 16, "fp32", False, True),
         )
         for case in cases:
             with self.subTest(case=case[0]):

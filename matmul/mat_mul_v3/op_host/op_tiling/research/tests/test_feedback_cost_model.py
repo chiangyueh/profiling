@@ -103,6 +103,74 @@ class FeedbackCostModelTest(unittest.TestCase):
         self.assertAlmostEqual(prediction.latency_ratio, 1.2)
         self.assertGreater(prediction.runtime_risk_score, 0.5)
 
+    def test_within_noise_numerical_opportunity_becomes_mutation_centre(
+        self,
+    ) -> None:
+        observation = MeasuredObservation(
+            workload=self.workload,
+            schedule=self.success_schedule,
+            ratio_vs_official=0.988,
+            ratio_vs_bank=0.987,
+            source="calibration_template_probe",
+            record_id="promising",
+            status_vs_official="within_noise",
+            status_vs_bank="within_noise",
+            verified=True,
+            structured_verified=True,
+            bank_schedule=self.success_schedule,
+        )
+        expected = Candidate(
+            schedule=self.success_schedule,
+            template=Template.BASE,
+            source="feedback_promising_mutation",
+            rationale="test mutation",
+        )
+        with patch(
+            "tiling_search.feedback.semantic_mutations",
+            return_value=[expected],
+        ) as mutations:
+            candidates = feedback_mutations(
+                self.workload,
+                self.hardware,
+                [observation],
+            )
+        self.assertTrue(candidates)
+        self.assertEqual(
+            mutations.call_args.kwargs["source"],
+            "feedback_promising_mutation",
+        )
+        self.assertEqual(
+            {candidate.source for candidate in candidates},
+            {"feedback_promising_mutation"},
+        )
+
+    def test_bundled_v13_evidence_is_complete_for_finished_prefix(
+        self,
+    ) -> None:
+        path = RESEARCH / "config/paired_measurements_net_log30.csv"
+        observations, exclusions = load_resume_feedback(
+            path,
+            "Ascend910B3",
+            20,
+            "8.1.RC1+toolkit-7.7.0.1.225",
+        )
+        self.assertEqual(len(observations), 2520)
+        self.assertEqual(
+            sum(
+                observation.source == "runtime_rejected"
+                for observation in observations
+            ),
+            174,
+        )
+        self.assertEqual(
+            sum(
+                observation.source == "runtime_verified"
+                for observation in observations
+            ),
+            90,
+        )
+        self.assertGreaterEqual(len(exclusions), 2400)
+
     def test_workload_core_limit_is_normalized_to_hardware(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "workloads.csv"

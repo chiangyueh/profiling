@@ -788,6 +788,77 @@ class OneShotSelectionTest(unittest.TestCase):
             [safe.schedule],
         )
 
+    def test_adaptive_calibration_skips_saturated_target_template(
+        self,
+    ) -> None:
+        observations = [
+            MeasuredObservation(
+                workload=self.workload,
+                schedule=self.custom.schedule,
+                ratio_vs_official=1.04,
+                ratio_vs_bank=1.03,
+                source="calibration_template_probe",
+                record_id=f"negative_{index}",
+                status_vs_official="regressed",
+                status_vs_bank="regressed",
+                verified=True,
+                structured_verified=True,
+                bank_schedule=self.bank,
+            )
+            for index in range(12)
+        ]
+        selected = select_adaptive_calibration_candidates(
+            self.workload,
+            [self.custom],
+            self.incumbent,
+            observations,
+            self.hardware,
+            budget=8,
+            cost_model=_RuntimeModel(),
+            effect_model=_AdaptiveEffectModel(),
+            safety_model=_AdaptiveSafetyModel(),
+            observed_bins=frozenset(),
+            target_templates=frozenset({Template.BASE}),
+        )
+        self.assertEqual(selected, [])
+
+    def test_adaptive_calibration_refines_numerical_opportunity(
+        self,
+    ) -> None:
+        observations = [
+            MeasuredObservation(
+                workload=self.workload,
+                schedule=self.custom.schedule,
+                ratio_vs_official=0.988,
+                ratio_vs_bank=0.987,
+                source="calibration_template_probe",
+                record_id=f"promising_{index}",
+                status_vs_official="within_noise",
+                status_vs_bank="within_noise",
+                verified=True,
+                structured_verified=True,
+                bank_schedule=self.bank,
+            )
+            for index in range(12)
+        ]
+        selected = select_adaptive_calibration_candidates(
+            self.workload,
+            [self.custom],
+            self.incumbent,
+            observations,
+            self.hardware,
+            budget=8,
+            cost_model=_RuntimeModel(),
+            effect_model=_AdaptiveEffectModel(),
+            safety_model=_AdaptiveSafetyModel(),
+            observed_bins=frozenset(),
+            target_templates=frozenset({Template.BASE}),
+        )
+        self.assertEqual(
+            [candidate.schedule for candidate in selected],
+            [self.custom.schedule],
+        )
+
     def test_paired_full_load_evidence_can_change_one_shot_template(
         self,
     ) -> None:

@@ -16,6 +16,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from callback import CallbackError, exact_roundtrip, invoke
 from tiling_search import (
+    adaptive_calibration_evidence,
     BankRelativeEffectModel,
     BankRelativeSafetyModel,
     CandidateEngine,
@@ -709,7 +710,8 @@ def main() -> None:
     workloads = load_workloads(args.workloads, args.aic_cores)
     calibration_quotas = (
         load_calibration_quotas(args.workloads)
-        if args.selection_mode == "calibration"
+        if args.selection_mode
+        in {"adaptive-calibration", "calibration"}
         else {}
     )
     if args.workload_limit > 0:
@@ -773,6 +775,16 @@ def main() -> None:
             "CALIBRATION_RETRYABLE_UNPAIRED "
             f"fingerprints={len(retryable_unpaired)}"
         )
+    if args.selection_mode in {"adaptive-calibration", "one-shot"}:
+        observations, hydrated, hydration_failures = hydrate_bank_context(
+            observations
+        )
+        print(
+            "BANK_CONTEXT "
+            f"hydrated_workloads={hydrated} "
+            f"failed_workloads={hydration_failures} "
+            "source=current_RuntimeKb_callback"
+        )
     if args.selection_mode == "one-shot":
         # A deployment decision must not learn from an earlier measurement of
         # the target shape. This also makes a resumed run regenerate the same
@@ -793,15 +805,6 @@ def main() -> None:
             for item in exclusions
             if item[:6] not in target_prefixes
         }
-        observations, hydrated, hydration_failures = hydrate_bank_context(
-            observations
-        )
-        print(
-            "BANK_CONTEXT "
-            f"hydrated_workloads={hydrated} "
-            f"failed_workloads={hydration_failures} "
-            "source=current_RuntimeKb_callback"
-        )
     latency_observations = sum(
         observation.source
         not in {"runtime_rejected", "runtime_verified"}
@@ -1002,6 +1005,26 @@ def main() -> None:
             if remaining_target_quotas is not None
             else max(0, args.npu_candidates - calibration_completed)
         )
+        if args.selection_mode == "adaptive-calibration":
+            target_templates = frozenset(target_quotas or {})
+            evidence = adaptive_calibration_evidence(
+                workload,
+                observations,
+                target_templates,
+            )
+            if not evidence.should_refine:
+                print(
+                    "ADAPTIVE_DECISION "
+                    f"{workload.workload_id} "
+                    "targets="
+                    f"{','.join(sorted(item.value for item in target_templates))} "
+                    f"paired={evidence.paired} "
+                    f"rejected={evidence.rejected} "
+                    "best_ratio="
+                    f"{evidence.best_ratio if evidence.best_ratio < float('inf') else 'NA'} "
+                    "action=skip_before_host_generation"
+                )
+                continue
         if (
             args.selection_mode == "calibration"
             and calibration_budget == 0
@@ -1047,6 +1070,14 @@ def main() -> None:
             source="bank_incumbent",
             rationale="exact official RuntimeKb control",
         )
+        adaptive_template_quotas = (
+            {
+                template: args.callback_candidates
+                for template in (target_quotas or {})
+            }
+            if args.selection_mode == "adaptive-calibration"
+            else None
+        )
         result = engine.generate(
             workload,
             hardware,
@@ -1054,7 +1085,7 @@ def main() -> None:
             template_quotas=(
                 remaining_target_quotas
                 if args.selection_mode == "calibration"
-                else None
+                else adaptive_template_quotas
             ),
         )
         ordered: list[Candidate] = [
@@ -1226,6 +1257,7 @@ def main() -> None:
                 effect_model=adaptive_effect_model,
                 safety_model=adaptive_safety_model,
                 observed_bins=adaptive_observed_bins,
+                target_templates=frozenset(target_quotas or {}),
             )
             racing_plan = None
         elif args.selection_mode == "calibration":

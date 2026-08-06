@@ -15,12 +15,14 @@ from .domain import (
 )
 from .orchestrator import CandidateEngine, SearchConfig
 from .one_shot import (
+    AdaptiveCalibrationEvidence,
     BankRelativeEffectModel,
     BankRelativePrediction,
     BankRelativeSafetyModel,
     BankRelativeSafetyPrediction,
     BankRelativeValidation,
     OneShotDecision,
+    adaptive_calibration_evidence,
     select_adaptive_calibration_candidates,
     select_calibration_candidates,
     select_one_shot_candidate,
@@ -32,6 +34,7 @@ from .ranking import PairwiseLatencyRanker, PairwiseLatencyPrediction
 __all__ = [
     "KNOWLEDGE_FIELDS",
     "BehaviorTarget",
+    "AdaptiveCalibrationEvidence",
     "BankRelativeEffectModel",
     "BankRelativePrediction",
     "BankRelativeSafetyModel",
@@ -53,6 +56,7 @@ __all__ = [
     "Template",
     "TemplateEvidence",
     "Workload",
+    "adaptive_calibration_evidence",
     "plan_template_race",
     "select_adaptive_calibration_candidates",
     "select_calibration_candidates",

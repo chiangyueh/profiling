@@ -114,6 +114,65 @@ class TemplateCalibrationEvidence:
 
 
 @dataclass(frozen=True)
+class AdaptiveCalibrationEvidence:
+    paired: int
+    rejected: int
+    best_ratio: float
+
+    @property
+    def should_refine(self) -> bool:
+        return self.paired >= 6 and self.best_ratio <= 0.99
+
+    @property
+    def empirically_safe(self) -> bool:
+        return (
+            self.paired >= 12
+            and self.rejected / max(1, self.paired + self.rejected)
+            <= 0.05
+        )
+
+
+def adaptive_calibration_evidence(
+    workload: Workload,
+    observations: Sequence[MeasuredObservation],
+    target_templates: frozenset[Template],
+) -> AdaptiveCalibrationEvidence:
+    """Summarize whether a broad measured region merits refinement."""
+
+    target = [
+        observation
+        for observation in observations
+        if (
+            observation.workload.identity() == workload.identity()
+            and template_of(observation.schedule) in target_templates
+        )
+    ]
+    paired = [
+        observation
+        for observation in target
+        if (
+            observation.verified
+            and observation.source
+            not in {"runtime_rejected", "runtime_verified"}
+        )
+    ]
+    return AdaptiveCalibrationEvidence(
+        paired=len(paired),
+        rejected=sum(
+            observation.source == "runtime_rejected"
+            for observation in target
+        ),
+        best_ratio=min(
+            (
+                observation.measured_ratio
+                for observation in paired
+            ),
+            default=math.inf,
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class _EffectRow:
     observation: MeasuredObservation
     candidate_vector: BehaviorVector
@@ -1377,6 +1436,7 @@ def select_adaptive_calibration_candidates(
     effect_model: BankRelativeEffectModel | None = None,
     safety_model: BankRelativeSafetyModel | None = None,
     observed_bins: frozenset[tuple[object, ...]] | None = None,
+    target_templates: frozenset[Template] | None = None,
 ) -> list[Candidate]:
     """Select a measured-feedback refinement batch without shape gates.
 
@@ -1415,8 +1475,45 @@ def select_adaptive_calibration_candidates(
             incumbent.schedule, candidate.schedule
         ):
             continue
+        if (
+            target_templates is not None
+            and candidate.template not in target_templates
+        ):
+            continue
         unique.setdefault(candidate.schedule.signature(), candidate)
 
+    target_evidence = (
+        adaptive_calibration_evidence(
+            workload, observations, target_templates
+        )
+        if target_templates is not None
+        else AdaptiveCalibrationEvidence(
+            paired=0,
+            rejected=0,
+            best_ratio=math.inf,
+        )
+    )
+    # The broad pass has already provided coverage. A refinement batch is
+    # justified only by a paired numerical opportunity on this workload and
+    # target template. This is feedback-driven saturation, not a shape gate.
+    if (
+        target_templates is not None
+        and not target_evidence.should_refine
+    ):
+        print(
+            "ADAPTIVE_DECISION "
+            f"{workload.workload_id} "
+            "targets="
+            f"{','.join(sorted(item.value for item in target_templates))} "
+            f"paired={target_evidence.paired} "
+            f"rejected={target_evidence.rejected} "
+            "best_ratio="
+            f"{target_evidence.best_ratio if math.isfinite(target_evidence.best_ratio) else 'NA'} "
+            "action=skip_saturated_or_no_paired_opportunity"
+        )
+        return []
+
+    empirically_safe_target = target_evidence.empirically_safe
     rated = []
     unsafe_filtered = 0
     bank_vector = behavior_vector(
@@ -1443,7 +1540,8 @@ def select_adaptive_calibration_candidates(
         else:
             risk = runtime.runtime_risk_score
             risk_support = runtime.runtime_risk_support
-        if risk_support >= 0.10 and risk >= 0.35:
+        risk_limit = 0.75 if empirically_safe_target else 0.35
+        if risk_support >= 0.10 and risk >= risk_limit:
             unsafe_filtered += 1
             continue
         transition = bank_transition(
@@ -1454,6 +1552,7 @@ def select_adaptive_calibration_candidates(
         feedback_winner = candidate.source in {
             "feedback_winner_transfer",
             "feedback_winner_mutation",
+            "feedback_promising_mutation",
         }
         regression = (
             candidate.source == "feedback_regression_counterfactual"
@@ -1656,6 +1755,20 @@ def select_adaptive_calibration_candidates(
         selected,
         selected_signatures,
     )
+    if target_templates is not None:
+        print(
+            "ADAPTIVE_DECISION "
+            f"{workload.workload_id} "
+            "targets="
+            f"{','.join(sorted(item.value for item in target_templates))} "
+            f"paired={target_evidence.paired} "
+            f"rejected={target_evidence.rejected} "
+            f"best_ratio={target_evidence.best_ratio:.6g} "
+            f"evaluated={len(unique)} "
+            f"safe={len(rated)} "
+            f"selected={len(selected[:budget])} "
+            "action=refine_measured_opportunity"
+        )
     return selected[:budget]
 
 

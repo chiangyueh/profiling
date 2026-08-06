@@ -157,12 +157,6 @@ SUMMARY="${ROOT}/results/npu_v14_one_shot_summary.csv"
 FAMILY_SUMMARY="${ROOT}/results/npu_v14_one_shot_family_summary.csv"
 CANDIDATE_RESULTS="${ROOT}/results/npu_v14_one_shot_candidates.csv"
 RESUME="${ROOT}/results/npu_v14_one_shot_resume.csv"
-CALIBRATION_CANDIDATES="${ROOT}/results/npu_v13_template_calibration_search_candidates.csv"
-CALIBRATION_ALL="${ROOT}/results/npu_v13_template_calibration_search_all.csv"
-CALIBRATION_SUMMARY="${ROOT}/results/npu_v13_template_calibration_summary.csv"
-CALIBRATION_FAMILY_SUMMARY="${ROOT}/results/npu_v13_template_calibration_family_summary.csv"
-CALIBRATION_RESULTS="${ROOT}/results/npu_v13_template_calibration_candidates.csv"
-CALIBRATION_RESUME="${ROOT}/results/npu_v13_template_calibration_resume.csv"
 ADAPTIVE_CANDIDATES="${ROOT}/results/npu_v14_adaptive_search_candidates.csv"
 ADAPTIVE_ALL="${ROOT}/results/npu_v14_adaptive_search_all.csv"
 ADAPTIVE_SUMMARY="${ROOT}/results/npu_v14_adaptive_summary.csv"
@@ -172,24 +166,25 @@ ADAPTIVE_RESUME="${ROOT}/results/npu_v14_adaptive_resume.csv"
 PAIRED_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log25_26.csv"
 V9_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log27.csv"
 V11_TEMPLATE_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log28.csv"
+V13_TEMPLATE_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log30.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260805-hierarchical-adaptive-v14"
+echo "  script:     run_npu.sh 20260806-evidence-targeted-adaptive-v14"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      broad_calibration_feedback_refinement_unseen_one_shot"
+echo "  scope:      v13_evidence_targeted_refinement_unseen_one_shot"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  summary:    ${SUMMARY}"
 echo "  families:   ${FAMILY_SUMMARY}"
 echo "  candidates: ${CANDIDATE_RESULTS}"
 echo "  resume:     ${RESUME}"
-echo "  calibration:${CALIBRATION_RESUME}"
+echo "  v13_evidence:${V13_TEMPLATE_EVIDENCE}"
 echo "  adaptive:   ${ADAPTIVE_RESUME}"
 echo "  log:        ${RUN_LOG}"
 echo
 
-echo "[1/6] Build callback/bank/NPU tools ..."
+echo "[1/5] Build callback/bank/NPU tools ..."
 cmake -S "${RESEARCH}" -B "${BUILD_DIR}" \
     -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" \
     -DCMAKE_BUILD_TYPE=Release >/dev/null
@@ -205,7 +200,7 @@ print_acl_loader_diag() {
         sed 's/^/    /' || true
 }
 
-echo "[2/6] Detect NPU and platform ..."
+echo "[2/5] Detect NPU and platform ..."
 DETECT_TIMEOUT_SEC="${DETECT_TIMEOUT_SEC:-30}"
 PLATFORM_TIMEOUT_SEC="${PLATFORM_TIMEOUT_SEC:-60}"
 SOC_PROBE_LOG="${ROOT}/results/logs/soc_probe_${RUN_ID}.log"
@@ -313,17 +308,13 @@ python3 "${RESEARCH}/build_template_calibration.py" \
     --hbm-bpc "${HBM_BPC:-1}"
 
 NPU_CANDIDATES=1
-CALIBRATION_NPU_CANDIDATES=80
-ADAPTIVE_NPU_CANDIDATES=16
+ADAPTIVE_NPU_CANDIDATES=24
 CALLBACK_CANDIDATES=192
-CALIBRATION_CALLBACK_CANDIDATES=512
 ADAPTIVE_CALLBACK_CANDIDATES=256
 BEHAVIOR_CANDIDATES=1024
 if [[ "${MODE}" == "smoke" ]]; then
-    CALIBRATION_NPU_CANDIDATES=6
     ADAPTIVE_NPU_CANDIDATES=4
     CALLBACK_CANDIDATES=48
-    CALIBRATION_CALLBACK_CANDIDATES=48
     ADAPTIVE_CALLBACK_CANDIDATES=48
     BEHAVIOR_CANDIDATES=128
 fi
@@ -381,6 +372,7 @@ generate_candidates() {
         --resume-feedback "${PAIRED_EVIDENCE}"
         --resume-feedback "${V9_FEEDBACK}"
         --resume-feedback "${V11_TEMPLATE_EVIDENCE}"
+        --resume-feedback "${V13_TEMPLATE_EVIDENCE}"
     )
     local resume_feedback
     for resume_feedback in "$@"; do
@@ -426,60 +418,28 @@ profile_stage() {
         --pair-block-size "${pair_block_size}"
 }
 
-echo "[3/6] Resume broad bank-relative calibration ..."
-CALIBRATION_AUDIT_PASSES="${CALIBRATION_AUDIT_PASSES:-1}"
-CALIBRATION_AUDIT_RC=3
-for ((calibration_pass = 1; calibration_pass <= CALIBRATION_AUDIT_PASSES; calibration_pass++)); do
-    echo "  calibration_pass=${calibration_pass}/${CALIBRATION_AUDIT_PASSES}"
-    generate_candidates \
-        "${CALIBRATION_WORKLOADS}" \
-        "${CALIBRATION_CANDIDATES}" \
-        "${CALIBRATION_ALL}" \
-        calibration \
-        "${CALIBRATION_NPU_CANDIDATES}" \
-        "${CALIBRATION_CALLBACK_CANDIDATES}" \
-        "${CALIBRATION_RESUME}"
-    if [[ "${MODE}" == "full" ]]; then
-        python3 "${RESEARCH}/audit_candidate_distribution.py" \
-            --candidates "${CALIBRATION_CANDIDATES}"
-    fi
-    if [[ "$(wc -l < "${CALIBRATION_CANDIDATES}")" -gt 1 ]]; then
-        profile_stage \
-            "${CALIBRATION_CANDIDATES}" \
-            "${CALIBRATION_SUMMARY}" \
-            "${CALIBRATION_RESULTS}" \
-            "${CALIBRATION_FAMILY_SUMMARY}" \
-            "${CALIBRATION_RESUME}" \
-            8
-    else
-        echo "  calibration_profile: skipped; tracked paired evidence is complete"
-    fi
-    set +e
-    python3 "${RESEARCH}/audit_template_calibration.py" \
-        --workloads "${CALIBRATION_WORKLOADS}" \
-        --evidence "${V11_TEMPLATE_EVIDENCE}" \
-        --resume "${CALIBRATION_RESUME}" \
-        --soc "${SOC}" \
-        --aic "${AIC}" \
-        --toolkit "${TOOLKIT_VERSION}"
-    CALIBRATION_AUDIT_RC=$?
-    set -e
-    if [[ "${CALIBRATION_AUDIT_RC}" -eq 0 ]]; then
-        break
-    fi
-    if [[ "${CALIBRATION_AUDIT_RC}" -ne 3 ]]; then
-        echo "fatal: template calibration audit failed rc=${CALIBRATION_AUDIT_RC}" >&2
-        exit "${CALIBRATION_AUDIT_RC}"
-    fi
-done
-if [[ "${CALIBRATION_AUDIT_RC}" -ne 0 ]]; then
-    echo "  calibration_status: incomplete strict-paired coverage retained"
-    echo "  calibration_status: continuing; candidate failures are model evidence"
-    echo "  calibration_resume: ${CALIBRATION_RESUME}"
-fi
+echo "[3/5] Load completed v13 broad calibration evidence ..."
+python3 - "${V13_TEMPLATE_EVIDENCE}" <<'PY'
+import csv
+import sys
+
+with open(sys.argv[1], newline="", encoding="utf-8") as source:
+    rows = list(csv.DictReader(source))
+paired = sum(
+    row.get("success") == "1" and row.get("pair_validated") == "1"
+    for row in rows
+)
+rejected = sum(row.get("success") == "0" for row in rows)
+unpaired = len(rows) - paired - rejected
+print(
+    "  v13_evidence: "
+    f"records={len(rows)} paired={paired} "
+    f"runtime_rejected={rejected} runtime_verified_unpaired={unpaired}"
+)
+PY
 echo "  ok"
 
-echo "[4/6] Refine the search frontier from measured feedback ..."
+echo "[4/5] Refine only measured template opportunities ..."
 generate_candidates \
     "${CALIBRATION_WORKLOADS}" \
     "${ADAPTIVE_CANDIDATES}" \
@@ -487,7 +447,6 @@ generate_candidates \
     adaptive-calibration \
     "${ADAPTIVE_NPU_CANDIDATES}" \
     "${ADAPTIVE_CALLBACK_CANDIDATES}" \
-    "${CALIBRATION_RESUME}" \
     "${ADAPTIVE_RESUME}"
 if [[ "$(wc -l < "${ADAPTIVE_CANDIDATES}")" -gt 1 ]]; then
     profile_stage \
@@ -502,7 +461,7 @@ else
 fi
 echo "  ok"
 
-echo "[5/6] Generate one-shot decisions for unseen workloads ..."
+echo "[5/5] Generate and measure one-shot decisions for unseen workloads ..."
 generate_candidates \
     "${WORKLOADS}" \
     "${CANDIDATES}" \
@@ -510,12 +469,10 @@ generate_candidates \
     one-shot \
     "${NPU_CANDIDATES}" \
     "${CALLBACK_CANDIDATES}" \
-    "${CALIBRATION_RESUME}" \
     "${ADAPTIVE_RESUME}" \
     "${RESUME}"
 echo "  ok"
 
-echo "[6/6] Measure one-shot decision against original MatMulV3 ..."
 profile_stage \
     "${CANDIDATES}" \
     "${SUMMARY}" \
@@ -531,6 +488,6 @@ echo "  Summary:    ${SUMMARY}"
 echo "  Families:   ${FAMILY_SUMMARY}"
 echo "  Candidates: ${CANDIDATE_RESULTS}"
 echo "  Resume:     ${RESUME}"
-echo "  Calibration:${CALIBRATION_RESULTS}"
+echo "  V13 evidence:${V13_TEMPLATE_EVIDENCE}"
 echo "  Adaptive:   ${ADAPTIVE_RESULTS}"
 echo "  log:        ${RUN_LOG}"

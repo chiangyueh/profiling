@@ -588,6 +588,15 @@ def feedback_mutations(
             continue
         elif observation.is_winner:
             source = "feedback_winner_mutation"
+        elif (
+            observation.verified
+            and observation.measured_ratio <= 0.99
+        ):
+            # A paired result can cross the 1% numerical boundary while its
+            # run-specific noise estimate still labels it within-noise. It is
+            # not deployment evidence, but it is an informative centre for a
+            # confirmation batch.
+            source = "feedback_promising_mutation"
         elif observation.is_regression:
             source = "feedback_regression_counterfactual"
         else:

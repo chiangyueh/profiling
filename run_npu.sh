@@ -5,7 +5,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESEARCH="${ROOT}/matmul/mat_mul_v3/op_host/op_tiling/research"
 MODE="full"
 WORKLOADS="${RESEARCH}/config/workloads.csv"
-CALIBRATION_WORKLOADS="${ROOT}/results/npu_v13_template_calibration_workloads.csv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -151,40 +150,46 @@ RUN_LOG="${ROOT}/results/logs/run_npu_${RUN_ID}.log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
 BUILD_DIR="${ROOT}/.build/matmul_v3_tiling_research"
-CANDIDATES="${ROOT}/results/npu_v14_one_shot_search_candidates.csv"
-ALL_CANDIDATES="${ROOT}/results/npu_v14_one_shot_search_all.csv"
-SUMMARY="${ROOT}/results/npu_v14_one_shot_summary.csv"
-FAMILY_SUMMARY="${ROOT}/results/npu_v14_one_shot_family_summary.csv"
-CANDIDATE_RESULTS="${ROOT}/results/npu_v14_one_shot_candidates.csv"
-RESUME="${ROOT}/results/npu_v14_one_shot_resume.csv"
-ADAPTIVE_CANDIDATES="${ROOT}/results/npu_v14_adaptive_search_candidates.csv"
-ADAPTIVE_ALL="${ROOT}/results/npu_v14_adaptive_search_all.csv"
-ADAPTIVE_SUMMARY="${ROOT}/results/npu_v14_adaptive_summary.csv"
-ADAPTIVE_FAMILY_SUMMARY="${ROOT}/results/npu_v14_adaptive_family_summary.csv"
-ADAPTIVE_RESULTS="${ROOT}/results/npu_v14_adaptive_candidates.csv"
-ADAPTIVE_RESUME="${ROOT}/results/npu_v14_adaptive_resume.csv"
+MODEL_CANDIDATES="${ROOT}/results/npu_dual_model_search_candidates.csv"
+MODEL_ALL="${ROOT}/results/npu_dual_model_search_all.csv"
+MODEL_SUMMARY="${ROOT}/results/npu_dual_model_summary.csv"
+MODEL_FAMILY_SUMMARY="${ROOT}/results/npu_dual_model_family_summary.csv"
+MODEL_RESULTS="${ROOT}/results/npu_dual_model_candidates.csv"
+MODEL_RESUME="${ROOT}/results/npu_dual_model_resume.csv"
+BASE_CANDIDATES="${ROOT}/results/npu_dual_base_search_candidates.csv"
+BASE_ALL="${ROOT}/results/npu_dual_base_search_all.csv"
+BASE_SUMMARY="${ROOT}/results/npu_dual_base_summary.csv"
+BASE_FAMILY_SUMMARY="${ROOT}/results/npu_dual_base_family_summary.csv"
+BASE_RESULTS="${ROOT}/results/npu_dual_base_candidates.csv"
+BASE_RESUME="${ROOT}/results/npu_dual_base_resume.csv"
+MODEL_LOG="${ROOT}/results/logs/strategy_model_${RUN_ID}.log"
+BASE_LOG="${ROOT}/results/logs/strategy_base_${RUN_ID}.log"
+COMPARISON="${ROOT}/results/npu_dual_comparison.csv"
 PAIRED_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log25_26.csv"
 V9_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log27.csv"
 V11_TEMPLATE_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log28.csv"
 V13_TEMPLATE_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log30.csv"
+V14_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log31.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260806-evidence-targeted-adaptive-v14"
+echo "  script:     run_npu.sh 20260807-dual-deployment-v15"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      v13_evidence_targeted_refinement_unseen_one_shot"
+echo "  scope:      dual_compact_model_vs_direct_base"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
-echo "  summary:    ${SUMMARY}"
-echo "  families:   ${FAMILY_SUMMARY}"
-echo "  candidates: ${CANDIDATE_RESULTS}"
-echo "  resume:     ${RESUME}"
-echo "  v13_evidence:${V13_TEMPLATE_EVIDENCE}"
-echo "  adaptive:   ${ADAPTIVE_RESUME}"
-echo "  log:        ${RUN_LOG}"
+echo "  strategy_A: compact_data_driven"
+echo "    summary:  ${MODEL_SUMMARY}"
+echo "    resume:   ${MODEL_RESUME}"
+echo "    log:      ${MODEL_LOG}"
+echo "  strategy_B: direct_base_policy"
+echo "    summary:  ${BASE_SUMMARY}"
+echo "    resume:   ${BASE_RESUME}"
+echo "    log:      ${BASE_LOG}"
+echo "  main_log:   ${RUN_LOG}"
 echo
 
-echo "[1/5] Build callback/bank/NPU tools ..."
+echo "[1/4] Build callback/bank/NPU tools ..."
 cmake -S "${RESEARCH}" -B "${BUILD_DIR}" \
     -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" \
     -DCMAKE_BUILD_TYPE=Release >/dev/null
@@ -200,7 +205,7 @@ print_acl_loader_diag() {
         sed 's/^/    /' || true
 }
 
-echo "[2/5] Detect NPU and platform ..."
+echo "[2/4] Detect NPU and platform ..."
 DETECT_TIMEOUT_SEC="${DETECT_TIMEOUT_SEC:-30}"
 PLATFORM_TIMEOUT_SEC="${PLATFORM_TIMEOUT_SEC:-60}"
 SOC_PROBE_LOG="${ROOT}/results/logs/soc_probe_${RUN_ID}.log"
@@ -295,28 +300,12 @@ if [[ "${TOOLKIT_VERSION}" != 8.5* ]]; then
     echo "  compatibility: exact callback roundtrip and RuntimeKb preflight remain mandatory"
 fi
 
-python3 "${RESEARCH}/build_template_calibration.py" \
-    --output "${CALIBRATION_WORKLOADS}" \
-    --aic-cores "${AIC}" \
-    --l0a-bytes "${L0A}" \
-    --l0b-bytes "${L0B}" \
-    --l0c-bytes "${L0C}" \
-    --l1-bytes "${L1}" \
-    --ub-bytes "${UB}" \
-    --l2-bytes "${L2}" \
-    --l2-bpc "${L2_BPC:-1}" \
-    --hbm-bpc "${HBM_BPC:-1}"
-
 NPU_CANDIDATES=1
-ADAPTIVE_NPU_CANDIDATES=24
-CALLBACK_CANDIDATES=192
-ADAPTIVE_CALLBACK_CANDIDATES=256
-BEHAVIOR_CANDIDATES=1024
+MODEL_CALLBACK_CANDIDATES=8
+BEHAVIOR_CANDIDATES=12
 if [[ "${MODE}" == "smoke" ]]; then
-    ADAPTIVE_NPU_CANDIDATES=4
-    CALLBACK_CANDIDATES=48
-    ADAPTIVE_CALLBACK_CANDIDATES=48
-    BEHAVIOR_CANDIDATES=128
+    MODEL_CALLBACK_CANDIDATES=6
+    BEHAVIOR_CANDIDATES=8
 fi
 
 generate_candidates() {
@@ -373,6 +362,7 @@ generate_candidates() {
         --resume-feedback "${V9_FEEDBACK}"
         --resume-feedback "${V11_TEMPLATE_EVIDENCE}"
         --resume-feedback "${V13_TEMPLATE_EVIDENCE}"
+        --resume-feedback "${V14_FEEDBACK}"
     )
     local resume_feedback
     for resume_feedback in "$@"; do
@@ -382,6 +372,8 @@ generate_candidates() {
     done
     if [[ "${selection_mode}" == "adaptive-calibration" ||
           "${selection_mode}" == "calibration" ||
+          "${selection_mode}" == "compact-deployment" ||
+          "${selection_mode}" == "direct-base" ||
           "${selection_mode}" == "one-shot" ]]; then
         command+=(--skip-model-validation)
     fi
@@ -418,76 +410,117 @@ profile_stage() {
         --pair-block-size "${pair_block_size}"
 }
 
-echo "[3/5] Load completed v13 broad calibration evidence ..."
-python3 - "${V13_TEMPLATE_EVIDENCE}" <<'PY'
-import csv
-import sys
+run_strategy() {
+    local stage="$1"
+    local strategy="$2"
+    local selection_mode="$3"
+    local candidates="$4"
+    local all_candidates="$5"
+    local summary="$6"
+    local results="$7"
+    local family_summary="$8"
+    local resume="$9"
+    local strategy_log="${10}"
+    local callback_candidates="${11}"
 
-with open(sys.argv[1], newline="", encoding="utf-8") as source:
-    rows = list(csv.DictReader(source))
-paired = sum(
-    row.get("success") == "1" and row.get("pair_validated") == "1"
-    for row in rows
-)
-rejected = sum(row.get("success") == "0" for row in rows)
-unpaired = len(rows) - paired - rejected
-print(
-    "  v13_evidence: "
-    f"records={len(rows)} paired={paired} "
-    f"runtime_rejected={rejected} runtime_verified_unpaired={unpaired}"
-)
-PY
-echo "  ok"
+    echo "${stage}"
+    echo "STRATEGY_BEGIN name=${strategy} selection_mode=${selection_mode}"
+    echo "  isolated_log: ${strategy_log}"
+    local strategy_start
+    strategy_start="$(date +%s%N)"
+    (
+        set -Eeuo pipefail
+        local host_start
+        local host_end
+        local npu_start
+        local npu_end
+        host_start="$(date +%s%N)"
+        generate_candidates \
+            "${WORKLOADS}" \
+            "${candidates}" \
+            "${all_candidates}" \
+            "${selection_mode}" \
+            "${NPU_CANDIDATES}" \
+            "${callback_candidates}" \
+            "${resume}"
+        host_end="$(date +%s%N)"
+        echo "HOST_STAGE_TIME strategy=${strategy} wall_ms=$(( (host_end - host_start) / 1000000 ))"
 
-echo "[4/5] Refine only measured template opportunities ..."
-generate_candidates \
-    "${CALIBRATION_WORKLOADS}" \
-    "${ADAPTIVE_CANDIDATES}" \
-    "${ADAPTIVE_ALL}" \
-    adaptive-calibration \
-    "${ADAPTIVE_NPU_CANDIDATES}" \
-    "${ADAPTIVE_CALLBACK_CANDIDATES}" \
-    "${ADAPTIVE_RESUME}"
-if [[ "$(wc -l < "${ADAPTIVE_CANDIDATES}")" -gt 1 ]]; then
-    profile_stage \
-        "${ADAPTIVE_CANDIDATES}" \
-        "${ADAPTIVE_SUMMARY}" \
-        "${ADAPTIVE_RESULTS}" \
-        "${ADAPTIVE_FAMILY_SUMMARY}" \
-        "${ADAPTIVE_RESUME}" \
-        4
-else
-    echo "  adaptive_profile: skipped; no unmeasured safe frontier remains"
-fi
-echo "  ok"
+        npu_start="$(date +%s%N)"
+        profile_stage \
+            "${candidates}" \
+            "${summary}" \
+            "${results}" \
+            "${family_summary}" \
+            "${resume}" \
+            1
+        npu_end="$(date +%s%N)"
+        echo "NPU_STAGE_TIME strategy=${strategy} wall_ms=$(( (npu_end - npu_start) / 1000000 ))"
+    ) 2>&1 | tee "${strategy_log}"
+    local strategy_rc="${PIPESTATUS[0]}"
+    local strategy_end
+    strategy_end="$(date +%s%N)"
+    echo "STRATEGY_END name=${strategy} rc=${strategy_rc} wall_ms=$(( (strategy_end - strategy_start) / 1000000 ))"
+    return "${strategy_rc}"
+}
 
-echo "[5/5] Generate and measure one-shot decisions for unseen workloads ..."
-generate_candidates \
-    "${WORKLOADS}" \
-    "${CANDIDATES}" \
-    "${ALL_CANDIDATES}" \
-    one-shot \
-    "${NPU_CANDIDATES}" \
-    "${CALLBACK_CANDIDATES}" \
-    "${ADAPTIVE_RESUME}" \
-    "${RESUME}"
-echo "  ok"
+set +e
+run_strategy \
+    "[3/4] Strategy A: compact data-driven one-shot ..." \
+    compact_data_driven \
+    compact-deployment \
+    "${MODEL_CANDIDATES}" \
+    "${MODEL_ALL}" \
+    "${MODEL_SUMMARY}" \
+    "${MODEL_RESULTS}" \
+    "${MODEL_FAMILY_SUMMARY}" \
+    "${MODEL_RESUME}" \
+    "${MODEL_LOG}" \
+    "${MODEL_CALLBACK_CANDIDATES}"
+MODEL_RC="$?"
 
-profile_stage \
-    "${CANDIDATES}" \
-    "${SUMMARY}" \
-    "${CANDIDATE_RESULTS}" \
-    "${FAMILY_SUMMARY}" \
-    "${RESUME}" \
+run_strategy \
+    "[4/4] Strategy B: direct analytical BASE ..." \
+    direct_base_policy \
+    direct-base \
+    "${BASE_CANDIDATES}" \
+    "${BASE_ALL}" \
+    "${BASE_SUMMARY}" \
+    "${BASE_RESULTS}" \
+    "${BASE_FAMILY_SUMMARY}" \
+    "${BASE_RESUME}" \
+    "${BASE_LOG}" \
     1
-echo "  ok"
+BASE_RC="$?"
+set -e
+
+if [[ "${MODEL_RC}" -eq 0 && "${BASE_RC}" -eq 0 ]]; then
+    python3 "${RESEARCH}/compare_deployment.py" \
+        --model "${MODEL_RESULTS}" \
+        --base "${BASE_RESULTS}" \
+        --output "${COMPARISON}"
+else
+    echo "DUAL_COMPARISON skipped=1 reason=strategy_failure"
+fi
 
 echo
 echo "NPU run completed"
-echo "  Summary:    ${SUMMARY}"
-echo "  Families:   ${FAMILY_SUMMARY}"
-echo "  Candidates: ${CANDIDATE_RESULTS}"
-echo "  Resume:     ${RESUME}"
-echo "  V13 evidence:${V13_TEMPLATE_EVIDENCE}"
-echo "  Adaptive:   ${ADAPTIVE_RESULTS}"
-echo "  log:        ${RUN_LOG}"
+echo "  strategy_A_rc: ${MODEL_RC}"
+echo "    Summary:     ${MODEL_SUMMARY}"
+echo "    Candidates:  ${MODEL_RESULTS}"
+echo "    Resume:      ${MODEL_RESUME}"
+echo "    log:         ${MODEL_LOG}"
+echo "  strategy_B_rc: ${BASE_RC}"
+echo "    Summary:     ${BASE_SUMMARY}"
+echo "    Candidates:  ${BASE_RESULTS}"
+echo "    Resume:      ${BASE_RESUME}"
+echo "    log:         ${BASE_LOG}"
+if [[ "${MODEL_RC}" -eq 0 && "${BASE_RC}" -eq 0 ]]; then
+    echo "  Comparison:    ${COMPARISON}"
+fi
+echo "  main_log:      ${RUN_LOG}"
+
+if [[ "${MODEL_RC}" -ne 0 || "${BASE_RC}" -ne 0 ]]; then
+    echo "fatal: one or more isolated strategies failed; inspect its strategy log" >&2
+    exit 1
+fi

@@ -66,6 +66,15 @@ MEASUREMENT_COLUMNS = [
     "search_behavior_metrics",
     "tiling_signature",
     "bank_tiling_signature",
+    "deployment_strategy",
+    "host_history_load_ms",
+    "host_model_setup_ms",
+    "host_generation_ms",
+    "host_callback_ms",
+    "host_selection_ms",
+    "host_tiling_total_ms",
+    "host_generated_candidates",
+    "host_callback_candidates",
     "success",
     "preflight_passed",
     "preflight_mode",
@@ -94,6 +103,12 @@ MEASUREMENT_COLUMNS = [
 STRICT_NUMERIC_PREFLIGHT_MODES = {
     "numeric_ones_full_v2",
     "numeric_signed_axes_full_v3",
+}
+DEPLOYMENT_CUSTOM_SOURCES = {
+    "compact_data_driven",
+    "direct_base_policy",
+    "one_shot_bank_relative",
+    "one_shot_custom_policy",
 }
 MEASUREMENT_PROTOCOL_VERSION = "paired_equal_sampling_v2"
 
@@ -672,6 +687,15 @@ def profile_record(
         "search_behavior_metrics",
         "tiling_signature",
         "bank_tiling_signature",
+        "deployment_strategy",
+        "host_history_load_ms",
+        "host_model_setup_ms",
+        "host_generation_ms",
+        "host_callback_ms",
+        "host_selection_ms",
+        "host_tiling_total_ms",
+        "host_generated_candidates",
+        "host_callback_candidates",
     ):
         row[column] = source.get(column, "")
     row.update(
@@ -826,6 +850,8 @@ def summarize(
         if best is None:
             summary["paired_outcome"] = "failed"
             if source["candidate_source"] in {
+                "compact_data_driven",
+                "direct_base_policy",
                 "one_shot_research_candidate",
                 "one_shot_bank_incumbent",
                 "one_shot_bank_relative",
@@ -1377,6 +1403,20 @@ def main() -> None:
                     )
                     if truthy(record["success"]) and pair_valid:
                         print(
+                            "NPU_TIME "
+                            "strategy="
+                            f"{candidate.get('deployment_strategy') or candidate['candidate_source']} "
+                            f"workload={workload_id} "
+                            f"kernel_median_ms={record['median_ms']} "
+                            f"kernel_stddev_ms={record['stddev_ms']} "
+                            f"host_history_load_ms="
+                            f"{candidate.get('host_history_load_ms', '')} "
+                            f"host_model_setup_ms="
+                            f"{candidate.get('host_model_setup_ms', '')} "
+                            f"host_tiling_ms="
+                            f"{candidate.get('host_tiling_total_ms', '')}"
+                        )
+                        print(
                             f"candidate_done [{index}/{len(pending)}] "
                             f"{workload_id} rank={candidate['rank']} "
                             f"tpl={candidate['search_template']} "
@@ -1477,19 +1517,16 @@ def main() -> None:
         for row in summaries
     )
     custom_attempted = sum(
-        row.get("best_source")
-        in {"one_shot_bank_relative", "one_shot_custom_policy"}
+        row.get("best_source") in DEPLOYMENT_CUSTOM_SOURCES
         for row in summaries
     )
     custom_measured = sum(
-        row.get("best_source")
-        in {"one_shot_bank_relative", "one_shot_custom_policy"}
+        row.get("best_source") in DEPLOYMENT_CUSTOM_SOURCES
         and bool(row.get("best_ms"))
         for row in summaries
     )
     custom_faster = sum(
-        row.get("best_source")
-        in {"one_shot_bank_relative", "one_shot_custom_policy"}
+        row.get("best_source") in DEPLOYMENT_CUSTOM_SOURCES
         and row.get("optimization_result") == "improved"
         for row in summaries
     )

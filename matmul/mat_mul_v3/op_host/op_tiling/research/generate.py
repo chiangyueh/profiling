@@ -6,6 +6,7 @@ import csv
 import json
 import re
 import sys
+import time
 import warnings
 from collections import Counter
 from dataclasses import replace
@@ -26,6 +27,7 @@ from tiling_search import (
     OneShotDecision,
     SearchConfig,
     Workload,
+    direct_base_candidate,
     plan_template_race,
     select_adaptive_calibration_candidates,
     select_calibration_candidates,
@@ -96,6 +98,15 @@ COLUMNS = [
     "search_behavior_metrics",
     "tiling_signature",
     "bank_tiling_signature",
+    "deployment_strategy",
+    "host_history_load_ms",
+    "host_model_setup_ms",
+    "host_generation_ms",
+    "host_callback_ms",
+    "host_selection_ms",
+    "host_tiling_total_ms",
+    "host_generated_candidates",
+    "host_callback_candidates",
     *FIELD_COLUMNS.values(),
     "callback_tiling_key",
     "callback_block_dim",
@@ -682,6 +693,8 @@ def parse_args() -> argparse.Namespace:
             "adaptive-calibration",
             "calibration",
             "campaign",
+            "compact-deployment",
+            "direct-base",
             "one-shot",
         ),
         default="campaign",
@@ -691,6 +704,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    learned_deployment = args.selection_mode in {
+        "compact-deployment",
+        "one-shot",
+    }
+    direct_deployment = args.selection_mode == "direct-base"
     verify_upstream_contract(args.source_root)
     from tbe.common.platform import set_current_compile_soc_info
 
@@ -728,24 +746,30 @@ def main() -> None:
                 "template quota for every workload: "
                 + ",".join(missing_quotas)
             )
-    observations, exclusions = load_feedback(
-        soc=args.soc,
-        aic_cores=args.aic_cores,
-        observation_paths=args.observations,
-        exclusion_paths=args.exclusions,
-    )
-    strict_paired_counts = load_strict_paired_template_counts(
-        args.resume_feedback,
-        args.soc,
-        args.aic_cores,
-        args.toolkit,
-        {workload.workload_id: workload for workload in workloads},
-    )
+    history_load_start = time.perf_counter_ns()
+    if direct_deployment:
+        observations = []
+        exclusions = set()
+        strict_paired_counts = Counter()
+    else:
+        observations, exclusions = load_feedback(
+            soc=args.soc,
+            aic_cores=args.aic_cores,
+            observation_paths=args.observations,
+            exclusion_paths=args.exclusions,
+        )
+        strict_paired_counts = load_strict_paired_template_counts(
+            args.resume_feedback,
+            args.soc,
+            args.aic_cores,
+            args.toolkit,
+            {workload.workload_id: workload for workload in workloads},
+        )
     unpaired_one_shot: dict[
         tuple[int, int, int, str, bool, bool, int],
         Schedule,
     ] = {}
-    for resume_feedback in args.resume_feedback:
+    for resume_feedback in (() if direct_deployment else args.resume_feedback):
         resume_observations, resume_exclusions = load_resume_feedback(
             resume_feedback,
             args.soc,
@@ -775,7 +799,10 @@ def main() -> None:
             "CALIBRATION_RETRYABLE_UNPAIRED "
             f"fingerprints={len(retryable_unpaired)}"
         )
-    if args.selection_mode in {"adaptive-calibration", "one-shot"}:
+    if args.selection_mode in {
+        "adaptive-calibration",
+        "one-shot",
+    }:
         observations, hydrated, hydration_failures = hydrate_bank_context(
             observations
         )
@@ -785,7 +812,7 @@ def main() -> None:
             f"failed_workloads={hydration_failures} "
             "source=current_RuntimeKb_callback"
         )
-    if args.selection_mode == "one-shot":
+    if learned_deployment:
         # A deployment decision must not learn from an earlier measurement of
         # the target shape. This also makes a resumed run regenerate the same
         # fingerprint so profile.py can reuse its exact completed measurement.
@@ -805,6 +832,15 @@ def main() -> None:
             for item in exclusions
             if item[:6] not in target_prefixes
         }
+    history_load_ms = (
+        time.perf_counter_ns() - history_load_start
+    ) / 1_000_000.0
+    print(
+        "TILING_HISTORY_LOAD "
+        f"strategy={args.selection_mode} "
+        f"history_records={len(observations)} "
+        f"ms={history_load_ms:.6f}"
+    )
     latency_observations = sum(
         observation.source
         not in {"runtime_rejected", "runtime_verified"}
@@ -825,14 +861,17 @@ def main() -> None:
         f"runtime_rejected={runtime_rejections} "
         f"runtime_verified_only={runtime_verified_only}"
     )
-    if not args.skip_model_validation and args.selection_mode != "calibration":
+    if (
+        not args.skip_model_validation
+        and args.selection_mode not in {"calibration", "direct-base"}
+    ):
         for leave_workload_out in (False, True):
             validation = validate_feedback_model(
                 observations,
                 hardware,
                 leave_workload_out=leave_workload_out,
             )
-            if args.selection_mode == "one-shot":
+            if learned_deployment:
                 print(
                     "RUNTIME_RISK_VALIDATION "
                     f"mode={validation.mode} "
@@ -863,39 +902,58 @@ def main() -> None:
                 "validation_only=1"
             )
     engine_observations = (
-        observations
-        if args.selection_mode
-        in {"adaptive-calibration", "campaign", "one-shot"}
-        else ()
+        ()
+        if args.selection_mode == "compact-deployment"
+        else (
+            observations
+            if args.selection_mode
+            in {"adaptive-calibration", "campaign", "one-shot"}
+            else ()
+        )
     )
-    engine = CandidateEngine(
-        config=SearchConfig(
-            budget=GenerationBudget(
-                raw_attempts=16000,
-                legal_candidates=7000,
-                behavior_candidates=args.behavior_candidates,
-                callback_candidates=args.callback_candidates,
-                npu_candidates=args.npu_candidates,
+    if args.selection_mode == "compact-deployment":
+        generation_budget = GenerationBudget(
+            raw_attempts=48,
+            legal_candidates=12,
+            behavior_candidates=min(args.behavior_candidates, 12),
+            callback_candidates=min(args.callback_candidates, 8),
+            npu_candidates=1,
+        )
+    else:
+        generation_budget = GenerationBudget(
+            raw_attempts=16000,
+            legal_candidates=7000,
+            behavior_candidates=args.behavior_candidates,
+            callback_candidates=args.callback_candidates,
+            npu_candidates=args.npu_candidates,
+        )
+    engine = (
+        None
+        if direct_deployment
+        else CandidateEngine(
+            config=SearchConfig(
+                budget=generation_budget,
+                include_exploration=args.selection_mode
+                in {"adaptive-calibration", "calibration", "campaign"},
             ),
-            include_exploration=args.selection_mode
-            in {"adaptive-calibration", "calibration", "campaign"},
-        ),
-        observations=engine_observations,
-        exclusions=exclusions,
+            observations=engine_observations,
+            exclusions=exclusions,
+        )
     )
+    model_setup_start = time.perf_counter_ns()
     one_shot_cost_model = (
         FeedbackCostModel(observations, hardware)
-        if args.selection_mode == "one-shot"
+        if learned_deployment
         else None
     )
     one_shot_effect_model = (
         BankRelativeEffectModel(observations, hardware)
-        if args.selection_mode == "one-shot"
+        if learned_deployment
         else None
     )
     one_shot_safety_model = (
         BankRelativeSafetyModel(observations, hardware)
-        if args.selection_mode == "one-shot"
+        if learned_deployment
         else None
     )
     adaptive_cost_model = (
@@ -912,6 +970,16 @@ def main() -> None:
         BankRelativeSafetyModel(observations, hardware)
         if args.selection_mode == "adaptive-calibration"
         else None
+    )
+    model_setup_ms = (
+        time.perf_counter_ns() - model_setup_start
+    ) / 1_000_000.0
+    print(
+        "TILING_MODEL_SETUP "
+        f"strategy={args.selection_mode} "
+        f"history_records={len(observations)} "
+        f"model_enabled={int(learned_deployment)} "
+        f"ms={model_setup_ms:.6f}"
     )
     adaptive_observed_bins = (
         frozenset(
@@ -1063,6 +1131,7 @@ def main() -> None:
         control_row["bank_tiling_signature"] = (
             bank.schedule.signature_text()
         )
+        control_row["deployment_strategy"] = args.selection_mode
         output_rows.append(control_row)
         incumbent = Candidate(
             schedule=bank.schedule,
@@ -1078,31 +1147,57 @@ def main() -> None:
             if args.selection_mode == "adaptive-calibration"
             else None
         )
-        result = engine.generate(
-            workload,
-            hardware,
-            local_anchor=bank.schedule,
-            template_quotas=(
-                remaining_target_quotas
-                if args.selection_mode == "calibration"
-                else adaptive_template_quotas
-            ),
-        )
-        ordered: list[Candidate] = [
-            *result.callback_candidates,
-            *(
-                candidate
-                for candidate in result.candidates
-                if candidate.schedule.signature()
-                not in {
-                    selected.schedule.signature()
-                    for selected in result.callback_candidates
-                }
-            ),
-        ]
+        host_tiling_start = time.perf_counter_ns()
+        generation_start = host_tiling_start
+        if direct_deployment:
+            try:
+                direct_candidate = direct_base_candidate(
+                    workload, hardware
+                )
+            except Exception as exception:
+                print(
+                    "DIRECT_BASE_BLOCKED "
+                    f"{workload.workload_id} "
+                    "stage=construction "
+                    f"reason={str(exception)[:240]} action=continue"
+                )
+                continue
+            result = None
+            ordered = [direct_candidate]
+            generated_candidates = 1
+        else:
+            if engine is None:
+                raise RuntimeError("candidate engine was not initialized")
+            result = engine.generate(
+                workload,
+                hardware,
+                local_anchor=bank.schedule,
+                template_quotas=(
+                    remaining_target_quotas
+                    if args.selection_mode == "calibration"
+                    else adaptive_template_quotas
+                ),
+            )
+            ordered = [
+                *result.callback_candidates,
+                *(
+                    candidate
+                    for candidate in result.candidates
+                    if candidate.schedule.signature()
+                    not in {
+                        selected.schedule.signature()
+                        for selected in result.callback_candidates
+                    }
+                ),
+            ]
+            generated_candidates = result.legal_candidates
+        generation_ms = (
+            time.perf_counter_ns() - generation_start
+        ) / 1_000_000.0
         callback_accepted: list[tuple[Candidate, object]] = []
         callback_rejected = 0
         seen: set[tuple[int, ...]] = set()
+        callback_start = time.perf_counter_ns()
         for candidate in ordered:
             signature = candidate.schedule.signature()
             if signature in seen:
@@ -1130,8 +1225,23 @@ def main() -> None:
                 all_rows.append(rejected)
                 continue
             callback_accepted.append((candidate, callback))
-            if len(callback_accepted) >= args.callback_candidates:
+            callback_limit = (
+                1
+                if direct_deployment
+                else generation_budget.callback_candidates
+            )
+            if len(callback_accepted) >= callback_limit:
                 break
+        callback_ms = (
+            time.perf_counter_ns() - callback_start
+        ) / 1_000_000.0
+        if direct_deployment and not callback_accepted:
+            print(
+                "DIRECT_BASE_BLOCKED "
+                f"{workload.workload_id} "
+                "reason=exact_callback_rejected action=continue"
+            )
+            continue
         callback_by_signature = {
             candidate.schedule.signature(): callback
             for candidate, callback in callback_accepted
@@ -1141,7 +1251,8 @@ def main() -> None:
         ]
         callback_by_signature[bank.schedule.signature()] = bank
         one_shot_decision = None
-        if args.selection_mode == "one-shot":
+        selection_start = time.perf_counter_ns()
+        if learned_deployment:
             one_shot_decision = select_one_shot_candidate(
                 workload,
                 callback_candidates,
@@ -1243,7 +1354,40 @@ def main() -> None:
                     "one-shot deployment must use the independently "
                     "generated selection; bank record injection is disabled"
                 )
+            if args.selection_mode == "compact-deployment":
+                chosen = one_shot_decision.candidate
+                chosen = Candidate(
+                    schedule=chosen.schedule,
+                    template=chosen.template,
+                    source="compact_data_driven",
+                    rationale=(
+                        "deployment-sized learned selection; "
+                        f"generator={one_shot_decision.generator_source}; "
+                        f"{chosen.rationale}"
+                    ),
+                    acquisition=chosen.acquisition,
+                    parent_signatures=chosen.parent_signatures,
+                    behavior_key=chosen.behavior_key,
+                    metrics={
+                        **chosen.metrics,
+                        "deployment_recommended_custom": 1.0,
+                        "compact_deployment_forced_choice": 1.0,
+                        "candidate_pool_size": float(
+                            len(callback_candidates)
+                        ),
+                        "history_rows_used": float(len(observations)),
+                    },
+                )
+                one_shot_decision = replace(
+                    one_shot_decision,
+                    candidate=chosen,
+                    deployment_candidate=chosen,
+                    selection_policy="compact_model_custom",
+                )
             selected_candidates = [one_shot_decision.candidate]
+            racing_plan = None
+        elif direct_deployment:
+            selected_candidates = callback_candidates
             racing_plan = None
         elif args.selection_mode == "adaptive-calibration":
             selected_candidates = select_adaptive_calibration_candidates(
@@ -1306,6 +1450,12 @@ def main() -> None:
                 template_quotas=racing_plan.template_quotas,
                 allow_risky_template_probes=True,
             )
+        selection_ms = (
+            time.perf_counter_ns() - selection_start
+        ) / 1_000_000.0
+        host_tiling_total_ms = (
+            time.perf_counter_ns() - host_tiling_start
+        ) / 1_000_000.0
         accepted = [
             (
                 candidate,
@@ -1326,18 +1476,43 @@ def main() -> None:
             row["bank_tiling_signature"] = (
                 bank.schedule.signature_text()
             )
+            row.update(
+                {
+                    "deployment_strategy": args.selection_mode,
+                    "host_history_load_ms": (
+                        f"{history_load_ms:.6f}"
+                    ),
+                    "host_model_setup_ms": f"{model_setup_ms:.6f}",
+                    "host_generation_ms": f"{generation_ms:.6f}",
+                    "host_callback_ms": f"{callback_ms:.6f}",
+                    "host_selection_ms": f"{selection_ms:.6f}",
+                    "host_tiling_total_ms": (
+                        f"{host_tiling_total_ms:.6f}"
+                    ),
+                    "host_generated_candidates": str(
+                        generated_candidates
+                    ),
+                    "host_callback_candidates": str(
+                        len(callback_candidates)
+                    ),
+                }
+            )
             output_rows.append(row)
             all_rows.append(row)
             source_counts[candidate.source] += 1
             template_counts[candidate.template.value] += 1
-        reports = ";".join(
-            (
-                f"{report.template.value}:raw={report.raw_generated},"
-                f"common={report.common_legal},"
-                f"template={report.template_legal},"
-                f"emitted={report.emitted}"
+        reports = (
+            ";".join(
+                (
+                    f"{report.template.value}:raw={report.raw_generated},"
+                    f"common={report.common_legal},"
+                    f"template={report.template_legal},"
+                    f"emitted={report.emitted}"
+                )
+                for report in result.reports
             )
-            for report in result.reports
+            if result is not None
+            else "BASE:raw=1,common=1,template=1,emitted=1"
         )
         print(
             "SEARCH_WORKLOAD "
@@ -1345,17 +1520,35 @@ def main() -> None:
             f"dtype={workload.dtype} trans={int(workload.trans_a)}"
             f"{int(workload.trans_b)} selected={len(accepted)} "
             f"callback_rejected={callback_rejected} "
-            f"behavior_bins={result.behavior_bins} "
-            f"legal_pool={result.legal_candidates} "
-            f"draft_pool={result.draft_candidates} "
-            f"excluded={result.excluded_fingerprints} solvers={reports}"
+            "behavior_bins="
+            f"{result.behavior_bins if result is not None else 1} "
+            f"legal_pool={generated_candidates} "
+            "draft_pool="
+            f"{result.draft_candidates if result is not None else 1} "
+            "excluded="
+            f"{result.excluded_fingerprints if result is not None else 0} "
+            f"solvers={reports}"
+        )
+        print(
+            "TILING_TIME "
+            f"strategy={args.selection_mode} "
+            f"workload={workload.workload_id} "
+            f"generation_ms={generation_ms:.6f} "
+            f"callback_ms={callback_ms:.6f} "
+            f"selection_ms={selection_ms:.6f} "
+            f"total_ms={host_tiling_total_ms:.6f} "
+            f"generated={generated_candidates} "
+            f"callback_accepted={len(callback_candidates)} "
+            f"selected={len(accepted)}"
         )
         if one_shot_decision is not None:
             selected = one_shot_decision.candidate
             metrics = selected.metrics
             print(
                 "ONE_SHOT_DECISION "
-                f"{workload.workload_id} template={selected.template.value} "
+                f"{workload.workload_id} "
+                f"strategy={args.selection_mode} "
+                f"template={selected.template.value} "
                 f"evaluated={one_shot_decision.evaluated} "
                 f"safe={one_shot_decision.safe_candidates} "
                 f"direct_base={one_shot_decision.direct_base_candidates} "
@@ -1415,6 +1608,19 @@ def main() -> None:
                 f"{metrics.get('l2_capacity_pressure', 0.0):.6g} "
                 "runtime_risk="
                 f"{metrics.get('runtime_risk_score', 0.5):.6g} "
+                f"signature={selected.schedule.signature_text()}"
+            )
+            expected_candidates = 1
+        elif direct_deployment:
+            selected = accepted[0][0]
+            print(
+                "DIRECT_BASE_DECISION "
+                f"{workload.workload_id} "
+                f"template={selected.template.value} "
+                "history_rows_used=0 candidate_pool=1 "
+                "formula=upstream_base_l1_core_l2_fallback "
+                "bank_signature_exact="
+                f"{int(selected.schedule == bank.schedule)} "
                 f"signature={selected.schedule.signature_text()}"
             )
             expected_candidates = 1

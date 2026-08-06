@@ -24,16 +24,16 @@ COLUMNS = [
     "model_speedup_vs_bank",
     "model_status_vs_official",
     "model_status_vs_bank",
-    "base_template",
-    "base_signature",
-    "base_host_history_load_ms",
-    "base_host_model_setup_ms",
-    "base_host_tiling_ms",
-    "base_npu_ms",
-    "base_speedup_vs_official",
-    "base_speedup_vs_bank",
-    "base_status_vs_official",
-    "base_status_vs_bank",
+    "rule_template",
+    "rule_signature",
+    "rule_host_history_load_ms",
+    "rule_host_model_setup_ms",
+    "rule_host_tiling_ms",
+    "rule_npu_ms",
+    "rule_speedup_vs_official",
+    "rule_speedup_vs_bank",
+    "rule_status_vs_official",
+    "rule_status_vs_bank",
     "preferred_strategy",
 ]
 
@@ -70,36 +70,36 @@ def worst_ratio(row: dict[str, str]) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--base", type=Path, required=True)
+    parser.add_argument("--rule", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     model = read_measurements(args.model)
-    base = read_measurements(args.base)
+    rule = read_measurements(args.rule)
     rows = []
-    counts = {"model": 0, "base": 0, "tie": 0, "unavailable": 0}
-    for workload_id in sorted(set(model) | set(base)):
+    counts = {"model": 0, "rule": 0, "tie": 0, "unavailable": 0}
+    for workload_id in sorted(set(model) | set(rule)):
         model_row = model.get(workload_id)
-        base_row = base.get(workload_id)
-        source = model_row or base_row or {}
-        if trusted(model_row) and trusted(base_row):
+        rule_row = rule.get(workload_id)
+        source = model_row or rule_row or {}
+        if trusted(model_row) and trusted(rule_row):
             model_ratio = worst_ratio(model_row)
-            base_ratio = worst_ratio(base_row)
-            if abs(model_ratio - base_ratio) <= 0.005:
+            rule_ratio = worst_ratio(rule_row)
+            if abs(model_ratio - rule_ratio) <= 0.005:
                 preferred = "tie_within_0.5pct"
                 counts["tie"] += 1
-            elif model_ratio < base_ratio:
+            elif model_ratio < rule_ratio:
                 preferred = "compact_data_driven"
                 counts["model"] += 1
             else:
-                preferred = "direct_base_policy"
-                counts["base"] += 1
+                preferred = "direct_rule_base"
+                counts["rule"] += 1
         elif trusted(model_row):
             preferred = "compact_data_driven_only_trusted"
             counts["model"] += 1
-        elif trusted(base_row):
-            preferred = "direct_base_policy_only_trusted"
-            counts["base"] += 1
+        elif trusted(rule_row):
+            preferred = "direct_rule_base_only_trusted"
+            counts["rule"] += 1
         else:
             preferred = "no_trusted_pair"
             counts["unavailable"] += 1
@@ -115,7 +115,7 @@ def main() -> None:
             "trans_b",
         ):
             row[column] = source.get(column, "")
-        for prefix, item in (("model", model_row), ("base", base_row)):
+        for prefix, item in (("model", model_row), ("rule", rule_row)):
             if item is None:
                 continue
             row.update(
@@ -162,7 +162,7 @@ def main() -> None:
         "DUAL_COMPARISON "
         f"workloads={len(rows)} "
         f"model_preferred={counts['model']} "
-        f"base_preferred={counts['base']} "
+        f"rule_preferred={counts['rule']} "
         f"ties={counts['tie']} "
         f"unavailable={counts['unavailable']} "
         f"output={args.output}"

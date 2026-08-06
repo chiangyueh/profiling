@@ -156,14 +156,14 @@ MODEL_SUMMARY="${ROOT}/results/npu_dual_model_summary.csv"
 MODEL_FAMILY_SUMMARY="${ROOT}/results/npu_dual_model_family_summary.csv"
 MODEL_RESULTS="${ROOT}/results/npu_dual_model_candidates.csv"
 MODEL_RESUME="${ROOT}/results/npu_dual_model_resume.csv"
-BASE_CANDIDATES="${ROOT}/results/npu_dual_base_search_candidates.csv"
-BASE_ALL="${ROOT}/results/npu_dual_base_search_all.csv"
-BASE_SUMMARY="${ROOT}/results/npu_dual_base_summary.csv"
-BASE_FAMILY_SUMMARY="${ROOT}/results/npu_dual_base_family_summary.csv"
-BASE_RESULTS="${ROOT}/results/npu_dual_base_candidates.csv"
-BASE_RESUME="${ROOT}/results/npu_dual_base_resume.csv"
+RULE_CANDIDATES="${ROOT}/results/npu_dual_rule_search_candidates.csv"
+RULE_ALL="${ROOT}/results/npu_dual_rule_search_all.csv"
+RULE_SUMMARY="${ROOT}/results/npu_dual_rule_summary.csv"
+RULE_FAMILY_SUMMARY="${ROOT}/results/npu_dual_rule_family_summary.csv"
+RULE_RESULTS="${ROOT}/results/npu_dual_rule_candidates.csv"
+RULE_RESUME="${ROOT}/results/npu_dual_rule_resume.csv"
 MODEL_LOG="${ROOT}/results/logs/strategy_model_${RUN_ID}.log"
-BASE_LOG="${ROOT}/results/logs/strategy_base_${RUN_ID}.log"
+RULE_LOG="${ROOT}/results/logs/strategy_rule_${RUN_ID}.log"
 COMPARISON="${ROOT}/results/npu_dual_comparison.csv"
 PAIRED_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log25_26.csv"
 V9_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log27.csv"
@@ -173,19 +173,19 @@ V14_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log31.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260807-history-distilled-base-v16"
+echo "  script:     run_npu.sh 20260807-dual-model-vs-direct-rule-v17"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      dual_compact_model_vs_history_distilled_base"
+echo "  scope:      dual_compact_model_vs_direct_rule_base"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  strategy_A: compact_data_driven"
 echo "    summary:  ${MODEL_SUMMARY}"
 echo "    resume:   ${MODEL_RESUME}"
 echo "    log:      ${MODEL_LOG}"
-echo "  strategy_B: history_distilled_direct_base"
-echo "    summary:  ${BASE_SUMMARY}"
-echo "    resume:   ${BASE_RESUME}"
-echo "    log:      ${BASE_LOG}"
+echo "  strategy_B: direct_rule_base"
+echo "    summary:  ${RULE_SUMMARY}"
+echo "    resume:   ${RULE_RESUME}"
+echo "    log:      ${RULE_LOG}"
 echo "  main_log:   ${RUN_LOG}"
 echo
 
@@ -333,43 +333,47 @@ generate_candidates() {
         --l2-bytes "${L2}"
         --l2-bpc "${L2_BPC:-1}"
         --hbm-bpc "${HBM_BPC:-1}"
-        --observations "${RESEARCH}/config/measured_observations.csv"
-        --observations "${RESEARCH}/config/measured_observations_net_log11.csv"
-        --observations "${RESEARCH}/config/measured_observations_net_log14.csv"
-        --observations "${RESEARCH}/config/measured_observations_net_log15.csv"
-        --observations "${RESEARCH}/config/measured_observations_net_log17.csv"
-        --observations "${RESEARCH}/config/measured_observations_net_log18.csv"
-        --observations "${RESEARCH}/config/measured_observations_net_log19.csv"
-        --observations "${RESEARCH}/config/measured_observations_net_log21.csv"
-        --observations "${RESEARCH}/config/measured_observations_net_log22.csv"
-        --observations "${RESEARCH}/config/measured_observations_net_log23.csv"
-        --observations "${RESEARCH}/config/measured_observations_net_log24.csv"
-        --exclusions "${RESEARCH}/config/measured_fingerprints.csv"
-        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log14.csv"
-        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log15.csv"
-        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log17.csv"
-        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log18.csv"
-        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log19.csv"
-        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log21.csv"
-        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log22.csv"
-        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log23.csv"
-        --exclusions "${RESEARCH}/config/measured_fingerprints_net_log24.csv"
         --npu-candidates "${npu_candidates}"
         --callback-candidates "${callback_candidates}"
         --behavior-candidates "${BEHAVIOR_CANDIDATES}"
         --selection-mode "${selection_mode}"
-        --resume-feedback "${PAIRED_EVIDENCE}"
-        --resume-feedback "${V9_FEEDBACK}"
-        --resume-feedback "${V11_TEMPLATE_EVIDENCE}"
-        --resume-feedback "${V13_TEMPLATE_EVIDENCE}"
-        --resume-feedback "${V14_FEEDBACK}"
     )
-    local resume_feedback
-    for resume_feedback in "$@"; do
-        if [[ -n "${resume_feedback}" ]]; then
-            command+=(--resume-feedback "${resume_feedback}")
-        fi
-    done
+    if [[ "${selection_mode}" != "direct-base" ]]; then
+        command+=(
+            --observations "${RESEARCH}/config/measured_observations.csv"
+            --observations "${RESEARCH}/config/measured_observations_net_log11.csv"
+            --observations "${RESEARCH}/config/measured_observations_net_log14.csv"
+            --observations "${RESEARCH}/config/measured_observations_net_log15.csv"
+            --observations "${RESEARCH}/config/measured_observations_net_log17.csv"
+            --observations "${RESEARCH}/config/measured_observations_net_log18.csv"
+            --observations "${RESEARCH}/config/measured_observations_net_log19.csv"
+            --observations "${RESEARCH}/config/measured_observations_net_log21.csv"
+            --observations "${RESEARCH}/config/measured_observations_net_log22.csv"
+            --observations "${RESEARCH}/config/measured_observations_net_log23.csv"
+            --observations "${RESEARCH}/config/measured_observations_net_log24.csv"
+            --exclusions "${RESEARCH}/config/measured_fingerprints.csv"
+            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log14.csv"
+            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log15.csv"
+            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log17.csv"
+            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log18.csv"
+            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log19.csv"
+            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log21.csv"
+            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log22.csv"
+            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log23.csv"
+            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log24.csv"
+            --resume-feedback "${PAIRED_EVIDENCE}"
+            --resume-feedback "${V9_FEEDBACK}"
+            --resume-feedback "${V11_TEMPLATE_EVIDENCE}"
+            --resume-feedback "${V13_TEMPLATE_EVIDENCE}"
+            --resume-feedback "${V14_FEEDBACK}"
+        )
+        local resume_feedback
+        for resume_feedback in "$@"; do
+            if [[ -n "${resume_feedback}" ]]; then
+                command+=(--resume-feedback "${resume_feedback}")
+            fi
+        done
+    fi
     if [[ "${selection_mode}" == "adaptive-calibration" ||
           "${selection_mode}" == "calibration" ||
           "${selection_mode}" == "compact-deployment" ||
@@ -480,24 +484,24 @@ run_strategy \
 MODEL_RC="$?"
 
 run_strategy \
-    "[4/4] Strategy B: history-distilled direct BASE ..." \
-    history_distilled_direct_base \
+    "[4/4] Strategy B: fixed-rule direct BASE ..." \
+    direct_rule_base \
     direct-base \
-    "${BASE_CANDIDATES}" \
-    "${BASE_ALL}" \
-    "${BASE_SUMMARY}" \
-    "${BASE_RESULTS}" \
-    "${BASE_FAMILY_SUMMARY}" \
-    "${BASE_RESUME}" \
-    "${BASE_LOG}" \
+    "${RULE_CANDIDATES}" \
+    "${RULE_ALL}" \
+    "${RULE_SUMMARY}" \
+    "${RULE_RESULTS}" \
+    "${RULE_FAMILY_SUMMARY}" \
+    "${RULE_RESUME}" \
+    "${RULE_LOG}" \
     1
-BASE_RC="$?"
+RULE_RC="$?"
 set -e
 
-if [[ "${MODEL_RC}" -eq 0 && "${BASE_RC}" -eq 0 ]]; then
+if [[ "${MODEL_RC}" -eq 0 && "${RULE_RC}" -eq 0 ]]; then
     python3 "${RESEARCH}/compare_deployment.py" \
         --model "${MODEL_RESULTS}" \
-        --base "${BASE_RESULTS}" \
+        --rule "${RULE_RESULTS}" \
         --output "${COMPARISON}"
 else
     echo "DUAL_COMPARISON skipped=1 reason=strategy_failure"
@@ -510,17 +514,17 @@ echo "    Summary:     ${MODEL_SUMMARY}"
 echo "    Candidates:  ${MODEL_RESULTS}"
 echo "    Resume:      ${MODEL_RESUME}"
 echo "    log:         ${MODEL_LOG}"
-echo "  strategy_B_rc: ${BASE_RC}"
-echo "    Summary:     ${BASE_SUMMARY}"
-echo "    Candidates:  ${BASE_RESULTS}"
-echo "    Resume:      ${BASE_RESUME}"
-echo "    log:         ${BASE_LOG}"
-if [[ "${MODEL_RC}" -eq 0 && "${BASE_RC}" -eq 0 ]]; then
+echo "  strategy_B_rc: ${RULE_RC}"
+echo "    Summary:     ${RULE_SUMMARY}"
+echo "    Candidates:  ${RULE_RESULTS}"
+echo "    Resume:      ${RULE_RESUME}"
+echo "    log:         ${RULE_LOG}"
+if [[ "${MODEL_RC}" -eq 0 && "${RULE_RC}" -eq 0 ]]; then
     echo "  Comparison:    ${COMPARISON}"
 fi
 echo "  main_log:      ${RUN_LOG}"
 
-if [[ "${MODEL_RC}" -ne 0 || "${BASE_RC}" -ne 0 ]]; then
+if [[ "${MODEL_RC}" -ne 0 || "${RULE_RC}" -ne 0 ]]; then
     echo "fatal: one or more isolated strategies failed; inspect its strategy log" >&2
     exit 1
 fi

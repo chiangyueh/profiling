@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 import sys
 import unittest
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
+from statistics import median
 
 
 RESEARCH = Path(__file__).resolve().parents[1]
@@ -11,17 +13,22 @@ sys.path.insert(0, str(RESEARCH))
 
 from tiling_search import (
     CandidateEngine,
+    DIRECT_BASE_AUDIT_BANK_WORKLOADS,
+    DIRECT_BASE_AUDIT_PAIRED_RECORDS,
+    DIRECT_BASE_AUDIT_UNIQUE_RECORDS,
+    DIRECT_BASE_AUDIT_WINNER_WORKLOADS,
+    DIRECT_BASE_AUDIT_WORKLOADS,
+    DIRECT_BASE_L2_RESIDENT_RATIO,
     GenerationBudget,
     Hardware,
     SearchConfig,
     Template,
     Workload,
     direct_base_candidate,
-    fit_direct_base_evidence,
 )
 from generate import load_resume_feedback
-from tiling_search.contracts import template_of, validate_schedule
-from tiling_search.solvers.base_policy import upstream_base_l2_policy
+from tiling_search.contracts import ceil_div, template_of, validate_schedule
+from tiling_search.domain import INPUT_BYTES, OUTPUT_BYTES
 
 
 class DeploymentStrategiesTest(unittest.TestCase):
@@ -116,7 +123,7 @@ class DeploymentStrategiesTest(unittest.TestCase):
             candidate.metrics["policy_l2_mode_whole"], 1.0
         )
 
-    def test_history_distillation_reconstructs_all_base_banks(
+    def test_offline_audit_supports_fixed_direct_rules(
         self,
     ) -> None:
         names = (
@@ -137,27 +144,44 @@ class DeploymentStrategiesTest(unittest.TestCase):
             )
             observations.extend(loaded)
 
-        evidence = fit_direct_base_evidence(
-            observations, self.hardware
-        )
-        self.assertEqual(evidence.paired_base_records, 498)
-        self.assertEqual(evidence.unique_base_records, 373)
-        self.assertEqual(evidence.base_workloads, 78)
-        self.assertEqual(evidence.bank_base_workloads, 58)
-        self.assertEqual(evidence.geometry_policy_matches, 58)
-        self.assertEqual(evidence.l1_policy_matches, 58)
-        self.assertEqual(evidence.core_policy_matches, 58)
-        self.assertEqual(evidence.whole_l2_bank_workloads, 36)
+        paired = [
+            observation
+            for observation in observations
+            if observation.verified
+            and observation.source
+            not in {"runtime_rejected", "runtime_verified"}
+            and template_of(observation.schedule) == Template.BASE
+        ]
+        grouped = defaultdict(list)
+        for observation in paired:
+            grouped[
+                (
+                    observation.workload.identity(),
+                    observation.schedule.signature(),
+                )
+            ].append(observation.measured_ratio)
+        best_by_workload = {}
+        for key, ratios in grouped.items():
+            workload_identity = key[0]
+            best_by_workload[workload_identity] = min(
+                median(ratios),
+                best_by_workload.get(
+                    workload_identity, float("inf")
+                ),
+            )
+
         self.assertEqual(
-            evidence.partitioned_l2_bank_workloads, 22
+            len(paired), DIRECT_BASE_AUDIT_PAIRED_RECORDS
         )
-        self.assertGreater(
-            evidence.resident_l2_threshold_bytes,
-            94.625 * 1024 * 1024,
+        self.assertEqual(
+            len(grouped), DIRECT_BASE_AUDIT_UNIQUE_RECORDS
         )
-        self.assertLess(
-            evidence.resident_l2_threshold_bytes,
-            101.553 * 1024 * 1024,
+        self.assertEqual(
+            len(best_by_workload), DIRECT_BASE_AUDIT_WORKLOADS
+        )
+        self.assertEqual(
+            sum(ratio < 0.99 for ratio in best_by_workload.values()),
+            DIRECT_BASE_AUDIT_WINNER_WORKLOADS,
         )
 
         banks = {}
@@ -172,42 +196,60 @@ class DeploymentStrategiesTest(unittest.TestCase):
                     observation.workload,
                     bank,
                 )
-        self.assertEqual(len(banks), 58)
+        self.assertEqual(
+            len(banks), DIRECT_BASE_AUDIT_BANK_WORKLOADS
+        )
+
+        whole_sizes = []
+        partitioned_sizes = []
         for workload, bank in banks.values():
-            reconstructed, _ = upstream_base_l2_policy(
-                workload,
-                self.hardware,
-                base_m=bank["baseM"],
-                base_n=bank["baseN"],
-                resident_threshold_bytes=(
-                    evidence.resident_l2_threshold_bytes
-                ),
+            m_tasks = ceil_div(
+                workload.m, bank["singleCoreM"]
             )
-            expected = tuple(
-                bank[field]
-                for field in (
-                    "l2MTileCnt",
-                    "l2NTileCnt",
-                    "l2MTileBlock",
-                    "l2NTileBlock",
-                    "l2IterateOrder",
-                )
+            n_tasks = ceil_div(
+                workload.n, bank["singleCoreN"]
             )
-            self.assertEqual(
-                reconstructed,
-                expected,
-                workload.workload_id,
+            total_bytes = (
+                workload.m
+                * workload.k
+                * INPUT_BYTES[workload.dtype]
+                + workload.k
+                * workload.n
+                * INPUT_BYTES[workload.dtype]
+                + workload.m
+                * workload.n
+                * OUTPUT_BYTES[workload.dtype]
             )
+            if (
+                bank["l2MTileCnt"],
+                bank["l2NTileCnt"],
+                bank["l2MTileBlock"],
+                bank["l2NTileBlock"],
+            ) == (1, 1, m_tasks, n_tasks):
+                whole_sizes.append(total_bytes)
+            else:
+                partitioned_sizes.append(total_bytes)
+
             candidate = direct_base_candidate(
                 workload,
                 self.hardware,
-                evidence,
             )
             self.assertEqual(
                 candidate.schedule.signature(),
                 bank.signature(),
                 workload.workload_id,
             )
+
+        self.assertEqual(len(whole_sizes), 36)
+        self.assertEqual(len(partitioned_sizes), 22)
+        threshold = math.sqrt(
+            max(whole_sizes) * min(partitioned_sizes)
+        )
+        self.assertAlmostEqual(
+            threshold / self.hardware.l2_bytes,
+            DIRECT_BASE_L2_RESIDENT_RATIO,
+            places=12,
+        )
 
     def test_direct_base_covers_dtype_and_layout_variants(self) -> None:
         cases = (

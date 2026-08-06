@@ -14,9 +14,14 @@ from .domain import (
     Workload,
 )
 from .deployment import (
-    DirectBaseEvidence,
+    DIRECT_BASE_AUDIT_BANK_WORKLOADS,
+    DIRECT_BASE_AUDIT_PAIRED_RECORDS,
+    DIRECT_BASE_AUDIT_UNIQUE_RECORDS,
+    DIRECT_BASE_AUDIT_WINNER_WORKLOADS,
+    DIRECT_BASE_AUDIT_WORKLOADS,
+    DIRECT_BASE_L2_RESIDENT_RATIO,
+    DIRECT_BASE_RULE_VERSION,
     direct_base_candidate,
-    fit_direct_base_evidence,
 )
 from .orchestrator import CandidateEngine, SearchConfig
 from .one_shot import (
@@ -47,7 +52,13 @@ __all__ = [
     "BankRelativeValidation",
     "Candidate",
     "CandidateEngine",
-    "DirectBaseEvidence",
+    "DIRECT_BASE_AUDIT_BANK_WORKLOADS",
+    "DIRECT_BASE_AUDIT_PAIRED_RECORDS",
+    "DIRECT_BASE_AUDIT_UNIQUE_RECORDS",
+    "DIRECT_BASE_AUDIT_WINNER_WORKLOADS",
+    "DIRECT_BASE_AUDIT_WORKLOADS",
+    "DIRECT_BASE_L2_RESIDENT_RATIO",
+    "DIRECT_BASE_RULE_VERSION",
     "GenerationBudget",
     "Hardware",
     "MeasuredObservation",
@@ -69,5 +80,4 @@ __all__ = [
     "select_one_shot_candidate",
     "validate_bank_relative_selector",
     "direct_base_candidate",
-    "fit_direct_base_evidence",
 ]

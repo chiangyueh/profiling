@@ -48,6 +48,7 @@ KNOWLEDGE_COLUMNS = {
 MEASUREMENT_COLUMNS = [
     "record_id",
     "run_id",
+    "benchmark_stage",
     "soc",
     "aic",
     "toolkit",
@@ -58,11 +59,14 @@ MEASUREMENT_COLUMNS = [
     "dtype",
     "trans_a",
     "trans_b",
+    "max_cores",
     "rank",
     "candidate_role",
     "candidate_source",
     "search_template",
+    "search_rationale",
     "search_acquisition",
+    "search_behavior_key",
     "search_behavior_metrics",
     "tiling_signature",
     "bank_tiling_signature",
@@ -75,16 +79,46 @@ MEASUREMENT_COLUMNS = [
     "host_tiling_total_ms",
     "host_generated_candidates",
     "host_callback_candidates",
+    *KNOWLEDGE_COLUMNS.values(),
+    "callback_tiling_key",
+    "callback_block_dim",
+    "callback_workspace_bytes",
+    "callback_tiling_sha256",
     "success",
     "preflight_passed",
     "preflight_mode",
+    "failure_stage",
+    "failure_classification",
     "error",
+    "min_ms",
+    "mean_ms",
     "median_ms",
     "stddev_ms",
+    "p95_ms",
+    "max_ms",
+    "tflops",
+    "warmup",
+    "repeat",
+    "samples",
+    "runner_wall_ms",
+    "acl_init_ms",
+    "set_device_ms",
+    "context_stream_ms",
+    "allocation_ms",
+    "input_setup_ms",
+    "workspace_setup_ms",
+    "preflight_ms",
+    "warmup_ms",
+    "sampling_wall_ms",
+    "raw_samples_json",
     "official_ms",
     "official_stddev_ms",
+    "official_raw_samples_json",
+    "official_profile_json",
     "bank_ms",
     "bank_stddev_ms",
+    "bank_raw_samples_json",
+    "bank_profile_json",
     "speedup_vs_official",
     "speedup_vs_bank",
     "delta_ms_vs_official",
@@ -95,7 +129,11 @@ MEASUREMENT_COLUMNS = [
     "status_vs_bank",
     "pair_validated",
     "official_post_ms",
+    "official_post_raw_samples_json",
+    "official_post_profile_json",
     "bank_post_ms",
+    "bank_post_raw_samples_json",
+    "bank_post_profile_json",
     "official_drift_pct",
     "bank_drift_pct",
 ]
@@ -193,6 +231,24 @@ def truthy(value: object) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def classify_failure(measured: dict[str, str]) -> tuple[str, str]:
+    if truthy(measured.get("success")):
+        return "", ""
+    mode = measured.get("preflight_mode", "")
+    error = measured.get("error", "").lower()
+    if mode == "timeout":
+        return "npu_execution", "timeout"
+    if "runtimekb" in error:
+        return "runtime_kb_preflight", "runtime_kb_rejected"
+    if "numeric" in error or "output" in error:
+        return "numeric_preflight", "numeric_mismatch"
+    if mode == "runner_exception":
+        return "runner", "runner_exception"
+    if mode == "runner_failed":
+        return "npu_execution", "runner_failed"
+    return "npu_execution", mode or "runtime_rejected"
+
+
 def align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
@@ -218,6 +274,13 @@ def write_csv(
         destination.flush()
         os.fsync(destination.fileno())
     temporary.replace(path)
+
+
+def emit_benchmark_record(row: dict[str, str]) -> None:
+    print(
+        "BENCHMARK_RECORD "
+        + json.dumps(row, separators=(",", ":"), sort_keys=True)
+    )
 
 
 def pack_info(info: dict) -> bytes:
@@ -462,6 +525,7 @@ def run_runner(
     ]
     if require_numeric_preflight:
         command.append("--require-numeric-preflight")
+    runner_start = time.perf_counter_ns()
     process = subprocess.Popen(
         command,
         env=env,
@@ -486,7 +550,14 @@ def run_runner(
             "error": f"MatMulV3 timeout after {timeout}s",
             "median_ms": "",
             "stddev_ms": "",
+            "runner_wall_ms": (
+                f"{(time.perf_counter_ns() - runner_start) / 1_000_000.0:.6f}"
+            ),
+            "raw_samples_json": "[]",
         }
+    runner_wall_ms = (
+        time.perf_counter_ns() - runner_start
+    ) / 1_000_000.0
     if not output.is_file():
         return {
             "success": "0",
@@ -495,11 +566,23 @@ def run_runner(
             "error": stdout.strip()[-1000:],
             "median_ms": "",
             "stddev_ms": "",
+            "runner_wall_ms": f"{runner_wall_ms:.6f}",
+            "raw_samples_json": "[]",
         }
     rows = read_csv(output)
     if not rows:
         raise ProfileError(f"runner returned no row for {workload_id}")
     row = rows[0]
+    sample_rows = read_csv(sample_output) if sample_output.is_file() else []
+    row["raw_samples_json"] = json.dumps(
+        [
+            float(sample["latency_ms"])
+            for sample in sample_rows
+            if sample.get("latency_ms")
+        ],
+        separators=(",", ":"),
+    )
+    row["runner_wall_ms"] = f"{runner_wall_ms:.6f}"
     if process.returncode and truthy(row.get("success")):
         row["success"] = "0"
         row["error"] = stdout.strip()[-1000:]
@@ -517,6 +600,7 @@ def safe_run_runner(*args, **kwargs) -> dict[str, str]:
             "error": str(exception),
             "median_ms": "",
             "stddev_ms": "",
+            "raw_samples_json": "[]",
         }
 
 
@@ -691,6 +775,7 @@ def profile_record(
     soc: str,
     aic: int,
     toolkit: str,
+    benchmark_stage: str = "unspecified",
     official: dict[str, str] | None = None,
     bank: dict[str, str] | None = None,
     official_post: dict[str, str] | None = None,
@@ -706,11 +791,14 @@ def profile_record(
         "dtype",
         "trans_a",
         "trans_b",
+        "max_cores",
         "rank",
         "candidate_role",
         "candidate_source",
         "search_template",
+        "search_rationale",
         "search_acquisition",
+        "search_behavior_key",
         "search_behavior_metrics",
         "tiling_signature",
         "bank_tiling_signature",
@@ -723,21 +811,48 @@ def profile_record(
         "host_tiling_total_ms",
         "host_generated_candidates",
         "host_callback_candidates",
+        *KNOWLEDGE_COLUMNS.values(),
+        "callback_tiling_key",
+        "callback_block_dim",
+        "callback_workspace_bytes",
+        "callback_tiling_sha256",
     ):
         row[column] = source.get(column, "")
     row.update(
         {
             "record_id": record_id,
             "run_id": run_id,
+            "benchmark_stage": benchmark_stage,
             "soc": soc,
             "aic": str(aic),
             "toolkit": toolkit,
             "success": measured.get("success", "0"),
             "preflight_passed": measured.get("preflight_passed", "0"),
             "preflight_mode": measured.get("preflight_mode", ""),
+            "failure_stage": classify_failure(measured)[0],
+            "failure_classification": classify_failure(measured)[1],
             "error": measured.get("error", ""),
+            "min_ms": measured.get("min_ms", ""),
+            "mean_ms": measured.get("mean_ms", ""),
             "median_ms": measured.get("median_ms", ""),
             "stddev_ms": measured.get("stddev_ms", ""),
+            "p95_ms": measured.get("p95_ms", ""),
+            "max_ms": measured.get("max_ms", ""),
+            "tflops": measured.get("tflops", ""),
+            "warmup": measured.get("warmup", ""),
+            "repeat": measured.get("repeat", ""),
+            "samples": measured.get("samples", ""),
+            "runner_wall_ms": measured.get("runner_wall_ms", ""),
+            "acl_init_ms": measured.get("acl_init_ms", ""),
+            "set_device_ms": measured.get("set_device_ms", ""),
+            "context_stream_ms": measured.get("context_stream_ms", ""),
+            "allocation_ms": measured.get("allocation_ms", ""),
+            "input_setup_ms": measured.get("input_setup_ms", ""),
+            "workspace_setup_ms": measured.get("workspace_setup_ms", ""),
+            "preflight_ms": measured.get("preflight_ms", ""),
+            "warmup_ms": measured.get("warmup_ms", ""),
+            "sampling_wall_ms": measured.get("sampling_wall_ms", ""),
+            "raw_samples_json": measured.get("raw_samples_json", "[]"),
             "pair_validated": str(int(pair_validated)),
         }
     )
@@ -745,7 +860,19 @@ def profile_record(
         row.update(
             {
                 "official_post_ms": official_post.get("median_ms", ""),
+                "official_post_raw_samples_json": official_post.get(
+                    "raw_samples_json", "[]"
+                ),
+                "official_post_profile_json": json.dumps(
+                    official_post, separators=(",", ":"), sort_keys=True
+                ),
                 "bank_post_ms": bank_post.get("median_ms", ""),
+                "bank_post_raw_samples_json": bank_post.get(
+                    "raw_samples_json", "[]"
+                ),
+                "bank_post_profile_json": json.dumps(
+                    bank_post, separators=(",", ":"), sort_keys=True
+                ),
                 "official_drift_pct": (
                     f"{baseline_drift_pct(official, official_post):.12g}"
                     if official is not None
@@ -755,6 +882,27 @@ def profile_record(
                     f"{baseline_drift_pct(bank, bank_post):.12g}"
                     if bank is not None
                     else ""
+                ),
+            }
+        )
+    if official is not None and bank is not None:
+        row.update(
+            {
+                "official_ms": official.get("median_ms", ""),
+                "official_stddev_ms": official.get("stddev_ms", ""),
+                "official_raw_samples_json": official.get(
+                    "raw_samples_json", "[]"
+                ),
+                "official_profile_json": json.dumps(
+                    official, separators=(",", ":"), sort_keys=True
+                ),
+                "bank_ms": bank.get("median_ms", ""),
+                "bank_stddev_ms": bank.get("stddev_ms", ""),
+                "bank_raw_samples_json": bank.get(
+                    "raw_samples_json", "[]"
+                ),
+                "bank_profile_json": json.dumps(
+                    bank, separators=(",", ":"), sort_keys=True
                 ),
             }
         )
@@ -780,8 +928,14 @@ def profile_record(
             {
                 "official_ms": f"{official_ms:.12g}",
                 "official_stddev_ms": f"{official_std:.12g}",
+                "official_raw_samples_json": official.get(
+                    "raw_samples_json", "[]"
+                ),
                 "bank_ms": f"{bank_ms:.12g}",
                 "bank_stddev_ms": f"{bank_std:.12g}",
+                "bank_raw_samples_json": bank.get(
+                    "raw_samples_json", "[]"
+                ),
                 "speedup_vs_official": f"{speedup_official:.12g}",
                 "speedup_vs_bank": f"{speedup_bank:.12g}",
                 "delta_ms_vs_official": (
@@ -1086,6 +1240,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-drift-pct", type=float, default=3.0)
     parser.add_argument("--pair-block-size", type=int, default=4)
     parser.add_argument("--pair-attempts", type=int, default=3)
+    parser.add_argument("--campaign-stage", default="unspecified")
+    parser.add_argument("--run-id")
     return parser.parse_args()
 
 
@@ -1129,7 +1285,7 @@ def main() -> None:
         for column, value in candidate.items():
             if column in MEASUREMENT_COLUMNS:
                 record[column] = value
-    run_id = time.strftime("%Y%m%d_%H%M%S")
+    run_id = args.run_id or time.strftime("%Y%m%d_%H%M%S")
 
     with tempfile.TemporaryDirectory(
         prefix=".matmul_v3_profile_", dir=args.summary.parent
@@ -1333,6 +1489,7 @@ def main() -> None:
                         soc=args.soc,
                         aic=args.aic,
                         toolkit=args.toolkit,
+                        benchmark_stage=args.campaign_stage,
                         official=official,
                         bank=bank,
                     )
@@ -1453,6 +1610,7 @@ def main() -> None:
                         soc=args.soc,
                         aic=args.aic,
                         toolkit=args.toolkit,
+                        benchmark_stage=args.campaign_stage,
                         official=official_reference,
                         bank=bank_reference,
                         official_post=official_post,
@@ -1473,6 +1631,8 @@ def main() -> None:
                             f"bank={bank_drift:.6g}%"
                         )
                     records[record_id] = record
+                    if args.campaign_stage != "unspecified":
+                        emit_benchmark_record(record)
                     metrics = json.loads(
                         candidate.get("search_behavior_metrics") or "{}"
                     )
@@ -1548,8 +1708,11 @@ def main() -> None:
             pending_workloads
             and blocked_workloads == pending_workloads
         ):
-            raise ProfileError(
-                "all pending workloads were blocked by baseline failures"
+            print(
+                "BENCHMARK_ACQUISITION_BLOCKED "
+                f"stage={args.campaign_stage} "
+                "reason=all_pending_workloads_failed_baseline "
+                "action=preserve_resume_and_report_incomplete"
             )
 
     summaries = summarize(
@@ -1696,10 +1859,17 @@ def main() -> None:
             f"{row['max_speedup_vs_official'] or 'NA'}"
         )
     print("FAMILY_RESULT_END")
-    print(
-        f"profile_npu completed summary={args.summary} "
-        f"candidates={args.candidate_results} resume={args.resume}"
-    )
+    if args.campaign_stage == "unspecified":
+        print(
+            f"profile_npu completed summary={args.summary} "
+            f"candidates={args.candidate_results} resume={args.resume}"
+        )
+    else:
+        print(
+            "profile_npu completed "
+            f"stage={args.campaign_stage} state=internal "
+            "handoff=main_log"
+        )
 
 
 if __name__ == "__main__":

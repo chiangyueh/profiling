@@ -4,7 +4,8 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESEARCH="${ROOT}/matmul/mat_mul_v3/op_host/op_tiling/research"
 MODE="full"
-WORKLOADS="${RESEARCH}/config/workloads.csv"
+WORKLOADS=""
+WORKLOADS_SUPPLIED=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -14,6 +15,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --workloads)
             WORKLOADS="$(realpath "${2:?missing workload CSV}")"
+            WORKLOADS_SUPPLIED=1
             shift 2
             ;;
         --help|-h)
@@ -150,47 +152,21 @@ RUN_LOG="${ROOT}/results/logs/run_npu_${RUN_ID}.log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
 BUILD_DIR="${ROOT}/.build/matmul_v3_tiling_research"
-MODEL_CANDIDATES="${ROOT}/results/npu_dual_model_search_candidates.csv"
-MODEL_ALL="${ROOT}/results/npu_dual_model_search_all.csv"
-MODEL_SUMMARY="${ROOT}/results/npu_dual_model_summary.csv"
-MODEL_FAMILY_SUMMARY="${ROOT}/results/npu_dual_model_family_summary.csv"
-MODEL_RESULTS="${ROOT}/results/npu_dual_model_candidates.csv"
-MODEL_RESUME="${ROOT}/results/npu_dual_model_resume.csv"
-RULE_CANDIDATES="${ROOT}/results/npu_dual_rule_search_candidates.csv"
-RULE_ALL="${ROOT}/results/npu_dual_rule_search_all.csv"
-RULE_SUMMARY="${ROOT}/results/npu_dual_rule_summary.csv"
-RULE_FAMILY_SUMMARY="${ROOT}/results/npu_dual_rule_family_summary.csv"
-RULE_RESULTS="${ROOT}/results/npu_dual_rule_candidates.csv"
-RULE_RESUME="${ROOT}/results/npu_dual_rule_resume.csv"
-MODEL_LOG="${ROOT}/results/logs/strategy_model_${RUN_ID}.log"
-RULE_LOG="${ROOT}/results/logs/strategy_rule_${RUN_ID}.log"
-COMPARISON="${ROOT}/results/npu_dual_comparison.csv"
-PAIRED_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log25_26.csv"
-V9_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log27.csv"
-V11_TEMPLATE_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log28.csv"
-V13_TEMPLATE_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log30.csv"
-V14_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log31.csv"
-V19_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log33.csv"
+STATE_ROOT="${ROOT}/.benchmark_state/hardware_coverage_v1"
+PROBE_STATE="${STATE_ROOT}/probe"
+mkdir -p "${PROBE_STATE}"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260807-hardware-template-competition-v22"
+echo "  script:     run_npu.sh 20260807-hardware-coverage-benchmark-v23"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      dual_data_driven_vs_hardware_template_rule_v7"
+echo "  scope:      broad_contract_search_with_same_run_feedback"
 echo "  mode:       ${MODE}"
-echo "  workloads:  ${WORKLOADS}"
-echo "  strategy_A: evidence_bounded_data_driven"
-echo "    summary:  ${MODEL_SUMMARY}"
-echo "    resume:   ${MODEL_RESUME}"
-echo "    log:      ${MODEL_LOG}"
-echo "  strategy_B: stateless_hardware_template_competition"
-echo "    summary:  ${RULE_SUMMARY}"
-echo "    resume:   ${RULE_RESUME}"
-echo "    log:      ${RULE_LOG}"
-echo "  main_log:   ${RUN_LOG}"
+echo "  handoff:    one_log_only"
+echo "  log:        ${RUN_LOG}"
 echo
 
-echo "[1/4] Build callback/bank/NPU tools ..."
+echo "[1/5] Build callback/bank/NPU tools ..."
 cmake -S "${RESEARCH}" -B "${BUILD_DIR}" \
     -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" \
     -DCMAKE_BUILD_TYPE=Release >/dev/null
@@ -206,11 +182,11 @@ print_acl_loader_diag() {
         sed 's/^/    /' || true
 }
 
-echo "[2/4] Detect NPU and platform ..."
+echo "[2/5] Detect NPU and platform ..."
 DETECT_TIMEOUT_SEC="${DETECT_TIMEOUT_SEC:-30}"
 PLATFORM_TIMEOUT_SEC="${PLATFORM_TIMEOUT_SEC:-60}"
-SOC_PROBE_LOG="${ROOT}/results/logs/soc_probe_${RUN_ID}.log"
-PLATFORM_PROBE_LOG="${ROOT}/results/logs/platform_probe_${RUN_ID}.log"
+SOC_PROBE_LOG="${PROBE_STATE}/soc_probe.log"
+PLATFORM_PROBE_LOG="${PROBE_STATE}/platform_probe.log"
 
 echo "  detect_stage: ACL SoC probe"
 set +e
@@ -301,25 +277,69 @@ if [[ "${TOOLKIT_VERSION}" != 8.5* ]]; then
     echo "  compatibility: exact callback roundtrip and RuntimeKb preflight remain mandatory"
 fi
 
-NPU_CANDIDATES=1
-MODEL_CALLBACK_CANDIDATES=24
-BEHAVIOR_CANDIDATES=48
-if [[ "${MODE}" == "smoke" ]]; then
-    MODEL_CALLBACK_CANDIDATES=12
-    BEHAVIOR_CANDIDATES=24
+CAMPAIGN_ID_SOURCE="hardware_coverage_v1|${SOC}|${AIC}|${TOOLKIT_VERSION}|${MODE}"
+if [[ "${WORKLOADS_SUPPLIED}" -eq 1 ]]; then
+    CAMPAIGN_ID_SOURCE="${CAMPAIGN_ID_SOURCE}|$(sha256sum "${WORKLOADS}" | cut -d' ' -f1)"
+fi
+CAMPAIGN_ID="$(printf '%s' "${CAMPAIGN_ID_SOURCE}" | sha256sum | cut -c1-16)"
+CAMPAIGN_STATE="${STATE_ROOT}/${CAMPAIGN_ID}"
+mkdir -p "${CAMPAIGN_STATE}"
+MANIFEST="${CAMPAIGN_STATE}/workloads.csv"
+RESUME="${CAMPAIGN_STATE}/measurements.csv"
+STAGE1_CANDIDATES="${CAMPAIGN_STATE}/stage1_candidates.csv"
+STAGE1_ALL="${CAMPAIGN_STATE}/stage1_all.csv"
+STAGE2_CANDIDATES="${CAMPAIGN_STATE}/stage2_candidates.csv"
+STAGE2_ALL="${CAMPAIGN_STATE}/stage2_all.csv"
+
+if [[ "${WORKLOADS_SUPPLIED}" -eq 0 ]]; then
+    WORKLOADS="${MANIFEST}"
+    python3 "${RESEARCH}/benchmark_manifest.py" \
+        --output "${MANIFEST}" \
+        --aic-cores "${AIC}" \
+        --mode "${MODE}"
+else
+    echo "BENCHMARK_MANIFEST custom_workloads=${WORKLOADS}"
 fi
 
-generate_candidates() {
-    local workloads="$1"
+STAGE1_NPU=64
+STAGE1_CALLBACK=192
+STAGE1_BEHAVIOR=640
+STAGE2_NPU=32
+STAGE2_CALLBACK=160
+STAGE2_BEHAVIOR=512
+if [[ "${MODE}" == "smoke" ]]; then
+    STAGE1_NPU=8
+    STAGE1_CALLBACK=32
+    STAGE1_BEHAVIOR=64
+    STAGE2_NPU=4
+    STAGE2_CALLBACK=24
+    STAGE2_BEHAVIOR=48
+fi
+
+append_historical_feedback() {
+    local -n command_ref="$1"
+    local path
+    for path in "${RESEARCH}"/config/measured_observations*.csv; do
+        [[ -f "${path}" ]] && command_ref+=(--observations "${path}")
+    done
+    for path in "${RESEARCH}"/config/measured_fingerprints*.csv; do
+        [[ -f "${path}" ]] && command_ref+=(--exclusions "${path}")
+    done
+    for path in "${RESEARCH}"/config/paired_measurements*.csv; do
+        [[ -f "${path}" ]] && command_ref+=(--resume-feedback "${path}")
+    done
+}
+
+generate_stage() {
+    local stage="$1"
     local output="$2"
     local all_output="$3"
-    local selection_mode="$4"
-    local npu_candidates="$5"
-    local callback_candidates="$6"
-    shift 6
+    local npu_candidates="$4"
+    local callback_candidates="$5"
+    local behavior_candidates="$6"
     local command=(
         python3 "${RESEARCH}/generate.py"
-        --workloads "${workloads}"
+        --workloads "${WORKLOADS}"
         --output "${output}"
         --all-output "${all_output}"
         --source-root "${ROOT}/matmul/mat_mul_v3"
@@ -336,69 +356,34 @@ generate_candidates() {
         --hbm-bpc "${HBM_BPC:-1}"
         --npu-candidates "${npu_candidates}"
         --callback-candidates "${callback_candidates}"
-        --behavior-candidates "${BEHAVIOR_CANDIDATES}"
-        --selection-mode "${selection_mode}"
+        --behavior-candidates "${behavior_candidates}"
+        --selection-mode campaign
+        --search-stage "${stage}"
+        --fixed-campaign-budget
+        --skip-model-validation
     )
-    if [[ "${selection_mode}" != "direct-rule" ]]; then
-        command+=(
-            --observations "${RESEARCH}/config/measured_observations.csv"
-            --observations "${RESEARCH}/config/measured_observations_net_log11.csv"
-            --observations "${RESEARCH}/config/measured_observations_net_log14.csv"
-            --observations "${RESEARCH}/config/measured_observations_net_log15.csv"
-            --observations "${RESEARCH}/config/measured_observations_net_log17.csv"
-            --observations "${RESEARCH}/config/measured_observations_net_log18.csv"
-            --observations "${RESEARCH}/config/measured_observations_net_log19.csv"
-            --observations "${RESEARCH}/config/measured_observations_net_log21.csv"
-            --observations "${RESEARCH}/config/measured_observations_net_log22.csv"
-            --observations "${RESEARCH}/config/measured_observations_net_log23.csv"
-            --observations "${RESEARCH}/config/measured_observations_net_log24.csv"
-            --exclusions "${RESEARCH}/config/measured_fingerprints.csv"
-            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log14.csv"
-            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log15.csv"
-            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log17.csv"
-            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log18.csv"
-            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log19.csv"
-            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log21.csv"
-            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log22.csv"
-            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log23.csv"
-            --exclusions "${RESEARCH}/config/measured_fingerprints_net_log24.csv"
-            --resume-feedback "${PAIRED_EVIDENCE}"
-            --resume-feedback "${V9_FEEDBACK}"
-            --resume-feedback "${V11_TEMPLATE_EVIDENCE}"
-            --resume-feedback "${V13_TEMPLATE_EVIDENCE}"
-            --resume-feedback "${V14_FEEDBACK}"
-            --resume-feedback "${V19_FEEDBACK}"
-        )
-        local resume_feedback
-        for resume_feedback in "$@"; do
-            if [[ -n "${resume_feedback}" ]]; then
-                command+=(--resume-feedback "${resume_feedback}")
-            fi
-        done
-    fi
-    if [[ "${selection_mode}" == "adaptive-calibration" ||
-          "${selection_mode}" == "calibration" ||
-          "${selection_mode}" == "compact-deployment" ||
-          "${selection_mode}" == "direct-rule" ||
-          "${selection_mode}" == "one-shot" ]]; then
-        command+=(--skip-model-validation)
+    append_historical_feedback command
+    if [[ "${stage}" == "stage2" ]]; then
+        command+=(--resume-feedback "${RESUME}")
     fi
     "${command[@]}"
 }
 
 profile_stage() {
-    local candidates="$1"
-    local summary="$2"
-    local results="$3"
-    local family_summary="$4"
-    local resume="$5"
-    local pair_block_size="$6"
+    local stage="$1"
+    local candidates="$2"
+    local repeat="$3"
+    local samples="$4"
+    local warmup="$5"
+    local pair_block="$6"
     python3 "${RESEARCH}/profile.py" \
+        --campaign-stage "${stage}" \
+        --run-id "${RUN_ID}" \
         --candidates "${candidates}" \
-        --summary "${summary}" \
-        --family-summary "${family_summary}" \
-        --candidate-results "${results}" \
-        --resume "${resume}" \
+        --summary "${CAMPAIGN_STATE}/${stage}_summary.csv" \
+        --family-summary "${CAMPAIGN_STATE}/${stage}_families.csv" \
+        --candidate-results "${CAMPAIGN_STATE}/${stage}_results.csv" \
+        --resume "${RESUME}" \
         --runner "${RUNNER}" \
         --probe "${PROBE}" \
         --cann-root "${CANN_ROOT}" \
@@ -406,128 +391,116 @@ profile_stage() {
         --aic "${AIC}" \
         --toolkit "${TOOLKIT_VERSION}" \
         --timeout "${PROFILE_TIMEOUT_SEC:-120}" \
-        --warmup "${WARMUP:-10}" \
-        --repeat "${REPEAT:-50}" \
-        --samples "${SAMPLES:-15}" \
-        --baseline-repeat "${BASELINE_REPEAT:-${REPEAT:-50}}" \
-        --baseline-samples "${BASELINE_SAMPLES:-${SAMPLES:-15}}" \
+        --warmup "${warmup}" \
+        --repeat "${repeat}" \
+        --samples "${samples}" \
+        --baseline-repeat "${repeat}" \
+        --baseline-samples "${samples}" \
         --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-512}" \
         --baseline-drift-pct "${BASELINE_DRIFT_PCT:-3}" \
         --pair-attempts "${PAIR_ATTEMPTS:-3}" \
-        --pair-block-size "${pair_block_size}"
+        --pair-block-size "${pair_block}"
 }
 
-run_strategy() {
+stage_status() {
     local stage="$1"
-    local strategy="$2"
-    local selection_mode="$3"
-    local candidates="$4"
-    local all_candidates="$5"
-    local summary="$6"
-    local results="$7"
-    local family_summary="$8"
-    local resume="$9"
-    local strategy_log="${10}"
-    local callback_candidates="${11}"
-
-    echo "${stage}"
-    echo "STRATEGY_BEGIN name=${strategy} selection_mode=${selection_mode}"
-    echo "  isolated_log: ${strategy_log}"
-    local strategy_start
-    strategy_start="$(date +%s%N)"
-    (
-        set -Eeuo pipefail
-        local host_start
-        local host_end
-        local npu_start
-        local npu_end
-        host_start="$(date +%s%N)"
-        generate_candidates \
-            "${WORKLOADS}" \
-            "${candidates}" \
-            "${all_candidates}" \
-            "${selection_mode}" \
-            "${NPU_CANDIDATES}" \
-            "${callback_candidates}" \
-            "${resume}"
-        host_end="$(date +%s%N)"
-        echo "HOST_STAGE_TIME strategy=${strategy} wall_ms=$(( (host_end - host_start) / 1000000 ))"
-
-        npu_start="$(date +%s%N)"
-        profile_stage \
-            "${candidates}" \
-            "${summary}" \
-            "${results}" \
-            "${family_summary}" \
-            "${resume}" \
-            1
-        npu_end="$(date +%s%N)"
-        echo "NPU_STAGE_TIME strategy=${strategy} wall_ms=$(( (npu_end - npu_start) / 1000000 ))"
-    ) 2>&1 | tee "${strategy_log}"
-    local strategy_rc="${PIPESTATUS[0]}"
-    local strategy_end
-    strategy_end="$(date +%s%N)"
-    echo "STRATEGY_END name=${strategy} rc=${strategy_rc} wall_ms=$(( (strategy_end - strategy_start) / 1000000 ))"
-    return "${strategy_rc}"
+    local candidates="$2"
+    local expected_per_workload="$3"
+    shift 3
+    python3 "${RESEARCH}/benchmark_status.py" \
+        --stage "${stage}" \
+        --candidates "${candidates}" \
+        --workloads "${WORKLOADS}" \
+        --expected-per-workload "${expected_per_workload}" \
+        --resume "${RESUME}" \
+        --soc "${SOC}" \
+        --aic "${AIC}" \
+        --toolkit "${TOOLKIT_VERSION}" \
+        "$@"
 }
 
-set +e
-run_strategy \
-    "[3/4] Strategy A: evidence-bounded data-driven one-shot ..." \
-    compact_data_driven \
-    compact-deployment \
-    "${MODEL_CANDIDATES}" \
-    "${MODEL_ALL}" \
-    "${MODEL_SUMMARY}" \
-    "${MODEL_RESULTS}" \
-    "${MODEL_FAMILY_SUMMARY}" \
-    "${MODEL_RESUME}" \
-    "${MODEL_LOG}" \
-    "${MODEL_CALLBACK_CANDIDATES}"
-MODEL_RC="$?"
+telemetry_snapshot() {
+    local point="$1"
+    echo "BENCHMARK_TELEMETRY_BEGIN point=${point}"
+    if command -v npu-smi >/dev/null 2>&1; then
+        timeout 15 npu-smi info || true
+    else
+        echo "npu_smi=unavailable"
+    fi
+    echo "BENCHMARK_TELEMETRY_END point=${point}"
+}
 
-run_strategy \
-    "[4/4] Strategy B: stateless hardware template competition ..." \
-    direct_template_rule \
-    direct-rule \
-    "${RULE_CANDIDATES}" \
-    "${RULE_ALL}" \
-    "${RULE_SUMMARY}" \
-    "${RULE_RESULTS}" \
-    "${RULE_FAMILY_SUMMARY}" \
-    "${RULE_RESUME}" \
-    "${RULE_LOG}" \
-    1
-RULE_RC="$?"
+echo "[3/5] Generate fixed broad coverage frontier ..."
+if [[ ! -s "${STAGE1_CANDIDATES}" ]]; then
+    STAGE_WALL_START="$(date +%s%N)"
+    generate_stage \
+        stage1 "${STAGE1_CANDIDATES}" "${STAGE1_ALL}" \
+        "${STAGE1_NPU}" "${STAGE1_CALLBACK}" "${STAGE1_BEHAVIOR}"
+    STAGE_WALL_END="$(date +%s%N)"
+    echo "BENCHMARK_HOST_STAGE stage=stage1 wall_ms=$(( (STAGE_WALL_END - STAGE_WALL_START) / 1000000 ))"
+else
+    echo "BENCHMARK_FRONTIER_REUSE stage=stage1 path=hidden_state"
+fi
+stage_status stage1 "${STAGE1_CANDIDATES}" "${STAGE1_NPU}" --frontier-only
+
+echo "[4/5] Measure broad coverage frontier on NPU ..."
+telemetry_snapshot stage1_pre
+STAGE_WALL_START="$(date +%s%N)"
+profile_stage stage1 "${STAGE1_CANDIDATES}" \
+    "${STAGE1_REPEAT:-20}" "${STAGE1_SAMPLES:-7}" \
+    "${STAGE1_WARMUP:-5}" "${STAGE1_PAIR_BLOCK:-8}"
+STAGE_WALL_END="$(date +%s%N)"
+echo "BENCHMARK_NPU_STAGE stage=stage1 wall_ms=$(( (STAGE_WALL_END - STAGE_WALL_START) / 1000000 ))"
+telemetry_snapshot stage1_post
+set +e
+stage_status stage1 "${STAGE1_CANDIDATES}" "${STAGE1_NPU}"
+STAGE1_STATUS="$?"
+set -e
+if [[ "${STAGE1_STATUS}" -ne 0 ]]; then
+    stage_status stage1 "${STAGE1_CANDIDATES}" \
+        "${STAGE1_NPU}" --emit-records \
+        --exclude-run-id "${RUN_ID}" || true
+    echo
+    echo "NPU run incomplete"
+    echo "  stage: stage1"
+    echo "  action: rerun the same command; completed fingerprints are preserved"
+    echo "  analysis_log: ${RUN_LOG}"
+    exit 3
+fi
+
+echo "[5/5] Generate and measure feedback-expanded frontier ..."
+if [[ ! -s "${STAGE2_CANDIDATES}" ]]; then
+    STAGE_WALL_START="$(date +%s%N)"
+    generate_stage \
+        stage2 "${STAGE2_CANDIDATES}" "${STAGE2_ALL}" \
+        "${STAGE2_NPU}" "${STAGE2_CALLBACK}" "${STAGE2_BEHAVIOR}"
+    STAGE_WALL_END="$(date +%s%N)"
+    echo "BENCHMARK_HOST_STAGE stage=stage2 wall_ms=$(( (STAGE_WALL_END - STAGE_WALL_START) / 1000000 ))"
+else
+    echo "BENCHMARK_FRONTIER_REUSE stage=stage2 path=hidden_state"
+fi
+stage_status stage2 "${STAGE2_CANDIDATES}" "${STAGE2_NPU}" --frontier-only
+telemetry_snapshot stage2_pre
+STAGE_WALL_START="$(date +%s%N)"
+profile_stage stage2 "${STAGE2_CANDIDATES}" \
+    "${STAGE2_REPEAT:-50}" "${STAGE2_SAMPLES:-15}" \
+    "${STAGE2_WARMUP:-10}" "${STAGE2_PAIR_BLOCK:-4}"
+STAGE_WALL_END="$(date +%s%N)"
+echo "BENCHMARK_NPU_STAGE stage=stage2 wall_ms=$(( (STAGE_WALL_END - STAGE_WALL_START) / 1000000 ))"
+telemetry_snapshot stage2_post
+set +e
+stage_status stage2 "${STAGE2_CANDIDATES}" \
+    "${STAGE2_NPU}" --emit-records --exclude-run-id "${RUN_ID}"
+STAGE2_STATUS="$?"
 set -e
 
-if [[ "${MODEL_RC}" -eq 0 && "${RULE_RC}" -eq 0 ]]; then
-    python3 "${RESEARCH}/compare_deployment.py" \
-        --model "${MODEL_RESULTS}" \
-        --rule "${RULE_RESULTS}" \
-        --output "${COMPARISON}"
-else
-    echo "DUAL_COMPARISON skipped=1 reason=strategy_failure"
-fi
-
 echo
-echo "NPU run completed"
-echo "  strategy_A_rc: ${MODEL_RC}"
-echo "    Summary:     ${MODEL_SUMMARY}"
-echo "    Candidates:  ${MODEL_RESULTS}"
-echo "    Resume:      ${MODEL_RESUME}"
-echo "    log:         ${MODEL_LOG}"
-echo "  strategy_B_rc: ${RULE_RC}"
-echo "    Summary:     ${RULE_SUMMARY}"
-echo "    Candidates:  ${RULE_RESULTS}"
-echo "    Resume:      ${RULE_RESUME}"
-echo "    log:         ${RULE_LOG}"
-if [[ "${MODEL_RC}" -eq 0 && "${RULE_RC}" -eq 0 ]]; then
-    echo "  Comparison:    ${COMPARISON}"
+if [[ "${STAGE2_STATUS}" -eq 0 ]]; then
+    echo "BENCHMARK_COMPLETION status=PASS stages=2"
+    echo "NPU run completed"
+else
+    echo "BENCHMARK_COMPLETION status=INCOMPLETE stage=stage2"
+    echo "NPU run incomplete; rerun the same command"
 fi
-echo "  main_log:      ${RUN_LOG}"
-
-if [[ "${MODEL_RC}" -ne 0 || "${RULE_RC}" -ne 0 ]]; then
-    echo "fatal: one or more isolated strategies failed; inspect its strategy log" >&2
-    exit 1
-fi
+echo "  analysis_log: ${RUN_LOG}"
+exit "${STAGE2_STATUS}"

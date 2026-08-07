@@ -723,6 +723,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workload-limit", type=int, default=0)
     parser.add_argument("--skip-model-validation", action="store_true")
     parser.add_argument(
+        "--fixed-campaign-budget",
+        action="store_true",
+        help="keep the requested NPU count while still using feedback expansion",
+    )
+    parser.add_argument(
         "--search-stage",
         choices=("stage1", "stage2"),
         default="stage1",
@@ -1305,6 +1310,15 @@ def main() -> None:
                     bank.schedule.signature_text()
                 )
                 all_rows.append(rejected)
+                if args.selection_mode == "campaign":
+                    print(
+                        "BENCHMARK_CALLBACK_REJECT "
+                        + json.dumps(
+                            rejected,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                    )
                 continue
             callback_accepted.append((candidate, callback))
             callback_limit = (
@@ -1483,7 +1497,7 @@ def main() -> None:
             racing_plan = plan_template_race(
                 workload,
                 callback_candidates,
-                observations,
+                () if args.fixed_campaign_budget else observations,
                 args.npu_candidates,
             )
             selected_candidates = select_behavior_coverage(
@@ -1596,6 +1610,27 @@ def main() -> None:
             f"{result.excluded_fingerprints if result is not None else 0} "
             f"solvers={reports}"
         )
+        if result is not None and args.selection_mode == "campaign":
+            for report in result.reports:
+                print(
+                    "BENCHMARK_SOLVER_REPORT "
+                    + json.dumps(
+                        {
+                            "workload_id": workload.workload_id,
+                            "stage": args.search_stage,
+                            "template": report.template.value,
+                            "raw_generated": report.raw_generated,
+                            "common_legal": report.common_legal,
+                            "template_legal": report.template_legal,
+                            "emitted": report.emitted,
+                            "failure_reasons": dict(
+                                report.failure_reasons
+                            ),
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                )
         print(
             "TILING_TIME "
             f"strategy={args.selection_mode} "

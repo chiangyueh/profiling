@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -63,7 +64,24 @@ struct ProfileSummary {
     double p95 = 0.0;
     double maximum = 0.0;
     double tflops = 0.0;
+    double aclInitMs = 0.0;
+    double setDeviceMs = 0.0;
+    double contextStreamMs = 0.0;
+    double allocationMs = 0.0;
+    double inputSetupMs = 0.0;
+    double workspaceSetupMs = 0.0;
+    double preflightMs = 0.0;
+    double warmupMs = 0.0;
+    double samplingWallMs = 0.0;
 };
+
+using SteadyClock = std::chrono::steady_clock;
+
+double ElapsedMs(const SteadyClock::time_point &start)
+{
+    return std::chrono::duration<double, std::milli>(
+        SteadyClock::now() - start).count();
+}
 
 struct DeviceBuffer {
     void *ptr = nullptr;
@@ -263,7 +281,10 @@ const std::vector<std::string> &ProfileColumns()
         "official_core_num", "official_m_dim", "official_n_dim",
         "proxy_total", "success", "preflight_passed", "preflight_mode", "error",
         "min_ms", "mean_ms", "median_ms", "stddev_ms", "p95_ms", "max_ms",
-        "tflops", "warmup", "repeat", "samples", "tiling_signature", "tiling_bin",
+        "tflops", "acl_init_ms", "set_device_ms", "context_stream_ms",
+        "allocation_ms", "input_setup_ms", "workspace_setup_ms",
+        "preflight_ms", "warmup_ms", "sampling_wall_ms",
+        "warmup", "repeat", "samples", "tiling_signature", "tiling_bin",
     };
     return columns;
 }
@@ -603,10 +624,13 @@ ProfileSummary ProfileOfficial(
         const size_t bBytes = CheckedBytes(workload.k, workload.n, elementBytes, "B");
         const size_t cBytes = CheckedBytes(workload.m, workload.n, elementBytes, "C");
         LogStage(workload, "device_malloc");
+        const auto allocationStart = SteadyClock::now();
         DeviceBuffer a(aBytes);
         DeviceBuffer b(bBytes);
         DeviceBuffer c(cBytes);
+        summary.allocationMs = ElapsedMs(allocationStart);
 
+        const auto inputSetupStart = SteadyClock::now();
         const size_t numericLimit =
             static_cast<size_t>(std::max(0, options.numericPreflightMaxMiB)) * 1024 * 1024;
         const bool numericPreflight =
@@ -635,7 +659,9 @@ ProfileSummary ProfileOfficial(
             summary.preflightMode = "zero_coverage_grid9_v1";
         }
         CheckAcl(aclrtMemset(c.ptr, c.bytes, 0x5a, c.bytes), "aclrtMemset official C poison");
+        summary.inputSetupMs = ElapsedMs(inputSetupStart);
 
+        const auto workspaceSetupStart = SteadyClock::now();
         const std::array<int64_t, 2> aView{workload.m, workload.k};
         const std::array<int64_t, 2> bView{workload.k, workload.n};
         const std::array<int64_t, 2> cView{workload.m, workload.n};
@@ -668,6 +694,7 @@ ProfileSummary ProfileOfficial(
             aclSetAclOpExecutorRepeatable(executor.ptr),
             "aclSetAclOpExecutorRepeatable");
         DeviceBuffer workspace(static_cast<size_t>(workspaceBytes));
+        summary.workspaceSetupMs = ElapsedMs(workspaceSetupStart);
 
         auto launch = [&]() {
             CheckAclnn(
@@ -676,6 +703,7 @@ ProfileSummary ProfileOfficial(
         };
 
         LogStage(workload, "preflight_launch");
+        const auto preflightStart = SteadyClock::now();
         launch();
         CheckAcl(aclrtSynchronizeStream(stream), "official preflight synchronize");
         const size_t outputBytes = ElementBytes(workload.dtype);
@@ -754,11 +782,15 @@ ProfileSummary ProfileOfficial(
             }
         }
         summary.preflightPassed = true;
+        summary.preflightMs = ElapsedMs(preflightStart);
 
         LogStage(workload, "warmup");
+        const auto warmupStart = SteadyClock::now();
         for (int32_t i = 0; i < options.warmup; ++i) launch();
         CheckAcl(aclrtSynchronizeStream(stream), "official warmup synchronize");
+        summary.warmupMs = ElapsedMs(warmupStart);
 
+        const auto samplingStart = SteadyClock::now();
         aclrtEvent start = nullptr;
         aclrtEvent end = nullptr;
         CheckAcl(aclrtCreateEvent(&start), "aclrtCreateEvent official start");
@@ -789,6 +821,7 @@ ProfileSummary ProfileOfficial(
             if (start != nullptr) aclrtDestroyEvent(start);
             throw;
         }
+        summary.samplingWallMs = ElapsedMs(samplingStart);
         ComputeStats(summary, workload);
     } catch (const std::exception &exception) {
         summary.error = exception.what();
@@ -836,6 +869,15 @@ void WriteProfileRow(
         ToText(summary.p95),
         ToText(summary.maximum),
         ToText(summary.tflops),
+        ToText(summary.aclInitMs),
+        ToText(summary.setDeviceMs),
+        ToText(summary.contextStreamMs),
+        ToText(summary.allocationMs),
+        ToText(summary.inputSetupMs),
+        ToText(summary.workspaceSetupMs),
+        ToText(summary.preflightMs),
+        ToText(summary.warmupMs),
+        ToText(summary.samplingWallMs),
         ToText(options.warmup),
         ToText(options.repeat),
         ToText(options.samples),
@@ -977,20 +1019,29 @@ int main(int argc, char **argv)
         aclrtStream stream = nullptr;
         int failures = 0;
         try {
+            auto setupStart = SteadyClock::now();
             CheckAcl(aclInit(nullptr), "aclInit");
+            const double aclInitMs = ElapsedMs(setupStart);
             aclInitialized = true;
+            setupStart = SteadyClock::now();
             CheckAcl(aclrtSetDevice(options.deviceId), "aclrtSetDevice");
+            const double setDeviceMs = ElapsedMs(setupStart);
             deviceSet = true;
+            setupStart = SteadyClock::now();
             CheckAcl(aclrtCreateContext(&context, options.deviceId), "aclrtCreateContext");
             CheckAcl(aclrtCreateStream(&stream), "aclrtCreateStream");
+            const double contextStreamMs = ElapsedMs(setupStart);
 
             for (size_t index = 0; index < workloads.size(); ++index) {
                 const Workload &workload = workloads[index];
                 std::cout << "official_progress: [" << index + 1 << '/' << workloads.size()
                           << "] " << workload.id << " M=" << workload.m << " N=" << workload.n
                           << " K=" << workload.k << " dtype=" << workload.dtype << std::endl;
-                const ProfileSummary summary =
+                ProfileSummary summary =
                     ProfileOfficial(workload, stream, options, samplesOutput);
+                summary.aclInitMs = aclInitMs;
+                summary.setDeviceMs = setDeviceMs;
+                summary.contextStreamMs = contextStreamMs;
                 WriteProfileRow(output, workload, summary, options);
                 std::cout << "official_done " << workload.id
                           << " supported=" << summary.supported

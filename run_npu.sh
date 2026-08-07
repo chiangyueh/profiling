@@ -174,9 +174,9 @@ V19_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log33.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260807-net-log33-counterfactual-v20"
+echo "  script:     run_npu.sh 20260807-offline-rule-induction-v21"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      dual_structure_preserving_model_vs_template_rule_v5"
+echo "  scope:      dual_structure_preserving_model_vs_template_rule_v6"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  strategy_A: evidence_bounded_data_driven"

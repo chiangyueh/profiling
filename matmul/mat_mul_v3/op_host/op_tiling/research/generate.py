@@ -31,6 +31,10 @@ from tiling_search import (
     DIRECT_RULE_AUDIT_RECORDS,
     DIRECT_RULE_AUDIT_UNIQUE_RECORDS,
     DIRECT_RULE_AUDIT_WORKLOADS,
+    DIRECT_RULE_TRUSTED_WINNER_EXECUTION_EQUIVALENT,
+    DIRECT_RULE_TRUSTED_WINNER_STRUCTURAL_NEAR,
+    DIRECT_RULE_TRUSTED_WINNER_TEMPLATE_MATCHES,
+    DIRECT_RULE_TRUSTED_WINNER_WORKLOADS,
     GenerationBudget,
     Hardware,
     MeasuredObservation,
@@ -60,7 +64,11 @@ from tiling_search.behavior import (
     select_behavior_coverage,
     validate_feedback_model,
 )
-from tiling_search.feedback import fingerprint, load_feedback
+from tiling_search.feedback import (
+    fingerprint,
+    load_feedback,
+    measurement_status_consistent,
+)
 
 
 FIELD_COLUMNS = {
@@ -440,12 +448,34 @@ def load_resume_feedback(
         except (KeyError, ValueError):
             continue
         exclusions.add(fingerprint(workload, schedule))
+        ratio_vs_official = candidate_ms / official_ms
+        ratio_vs_bank = candidate_ms / bank_ms
+        if not measurement_status_consistent(
+            ratio_vs_official,
+            ratio_vs_bank,
+            row.get("status_vs_official", ""),
+            row.get("status_vs_bank", ""),
+        ):
+            observations.append(
+                MeasuredObservation(
+                    workload=workload,
+                    schedule=schedule,
+                    ratio_vs_official=1.0,
+                    ratio_vs_bank=1.0,
+                    source="runtime_verified",
+                    record_id=row.get("record_id", path.stem),
+                    bank_schedule=optional_schedule(
+                        row.get("bank_tiling_signature")
+                    ),
+                )
+            )
+            continue
         observations.append(
             MeasuredObservation(
                 workload=workload,
                 schedule=schedule,
-                ratio_vs_official=candidate_ms / official_ms,
-                ratio_vs_bank=candidate_ms / bank_ms,
+                ratio_vs_official=ratio_vs_official,
+                ratio_vs_bank=ratio_vs_bank,
                 source=row.get("candidate_source", ""),
                 record_id=(
                     f"{row.get('run_id') or path.stem}:"
@@ -865,6 +895,14 @@ def main() -> None:
             f"audit_all_records={DIRECT_RULE_AUDIT_RECORDS} "
             f"audit_all_unique={DIRECT_RULE_AUDIT_UNIQUE_RECORDS} "
             f"audit_all_workloads={DIRECT_RULE_AUDIT_WORKLOADS} "
+            "trusted_winner_workloads="
+            f"{DIRECT_RULE_TRUSTED_WINNER_WORKLOADS} "
+            "trusted_winner_template_matches="
+            f"{DIRECT_RULE_TRUSTED_WINNER_TEMPLATE_MATCHES} "
+            "trusted_winner_execution_equivalent="
+            f"{DIRECT_RULE_TRUSTED_WINNER_EXECUTION_EQUIVALENT} "
+            "trusted_winner_structural_near="
+            f"{DIRECT_RULE_TRUSTED_WINNER_STRUCTURAL_NEAR} "
             f"l2_resident_ratio={DIRECT_BASE_L2_RESIDENT_RATIO:.12f} "
             "rules=template,geometry,l1,core,l2"
         )

@@ -23,24 +23,28 @@ from .solvers.base_policy import (
 from .solvers.common import make_schedule
 
 
-DIRECT_BASE_RULE_VERSION = "template_rule_v5"
+DIRECT_BASE_RULE_VERSION = "template_rule_v6"
 DIRECT_BASE_L2_RESIDENT_RATIO = 0.5105593326137546
-DIRECT_BASE_AUDIT_PAIRED_RECORDS = 545
-DIRECT_BASE_AUDIT_UNIQUE_RECORDS = 420
-DIRECT_BASE_AUDIT_WORKLOADS = 85
-DIRECT_BASE_AUDIT_WINNER_WORKLOADS = 15
-DIRECT_BASE_AUDIT_BANK_WORKLOADS = 58
+DIRECT_BASE_AUDIT_PAIRED_RECORDS = 398
+DIRECT_BASE_AUDIT_UNIQUE_RECORDS = 317
+DIRECT_BASE_AUDIT_WORKLOADS = 79
+DIRECT_BASE_AUDIT_WINNER_WORKLOADS = 2
+DIRECT_BASE_AUDIT_BANK_WORKLOADS = 48
 DIRECT_RULE_AUDIT_RECORDS = 7850
 DIRECT_RULE_AUDIT_UNIQUE_RECORDS = 7534
 DIRECT_RULE_AUDIT_WORKLOADS = 241
+DIRECT_RULE_TRUSTED_WINNER_WORKLOADS = 17
+DIRECT_RULE_TRUSTED_WINNER_TEMPLATE_MATCHES = 14
+DIRECT_RULE_TRUSTED_WINNER_EXECUTION_EQUIVALENT = 5
+DIRECT_RULE_TRUSTED_WINNER_STRUCTURAL_NEAR = 6
 DIRECT_RULE_TEMPLATE_AUDIT = {
-    Template.BASE: (132, 21, 80, 31),
+    Template.BASE: (128, 11, 89, 28),
     Template.AL1_FULL_LOAD: (8, 3, 4, 1),
     Template.BL1_FULL_LOAD: (30, 1, 22, 7),
     Template.BL1_FULL_LOAD_FIXPIPE: (12, 0, 12, 0),
     Template.BL1_FULL_LOAD_VEC_NZ2ND: (11, 1, 10, 0),
-    Template.DETERMINISTIC_SPLIT_K: (82, 33, 19, 30),
-    Template.SINGLE_CORE_SPLIT_K: (107, 23, 47, 37),
+    Template.DETERMINISTIC_SPLIT_K: (68, 4, 24, 40),
+    Template.SINGLE_CORE_SPLIT_K: (98, 3, 48, 47),
 }
 
 
@@ -188,7 +192,7 @@ def _use_deterministic_split_k(
     workload: Workload,
     hardware: Hardware,
 ) -> tuple[bool, str]:
-    """Distill the source-level split-K profitability decision.
+    """Distill source contracts and trusted paired split-K outcomes.
 
     These conditions select a kernel execution structure. They do not use a
     workload name, history row, fitted model, or RuntimeKb geometry.
@@ -204,6 +208,13 @@ def _use_deterministic_split_k(
         and not (not workload.trans_a and workload.trans_b)
     ):
         return True, "underfilled_output_k_parallelism"
+
+    if (
+        workload.k >= cores * 384
+        and workload.k >= 8 * (workload.m + workload.n)
+        and not (not workload.trans_a and workload.trans_b)
+    ):
+        return True, "reduction_dominated_k_parallelism"
 
     if (
         workload.dtype == "fp32"
@@ -250,7 +261,7 @@ def _candidate(
             "deployment_recommended_custom": 1.0,
             "history_rows_used": 0.0,
             "candidate_pool_size": 1.0,
-            "rule_version": 3.0,
+            "rule_version": 6.0,
             "rule_audit_total_records": float(
                 DIRECT_RULE_AUDIT_RECORDS
             ),
@@ -288,7 +299,10 @@ def _candidate(
         schedule=schedule,
         template=template,
         source="direct_rule_policy",
-        rationale=f"fixed source-derived template rule: {reason}",
+        rationale=(
+            "fixed source-and-offline-evidence-derived template rule: "
+            f"{reason}"
+        ),
         behavior_key=behavior_key(vector),
         metrics=metrics,
     )
@@ -697,6 +711,8 @@ def _single_split_candidate(
     in_bytes = INPUT_BYTES[workload.dtype]
     cores = min(workload.max_cores, hardware.aic_cores)
     base_k = 256 // in_bytes
+    if workload.k <= 4 * base_k:
+        return None
     step_m, step_n, step_k = 3, 1, 3
     depth_a, depth_b, order = 9, 6, 1
     m_tile = ceil_div(workload.m, step_m * 128)
@@ -762,40 +778,23 @@ def _single_split_candidate(
     used, single_m, single_n = max(
         choices, key=lambda item: (item[0], -item[1] * item[2])
     )
-    is_special_1536 = workload.k == 1536 and (
-        workload.m == 384 or workload.n == 384
+    average = (
+        workload.m
+        * workload.n
+        / max(1, single_m * single_n * cores)
     )
-    if not is_special_1536:
-        average = (
-            workload.m
-            * workload.n
-            / max(1, single_m * single_n * cores)
+    if (
+        single_n < 512
+        or average < 0.70
+        or (
+            workload.n * in_bytes % 256 == 0
+            and 896 <= workload.n <= 2048
+            and (single_n <= 640 or average < 0.85)
         )
-        if (
-            single_n < 512
-            or average < 0.70
-            or (
-                workload.n * in_bytes % 256 == 0
-                and 896 <= workload.n <= 2048
-                and (single_n <= 640 or average < 0.85)
-            )
-        ):
-            return None
-    mkn_small_k = (
-        workload.dtype in {"fp16", "bf16"}
-        and workload.k == 1536
-        and workload.m == 384
-        and workload.n >= 49152
-    )
-    nkm_small_k = (
-        workload.dtype in {"fp16", "bf16"}
-        and workload.k == 1536
-        and workload.n == 384
-        and workload.m >= 49152
-    )
-    if mkn_small_k or (
+    ):
+        return None
+    if (
         single_m == 384
-        and not nkm_small_k
         and not (
             workload.dtype == "fp32"
             and workload.n * in_bytes % 256
@@ -803,7 +802,7 @@ def _single_split_candidate(
     ):
         step_m, step_n, step_k = 3, 1, 3
         depth_a, depth_b, order = 9, 6, 1
-    elif nkm_small_k:
+    else:
         step_m, step_n, step_k = 1, 3, 3
         depth_a, depth_b, order = 6, 9, 0
     single_m = max(single_m, step_m * 128)
@@ -831,7 +830,7 @@ def _single_split_candidate(
         l2NTileCnt=1,
         l2MTileBlock=max(1, ceil_div(workload.m, single_m)),
         l2NTileBlock=max(1, ceil_div(workload.n, single_n)),
-        l2IterateOrder=1 if nkm_small_k else 0,
+        l2IterateOrder=0,
         tilingEnable=2,
     )
     return _candidate(
@@ -869,19 +868,9 @@ def _deterministic_after_single_reject(
 def _prefer_nk_split_layout(workload: Workload) -> bool:
     in_bytes = 4 if workload.dtype == "fp32" else 2
     n_32b_aligned = workload.n * in_bytes % 32 == 0
-    if workload.m <= workload.n or not n_32b_aligned:
+    if not n_32b_aligned:
         return False
-    if workload.m < 128:
-        return False
-    if (
-        _is_256b_aligned(workload.n, in_bytes)
-        and not _is_256b_aligned(workload.m, in_bytes)
-    ):
-        return False
-    if (
-        not _is_256b_aligned(workload.m, in_bytes)
-        and workload.n * in_bytes <= 256
-    ):
+    if workload.m < 128 or workload.n < 128:
         return False
     if workload.m >= 2048 and workload.n == 16:
         return False
@@ -933,7 +922,12 @@ def direct_rule_candidate(
     single_k = 3 * base_k
     k_chunks = ceil_div(workload.k, single_k)
     used_cores = min(
-        workload.max_cores, hardware.aic_cores, k_chunks
+        workload.max_cores,
+        hardware.aic_cores,
+        k_chunks,
+        4
+        * ceil_div(workload.m, 128)
+        * ceil_div(workload.n, 128),
     )
     prefer_nk = _prefer_nk_split_layout(workload)
     if prefer_nk:

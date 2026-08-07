@@ -122,6 +122,33 @@ def _comparison_status(
     return "within_noise"
 
 
+def measurement_status_consistent(
+    ratio_vs_official: float,
+    ratio_vs_bank: float,
+    status_vs_official: str,
+    status_vs_bank: str,
+) -> bool:
+    """Reject latency rows whose status contradicts the measured direction.
+
+    A few early paired exports contain mutually inconsistent status and
+    latency fields. They remain useful as NPU executability evidence, but
+    treating a ``regressed`` row with a 0.1 candidate/baseline ratio as a
+    latency winner poisons both ranking and offline rule audits.
+    """
+
+    pairs = (
+        (ratio_vs_official, status_vs_official),
+        (ratio_vs_bank, status_vs_bank),
+    )
+    return all(
+        not (
+            (status == "regressed" and ratio < 0.99)
+            or (status == "improved" and ratio > 1.01)
+        )
+        for ratio, status in pairs
+    )
+
+
 def _untrusted_observation_status(row: dict[str, str]) -> bool:
     statuses = " ".join(
         (
@@ -187,6 +214,12 @@ def load_feedback(
                     or not math.isfinite(ratio_bank)
                     or ratio_official <= 0
                     or ratio_bank <= 0
+                    or not measurement_status_consistent(
+                        ratio_official,
+                        ratio_bank,
+                        row.get("status_vs_official", ""),
+                        row.get("status_vs_bank", ""),
+                    )
                     or _untrusted_observation_status(row)
                 ):
                     continue

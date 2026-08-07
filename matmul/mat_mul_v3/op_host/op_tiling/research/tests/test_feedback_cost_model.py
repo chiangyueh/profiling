@@ -526,6 +526,50 @@ class FeedbackCostModelTest(unittest.TestCase):
         )
         self.assertEqual(len(exclusions), 1)
 
+    def test_contradictory_paired_latency_is_safety_only(self) -> None:
+        row = {
+            "candidate_role": "searched",
+            "candidate_source": "calibration_template_probe",
+            "soc": "Ascend910B3",
+            "aic": "20",
+            "toolkit": "8.1.RC1",
+            "workload_id": self.workload.workload_id,
+            "m": str(self.workload.m),
+            "n": str(self.workload.n),
+            "k": str(self.workload.k),
+            "dtype": self.workload.dtype,
+            "trans_a": "0",
+            "trans_b": "0",
+            "tiling_signature": self.success_schedule.signature_text(),
+            "success": "1",
+            "preflight_mode": "numeric_signed_axes_full_v3",
+            "pair_validated": "1",
+            "median_ms": "0.1",
+            "official_ms": "1",
+            "bank_ms": "1",
+            "status_vs_official": "regressed",
+            "status_vs_bank": "regressed",
+            "record_id": "shifted-latency-columns",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resume.csv"
+            with path.open("w", newline="", encoding="utf-8") as output:
+                writer = csv.DictWriter(output, fieldnames=tuple(row))
+                writer.writeheader()
+                writer.writerow(row)
+            observations, exclusions = load_resume_feedback(
+                path,
+                soc="Ascend910B3",
+                aic_cores=20,
+                toolkit="8.1.RC1",
+            )
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].source, "runtime_verified")
+        self.assertFalse(observations[0].verified)
+        self.assertEqual(observations[0].measured_ratio, 1.0)
+        self.assertEqual(len(exclusions), 1)
+
     def test_structured_measurement_overrides_provisional_duplicate(
         self,
     ) -> None:

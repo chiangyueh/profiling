@@ -24,6 +24,10 @@ from tiling_search import (
     DIRECT_RULE_AUDIT_UNIQUE_RECORDS,
     DIRECT_RULE_AUDIT_WORKLOADS,
     DIRECT_RULE_TEMPLATE_AUDIT,
+    DIRECT_RULE_TRUSTED_WINNER_EXECUTION_EQUIVALENT,
+    DIRECT_RULE_TRUSTED_WINNER_STRUCTURAL_NEAR,
+    DIRECT_RULE_TRUSTED_WINNER_TEMPLATE_MATCHES,
+    DIRECT_RULE_TRUSTED_WINNER_WORKLOADS,
     GenerationBudget,
     Hardware,
     KNOWLEDGE_FIELDS,
@@ -36,6 +40,10 @@ from tiling_search import (
 from generate import load_resume_feedback
 from tiling_search.contracts import ceil_div, template_of, validate_schedule
 from tiling_search.domain import INPUT_BYTES, OUTPUT_BYTES
+from tiling_search.bank_structure import (
+    bank_transition,
+    schedules_execution_equivalent,
+)
 from tiling_search.feedback import load_feedback
 
 
@@ -249,8 +257,8 @@ class DeploymentStrategiesTest(unittest.TestCase):
                 workload.workload_id,
             )
 
-        self.assertEqual(len(whole_sizes), 36)
-        self.assertEqual(len(partitioned_sizes), 22)
+        self.assertEqual(len(whole_sizes), 32)
+        self.assertEqual(len(partitioned_sizes), 16)
         threshold = math.sqrt(
             max(whole_sizes) * min(partitioned_sizes)
         )
@@ -369,6 +377,78 @@ class DeploymentStrategiesTest(unittest.TestCase):
                 (workloads, winners, within_noise, regressions),
                 template.value,
             )
+
+    def test_direct_rule_reconstructs_trusted_historical_winners(
+        self,
+    ) -> None:
+        config = RESEARCH / "config"
+        observations, _ = load_feedback(
+            soc="Ascend910B3",
+            aic_cores=20,
+            observation_paths=sorted(
+                config.glob("measured_observations*.csv")
+            ),
+            exclusion_paths=(),
+        )
+        for path in sorted(config.glob("paired_measurements*.csv")):
+            loaded, _ = load_resume_feedback(
+                path,
+                "Ascend910B3",
+                20,
+                "8.1.RC1+toolkit-7.7.0.1.225",
+            )
+            observations.extend(loaded)
+
+        winners = defaultdict(list)
+        for observation in observations:
+            if (
+                observation.is_verified_winner
+                and observation.measured_ratio < 0.99
+            ):
+                winners[observation.workload.identity()].append(
+                    observation
+                )
+
+        template_matches = 0
+        execution_equivalent = 0
+        structural_near = 0
+        for workload_winners in winners.values():
+            winner = min(
+                workload_winners,
+                key=lambda observation: observation.measured_ratio,
+            )
+            candidate = direct_rule_candidate(
+                winner.workload, self.hardware
+            )
+            template_matches += (
+                candidate.template == template_of(winner.schedule)
+            )
+            execution_equivalent += schedules_execution_equivalent(
+                candidate.schedule, winner.schedule
+            )
+            transition = bank_transition(
+                winner.schedule, candidate.schedule
+            )
+            structural_near += (
+                candidate.template == template_of(winner.schedule)
+                and len(transition.changed_subsystems) <= 2
+            )
+
+        self.assertEqual(
+            len(winners), DIRECT_RULE_TRUSTED_WINNER_WORKLOADS
+        )
+        self.assertEqual(
+            template_matches,
+            DIRECT_RULE_TRUSTED_WINNER_TEMPLATE_MATCHES,
+        )
+        self.assertEqual(
+            execution_equivalent,
+            DIRECT_RULE_TRUSTED_WINNER_EXECUTION_EQUIVALENT,
+        )
+        self.assertEqual(
+            structural_near,
+            DIRECT_RULE_TRUSTED_WINNER_STRUCTURAL_NEAR,
+        )
 
     def test_runtime_kb_contains_exact_records_not_rule_ranges(
         self,
@@ -714,6 +794,98 @@ class DeploymentStrategiesTest(unittest.TestCase):
             "20:256:48:128:256:48:32:4:4:1:1:0:"
             "4:4:2:2:1:1:1:0:0:0:2020",
         )
+
+    def test_direct_rule_reconstructs_reduction_dominated_winner(self) -> None:
+        workload = Workload(
+            "unseen_name",
+            1024,
+            1536,
+            32768,
+            "fp16",
+            False,
+            False,
+            20,
+        )
+        candidate = direct_rule_candidate(workload, self.hardware)
+
+        self.assertEqual(
+            candidate.template, Template.DETERMINISTIC_SPLIT_K
+        )
+        self.assertEqual(
+            candidate.schedule.signature_text(),
+            "20:1024:384:384:128:128:128:6:9:1:3:0:"
+            "3:3:2:2:2:1:1:1:4:0:3",
+        )
+
+    def test_direct_rule_reconstructs_low_output_split_winners(self) -> None:
+        cases = (
+            (
+                Workload(
+                    "first",
+                    320,
+                    256,
+                    28672,
+                    "fp16",
+                    False,
+                    False,
+                    20,
+                ),
+                20,
+                320,
+            ),
+            (
+                Workload(
+                    "second",
+                    192,
+                    128,
+                    16384,
+                    "fp16",
+                    False,
+                    False,
+                    20,
+                ),
+                8,
+                192,
+            ),
+        )
+        for workload, cores, single_m in cases:
+            with self.subTest(workload=workload.workload_id):
+                candidate = direct_rule_candidate(
+                    workload, self.hardware
+                )
+                self.assertEqual(
+                    candidate.template,
+                    Template.DETERMINISTIC_SPLIT_K,
+                )
+                self.assertEqual(
+                    candidate.schedule["usedCoreNum"], cores
+                )
+                self.assertEqual(
+                    candidate.schedule["singleCoreM"], single_m
+                )
+                self.assertEqual(
+                    candidate.schedule["singleCoreN"], 384
+                )
+                self.assertEqual(candidate.schedule["stepM"], 1)
+                self.assertEqual(candidate.schedule["stepN"], 3)
+
+    def test_direct_rule_uses_base_when_k_cannot_be_split(self) -> None:
+        for k in (384, 448, 512):
+            with self.subTest(k=k):
+                workload = Workload(
+                    "low_k",
+                    2688,
+                    2944,
+                    k,
+                    "fp16",
+                    False,
+                    False,
+                    20,
+                )
+                candidate = direct_rule_candidate(
+                    workload, self.hardware
+                )
+                self.assertEqual(candidate.template, Template.BASE)
 
     def test_direct_rule_rejects_single_split_for_tt_layout(self) -> None:
         workload = Workload(

@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from .behavior import behavior_key, behavior_vector
-from .contracts import align_up, ceil_div, validate_schedule
+from .contracts import (
+    align_up,
+    bl1_core_split_applicable,
+    ceil_div,
+    validate_schedule,
+)
 from .domain import (
     Candidate,
     Hardware,
+    INPUT_BYTES,
+    OUTPUT_BYTES,
     Template,
     Workload,
 )
@@ -16,13 +23,25 @@ from .solvers.base_policy import (
 from .solvers.common import make_schedule
 
 
-DIRECT_BASE_RULE_VERSION = "template_rule_v2"
+DIRECT_BASE_RULE_VERSION = "template_rule_v4"
 DIRECT_BASE_L2_RESIDENT_RATIO = 0.5105593326137546
 DIRECT_BASE_AUDIT_PAIRED_RECORDS = 498
 DIRECT_BASE_AUDIT_UNIQUE_RECORDS = 373
 DIRECT_BASE_AUDIT_WORKLOADS = 78
 DIRECT_BASE_AUDIT_WINNER_WORKLOADS = 15
 DIRECT_BASE_AUDIT_BANK_WORKLOADS = 58
+DIRECT_RULE_AUDIT_RECORDS = 7788
+DIRECT_RULE_AUDIT_UNIQUE_RECORDS = 7474
+DIRECT_RULE_AUDIT_WORKLOADS = 233
+DIRECT_RULE_TEMPLATE_AUDIT = {
+    Template.BASE: (125, 21, 75, 29),
+    Template.AL1_FULL_LOAD: (7, 2, 4, 1),
+    Template.BL1_FULL_LOAD: (27, 1, 21, 5),
+    Template.BL1_FULL_LOAD_FIXPIPE: (11, 0, 11, 0),
+    Template.BL1_FULL_LOAD_VEC_NZ2ND: (10, 0, 10, 0),
+    Template.DETERMINISTIC_SPLIT_K: (81, 33, 19, 29),
+    Template.SINGLE_CORE_SPLIT_K: (103, 23, 44, 36),
+}
 
 
 def direct_base_candidate(
@@ -181,7 +200,7 @@ def _use_deterministic_split_k(
     output_blocks = m_blocks * n_blocks
     if (
         workload.k >= cores * 384
-        and output_blocks <= cores
+        and output_blocks < max(1, cores // 2)
         and not (not workload.trans_a and workload.trans_b)
     ):
         return True, "underfilled_output_k_parallelism"
@@ -205,6 +224,632 @@ def _use_deterministic_split_k(
         return True, "fp32_tn_small_output"
 
     return False, "base_output_parallelism_sufficient"
+
+
+def _candidate(
+    workload: Workload,
+    hardware: Hardware,
+    schedule,
+    template: Template,
+    reason: str,
+) -> Candidate:
+    contract = validate_schedule(workload, schedule, hardware)
+    if not contract.valid:
+        raise ValueError(
+            f"direct {template.value} policy violates contract: "
+            + ",".join(contract.violations)
+        )
+    vector = behavior_vector(workload, schedule, hardware)
+    metrics = dict(vector.metrics)
+    audited, winners, within_noise, regressions = (
+        DIRECT_RULE_TEMPLATE_AUDIT[template]
+    )
+    metrics.update(
+        {
+            "model_enabled": 0.0,
+            "deployment_recommended_custom": 1.0,
+            "history_rows_used": 0.0,
+            "candidate_pool_size": 1.0,
+            "rule_version": 3.0,
+            "rule_audit_total_records": float(
+                DIRECT_RULE_AUDIT_RECORDS
+            ),
+            "rule_audit_unique_records": float(
+                DIRECT_RULE_AUDIT_UNIQUE_RECORDS
+            ),
+            "rule_audit_workloads": float(
+                DIRECT_RULE_AUDIT_WORKLOADS
+            ),
+            "rule_audit_template_workloads": float(audited),
+            "rule_audit_template_winners": float(winners),
+            "rule_audit_template_within_noise": float(within_noise),
+            "rule_audit_template_regressions": float(regressions),
+            "policy_template_base": float(template == Template.BASE),
+            "policy_template_al1_full_load": float(
+                template == Template.AL1_FULL_LOAD
+            ),
+            "policy_template_bl1_full_load": float(
+                template
+                in {
+                    Template.BL1_FULL_LOAD,
+                    Template.BL1_FULL_LOAD_FIXPIPE,
+                    Template.BL1_FULL_LOAD_VEC_NZ2ND,
+                }
+            ),
+            "policy_template_single_core_split_k": float(
+                template == Template.SINGLE_CORE_SPLIT_K
+            ),
+            "policy_template_deterministic_split_k": float(
+                template == Template.DETERMINISTIC_SPLIT_K
+            ),
+        }
+    )
+    return Candidate(
+        schedule=schedule,
+        template=template,
+        source="direct_rule_policy",
+        rationale=f"fixed source-derived template rule: {reason}",
+        behavior_key=behavior_key(vector),
+        metrics=metrics,
+    )
+
+
+def _al1_candidate(
+    workload: Workload,
+    hardware: Hardware,
+) -> Candidate | None:
+    """Port the 8.5 DoAL1FullLoadTiling constructor and gate."""
+
+    if (
+        workload.dtype != "fp32"
+        or workload.trans_a
+        or not workload.trans_b
+        or workload.m > 16
+        or workload.n <= 16
+        or workload.n > 16 * min(workload.max_cores, hardware.aic_cores)
+        or workload.k < 4096
+        or workload.k % 128
+    ):
+        return None
+    base_m = base_n = 16
+    base_k = 256
+    step_k = ceil_div(workload.k, base_k)
+    resident_a = align_up(workload.m, 16) * align_up(
+        workload.k, 8
+    ) * INPUT_BYTES[workload.dtype]
+    staged_b = (
+        base_n * base_k * 2 * INPUT_BYTES[workload.dtype]
+    )
+    if resident_a + staged_b > hardware.effective_l1_bytes:
+        return None
+    schedule = make_schedule(
+        usedCoreNum=min(
+            workload.max_cores,
+            hardware.aic_cores,
+            ceil_div(workload.n, base_n),
+        ),
+        singleCoreM=workload.m,
+        singleCoreN=base_n,
+        singleCoreK=workload.k,
+        baseM=base_m,
+        baseN=base_n,
+        baseK=base_k,
+        depthA1=step_k,
+        depthB1=2,
+        stepM=1,
+        stepN=1,
+        iterateOrder=0,
+        stepKa=step_k,
+        stepKb=1,
+        dbL0A=2,
+        dbL0B=2,
+        dbL0C=2,
+        l2MTileCnt=1,
+        l2NTileCnt=1,
+        l2MTileBlock=1,
+        l2NTileBlock=ceil_div(workload.n, base_n),
+        l2IterateOrder=1,
+        tilingEnable=10,
+    )
+    return _candidate(
+        workload,
+        hardware,
+        schedule,
+        Template.AL1_FULL_LOAD,
+        "upstream_al1_resident_a",
+    )
+
+
+def _bl1_fix_candidate(
+    workload: Workload,
+    hardware: Hardware,
+) -> Candidate | None:
+    """Port NeedSolveFixBound and DoBL1FullloadWithFixpipeTiling."""
+
+    if workload.trans_a or workload.k > 256 or workload.n >= 256:
+        return None
+    out_alignment = 256 // OUTPUT_BYTES[workload.dtype]
+    if (
+        workload.n % out_alignment == 0
+        or out_alignment % workload.n == 0
+        or workload.m
+        < min(workload.max_cores, hardware.aic_cores) * 512
+    ):
+        return None
+    c0 = 32 // INPUT_BYTES[workload.dtype]
+    if workload.n < c0 and workload.k < c0:
+        return None
+    if workload.dtype in {"fp16", "bf16"}:
+        mode = 1020
+        template = Template.BL1_FULL_LOAD_FIXPIPE
+    elif (
+        workload.dtype == "fp32"
+        and workload.k % c0 == 0
+        and workload.n <= 192
+    ):
+        mode = 2020
+        template = Template.BL1_FULL_LOAD_VEC_NZ2ND
+    else:
+        return None
+    from .contracts import bl1_fix_geometry
+
+    geometry = bl1_fix_geometry(workload, hardware)
+    if geometry is None:
+        return None
+    schedule = make_schedule(
+        usedCoreNum=min(
+            workload.max_cores,
+            hardware.aic_cores,
+            ceil_div(workload.m, geometry["baseM"]),
+        ),
+        singleCoreM=geometry["baseM"],
+        singleCoreN=geometry["baseN"],
+        singleCoreK=workload.k,
+        baseM=geometry["baseM"],
+        baseN=geometry["baseN"],
+        baseK=geometry["baseK"],
+        depthA1=geometry["depthA1"],
+        depthB1=geometry["depthB1"],
+        stepM=1,
+        stepN=1,
+        iterateOrder=0,
+        stepKa=geometry["stepKa"],
+        stepKb=geometry["stepKb"],
+        dbL0A=2,
+        dbL0B=2,
+        dbL0C=1,
+        l2MTileCnt=1,
+        l2NTileCnt=1,
+        l2MTileBlock=0,
+        l2NTileBlock=0,
+        l2IterateOrder=0,
+        tilingEnable=mode,
+    )
+    return _candidate(
+        workload,
+        hardware,
+        schedule,
+        template,
+        "upstream_bl1_fixpipe_bound",
+    )
+
+
+def _bl1_candidate(
+    workload: Workload,
+    hardware: Hardware,
+) -> Candidate | None:
+    """Construct the upstream BL1-resident policy without bank geometry."""
+
+    if bl1_core_split_applicable(workload):
+        _, _, base_k, db_a, db_b, _ = (
+            upstream_base_geometry_policy(workload, hardware)
+        )
+        base_m = 128
+        base_n = workload.n // 2
+        single_m = align_up(ceil_div(workload.m, 12), base_m)
+        step_k = ceil_div(workload.k, base_k)
+        schedule = make_schedule(
+            usedCoreNum=min(
+                workload.max_cores,
+                hardware.aic_cores,
+                2 * ceil_div(workload.m, single_m),
+            ),
+            singleCoreM=single_m,
+            singleCoreN=base_n,
+            singleCoreK=workload.k,
+            baseM=base_m,
+            baseN=base_n,
+            baseK=base_k,
+            depthA1=2 * step_k,
+            depthB1=step_k,
+            stepM=1,
+            stepN=1,
+            iterateOrder=0,
+            stepKa=step_k,
+            stepKb=step_k,
+            dbL0A=db_a,
+            dbL0B=db_b,
+            dbL0C=1,
+            l2MTileCnt=1,
+            l2NTileCnt=1,
+            l2MTileBlock=ceil_div(workload.m, single_m),
+            l2NTileBlock=1,
+            l2IterateOrder=1,
+            tilingEnable=20,
+        )
+        return _candidate(
+            workload,
+            hardware,
+            schedule,
+            Template.BL1_FULL_LOAD,
+            "upstream_bl1_n512_core_split",
+        )
+
+    in_bytes = INPUT_BYTES[workload.dtype]
+    supported_n = {32, 64, 96, 128, 160, 192, 224, 256, 384}
+    on_the_fly = (
+        workload.n in supported_n
+        and (
+            not workload.trans_b
+            or workload.k * in_bytes in supported_n
+        )
+    )
+    c0 = 32 // in_bytes
+    inner_a = workload.m if workload.trans_a else workload.k
+    outer_a = workload.k if workload.trans_a else workload.m
+    vnchw_a = (
+        workload.dtype == "fp32"
+        and outer_a >= 72368
+        and 1 < inner_a <= c0
+    )
+    valid_mk = (
+        workload.m > 16 * max(workload.k, workload.n)
+        and workload.k <= 256
+    )
+    resident_b = workload.k * workload.n * in_bytes
+    if (
+        not valid_mk
+        or not (
+            on_the_fly
+            or (
+                vnchw_a
+                and resident_b < hardware.effective_l1_bytes // 2
+            )
+        )
+    ):
+        return None
+    base_m, base_n, base_k, db_a, db_b, db_c = (
+        upstream_base_geometry_policy(workload, hardware)
+    )
+    base_k = max(base_k, 128 // in_bytes)
+    n_alignment = 16 if workload.trans_b else 32 // in_bytes
+    base_n = align_up(min(workload.n, base_n), n_alignment)
+    step_n = ceil_div(workload.n, base_n)
+    step_k = ceil_div(workload.k, base_k)
+    depth_a = 2 * step_k
+    depth_b = step_n * step_k
+    while base_m >= 16:
+        l1_bytes = base_k * (
+            depth_a * base_m + depth_b * base_n
+        ) * in_bytes
+        if l1_bytes <= hardware.effective_l1_bytes:
+            break
+        base_m //= 2
+    if base_m < 16:
+        return None
+    db_c = (
+        2
+        if base_m * base_n * 4 * 2 <= hardware.l0c_bytes
+        else 1
+    )
+    single_m = 2 * base_m
+    schedule = make_schedule(
+        usedCoreNum=min(
+            workload.max_cores,
+            hardware.aic_cores,
+            ceil_div(workload.m, single_m),
+        ),
+        singleCoreM=single_m,
+        singleCoreN=workload.n,
+        singleCoreK=workload.k,
+        baseM=base_m,
+        baseN=base_n,
+        baseK=base_k,
+        depthA1=depth_a,
+        depthB1=depth_b,
+        stepM=1,
+        stepN=step_n,
+        iterateOrder=0,
+        stepKa=step_k,
+        stepKb=step_k,
+        dbL0A=db_a,
+        dbL0B=db_b,
+        dbL0C=db_c,
+        l2MTileCnt=1,
+        l2NTileCnt=1,
+        l2MTileBlock=ceil_div(workload.m, single_m),
+        l2NTileBlock=1,
+        l2IterateOrder=1,
+        tilingEnable=20,
+    )
+    return _candidate(
+        workload,
+        hardware,
+        schedule,
+        Template.BL1_FULL_LOAD,
+        "upstream_bl1_resident_b",
+    )
+
+
+def _ceil_core_factor(value: int, cores: int) -> int:
+    factors = {
+        20: (1, 2, 4, 5, 10, 20),
+        24: (1, 2, 3, 4, 6, 8, 12, 24),
+        32: (1, 2, 4, 8, 16, 32),
+    }.get(cores, tuple(range(1, cores + 1)))
+    for factor in factors:
+        if value <= factor:
+            return factor
+    tail = value % cores
+    return (
+        ceil_div(value, cores) * cores
+        if tail > cores // 2
+        else max(cores, value // cores * cores)
+    )
+
+
+def _single_split_applicable(
+    workload: Workload,
+    hardware: Hardware,
+) -> bool:
+    cores = min(workload.max_cores, hardware.aic_cores)
+    if (
+        workload.dtype in {"fp16", "bf16"}
+        and workload.k == 1536
+        and workload.m % 128 == 0
+        and workload.n % 128 == 0
+        and (
+            (workload.m >= 49152 and workload.n == 384)
+            or (workload.n >= 49152 and workload.m == 384)
+        )
+        and workload.m * workload.n * 4
+        <= int(0.65 * hardware.l2_bytes)
+    ):
+        return True
+    if workload.k >= 27392:
+        return True
+    base_m, base_n, _, _, _, _ = upstream_base_geometry_policy(
+        workload, hardware
+    )
+    _, l2_mode = upstream_base_l2_policy(
+        workload,
+        hardware,
+        base_m=base_m,
+        base_n=base_n,
+        resident_threshold_bytes=(
+            DIRECT_BASE_L2_RESIDENT_RATIO * hardware.l2_bytes
+        ),
+    )
+    enough_cube_work = (
+        workload.m * workload.k >= 5 * (3 * 128) ** 2
+        and workload.n >= 1024
+        and workload.m >= 3 * 128
+        and workload.k >= 3 * 128
+        and workload.m * workload.n
+        >= 1024 * (3 * 128) * cores
+    )
+    if l2_mode != "cache_partitioned" and enough_cube_work:
+        return True
+    if (
+        workload.trans_a
+        and not workload.trans_b
+        and workload.k >= 11000
+        and workload.n * INPUT_BYTES[workload.dtype] % 256 == 0
+        and (
+            (workload.m % 8192 == 0 and workload.n >= 6144)
+            or (workload.n % 8192 == 0 and workload.m >= 6144)
+        )
+    ):
+        return True
+    return False
+
+
+def _single_split_candidate(
+    workload: Workload,
+    hardware: Hardware,
+) -> Candidate | None:
+    """Port the 20-AIC single-core split-K partition procedure."""
+
+    if not _single_split_applicable(workload, hardware):
+        return None
+    in_bytes = INPUT_BYTES[workload.dtype]
+    cores = min(workload.max_cores, hardware.aic_cores)
+    base_k = 256 // in_bytes
+    step_m, step_n, step_k = 3, 1, 3
+    depth_a, depth_b, order = 9, 6, 1
+    m_tile = ceil_div(workload.m, step_m * 128)
+    n_tile = ceil_div(workload.n, 3072)
+    if m_tile * n_tile < cores:
+        step_m, step_n, step_k = 2, 1, 4
+        depth_a = depth_b = 8
+    if workload.m < 384 or workload.n < 384:
+        step_m = step_n = 1
+        step_k = 4
+        depth_a = depth_b = 8
+    m_align = (256 if workload.trans_a else 32) // in_bytes
+    n_align = 256 // in_bytes
+    m_tile = ceil_div(workload.m, step_m * 128)
+    n_tile = _ceil_core_factor(
+        ceil_div(workload.n, 3072), cores
+    )
+    choices: list[tuple[int, int, int]] = []
+    if m_tile * n_tile >= cores:
+        m_parts = max(1, cores // max(1, n_tile))
+        single_m = min(
+            workload.m,
+            align_up(ceil_div(workload.m, m_parts), m_align),
+        )
+        single_n = min(
+            workload.n,
+            align_up(ceil_div(workload.n, n_tile), n_align),
+        )
+        used = min(
+            cores,
+            ceil_div(workload.m, single_m)
+            * ceil_div(workload.n, single_n),
+        )
+        choices.append((used, single_m, single_n))
+    total = 0
+    probe_n = max(1, n_tile)
+    while probe_n <= cores:
+        probe_n = _ceil_core_factor(probe_n, cores)
+        m_parts = max(1, cores // max(1, probe_n))
+        single_n = align_up(
+            ceil_div(workload.n, probe_n), n_align
+        )
+        single_m = align_up(
+            ceil_div(workload.m, m_parts), m_align
+        )
+        used = ceil_div(workload.m, single_m) * ceil_div(
+            workload.n, single_n
+        )
+        if used > total:
+            total = used
+            choices.append(
+                (
+                    min(cores, used),
+                    min(single_m, workload.m),
+                    min(single_n, workload.n),
+                )
+            )
+        if probe_n == cores:
+            break
+        probe_n += 1
+    if not choices:
+        return None
+    used, single_m, single_n = max(
+        choices, key=lambda item: (item[0], -item[1] * item[2])
+    )
+    is_special_1536 = workload.k == 1536 and (
+        workload.m == 384 or workload.n == 384
+    )
+    if not is_special_1536:
+        average = (
+            workload.m
+            * workload.n
+            / max(1, single_m * single_n * cores)
+        )
+        if (
+            single_n < 512
+            or average < 0.70
+            or (
+                workload.n * in_bytes % 256 == 0
+                and 896 <= workload.n <= 2048
+                and (single_n <= 640 or average < 0.85)
+            )
+        ):
+            return None
+    mkn_small_k = (
+        workload.dtype in {"fp16", "bf16"}
+        and workload.k == 1536
+        and workload.m == 384
+        and workload.n >= 49152
+    )
+    nkm_small_k = (
+        workload.dtype in {"fp16", "bf16"}
+        and workload.k == 1536
+        and workload.n == 384
+        and workload.m >= 49152
+    )
+    if mkn_small_k or (
+        single_m == 384
+        and not nkm_small_k
+        and not (
+            workload.dtype == "fp32"
+            and workload.n * in_bytes % 256
+        )
+    ):
+        step_m, step_n, step_k = 3, 1, 3
+        depth_a, depth_b, order = 9, 6, 1
+    elif nkm_small_k:
+        step_m, step_n, step_k = 1, 3, 3
+        depth_a, depth_b, order = 6, 9, 0
+    single_m = max(single_m, step_m * 128)
+    single_n = max(single_n, step_n * 128)
+    single_k = step_k * base_k
+    schedule = make_schedule(
+        usedCoreNum=used,
+        singleCoreM=single_m,
+        singleCoreN=single_n,
+        singleCoreK=single_k,
+        baseM=128,
+        baseN=128,
+        baseK=base_k,
+        depthA1=depth_a,
+        depthB1=depth_b,
+        stepM=step_m,
+        stepN=step_n,
+        iterateOrder=order,
+        stepKa=step_k,
+        stepKb=step_k,
+        dbL0A=2,
+        dbL0B=2,
+        dbL0C=2,
+        l2MTileCnt=1,
+        l2NTileCnt=1,
+        l2MTileBlock=max(1, ceil_div(workload.m, single_m)),
+        l2NTileBlock=max(1, ceil_div(workload.n, single_n)),
+        l2IterateOrder=1 if nkm_small_k else 0,
+        tilingEnable=2,
+    )
+    return _candidate(
+        workload,
+        hardware,
+        schedule,
+        Template.SINGLE_CORE_SPLIT_K,
+        "upstream_single_core_split_k_partition",
+    )
+
+
+def _deterministic_after_single_reject(
+    workload: Workload,
+    hardware: Hardware,
+) -> tuple[bool, str]:
+    """Mirror the high-K tail of SupportMultiSplitK.
+
+    Upstream tries single-core split-K first.  If its load-balance checks
+    reject the schedule, deterministic split-K remains available except for
+    a dense, N-unaligned output grid where L2 BASE is preferred.
+    """
+
+    if workload.k < 27392:
+        return False, "deterministic_high_k_threshold_not_met"
+    in_bytes = INPUT_BYTES[workload.dtype]
+    m_count = ceil_div(workload.m, 128)
+    n_count = ceil_div(workload.n, 128)
+    n_256_aligned = workload.n * in_bytes % 256 == 0
+    inner_a = (
+        workload.m if workload.trans_a else workload.k
+    ) * in_bytes % 256 == 0
+    inner_b = (
+        workload.k if workload.trans_b else workload.n
+    ) * in_bytes % 256 == 0
+    fp32_mte_bound = (
+        workload.dtype == "fp32" and (not inner_a or not inner_b)
+    )
+    grid = m_count * n_count
+    grid_efficiency = grid / max(
+        1, align_up(grid, min(workload.max_cores, hardware.aic_cores))
+    )
+    if (
+        m_count >= 4
+        and n_count >= 4
+        and not n_256_aligned
+        and not fp32_mte_bound
+        and grid_efficiency > 0.8
+    ):
+        return False, "dense_unaligned_output_prefers_base_l2"
+    return True, "single_split_rejected_high_k_deterministic"
 
 
 def _prefer_nk_split_layout(workload: Workload) -> bool:
@@ -233,26 +878,43 @@ def direct_rule_candidate(
     workload: Workload,
     hardware: Hardware,
 ) -> Candidate:
-    """Return one template-aware schedule using fixed source-derived rules."""
+    """Return one schedule from the complete fixed template rule tree.
+
+    RuntimeKb is intentionally absent.  The ordering mirrors upstream's
+    kernel-specific opportunities, while the deterministic split-K rule is
+    evaluated before single-core split-K only when output parallelism is
+    provably insufficient.
+    """
+
+    fix = _bl1_fix_candidate(workload, hardware)
+    if fix is not None:
+        return fix
+    al1 = _al1_candidate(workload, hardware)
+    if al1 is not None:
+        return al1
+    bl1 = _bl1_candidate(workload, hardware)
+    if bl1 is not None:
+        return bl1
 
     use_split_k, reason = _use_deterministic_split_k(workload, hardware)
     if not use_split_k:
+        single = _single_split_candidate(workload, hardware)
+        if single is not None:
+            return single
+        use_split_k, reason = _deterministic_after_single_reject(
+            workload, hardware
+        )
+    if not use_split_k:
         base = direct_base_candidate(workload, hardware)
-        return Candidate(
-            schedule=base.schedule,
-            template=base.template,
-            source="direct_rule_policy",
-            rationale=f"fixed template rule selected BASE: {reason}",
-            behavior_key=base.behavior_key,
-            metrics={
-                **base.metrics,
-                "rule_version": 2.0,
-                "policy_template_base": 1.0,
-                "policy_template_deterministic_split_k": 0.0,
-            },
+        return _candidate(
+            workload,
+            hardware,
+            base.schedule,
+            Template.BASE,
+            "upstream_base_after_no_special_template",
         )
 
-    in_bytes = 4 if workload.dtype == "fp32" else 2
+    in_bytes = INPUT_BYTES[workload.dtype]
     base_k = 256 // in_bytes
     single_k = 3 * base_k
     k_chunks = ceil_div(workload.k, single_k)
@@ -261,17 +923,49 @@ def direct_rule_candidate(
     )
     prefer_nk = _prefer_nk_split_layout(workload)
     if prefer_nk:
-        single_m = 384
-        single_n = max(128, align_up(workload.n, 16))
-        step_m, step_n = 3, 1
-        depth_a, depth_b = 9, 6
-        iterate_order, l2_order = 1, 0
-    else:
-        single_m = max(128, align_up(workload.m, 16))
+        single_m = workload.m
         single_n = 384
         step_m, step_n = 1, 3
         depth_a, depth_b = 6, 9
-        iterate_order, l2_order = 0, 1
+        iterate_order, l2_order = 0, 0
+        per_core_l2 = hardware.l2_bytes * 7 // 10 // max(
+            1, hardware.aic_cores
+        )
+        fixed_n = min(single_n, workload.n)
+        available = per_core_l2 - single_k * fixed_n * in_bytes
+        divisor = single_k * in_bytes + fixed_n * 4
+        if available > 0 and workload.m > available // divisor:
+            split = align_up(max(128, available // divisor), 128)
+            count = ceil_div(workload.m, split)
+            single_m = align_up(ceil_div(workload.m, count), 128)
+    else:
+        single_m = 384
+        single_n = workload.n
+        step_m, step_n = 3, 1
+        depth_a, depth_b = 9, 6
+        iterate_order, l2_order = 1, 1
+        per_core_l2 = hardware.l2_bytes * 7 // 10 // max(
+            1, hardware.aic_cores
+        )
+        fixed_m = min(single_m, workload.m)
+        available = per_core_l2 - single_k * fixed_m * in_bytes
+        divisor = single_k * in_bytes + fixed_m * 4
+        if available > 0 and workload.n > available // divisor:
+            split = align_up(max(128, available // divisor), 128)
+            count = ceil_div(workload.n, split)
+            single_n = align_up(ceil_div(workload.n, count), 128)
+    if (
+        workload.dtype == "fp32"
+        and workload.m <= 64
+        and workload.n <= 64
+    ):
+        used_cores = min(
+            used_cores,
+            8
+            + max(0, (workload.k - 6144) // 1024)
+            + ceil_div(workload.m, 16)
+            + ceil_div(workload.n, 16),
+        )
     schedule = make_schedule(
         usedCoreNum=used_cores,
         singleCoreM=single_m,
@@ -297,33 +991,10 @@ def direct_rule_candidate(
         l2IterateOrder=l2_order,
         tilingEnable=3,
     )
-    contract = validate_schedule(workload, schedule, hardware)
-    if not contract.valid:
-        raise ValueError(
-            "direct deterministic split-K policy violates contract: "
-            + ",".join(contract.violations)
-        )
-    vector = behavior_vector(workload, schedule, hardware)
-    metrics = dict(vector.metrics)
-    metrics.update(
-        {
-            "model_enabled": 0.0,
-            "deployment_recommended_custom": 1.0,
-            "history_rows_used": 0.0,
-            "candidate_pool_size": 1.0,
-            "rule_version": 2.0,
-            "policy_template_base": 0.0,
-            "policy_template_deterministic_split_k": 1.0,
-        }
-    )
-    return Candidate(
-        schedule=schedule,
-        template=Template.DETERMINISTIC_SPLIT_K,
-        source="direct_rule_policy",
-        rationale=(
-            "fixed template rule selected deterministic split-K: "
-            f"{reason}"
-        ),
-        behavior_key=behavior_key(vector),
-        metrics=metrics,
+    return _candidate(
+        workload,
+        hardware,
+        schedule,
+        Template.DETERMINISTIC_SPLIT_K,
+        f"upstream_deterministic_split_k:{reason}",
     )

@@ -258,7 +258,7 @@ class OneShotSelectionTest(unittest.TestCase):
             )
         return evidence
 
-    def test_no_paired_effect_evidence_selects_research_challenger(
+    def test_no_paired_effect_evidence_selects_compact_custom(
         self,
     ) -> None:
         decision = select_one_shot_candidate(
@@ -271,18 +271,18 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.candidate.schedule, self.custom.schedule)
         self.assertEqual(
-            decision.candidate.source, "one_shot_research_candidate"
+            decision.candidate.source, "compact_data_driven"
         )
         self.assertEqual(
-            decision.deployment_candidate.schedule, self.bank
+            decision.deployment_candidate.schedule, self.custom.schedule
         )
         self.assertEqual(
             decision.selection_policy,
-            "paired_feedback_active_challenger",
+            "risk_bounded_compact_custom",
         )
         self.assertEqual(
             decision.candidate.metrics["deployment_recommended_custom"],
-            0.0,
+            1.0,
         )
         self.assertEqual(decision.custom_eligible_candidates, 1)
 
@@ -305,7 +305,7 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.candidate.schedule, broad.schedule)
         self.assertEqual(
-            decision.deployment_candidate.schedule, self.bank
+            decision.deployment_candidate.schedule, broad.schedule
         )
 
     def test_feedback_transfer_is_preferred_for_active_measurement(
@@ -336,14 +336,14 @@ class OneShotSelectionTest(unittest.TestCase):
             decision.generator_source, "feedback_winner_transfer"
         )
         self.assertEqual(
-            decision.candidate.source, "one_shot_research_candidate"
+            decision.candidate.source, "compact_data_driven"
         )
         self.assertEqual(
             decision.selection_policy,
-            "paired_feedback_active_challenger",
+            "risk_bounded_compact_custom",
         )
 
-    def test_independent_bank_reconstruction_is_not_discarded(
+    def test_independent_bank_reconstruction_is_not_a_deployment(
         self,
     ) -> None:
         reconstructed = Candidate(
@@ -352,30 +352,17 @@ class OneShotSelectionTest(unittest.TestCase):
             source="contract_coupled_policy",
             rationale="independently reconstructed schedule",
         )
-        decision = select_one_shot_candidate(
-            self.workload,
-            [reconstructed],
-            self.incumbent,
-            (),
-            self.hardware,
-            cost_model=_RuntimeModel(),
-        )
-        self.assertEqual(decision.candidate.schedule, self.bank)
-        self.assertEqual(
-            decision.selection_policy,
-            "independent_bank_reconstruction",
-        )
-        self.assertEqual(decision.custom_eligible_candidates, 0)
-        self.assertEqual(decision.bank_equivalent_candidates, 1)
-        self.assertEqual(
-            decision.candidate.metrics["bank_execution_equivalent"], 1.0
-        )
-        self.assertEqual(
-            decision.candidate.metrics["bank_signature_exact"], 1.0
-        )
-        self.assertEqual(
-            decision.candidate.metrics["one_shot_incumbent_fallback"], 0.0
-        )
+        with self.assertRaisesRegex(
+            ValueError, "non-bank candidate",
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [reconstructed],
+                self.incumbent,
+                (),
+                self.hardware,
+                cost_model=_RuntimeModel(),
+            )
 
     def test_bank_transition_groups_23_fields_by_execution_subsystem(
         self,
@@ -985,7 +972,9 @@ class OneShotSelectionTest(unittest.TestCase):
                 safety_model=_SafeRelativeSafetyModel(),
             )
 
-    def test_cross_template_requires_stronger_independent_support(self) -> None:
+    def test_cross_template_without_hardware_opportunity_is_rejected(
+        self,
+    ) -> None:
         split = Candidate(
             schedule=self.bank.replace(tilingEnable=3),
             template=Template.DETERMINISTIC_SPLIT_K,
@@ -993,41 +982,32 @@ class OneShotSelectionTest(unittest.TestCase):
             rationale="cross-template candidate",
         )
         weak = self._paired_effects(split, ratio=0.96, count=3)
-        weak_decision = select_one_shot_candidate(
-            self.workload,
-            [split],
-            self.incumbent,
-            weak,
-            self.hardware,
-            cost_model=_RuntimeModel(),
-        )
-        self.assertEqual(weak_decision.candidate.schedule, split.schedule)
-        self.assertEqual(
-            weak_decision.deployment_candidate.schedule, self.bank
-        )
-        self.assertEqual(
-            weak_decision.selection_policy,
-            "paired_feedback_active_challenger",
-        )
+        with self.assertRaisesRegex(
+            ValueError, "no hardware-competitive",
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [split],
+                self.incumbent,
+                weak,
+                self.hardware,
+                cost_model=_RuntimeModel(),
+            )
 
         strong = self._paired_effects(split, ratio=0.80, count=3)
-        strong_decision = select_one_shot_candidate(
-            self.workload,
-            [split],
-            self.incumbent,
-            strong,
-            self.hardware,
-            cost_model=_RuntimeModel(),
-        )
-        self.assertEqual(strong_decision.candidate.schedule, split.schedule)
-        self.assertEqual(
-            strong_decision.deployment_candidate.schedule, self.bank
-        )
-        self.assertEqual(
-            strong_decision.candidate.metrics["template_competitive"], 0.0
-        )
+        with self.assertRaisesRegex(
+            ValueError, "no hardware-competitive",
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [split],
+                self.incumbent,
+                strong,
+                self.hardware,
+                cost_model=_RuntimeModel(),
+            )
 
-    def test_research_measurement_uses_expected_latency_not_tighter_regression(
+    def test_compact_custom_uses_expected_latency_not_tighter_regression(
         self,
     ) -> None:
         split = Candidate(
@@ -1047,10 +1027,10 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(decision.candidate.schedule, self.custom.schedule)
         self.assertEqual(
-            decision.candidate.source, "one_shot_research_candidate"
+            decision.candidate.source, "compact_data_driven"
         )
         self.assertEqual(
-            decision.deployment_candidate.schedule, self.bank
+            decision.deployment_candidate.schedule, self.custom.schedule
         )
 
     def test_low_core_split_k_has_no_template_opportunity(self) -> None:
@@ -1149,19 +1129,17 @@ class OneShotSelectionTest(unittest.TestCase):
             source="contract_coupled_policy",
             rationale="low-core challenger",
         )
-        decision = select_one_shot_candidate(
-            workload,
-            [challenger, reconstructed],
-            incumbent,
-            (),
-            self.hardware,
-            cost_model=_RuntimeModel(),
-        )
-        self.assertEqual(decision.candidate.schedule, bank)
-        self.assertEqual(
-            decision.selection_policy,
-            "independent_bank_reconstruction",
-        )
+        with self.assertRaisesRegex(
+            ValueError, "non-bank candidate",
+        ):
+            select_one_shot_candidate(
+                workload,
+                [challenger, reconstructed],
+                incumbent,
+                (),
+                self.hardware,
+                cost_model=_RuntimeModel(),
+            )
 
     def test_underfilled_bank_allows_split_k_parallelism_probe(self) -> None:
         workload = Workload(

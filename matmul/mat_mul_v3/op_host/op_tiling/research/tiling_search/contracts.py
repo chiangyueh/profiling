@@ -67,6 +67,26 @@ def bl1_official_fix_applicable(workload: Workload, mode: int) -> bool:
     return True
 
 
+def bl1_core_split_applicable(workload: Workload) -> bool:
+    """Mirror upstream's BL1 N=K=512 core-split gate."""
+
+    if (
+        workload.dtype not in {"fp16", "bf16"}
+        or workload.trans_a
+        or not workload.trans_b
+        or not 30848 <= workload.m <= 98048
+        or workload.n != 512
+        or workload.k != 512
+    ):
+        return False
+    m_tail_blocks = (workload.m // 128) % 12
+    if m_tail_blocks == 0:
+        return ((workload.m + 127) // 128) % 12 == 1
+    if m_tail_blocks == 6:
+        return ((workload.m + 127) // 128) % 12 != 7
+    return 1 <= m_tail_blocks < 6
+
+
 def bl1_fix_geometry(
     workload: Workload,
     hardware: Hardware,
@@ -552,6 +572,62 @@ def _bl1_contract(
             schedule["l2NTileBlock"],
         ) != (1, 1, 0, 0):
             violations.append("bl1_fix_l2_contract")
+        return violations
+
+    if bl1_core_split_applicable(workload):
+        expected_single_m = align_up(ceil_div(workload.m, 12), 128)
+        expected_step_k = ceil_div(workload.k, schedule["baseK"])
+        if (
+            schedule["baseM"],
+            schedule["baseN"],
+            schedule["singleCoreM"],
+            schedule["singleCoreN"],
+            schedule["singleCoreK"],
+        ) != (
+            128,
+            workload.n // 2,
+            expected_single_m,
+            workload.n // 2,
+            workload.k,
+        ):
+            violations.append("bl1_core_split_geometry")
+        if (
+            schedule["stepM"],
+            schedule["stepN"],
+            schedule["stepKa"],
+            schedule["stepKb"],
+            schedule["depthA1"],
+            schedule["depthB1"],
+        ) != (
+            1,
+            1,
+            expected_step_k,
+            expected_step_k,
+            2 * expected_step_k,
+            expected_step_k,
+        ):
+            violations.append("bl1_core_split_pipeline")
+        expected_cores = min(
+            workload.max_cores,
+            hardware.aic_cores,
+            2 * ceil_div(workload.m, expected_single_m),
+        )
+        if schedule["usedCoreNum"] != expected_cores:
+            violations.append("bl1_core_split_cores")
+        if (
+            schedule["l2MTileCnt"],
+            schedule["l2NTileCnt"],
+            schedule["l2MTileBlock"],
+            schedule["l2NTileBlock"],
+            schedule["l2IterateOrder"],
+        ) != (
+            1,
+            1,
+            ceil_div(workload.m, expected_single_m),
+            1,
+            1,
+        ):
+            violations.append("bl1_core_split_l2")
         return violations
 
     if schedule["singleCoreK"] < workload.k:

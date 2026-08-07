@@ -28,6 +28,9 @@ from tiling_search import (
     DIRECT_BASE_AUDIT_WORKLOADS,
     DIRECT_BASE_L2_RESIDENT_RATIO,
     DIRECT_BASE_RULE_VERSION,
+    DIRECT_RULE_AUDIT_RECORDS,
+    DIRECT_RULE_AUDIT_UNIQUE_RECORDS,
+    DIRECT_RULE_AUDIT_WORKLOADS,
     GenerationBudget,
     Hardware,
     MeasuredObservation,
@@ -701,7 +704,7 @@ def parse_args() -> argparse.Namespace:
             "calibration",
             "campaign",
             "compact-deployment",
-            "direct-base",
+            "direct-rule",
             "one-shot",
         ),
         default="campaign",
@@ -715,7 +718,7 @@ def main() -> None:
         "compact-deployment",
         "one-shot",
     }
-    direct_deployment = args.selection_mode == "direct-base"
+    direct_deployment = args.selection_mode == "direct-rule"
     verify_upstream_contract(args.source_root)
     from tbe.common.platform import set_current_compile_soc_info
 
@@ -859,6 +862,9 @@ def main() -> None:
             "audit_winner_workloads="
             f"{DIRECT_BASE_AUDIT_WINNER_WORKLOADS} "
             f"audit_bank_workloads={DIRECT_BASE_AUDIT_BANK_WORKLOADS} "
+            f"audit_all_records={DIRECT_RULE_AUDIT_RECORDS} "
+            f"audit_all_unique={DIRECT_RULE_AUDIT_UNIQUE_RECORDS} "
+            f"audit_all_workloads={DIRECT_RULE_AUDIT_WORKLOADS} "
             f"l2_resident_ratio={DIRECT_BASE_L2_RESIDENT_RATIO:.12f} "
             "rules=template,geometry,l1,core,l2"
         )
@@ -885,7 +891,7 @@ def main() -> None:
         )
     if (
         not args.skip_model_validation
-        and args.selection_mode not in {"calibration", "direct-base"}
+        and args.selection_mode not in {"calibration", "direct-rule"}
     ):
         for leave_workload_out in (False, True):
             validation = validate_feedback_model(
@@ -935,10 +941,10 @@ def main() -> None:
     )
     if args.selection_mode == "compact-deployment":
         generation_budget = GenerationBudget(
-            raw_attempts=48,
-            legal_candidates=12,
-            behavior_candidates=min(args.behavior_candidates, 12),
-            callback_candidates=min(args.callback_candidates, 8),
+            raw_attempts=384,
+            legal_candidates=96,
+            behavior_candidates=min(args.behavior_candidates, 48),
+            callback_candidates=min(args.callback_candidates, 24),
             npu_candidates=1,
         )
     else:
@@ -1201,7 +1207,21 @@ def main() -> None:
                     else adaptive_template_quotas
                 ),
             )
+            direct_candidates = []
+            if learned_deployment:
+                try:
+                    direct_candidates.append(
+                        direct_rule_candidate(workload, hardware)
+                    )
+                except Exception as exception:
+                    print(
+                        "ONE_SHOT_DIRECT_RULE_BLOCKED "
+                        f"{workload.workload_id} "
+                        f"reason={str(exception)[:240]} "
+                        "action=continue_with_independent_frontier"
+                    )
             ordered = [
+                *direct_candidates,
                 *result.callback_candidates,
                 *(
                     candidate
@@ -1276,20 +1296,32 @@ def main() -> None:
         one_shot_decision = None
         selection_start = time.perf_counter_ns()
         if learned_deployment:
-            one_shot_decision = select_one_shot_candidate(
-                workload,
-                callback_candidates,
-                incumbent,
-                observations,
-                hardware,
-                cost_model=one_shot_cost_model,
-                effect_model=one_shot_effect_model,
-                safety_model=one_shot_safety_model,
-            )
+            try:
+                one_shot_decision = select_one_shot_candidate(
+                    workload,
+                    callback_candidates,
+                    incumbent,
+                    observations,
+                    hardware,
+                    cost_model=one_shot_cost_model,
+                    effect_model=one_shot_effect_model,
+                    safety_model=one_shot_safety_model,
+                )
+            except ValueError as exception:
+                print(
+                    "ONE_SHOT_BLOCKED "
+                    f"{workload.workload_id} "
+                    f"reason={str(exception)[:240]} "
+                    "deployment=none fallback=disabled action=continue"
+                )
+                continue
             pending_schedule = unpaired_one_shot.get(
                 workload.identity()
             )
-            if pending_schedule is not None:
+            if (
+                pending_schedule is not None
+                and args.selection_mode != "compact-deployment"
+            ):
                 pending_candidate = next(
                     (
                         candidate
@@ -1376,36 +1408,6 @@ def main() -> None:
                 raise ValueError(
                     "one-shot deployment must use the independently "
                     "generated selection; bank record injection is disabled"
-                )
-            if args.selection_mode == "compact-deployment":
-                chosen = one_shot_decision.candidate
-                chosen = Candidate(
-                    schedule=chosen.schedule,
-                    template=chosen.template,
-                    source="compact_data_driven",
-                    rationale=(
-                        "deployment-sized learned selection; "
-                        f"generator={one_shot_decision.generator_source}; "
-                        f"{chosen.rationale}"
-                    ),
-                    acquisition=chosen.acquisition,
-                    parent_signatures=chosen.parent_signatures,
-                    behavior_key=chosen.behavior_key,
-                    metrics={
-                        **chosen.metrics,
-                        "deployment_recommended_custom": 1.0,
-                        "compact_deployment_forced_choice": 1.0,
-                        "candidate_pool_size": float(
-                            len(callback_candidates)
-                        ),
-                        "history_rows_used": float(len(observations)),
-                    },
-                )
-                one_shot_decision = replace(
-                    one_shot_decision,
-                    candidate=chosen,
-                    deployment_candidate=chosen,
-                    selection_policy="compact_model_custom",
                 )
             selected_candidates = [one_shot_decision.candidate]
             racing_plan = None

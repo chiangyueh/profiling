@@ -541,7 +541,7 @@ class ContractSearchTest(unittest.TestCase):
                     )
                     for row in csv.DictReader(source)
                 )
-        self.assertEqual(len(workloads), 24)
+        self.assertEqual(len(workloads), 32)
         self.assertFalse(workloads.intersection(observed))
 
     def test_bank_local_mutations_reach_callback_frontier(self) -> None:

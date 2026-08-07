@@ -173,7 +173,7 @@ V14_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log31.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260807-dual-model-vs-template-rule-v18"
+echo "  script:     run_npu.sh 20260807-dual-custom-vs-template-rule-v19"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      dual_compact_model_vs_direct_template_rule"
 echo "  mode:       ${MODE}"
@@ -301,11 +301,11 @@ if [[ "${TOOLKIT_VERSION}" != 8.5* ]]; then
 fi
 
 NPU_CANDIDATES=1
-MODEL_CALLBACK_CANDIDATES=8
-BEHAVIOR_CANDIDATES=12
+MODEL_CALLBACK_CANDIDATES=24
+BEHAVIOR_CANDIDATES=48
 if [[ "${MODE}" == "smoke" ]]; then
-    MODEL_CALLBACK_CANDIDATES=6
-    BEHAVIOR_CANDIDATES=8
+    MODEL_CALLBACK_CANDIDATES=12
+    BEHAVIOR_CANDIDATES=24
 fi
 
 generate_candidates() {
@@ -338,7 +338,7 @@ generate_candidates() {
         --behavior-candidates "${BEHAVIOR_CANDIDATES}"
         --selection-mode "${selection_mode}"
     )
-    if [[ "${selection_mode}" != "direct-base" ]]; then
+    if [[ "${selection_mode}" != "direct-rule" ]]; then
         command+=(
             --observations "${RESEARCH}/config/measured_observations.csv"
             --observations "${RESEARCH}/config/measured_observations_net_log11.csv"
@@ -377,7 +377,7 @@ generate_candidates() {
     if [[ "${selection_mode}" == "adaptive-calibration" ||
           "${selection_mode}" == "calibration" ||
           "${selection_mode}" == "compact-deployment" ||
-          "${selection_mode}" == "direct-base" ||
+          "${selection_mode}" == "direct-rule" ||
           "${selection_mode}" == "one-shot" ]]; then
         command+=(--skip-model-validation)
     fi
@@ -487,7 +487,7 @@ MODEL_RC="$?"
 run_strategy \
     "[4/4] Strategy B: fixed-rule direct template selection ..." \
     direct_template_rule \
-    direct-base \
+    direct-rule \
     "${RULE_CANDIDATES}" \
     "${RULE_ALL}" \
     "${RULE_SUMMARY}" \

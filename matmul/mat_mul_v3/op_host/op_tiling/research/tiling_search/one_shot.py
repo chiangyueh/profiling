@@ -1789,9 +1789,10 @@ def select_one_shot_candidate(
     The bank is an incumbent and paired measurement control, not a normal
     candidate source or deployment seed. Strong repeated paired evidence may
     recommend one custom deployment. Otherwise a runtime-safe non-bank
-    candidate is selected only as an active-learning measurement; it does not
-    become the deployment recommendation. An independent reconstruction of
-    the bank schedule remains a coverage result when no custom is executable.
+    candidate is selected as the compact strategy's deployment decision. An
+    independent reconstruction of the bank schedule remains a coverage result
+    when it is the only hardware-competitive independent result. If neither
+    exists, selection fails instead of injecting or falling back to the bank.
     """
 
     if incumbent.source != "bank_incumbent":
@@ -1816,6 +1817,7 @@ def select_one_shot_candidate(
         if candidate.source not in {
             "contract_coupled_policy",
             "contract_global",
+            "direct_rule_policy",
             "feedback_regression_counterfactual",
             "feedback_winner_transfer",
             "feedback_winner_mutation",
@@ -2078,11 +2080,12 @@ def select_one_shot_candidate(
             if prediction.samples == 0:
                 conservative += 0.10
         source_rank = {
-            "feedback_winner_transfer": 0,
-            "feedback_winner_mutation": 1,
-            "feedback_regression_counterfactual": 2,
-            "contract_coupled_policy": 3,
-            "contract_global": 4,
+            "direct_rule_policy": 0,
+            "feedback_winner_transfer": 1,
+            "feedback_winner_mutation": 2,
+            "feedback_regression_counterfactual": 3,
+            "contract_coupled_policy": 4,
+            "contract_global": 5,
         }.get(candidate.source, 5)
         return (
             conservative
@@ -2138,7 +2141,11 @@ def select_one_shot_candidate(
             )
             and item[7].competitive
         ]
-        selection_pool = research_pool or eligible
+        if not research_pool:
+            raise ValueError(
+                "one-shot selection has no hardware-competitive "
+                "non-bank candidate"
+            )
         (
             original,
             vector,
@@ -2148,7 +2155,7 @@ def select_one_shot_candidate(
             _,
             _,
             competition,
-        ) = min(selection_pool, key=research_score)
+        ) = min(research_pool, key=research_score)
         acquisition = research_score(
             (
                 original,
@@ -2162,28 +2169,16 @@ def select_one_shot_candidate(
                 competition,
             )
         )[0]
-        if schedules_execution_equivalent(
-            incumbent.schedule, original.schedule
-        ):
-            deployment_candidate = original
-            source = "one_shot_bank_equivalent"
-            rationale = (
-                "independent solver reconstructed the bank kernel "
-                f"execution schedule; generator={original.source}"
-            )
-            selection_policy = "independent_bank_reconstruction"
-            deployment_recommended = 0.0
-        else:
-            deployment_candidate = incumbent
-            source = "one_shot_research_candidate"
-            rationale = (
-                "single runtime-safe non-bank challenger selected for paired "
-                "active-learning measurement from expected bank-relative "
-                "latency, template competition, hardware work floor, and "
-                f"runtime rejection risk; generator={original.source}"
-            )
-            selection_policy = "paired_feedback_active_challenger"
-            deployment_recommended = 0.0
+        deployment_candidate = original
+        source = "compact_data_driven"
+        rationale = (
+            "single runtime-safe non-bank deployment selected from "
+            "expected bank-relative "
+            "latency, template competition, hardware work floor, and "
+            f"runtime rejection risk; generator={original.source}"
+        )
+        selection_policy = "risk_bounded_compact_custom"
+        deployment_recommended = 1.0
 
     vector.metrics.update(
         {

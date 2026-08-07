@@ -117,14 +117,17 @@ COLUMNS = [
     "tiling_signature",
     "bank_tiling_signature",
     "deployment_strategy",
+    "host_official_callback_ms",
     "host_history_load_ms",
     "host_model_setup_ms",
     "host_generation_ms",
     "host_callback_ms",
     "host_selection_ms",
     "host_tiling_total_ms",
+    "host_end_to_end_tiling_ms",
     "host_generated_candidates",
     "host_callback_candidates",
+    "host_callback_template_counts",
     *FIELD_COLUMNS.values(),
     "callback_tiling_key",
     "callback_block_dim",
@@ -1182,6 +1185,7 @@ def main() -> None:
                 "action=skip_completed_calibration_before_host_generation"
             )
             continue
+        official_callback_start = time.perf_counter_ns()
         try:
             official = invoke(workload)
             bank = exact_roundtrip(workload, official.schedule)
@@ -1192,6 +1196,9 @@ def main() -> None:
                 f"reason={str(exception)[:240]} action=continue"
             )
             continue
+        official_callback_ms = (
+            time.perf_counter_ns() - official_callback_start
+        ) / 1_000_000.0
         control_row = candidate_row(
             workload,
             0,
@@ -1509,6 +1516,14 @@ def main() -> None:
                 probe_templates=True,
                 template_probe_floor=1,
                 template_quotas=racing_plan.template_quotas,
+                protected_sources=frozenset(
+                    {
+                        "feedback_winner_transfer",
+                        "feedback_winner_mutation",
+                        "feedback_promising_mutation",
+                        "feedback_regression_counterfactual",
+                    }
+                ),
             )
         else:
             racing_plan = plan_template_race(
@@ -1541,6 +1556,10 @@ def main() -> None:
             )
             for candidate in selected_candidates
         ]
+        callback_template_counts = Counter(
+            candidate.template.value
+            for candidate in callback_candidates
+        )
         for rank, (candidate, callback) in enumerate(accepted, 1):
             row = candidate_row(
                 workload,
@@ -1557,6 +1576,9 @@ def main() -> None:
             row.update(
                 {
                     "deployment_strategy": args.selection_mode,
+                    "host_official_callback_ms": (
+                        f"{official_callback_ms:.6f}"
+                    ),
                     "host_history_load_ms": (
                         f"{history_load_ms:.6f}"
                     ),
@@ -1567,11 +1589,18 @@ def main() -> None:
                     "host_tiling_total_ms": (
                         f"{host_tiling_total_ms:.6f}"
                     ),
+                    "host_end_to_end_tiling_ms": (
+                        f"{official_callback_ms + host_tiling_total_ms:.6f}"
+                    ),
                     "host_generated_candidates": str(
                         generated_candidates
                     ),
                     "host_callback_candidates": str(
                         len(callback_candidates)
+                    ),
+                    "host_callback_template_counts": json.dumps(
+                        dict(sorted(callback_template_counts.items())),
+                        separators=(",", ":"),
                     ),
                 }
             )

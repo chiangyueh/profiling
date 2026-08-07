@@ -33,7 +33,7 @@ def _case(
     cores: int,
 ) -> Case:
     return Case(
-        workload_id=f"bench_v1_{index:03d}_{group}",
+        workload_id=f"bench_v2_{index:03d}_{group}",
         m=shape[0],
         n=shape[1],
         k=shape[2],
@@ -361,7 +361,7 @@ def main() -> None:
         "BENCHMARK_MANIFEST "
         + json.dumps(
             {
-                "version": "hardware_coverage_v1",
+                "version": "hardware_coverage_v2",
                 "workloads": len(cases),
                 "groups": dict(sorted(groups.items())),
                 "dtypes": dict(sorted(dtypes.items())),

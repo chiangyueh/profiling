@@ -20,7 +20,7 @@ from tiling_search import (
     SearchConfig,
     Workload,
 )
-from tiling_search.domain import KNOWLEDGE_FIELDS, Schedule, Template
+from tiling_search.domain import Candidate, KNOWLEDGE_FIELDS, Schedule, Template
 from tiling_search.behavior import select_behavior_coverage
 from tiling_search.behavior import behavior_vector
 from tiling_search.contracts import validate_schedule
@@ -835,6 +835,52 @@ class ContractSearchTest(unittest.TestCase):
                 candidate.schedule.signature()
                 for candidate in result.callback_candidates
             },
+        )
+
+    def test_final_stage_selection_retains_explicit_feedback(self) -> None:
+        workload = Workload(
+            workload_id="stage2_feedback_retention",
+            m=1792,
+            n=2816,
+            k=3584,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        schedules = []
+        for schedule in BaseSolver().generate(workload, self.hardware):
+            schedules.append(schedule)
+            if len(schedules) == 20:
+                break
+        self.assertEqual(len(schedules), 20)
+        candidates = [
+            Candidate(
+                schedule=schedule,
+                template=Template.BASE,
+                source=(
+                    "feedback_winner_mutation"
+                    if index == len(schedules) - 1
+                    else "contract_coupled_policy"
+                ),
+                rationale="feedback retention test",
+            )
+            for index, schedule in enumerate(schedules)
+        ]
+        selected = select_behavior_coverage(
+            workload,
+            candidates,
+            (),
+            self.hardware,
+            8,
+            probe_templates=True,
+            template_quotas={Template.BASE: 8},
+            protected_sources=frozenset({"feedback_winner_mutation"}),
+        )
+        self.assertEqual(len(selected), 8)
+        self.assertIn(
+            "feedback_winner_mutation",
+            {candidate.source for candidate in selected},
         )
 
     def test_template_race_reduces_only_with_repeated_paired_winner(

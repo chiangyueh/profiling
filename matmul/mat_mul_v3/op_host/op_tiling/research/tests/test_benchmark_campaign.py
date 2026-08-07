@@ -28,6 +28,48 @@ PROFILE = load_module(
     "benchmark_profile_under_test",
     RESEARCH / "profile.py",
 )
+STATUS = load_module(
+    "benchmark_status_under_test",
+    RESEARCH / "benchmark_status.py",
+)
+
+
+def frontier_rows(
+    workload_id: str,
+    count: int,
+    *,
+    signature_offset: int = 0,
+    feedback: bool = False,
+) -> list[dict[str, str]]:
+    rows = []
+    knowledge = tuple(PROFILE.KNOWLEDGE_COLUMNS.values())
+    for index in range(count):
+        row = {
+            "workload_id": workload_id,
+            "candidate_role": "searched",
+            "candidate_source": (
+                "feedback_winner_mutation"
+                if feedback and index == 0
+                else "contract_global"
+            ),
+            "search_template": "BASE" if index % 2 == 0 else "SINGLE_CORE_SPLIT_K",
+            "search_behavior_key": (
+                f'["bin",{signature_offset + index}]'
+            ),
+            "host_callback_template_counts": (
+                '{"BASE":16,"SINGLE_CORE_SPLIT_K":16}'
+            ),
+            "tiling_signature": ":".join(
+                str(signature_offset + index * 100 + field)
+                for field in range(23)
+            ),
+        }
+        for field, column in enumerate(knowledge):
+            row[column] = str(
+                signature_offset + index * (field + 1) + field + 1
+            )
+        rows.append(row)
+    return rows
 
 
 def test_manifest_has_balanced_nonrandom_coverage() -> None:
@@ -97,6 +139,12 @@ def test_profile_record_contains_replayable_measurement_context() -> None:
         "callback_block_dim": "20",
         "callback_workspace_bytes": "0",
         "callback_tiling_sha256": "abc",
+        "host_official_callback_ms": "0.25",
+        "host_tiling_total_ms": "12.5",
+        "host_end_to_end_tiling_ms": "12.75",
+        "host_callback_template_counts": (
+            '{"BASE":96,"SINGLE_CORE_SPLIT_K":96}'
+        ),
     }
     measured = {
         "success": "1",
@@ -133,6 +181,9 @@ def test_profile_record_contains_replayable_measurement_context() -> None:
     assert row["official_profile_json"]
     assert row["bank_profile_json"]
     assert row["callback_tiling_sha256"] == "abc"
+    assert row["host_official_callback_ms"] == "0.25"
+    assert row["host_end_to_end_tiling_ms"] == "12.75"
+    assert row["host_callback_template_counts"].startswith('{"BASE"')
     assert row["failure_stage"] == ""
 
 
@@ -144,3 +195,77 @@ def test_full_command_is_fixed_two_stage_campaign() -> None:
     assert '--resume-feedback "${RESUME}"' in script
     assert "BENCHMARK_RECORDS" not in script
     assert "npu_dual_model" not in script
+    assert "hardware_coverage_v2" in script
+    assert '--prior-candidates "${STAGE1_CANDIDATES}"' in script
+    assert script.count("--emit-records") == 1
+
+
+def test_frontier_audit_rejects_count_only_coverage() -> None:
+    candidates = frontier_rows("bench", 8)
+    accepted, complete = STATUS.frontier_audit(
+        candidates,
+        {"bench"},
+        8,
+    )
+    assert complete
+    assert accepted["failed_workloads"] == 0
+
+    collapsed = [dict(row) for row in candidates]
+    for row in collapsed:
+        row["search_behavior_key"] = '["same"]'
+        row["search_template"] = "BASE"
+        for column in STATUS.GEOMETRY_COLUMNS:
+            row[column] = "1"
+        for column in STATUS.PIPELINE_COLUMNS:
+            row[column] = "1"
+        for column in STATUS.EXECUTION_COLUMNS:
+            row[column] = "1"
+    rejected, complete = STATUS.frontier_audit(
+        collapsed,
+        {"bench"},
+        8,
+    )
+    assert not complete
+    assert rejected["failed_workloads"] == 1
+    failures = rejected["failures"]["bench"]
+    assert any("behavior_bins=" in failure for failure in failures)
+    assert any("templates=" in failure for failure in failures)
+
+
+def test_stage2_audit_requires_novel_and_measured_feedback() -> None:
+    stage1 = frontier_rows("bench", 8)
+    stage2 = frontier_rows("bench", 8, signature_offset=10000, feedback=True)
+    resume = [
+        {
+            "workload_id": "bench",
+            "tiling_signature": stage1[0]["tiling_signature"],
+            "success": "1",
+            "pair_validated": "1",
+            "status_vs_official": "improved",
+            "status_vs_bank": "improved",
+        }
+    ]
+    _, complete = STATUS.frontier_audit(
+        stage2,
+        {"bench"},
+        8,
+        prior_candidates=stage1,
+        resume_rows=resume,
+    )
+    assert complete
+
+    without_feedback = [dict(row) for row in stage2]
+    for row in without_feedback:
+        row["candidate_source"] = "contract_global"
+    audit, complete = STATUS.frontier_audit(
+        without_feedback,
+        {"bench"},
+        8,
+        prior_candidates=stage1,
+        resume_rows=resume,
+    )
+    assert not complete
+    assert (
+        "feedback_candidates=0,measured_winner_or_regression=1"
+        in audit["failures"]["bench"]
+    )

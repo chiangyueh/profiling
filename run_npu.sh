@@ -152,16 +152,18 @@ RUN_LOG="${ROOT}/results/logs/run_npu_${RUN_ID}.log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
 BUILD_DIR="${ROOT}/.build/matmul_v3_tiling_research"
-STATE_ROOT="${ROOT}/.benchmark_state/hardware_coverage_v1"
+STATE_ROOT="${ROOT}/.benchmark_state/hardware_coverage_v2"
 PROBE_STATE="${STATE_ROOT}/probe"
 mkdir -p "${PROBE_STATE}"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260807-hardware-coverage-benchmark-v23"
+echo "  script:     run_npu.sh 20260807-audited-hardware-coverage-v24"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
 echo "  scope:      broad_contract_search_with_same_run_feedback"
 echo "  mode:       ${MODE}"
+echo "  domain:     rank2_ND_no_bias fp16,bf16,fp32 NN,NT,TN,TT"
+echo "  measurement:full_numeric_preflight + paired_ACL_event_latency"
 echo "  handoff:    one_log_only"
 echo "  log:        ${RUN_LOG}"
 echo
@@ -277,7 +279,7 @@ if [[ "${TOOLKIT_VERSION}" != 8.5* ]]; then
     echo "  compatibility: exact callback roundtrip and RuntimeKb preflight remain mandatory"
 fi
 
-CAMPAIGN_ID_SOURCE="hardware_coverage_v1|${SOC}|${AIC}|${TOOLKIT_VERSION}|${MODE}"
+CAMPAIGN_ID_SOURCE="hardware_coverage_v2|${SOC}|${AIC}|${TOOLKIT_VERSION}|${MODE}"
 if [[ "${WORKLOADS_SUPPLIED}" -eq 1 ]]; then
     CAMPAIGN_ID_SOURCE="${CAMPAIGN_ID_SOURCE}|$(sha256sum "${WORKLOADS}" | cut -d' ' -f1)"
 fi
@@ -421,7 +423,7 @@ stage_status() {
 
 telemetry_snapshot() {
     local point="$1"
-    echo "BENCHMARK_TELEMETRY_BEGIN point=${point}"
+    echo "BENCHMARK_TELEMETRY_BEGIN point=${point} scope=stage_boundary"
     if command -v npu-smi >/dev/null 2>&1; then
         timeout 15 npu-smi info || true
     else
@@ -442,6 +444,9 @@ else
     echo "BENCHMARK_FRONTIER_REUSE stage=stage1 path=hidden_state"
 fi
 stage_status stage1 "${STAGE1_CANDIDATES}" "${STAGE1_NPU}" --frontier-only
+stage_status stage1 "${STAGE1_CANDIDATES}" \
+    "${STAGE1_NPU}" --emit-records \
+    --exclude-run-id "${RUN_ID}" || true
 
 echo "[4/5] Measure broad coverage frontier on NPU ..."
 telemetry_snapshot stage1_pre
@@ -457,9 +462,6 @@ stage_status stage1 "${STAGE1_CANDIDATES}" "${STAGE1_NPU}"
 STAGE1_STATUS="$?"
 set -e
 if [[ "${STAGE1_STATUS}" -ne 0 ]]; then
-    stage_status stage1 "${STAGE1_CANDIDATES}" \
-        "${STAGE1_NPU}" --emit-records \
-        --exclude-run-id "${RUN_ID}" || true
     echo
     echo "NPU run incomplete"
     echo "  stage: stage1"
@@ -479,7 +481,9 @@ if [[ ! -s "${STAGE2_CANDIDATES}" ]]; then
 else
     echo "BENCHMARK_FRONTIER_REUSE stage=stage2 path=hidden_state"
 fi
-stage_status stage2 "${STAGE2_CANDIDATES}" "${STAGE2_NPU}" --frontier-only
+stage_status stage2 "${STAGE2_CANDIDATES}" \
+    "${STAGE2_NPU}" --frontier-only \
+    --prior-candidates "${STAGE1_CANDIDATES}"
 telemetry_snapshot stage2_pre
 STAGE_WALL_START="$(date +%s%N)"
 profile_stage stage2 "${STAGE2_CANDIDATES}" \
@@ -490,13 +494,13 @@ echo "BENCHMARK_NPU_STAGE stage=stage2 wall_ms=$(( (STAGE_WALL_END - STAGE_WALL_
 telemetry_snapshot stage2_post
 set +e
 stage_status stage2 "${STAGE2_CANDIDATES}" \
-    "${STAGE2_NPU}" --emit-records --exclude-run-id "${RUN_ID}"
+    "${STAGE2_NPU}" --prior-candidates "${STAGE1_CANDIDATES}"
 STAGE2_STATUS="$?"
 set -e
 
 echo
 if [[ "${STAGE2_STATUS}" -eq 0 ]]; then
-    echo "BENCHMARK_COMPLETION status=PASS stages=2"
+    echo "BENCHMARK_COMPLETION status=ACQUISITION_COMPLETE stages=2"
     echo "NPU run completed"
 else
     echo "BENCHMARK_COMPLETION status=INCOMPLETE stage=stage2"

@@ -1591,6 +1591,7 @@ def select_behavior_coverage(
     template_quotas: Mapping[Template, int] | None = None,
     allow_risky_template_probes: bool = False,
     cost_model: FeedbackCostModel | None = None,
+    protected_sources: frozenset[str] = frozenset(),
 ) -> list[Candidate]:
     unique: dict[tuple[int, ...], Candidate] = {}
     for candidate in candidates:
@@ -1689,6 +1690,38 @@ def select_behavior_coverage(
         selected.append(item)
         selected_signatures.add(item[0].schedule.signature())
         template_counts[item[0].template] += 1
+
+    # Stage-two feedback must survive the final ranking pass. Merely adding
+    # mutations to the callback pool is insufficient because cost/template
+    # selection can otherwise remove every measured counterfactual.
+    if protected_sources:
+        protected_budget = max(1, limit // 4)
+        protected = [
+            item for item in scored if item[0].source in protected_sources
+        ]
+        for source in sorted({item[0].source for item in protected}):
+            if len(selected) >= protected_budget:
+                break
+            item = next(
+                (
+                    candidate
+                    for candidate in protected
+                    if (
+                        candidate[0].source == source
+                        and can_select(candidate)
+                    )
+                ),
+                None,
+            )
+            if item is not None:
+                add(item)
+        for item in protected:
+            if len(selected) >= protected_budget:
+                break
+            if item[0].schedule.signature() in selected_signatures:
+                continue
+            if can_select(item):
+                add(item)
 
     # Retain explicit probes for generated kernel families when requested.
     # Stage 1 uses this to keep a weak model from eliminating a template;

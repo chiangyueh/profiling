@@ -384,6 +384,13 @@ class ProfileIdentityTest(unittest.TestCase):
         self.assertFalse(PROFILE.measurement_completed(unpaired))
         self.assertFalse(PROFILE.measurement_reusable(unpaired))
 
+        exhausted = dict(unpaired)
+        exhausted["error"] = (
+            "latency_untrusted_baseline_drift official=4% bank=5%"
+        )
+        self.assertTrue(PROFILE.measurement_completed(exhausted))
+        self.assertTrue(PROFILE.measurement_reusable(exhausted))
+
     def test_interrupted_provisional_result_can_be_resumed(self) -> None:
         provisional = {
             "success": "1",

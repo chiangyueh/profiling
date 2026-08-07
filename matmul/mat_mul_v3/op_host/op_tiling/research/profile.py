@@ -71,14 +71,17 @@ MEASUREMENT_COLUMNS = [
     "tiling_signature",
     "bank_tiling_signature",
     "deployment_strategy",
+    "host_official_callback_ms",
     "host_history_load_ms",
     "host_model_setup_ms",
     "host_generation_ms",
     "host_callback_ms",
     "host_selection_ms",
     "host_tiling_total_ms",
+    "host_end_to_end_tiling_ms",
     "host_generated_candidates",
     "host_callback_candidates",
+    "host_callback_template_counts",
     *KNOWLEDGE_COLUMNS.values(),
     "callback_tiling_key",
     "callback_block_dim",
@@ -149,7 +152,7 @@ DEPLOYMENT_CUSTOM_SOURCES = {
     "one_shot_bank_relative",
     "one_shot_custom_policy",
 }
-MEASUREMENT_PROTOCOL_VERSION = "paired_equal_sampling_v2"
+MEASUREMENT_PROTOCOL_VERSION = "paired_equal_sampling_v3"
 
 SUMMARY_COLUMNS = [
     "workload_id",
@@ -706,6 +709,16 @@ def measurement_reusable(row: dict[str, str]) -> bool:
             "provisional",
             "runner_failed",
         }
+    if (
+        row.get("preflight_mode") in STRICT_NUMERIC_PREFLIGHT_MODES
+        and row.get("error", "").startswith(
+            "latency_untrusted_baseline_drift"
+        )
+    ):
+        # All pair attempts were consumed. Preserve this as terminal
+        # correctness evidence, but load_resume_feedback will not expose its
+        # unpaired latency to the cost model.
+        return True
     return (
         truthy(row.get("pair_validated"))
         and row.get("preflight_mode") in STRICT_NUMERIC_PREFLIGHT_MODES
@@ -716,8 +729,6 @@ def measurement_reusable(row: dict[str, str]) -> bool:
 
 def measurement_completed(row: dict[str, str]) -> bool:
     """Return whether an exact fingerprint has a final reusable result."""
-    if not truthy(row.get("success")):
-        return measurement_reusable(row)
     return measurement_reusable(row)
 
 
@@ -803,14 +814,17 @@ def profile_record(
         "tiling_signature",
         "bank_tiling_signature",
         "deployment_strategy",
+        "host_official_callback_ms",
         "host_history_load_ms",
         "host_model_setup_ms",
         "host_generation_ms",
         "host_callback_ms",
         "host_selection_ms",
         "host_tiling_total_ms",
+        "host_end_to_end_tiling_ms",
         "host_generated_candidates",
         "host_callback_candidates",
+        "host_callback_template_counts",
         *KNOWLEDGE_COLUMNS.values(),
         "callback_tiling_key",
         "callback_block_dim",
@@ -911,6 +925,7 @@ def profile_record(
         and official is not None
         and bank is not None
         and truthy(measured.get("success"))
+        and pair_validated
     ):
         candidate_ms = float(measured["median_ms"])
         candidate_std = float(measured["stddev_ms"])
@@ -1648,8 +1663,12 @@ def main() -> None:
                             f"{candidate.get('host_history_load_ms', '')} "
                             f"host_model_setup_ms="
                             f"{candidate.get('host_model_setup_ms', '')} "
+                            f"host_official_callback_ms="
+                            f"{candidate.get('host_official_callback_ms', '')} "
                             f"host_tiling_ms="
-                            f"{candidate.get('host_tiling_total_ms', '')}"
+                            f"{candidate.get('host_tiling_total_ms', '')} "
+                            f"host_end_to_end_tiling_ms="
+                            f"{candidate.get('host_end_to_end_tiling_ms', '')}"
                         )
                         print(
                             f"candidate_done [{index}/{len(pending)}] "

@@ -356,6 +356,7 @@ class CandidateEngine:
                 in {
                     "feedback_winner_transfer",
                     "feedback_winner_mutation",
+                    "feedback_promising_mutation",
                     "feedback_regression_counterfactual",
                 }
                 and candidate.schedule.signature()

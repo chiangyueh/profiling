@@ -1788,11 +1788,10 @@ def select_one_shot_candidate(
 
     The bank is an incumbent and paired measurement control, not a normal
     candidate source or deployment seed. Strong repeated paired evidence may
-    recommend one custom deployment. Otherwise a runtime-safe non-bank
-    candidate is selected as the compact strategy's deployment decision. An
-    independent reconstruction of the bank schedule remains a coverage result
-    when it is the only hardware-competitive independent result. If neither
-    exists, selection fails instead of injecting or falling back to the bank.
+    recommend one custom deployment. Without that evidence, the compact
+    strategy may alter only traversal or L2 fields while preserving the bank
+    execution structure. If neither path exists, selection fails instead of
+    injecting or falling back to the bank.
     """
 
     if incumbent.source != "bank_incumbent":
@@ -2140,11 +2139,15 @@ def select_one_shot_candidate(
                 incumbent.schedule, item[0].schedule
             )
             and item[7].competitive
+            and bank_transition(
+                incumbent.schedule, item[0].schedule
+            ).risk_tier
+            == 0
         ]
         if not research_pool:
             raise ValueError(
-                "one-shot selection has no hardware-competitive "
-                "non-bank candidate"
+                "one-shot selection has no structure-preserving, "
+                "hardware-competitive non-bank candidate"
             )
         (
             original,
@@ -2172,12 +2175,11 @@ def select_one_shot_candidate(
         deployment_candidate = original
         source = "compact_data_driven"
         rationale = (
-            "single runtime-safe non-bank deployment selected from "
-            "expected bank-relative "
-            "latency, template competition, hardware work floor, and "
-            f"runtime rejection risk; generator={original.source}"
+            "single runtime-safe, structure-preserving non-bank deployment "
+            "selected from expected bank-relative latency, hardware work "
+            f"floor, and runtime rejection risk; generator={original.source}"
         )
-        selection_policy = "risk_bounded_compact_custom"
+        selection_policy = "structure_preserving_compact_custom"
         deployment_recommended = 1.0
 
     vector.metrics.update(

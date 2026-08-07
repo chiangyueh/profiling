@@ -23,24 +23,24 @@ from .solvers.base_policy import (
 from .solvers.common import make_schedule
 
 
-DIRECT_BASE_RULE_VERSION = "template_rule_v4"
+DIRECT_BASE_RULE_VERSION = "template_rule_v5"
 DIRECT_BASE_L2_RESIDENT_RATIO = 0.5105593326137546
-DIRECT_BASE_AUDIT_PAIRED_RECORDS = 498
-DIRECT_BASE_AUDIT_UNIQUE_RECORDS = 373
-DIRECT_BASE_AUDIT_WORKLOADS = 78
+DIRECT_BASE_AUDIT_PAIRED_RECORDS = 545
+DIRECT_BASE_AUDIT_UNIQUE_RECORDS = 420
+DIRECT_BASE_AUDIT_WORKLOADS = 85
 DIRECT_BASE_AUDIT_WINNER_WORKLOADS = 15
 DIRECT_BASE_AUDIT_BANK_WORKLOADS = 58
-DIRECT_RULE_AUDIT_RECORDS = 7788
-DIRECT_RULE_AUDIT_UNIQUE_RECORDS = 7474
-DIRECT_RULE_AUDIT_WORKLOADS = 233
+DIRECT_RULE_AUDIT_RECORDS = 7850
+DIRECT_RULE_AUDIT_UNIQUE_RECORDS = 7534
+DIRECT_RULE_AUDIT_WORKLOADS = 241
 DIRECT_RULE_TEMPLATE_AUDIT = {
-    Template.BASE: (125, 21, 75, 29),
-    Template.AL1_FULL_LOAD: (7, 2, 4, 1),
-    Template.BL1_FULL_LOAD: (27, 1, 21, 5),
-    Template.BL1_FULL_LOAD_FIXPIPE: (11, 0, 11, 0),
-    Template.BL1_FULL_LOAD_VEC_NZ2ND: (10, 0, 10, 0),
-    Template.DETERMINISTIC_SPLIT_K: (81, 33, 19, 29),
-    Template.SINGLE_CORE_SPLIT_K: (103, 23, 44, 36),
+    Template.BASE: (132, 21, 80, 31),
+    Template.AL1_FULL_LOAD: (8, 3, 4, 1),
+    Template.BL1_FULL_LOAD: (30, 1, 22, 7),
+    Template.BL1_FULL_LOAD_FIXPIPE: (12, 0, 12, 0),
+    Template.BL1_FULL_LOAD_VEC_NZ2ND: (11, 1, 10, 0),
+    Template.DETERMINISTIC_SPLIT_K: (82, 33, 19, 30),
+    Template.SINGLE_CORE_SPLIT_K: (107, 23, 47, 37),
 }
 
 
@@ -200,7 +200,7 @@ def _use_deterministic_split_k(
     output_blocks = m_blocks * n_blocks
     if (
         workload.k >= cores * 384
-        and output_blocks < max(1, cores // 2)
+        and output_blocks < cores
         and not (not workload.trans_a and workload.trans_b)
     ):
         return True, "underfilled_output_k_parallelism"
@@ -391,9 +391,49 @@ def _bl1_fix_candidate(
         template = Template.BL1_FULL_LOAD_VEC_NZ2ND
     else:
         return None
-    from .contracts import bl1_fix_geometry
+    if template == Template.BL1_FULL_LOAD_VEC_NZ2ND:
+        base_n = align_up(workload.n, 16)
+        ub_bytes = hardware.ub_bytes or hardware.l0c_bytes
+        base_m = min(
+            hardware.l0c_capacity(1) // max(1, base_n * 4),
+            ub_bytes // max(1, base_n * OUTPUT_BYTES[workload.dtype]),
+            hardware.l0a_bytes
+            // max(1, 2 * INPUT_BYTES[workload.dtype] * 32),
+        )
+        base_m = base_m // 128 * 128
+        if base_m < 128:
+            return None
+        base_k = min(
+            hardware.l0a_bytes
+            // max(1, 2 * INPUT_BYTES[workload.dtype] * base_m),
+            hardware.l0b_bytes
+            // max(1, 2 * INPUT_BYTES[workload.dtype] * base_n),
+        )
+        base_k = base_k // 16 * 16
+        if base_k < 16:
+            return None
+        depth_b = ceil_div(workload.k, base_k)
+        depth_a = (
+            hardware.effective_l1_bytes
+            // INPUT_BYTES[workload.dtype]
+            - depth_b * base_n * base_k
+        ) // max(1, base_m * base_k)
+        depth_a = min(depth_a, depth_b)
+        if depth_a <= 0:
+            return None
+        geometry = {
+            "baseM": base_m,
+            "baseN": base_n,
+            "baseK": base_k,
+            "depthA1": min(depth_a, 8),
+            "depthB1": depth_b,
+            "stepKa": 4 if depth_a >= 8 else depth_a,
+            "stepKb": depth_b,
+        }
+    else:
+        from .contracts import bl1_fix_geometry
 
-    geometry = bl1_fix_geometry(workload, hardware)
+        geometry = bl1_fix_geometry(workload, hardware)
     if geometry is None:
         return None
     schedule = make_schedule(
@@ -603,19 +643,6 @@ def _single_split_applicable(
     hardware: Hardware,
 ) -> bool:
     cores = min(workload.max_cores, hardware.aic_cores)
-    if (
-        workload.dtype in {"fp16", "bf16"}
-        and workload.k == 1536
-        and workload.m % 128 == 0
-        and workload.n % 128 == 0
-        and (
-            (workload.m >= 49152 and workload.n == 384)
-            or (workload.n >= 49152 and workload.m == 384)
-        )
-        and workload.m * workload.n * 4
-        <= int(0.65 * hardware.l2_bytes)
-    ):
-        return True
     if workload.k >= 27392:
         return True
     base_m, base_n, _, _, _, _ = upstream_base_geometry_policy(
@@ -638,7 +665,12 @@ def _single_split_applicable(
         and workload.m * workload.n
         >= 1024 * (3 * 128) * cores
     )
-    if l2_mode != "cache_partitioned" and enough_cube_work:
+    if (
+        not workload.trans_a
+        and not workload.trans_b
+        and l2_mode != "cache_partitioned"
+        and enough_cube_work
+    ):
         return True
     if (
         workload.trans_a
@@ -815,40 +847,22 @@ def _deterministic_after_single_reject(
     workload: Workload,
     hardware: Hardware,
 ) -> tuple[bool, str]:
-    """Mirror the high-K tail of SupportMultiSplitK.
+    """Use deterministic split-K only for a genuinely underfilled grid.
 
-    Upstream tries single-core split-K first.  If its load-balance checks
-    reject the schedule, deterministic split-K remains available except for
-    a dense, N-unaligned output grid where L2 BASE is preferred.
+    The source callback selects this path while the 128x128 output block grid
+    cannot fill the AICs. Once the grid reaches the AIC count, BASE output
+    parallelism is sufficient and a rejected single-core split must not imply
+    deterministic split-K.
     """
 
     if workload.k < 27392:
         return False, "deterministic_high_k_threshold_not_met"
-    in_bytes = INPUT_BYTES[workload.dtype]
     m_count = ceil_div(workload.m, 128)
     n_count = ceil_div(workload.n, 128)
-    n_256_aligned = workload.n * in_bytes % 256 == 0
-    inner_a = (
-        workload.m if workload.trans_a else workload.k
-    ) * in_bytes % 256 == 0
-    inner_b = (
-        workload.k if workload.trans_b else workload.n
-    ) * in_bytes % 256 == 0
-    fp32_mte_bound = (
-        workload.dtype == "fp32" and (not inner_a or not inner_b)
-    )
     grid = m_count * n_count
-    grid_efficiency = grid / max(
-        1, align_up(grid, min(workload.max_cores, hardware.aic_cores))
-    )
-    if (
-        m_count >= 4
-        and n_count >= 4
-        and not n_256_aligned
-        and not fp32_mte_bound
-        and grid_efficiency > 0.8
-    ):
-        return False, "dense_unaligned_output_prefers_base_l2"
+    cores = min(workload.max_cores, hardware.aic_cores)
+    if grid >= cores:
+        return False, "output_grid_has_sufficient_parallelism"
     return True, "single_split_rejected_high_k_deterministic"
 
 

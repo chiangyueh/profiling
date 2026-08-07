@@ -140,6 +140,7 @@ class DeploymentStrategiesTest(unittest.TestCase):
             "paired_measurements_net_log28.csv",
             "paired_measurements_net_log30.csv",
             "paired_measurements_net_log31.csv",
+            "paired_measurements_net_log33.csv",
         )
         config = RESEARCH / "config"
         observations = []
@@ -475,7 +476,7 @@ class DeploymentStrategiesTest(unittest.TestCase):
         self.assertEqual(candidate.metrics["model_enabled"], 0.0)
         self.assertEqual(candidate.metrics["candidate_pool_size"], 1.0)
 
-    def test_direct_rule_uses_nk_single_split_for_reverse_k1536(
+    def test_direct_rule_rejects_reverse_k1536_split_after_net_log33(
         self,
     ) -> None:
         workload = Workload(
@@ -490,20 +491,7 @@ class DeploymentStrategiesTest(unittest.TestCase):
         )
         candidate = direct_rule_candidate(workload, self.hardware)
 
-        self.assertEqual(
-            candidate.template, Template.SINGLE_CORE_SPLIT_K
-        )
-        self.assertEqual(
-            (
-                candidate.schedule["stepM"],
-                candidate.schedule["stepN"],
-                candidate.schedule["depthA1"],
-                candidate.schedule["depthB1"],
-                candidate.schedule["iterateOrder"],
-                candidate.schedule["l2IterateOrder"],
-            ),
-            (1, 3, 6, 9, 0, 1),
-        )
+        self.assertEqual(candidate.template, Template.BASE)
 
     def test_direct_rule_ports_bl1_n512_core_split_variant(
         self,
@@ -565,7 +553,7 @@ class DeploymentStrategiesTest(unittest.TestCase):
             ).valid
         )
 
-    def test_direct_rule_uses_split_k_for_net_log32_counterexample(
+    def test_direct_rule_matches_callback_split_for_net_log33(
         self,
     ) -> None:
         workload = Workload(
@@ -655,9 +643,9 @@ class DeploymentStrategiesTest(unittest.TestCase):
                 Template.SINGLE_CORE_SPLIT_K,
                 Workload(
                     "single_k",
-                    384,
-                    53248,
-                    1536,
+                    2368,
+                    2880,
+                    31744,
                     "fp16",
                     False,
                     False,
@@ -668,9 +656,9 @@ class DeploymentStrategiesTest(unittest.TestCase):
                 Template.DETERMINISTIC_SPLIT_K,
                 Workload(
                     "det_k",
-                    512,
-                    320,
-                    30720,
+                    192,
+                    128,
+                    24576,
                     "fp16",
                     False,
                     False,
@@ -704,6 +692,43 @@ class DeploymentStrategiesTest(unittest.TestCase):
                         self.hardware,
                     ).valid
                 )
+
+    def test_direct_rule_uses_measured_vec_geometry(self) -> None:
+        workload = Workload(
+            "vec_net_log33",
+            16384,
+            48,
+            128,
+            "fp32",
+            False,
+            False,
+            20,
+        )
+        candidate = direct_rule_candidate(workload, self.hardware)
+
+        self.assertEqual(
+            candidate.template, Template.BL1_FULL_LOAD_VEC_NZ2ND
+        )
+        self.assertEqual(
+            candidate.schedule.signature_text(),
+            "20:256:48:128:256:48:32:4:4:1:1:0:"
+            "4:4:2:2:1:1:1:0:0:0:2020",
+        )
+
+    def test_direct_rule_rejects_single_split_for_tt_layout(self) -> None:
+        workload = Workload(
+            "tt_net_log33",
+            2688,
+            3328,
+            5376,
+            "fp16",
+            True,
+            True,
+            20,
+        )
+        candidate = direct_rule_candidate(workload, self.hardware)
+
+        self.assertEqual(candidate.template, Template.BASE)
 
     def test_compact_frontier_is_bounded_and_template_aware(self) -> None:
         workload = Workload(

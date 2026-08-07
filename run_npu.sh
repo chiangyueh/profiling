@@ -170,15 +170,16 @@ V9_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log27.csv"
 V11_TEMPLATE_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log28.csv"
 V13_TEMPLATE_EVIDENCE="${RESEARCH}/config/paired_measurements_net_log30.csv"
 V14_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log31.csv"
+V19_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log33.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260807-dual-custom-vs-template-rule-v19"
+echo "  script:     run_npu.sh 20260807-net-log33-counterfactual-v20"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      dual_compact_model_vs_direct_template_rule"
+echo "  scope:      dual_structure_preserving_model_vs_template_rule_v5"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
-echo "  strategy_A: compact_data_driven"
+echo "  strategy_A: evidence_bounded_data_driven"
 echo "    summary:  ${MODEL_SUMMARY}"
 echo "    resume:   ${MODEL_RESUME}"
 echo "    log:      ${MODEL_LOG}"
@@ -366,6 +367,7 @@ generate_candidates() {
             --resume-feedback "${V11_TEMPLATE_EVIDENCE}"
             --resume-feedback "${V13_TEMPLATE_EVIDENCE}"
             --resume-feedback "${V14_FEEDBACK}"
+            --resume-feedback "${V19_FEEDBACK}"
         )
         local resume_feedback
         for resume_feedback in "$@"; do
@@ -471,7 +473,7 @@ run_strategy() {
 
 set +e
 run_strategy \
-    "[3/4] Strategy A: compact data-driven one-shot ..." \
+    "[3/4] Strategy A: evidence-bounded data-driven one-shot ..." \
     compact_data_driven \
     compact-deployment \
     "${MODEL_CANDIDATES}" \

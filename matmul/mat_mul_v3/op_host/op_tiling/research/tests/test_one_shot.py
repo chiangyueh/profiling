@@ -278,7 +278,7 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(
             decision.selection_policy,
-            "risk_bounded_compact_custom",
+            "structure_preserving_compact_custom",
         )
         self.assertEqual(
             decision.candidate.metrics["deployment_recommended_custom"],
@@ -340,8 +340,34 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         self.assertEqual(
             decision.selection_policy,
-            "risk_bounded_compact_custom",
+            "structure_preserving_compact_custom",
         )
+
+    def test_no_evidence_rejects_execution_structure_change(self) -> None:
+        structural = Candidate(
+            schedule=self.bank.replace(
+                baseM=128,
+                baseN=128,
+                depthA1=8,
+                depthB1=8,
+                stepKa=4,
+                stepKb=4,
+            ),
+            template=Template.BASE,
+            source="contract_coupled_policy",
+            rationale="changes L0 and L1 without paired evidence",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "structure-preserving",
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [structural],
+                self.incumbent,
+                (),
+                self.hardware,
+                cost_model=_RuntimeModel(),
+            )
 
     def test_independent_bank_reconstruction_is_not_a_deployment(
         self,
@@ -983,7 +1009,7 @@ class OneShotSelectionTest(unittest.TestCase):
         )
         weak = self._paired_effects(split, ratio=0.96, count=3)
         with self.assertRaisesRegex(
-            ValueError, "no hardware-competitive",
+            ValueError, "hardware-competitive",
         ):
             select_one_shot_candidate(
                 self.workload,
@@ -996,7 +1022,7 @@ class OneShotSelectionTest(unittest.TestCase):
 
         strong = self._paired_effects(split, ratio=0.80, count=3)
         with self.assertRaisesRegex(
-            ValueError, "no hardware-competitive",
+            ValueError, "hardware-competitive",
         ):
             select_one_shot_candidate(
                 self.workload,

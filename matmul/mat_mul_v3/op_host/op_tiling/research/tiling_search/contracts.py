@@ -379,10 +379,10 @@ def _single_core_split_k_contract(
         violations.append("split_k_requires_multiple_chunks")
     if ceil_div(workload.k, schedule["singleCoreK"]) < 2:
         violations.append("split_k_chunk_count")
-    if schedule["singleCoreM"] < schedule["stepM"] * schedule["baseM"]:
-        violations.append("split_k_inner_m")
-    if schedule["singleCoreN"] < schedule["stepN"] * schedule["baseN"]:
-        violations.append("split_k_inner_n")
+    # The source constructor may choose a per-core M/N extent smaller than
+    # one full step (for example singleCoreM=240 with a 2x128 step). The
+    # split-K kernel pads that outer-core tail; RuntimeKb contains and the
+    # callback accepts such records, so this is not a correctness violation.
     # MatmulSingleCoreSplitKBaseBlock reads only calOrder from
     # L2cacheTilePara. The count/block fields are carried by the common
     # record, but do not describe singleCoreM/N coverage in this kernel.

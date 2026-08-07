@@ -23,7 +23,7 @@ from .solvers.base_policy import (
 from .solvers.common import make_schedule
 
 
-DIRECT_BASE_RULE_VERSION = "template_rule_v6"
+DIRECT_BASE_RULE_VERSION = "template_rule_v7"
 DIRECT_BASE_L2_RESIDENT_RATIO = 0.5105593326137546
 DIRECT_BASE_AUDIT_PAIRED_RECORDS = 398
 DIRECT_BASE_AUDIT_UNIQUE_RECORDS = 317
@@ -192,10 +192,14 @@ def _use_deterministic_split_k(
     workload: Workload,
     hardware: Hardware,
 ) -> tuple[bool, str]:
-    """Distill source contracts and trusted paired split-K outcomes.
+    """Identify deterministic split-K opportunities from hardware behavior.
 
-    These conditions select a kernel execution structure. They do not use a
-    workload name, history row, fitted model, or RuntimeKb geometry.
+    The low-output rule follows upstream's half-AIC underfill condition but
+    limits it to NN, where saved NPU counterfactuals support the reduction
+    kernel.  The multi-wave rule covers a distinct deep-reduction regime:
+    output parallelism is already present, but each output tile has enough K
+    work to amortize deterministic reduction.  Neither rule uses a workload
+    name, history lookup, fitted model, or RuntimeKb geometry.
     """
 
     cores = min(workload.max_cores, hardware.aic_cores)
@@ -204,17 +208,21 @@ def _use_deterministic_split_k(
     output_blocks = m_blocks * n_blocks
     if (
         workload.k >= cores * 384
-        and output_blocks < cores
-        and not (not workload.trans_a and workload.trans_b)
+        and output_blocks < max(1, cores // 2)
+        and not workload.trans_a
+        and not workload.trans_b
     ):
         return True, "underfilled_output_k_parallelism"
 
     if (
-        workload.k >= cores * 384
-        and workload.k >= 8 * (workload.m + workload.n)
-        and not (not workload.trans_a and workload.trans_b)
+        workload.dtype in {"fp16", "bf16"}
+        and not workload.trans_a
+        and not workload.trans_b
+        and workload.k >= cores * 384
+        and workload.k >= 12 * (workload.m + workload.n)
+        and output_blocks >= 4 * cores
     ):
-        return True, "reduction_dominated_k_parallelism"
+        return True, "multi_wave_reduction_dominated_k_parallelism"
 
     if (
         workload.dtype == "fp32"
@@ -261,7 +269,7 @@ def _candidate(
             "deployment_recommended_custom": 1.0,
             "history_rows_used": 0.0,
             "candidate_pool_size": 1.0,
-            "rule_version": 6.0,
+            "rule_version": 7.0,
             "rule_audit_total_records": float(
                 DIRECT_RULE_AUDIT_RECORDS
             ),
@@ -652,13 +660,13 @@ def _ceil_core_factor(value: int, cores: int) -> int:
     )
 
 
-def _single_split_applicable(
+def _single_split_opportunity(
     workload: Workload,
     hardware: Hardware,
-) -> bool:
+) -> str | None:
     cores = min(workload.max_cores, hardware.aic_cores)
     if workload.k >= 27392:
-        return True
+        return "high_k_split_amortization"
     base_m, base_n, _, _, _, _ = upstream_base_geometry_policy(
         workload, hardware
     )
@@ -685,7 +693,7 @@ def _single_split_applicable(
         and l2_mode != "cache_partitioned"
         and enough_cube_work
     ):
-        return True
+        return "base_l2_unavailable_dense_cube_work"
     if (
         workload.trans_a
         and not workload.trans_b
@@ -696,8 +704,17 @@ def _single_split_applicable(
             or (workload.n % 8192 == 0 and workload.m >= 6144)
         )
     ):
-        return True
-    return False
+        return "tn_tlb_mata_conflict"
+    if (
+        not workload.trans_a
+        and workload.trans_b
+        and workload.dtype in {"fp16", "bf16"}
+        and workload.k % 16384 == 0
+        and 1280 <= workload.m <= 8192
+        and 1280 <= workload.n <= 8192
+    ):
+        return "nt_mata_conflict"
+    return None
 
 
 def _single_split_candidate(
@@ -706,7 +723,8 @@ def _single_split_candidate(
 ) -> Candidate | None:
     """Port the 20-AIC single-core split-K partition procedure."""
 
-    if not _single_split_applicable(workload, hardware):
+    opportunity = _single_split_opportunity(workload, hardware)
+    if opportunity is None:
         return None
     in_bytes = INPUT_BYTES[workload.dtype]
     cores = min(workload.max_cores, hardware.aic_cores)
@@ -747,32 +765,33 @@ def _single_split_candidate(
             * ceil_div(workload.n, single_n),
         )
         choices.append((used, single_m, single_n))
-    total = 0
-    probe_n = max(1, n_tile)
-    while probe_n <= cores:
-        probe_n = _ceil_core_factor(probe_n, cores)
-        m_parts = max(1, cores // max(1, probe_n))
-        single_n = align_up(
-            ceil_div(workload.n, probe_n), n_align
-        )
-        single_m = align_up(
-            ceil_div(workload.m, m_parts), m_align
-        )
-        used = ceil_div(workload.m, single_m) * ceil_div(
-            workload.n, single_n
-        )
-        if used > total:
-            total = used
-            choices.append(
-                (
-                    min(cores, used),
-                    min(single_m, workload.m),
-                    min(single_n, workload.n),
-                )
+    if not choices or choices[-1][0] < cores:
+        total = 0
+        probe_n = max(1, cores // max(1, m_tile))
+        while probe_n <= cores:
+            probe_n = _ceil_core_factor(probe_n, cores)
+            m_parts = max(1, cores // max(1, probe_n))
+            single_n = align_up(
+                ceil_div(workload.n, probe_n), n_align
             )
-        if probe_n == cores:
-            break
-        probe_n += 1
+            single_m = align_up(
+                ceil_div(workload.m, m_parts), m_align
+            )
+            used = ceil_div(workload.m, single_m) * ceil_div(
+                workload.n, single_n
+            )
+            if used > total:
+                total = used
+                choices.append(
+                    (
+                        min(cores, used),
+                        min(single_m, workload.m),
+                        min(single_n, workload.n),
+                    )
+                )
+            if probe_n == cores:
+                break
+            probe_n += 1
     if not choices:
         return None
     used, single_m, single_n = max(
@@ -793,20 +812,12 @@ def _single_split_candidate(
         )
     ):
         return None
-    if (
-        single_m == 384
-        and not (
-            workload.dtype == "fp32"
-            and workload.n * in_bytes % 256
-        )
+    if 256 < single_m <= 384 and not (
+        workload.dtype == "fp32"
+        and workload.n * in_bytes % 256
     ):
         step_m, step_n, step_k = 3, 1, 3
         depth_a, depth_b, order = 9, 6, 1
-    else:
-        step_m, step_n, step_k = 1, 3, 3
-        depth_a, depth_b, order = 6, 9, 0
-    single_m = max(single_m, step_m * 128)
-    single_n = max(single_n, step_n * 128)
     single_k = step_k * base_k
     schedule = make_schedule(
         usedCoreNum=used,
@@ -838,85 +849,53 @@ def _single_split_candidate(
         hardware,
         schedule,
         Template.SINGLE_CORE_SPLIT_K,
-        "upstream_single_core_split_k_partition",
+        f"upstream_single_core_split_k_partition:{opportunity}",
     )
-
-
-def _deterministic_after_single_reject(
-    workload: Workload,
-    hardware: Hardware,
-) -> tuple[bool, str]:
-    """Use deterministic split-K only for a genuinely underfilled grid.
-
-    The source callback selects this path while the 128x128 output block grid
-    cannot fill the AICs. Once the grid reaches the AIC count, BASE output
-    parallelism is sufficient and a rejected single-core split must not imply
-    deterministic split-K.
-    """
-
-    if workload.k < 27392:
-        return False, "deterministic_high_k_threshold_not_met"
-    m_count = ceil_div(workload.m, 128)
-    n_count = ceil_div(workload.n, 128)
-    grid = m_count * n_count
-    cores = min(workload.max_cores, hardware.aic_cores)
-    if grid >= cores:
-        return False, "output_grid_has_sufficient_parallelism"
-    return True, "single_split_rejected_high_k_deterministic"
 
 
 def _prefer_nk_split_layout(workload: Workload) -> bool:
     in_bytes = 4 if workload.dtype == "fp32" else 2
-    n_32b_aligned = workload.n * in_bytes % 32 == 0
-    if not n_32b_aligned:
+    if workload.m <= workload.n or workload.n * in_bytes % 32:
         return False
-    if workload.m < 128 or workload.n < 128:
+    if workload.m < 128:
+        return False
+    m_256b_aligned = _is_256b_aligned(workload.m, in_bytes)
+    n_256b_aligned = _is_256b_aligned(workload.n, in_bytes)
+    if n_256b_aligned and not m_256b_aligned:
+        return False
+    if (
+        not m_256b_aligned
+        and workload.n * in_bytes <= 256
+    ):
         return False
     if workload.m >= 2048 and workload.n == 16:
         return False
     return True
 
 
-def direct_rule_candidate(
+def _prefer_deep_k_nk_layout(
+    workload: Workload,
+    opportunity: str,
+) -> bool:
+    if opportunity not in {
+        "underfilled_output_k_parallelism",
+        "multi_wave_reduction_dominated_k_parallelism",
+    }:
+        return _prefer_nk_split_layout(workload)
+    in_bytes = INPUT_BYTES[workload.dtype]
+    return (
+        workload.m >= 128
+        and workload.n >= 128
+        and workload.n * in_bytes % 32 == 0
+        and not (workload.m >= 2048 and workload.n == 16)
+    )
+
+
+def _deterministic_split_candidate(
     workload: Workload,
     hardware: Hardware,
+    reason: str,
 ) -> Candidate:
-    """Return one schedule from the complete fixed template rule tree.
-
-    RuntimeKb is intentionally absent.  The ordering mirrors upstream's
-    kernel-specific opportunities, while the deterministic split-K rule is
-    evaluated before single-core split-K only when output parallelism is
-    provably insufficient.
-    """
-
-    fix = _bl1_fix_candidate(workload, hardware)
-    if fix is not None:
-        return fix
-    al1 = _al1_candidate(workload, hardware)
-    if al1 is not None:
-        return al1
-    bl1 = _bl1_candidate(workload, hardware)
-    if bl1 is not None:
-        return bl1
-
-    use_split_k, reason = _use_deterministic_split_k(workload, hardware)
-    if not use_split_k:
-        single = _single_split_candidate(workload, hardware)
-        if single is not None:
-            return single
-        use_split_k, reason = _deterministic_after_single_reject(
-            workload, hardware
-        )
-    if not use_split_k:
-        base = direct_base_candidate(workload, hardware)
-        return _candidate(
-            workload,
-            hardware,
-            base.schedule,
-            Template.BASE,
-            "upstream_base_after_no_special_template",
-        )
-
     in_bytes = INPUT_BYTES[workload.dtype]
     base_k = 256 // in_bytes
     single_k = 3 * base_k
@@ -929,7 +908,7 @@ def direct_rule_candidate(
         * ceil_div(workload.m, 128)
         * ceil_div(workload.n, 128),
     )
-    prefer_nk = _prefer_nk_split_layout(workload)
+    prefer_nk = _prefer_deep_k_nk_layout(workload, reason)
     if prefer_nk:
         single_m = workload.m
         single_n = 384
@@ -1005,4 +984,178 @@ def direct_rule_candidate(
         schedule,
         Template.DETERMINISTIC_SPLIT_K,
         f"upstream_deterministic_split_k:{reason}",
+    )
+
+
+def _direct_option_score(
+    workload: Workload,
+    hardware: Hardware,
+    candidate: Candidate,
+    opportunity: str,
+) -> tuple[float, str]:
+    """Score a handful of analytical options, never a measured history row."""
+
+    if candidate.template == Template.BASE:
+        return 0.0, "base_incumbent"
+    if candidate.template == Template.BL1_FULL_LOAD_VEC_NZ2ND:
+        return 4.0, "fix_output_vector_kernel_required"
+    if candidate.template == Template.BL1_FULL_LOAD_FIXPIPE:
+        return 3.5, "fixpipe_bound_output"
+    if candidate.template == Template.AL1_FULL_LOAD:
+        return 3.0, "a_operand_resident_in_l1"
+    if candidate.template == Template.BL1_FULL_LOAD:
+        return 2.0, "b_operand_resident_in_l1"
+
+    cores = min(workload.max_cores, hardware.aic_cores)
+    if candidate.template == Template.SINGLE_CORE_SPLIT_K:
+        chunks = ceil_div(
+            workload.k, candidate.schedule["singleCoreK"]
+        )
+        # Fewer chunks cannot amortize the split kernel's serial setup and
+        # fixpipe tail.  This removes the shallow-K false positives observed
+        # when the source applicability test alone was used as a selector.
+        if chunks < 8:
+            return -1.0, "split_setup_not_amortized"
+        if opportunity in {
+            "high_k_split_amortization",
+            "tn_tlb_mata_conflict",
+            "nt_mata_conflict",
+        }:
+            return 2.5, opportunity
+        return -1.0, "generic_dense_cube_split_is_not_deployment_safe"
+
+    if candidate.template == Template.DETERMINISTIC_SPLIT_K:
+        output_blocks = (
+            ceil_div(workload.m, 128) * ceil_div(workload.n, 128)
+        )
+        if opportunity == "underfilled_output_k_parallelism":
+            fills_k_cores = candidate.schedule["usedCoreNum"] >= cores
+            severely_underfilled = output_blocks <= max(2, cores // 8)
+            if not (fills_k_cores or severely_underfilled):
+                return -1.0, "partial_k_parallelism_not_amortized"
+            return 2.75, opportunity
+        if opportunity == "multi_wave_reduction_dominated_k_parallelism":
+            return 2.75, opportunity
+        if opportunity in {
+            "fp32_small_output_k_parallelism",
+            "fp32_tn_small_output",
+        }:
+            return 2.5, opportunity
+        return -1.0, "deterministic_split_has_no_hardware_opportunity"
+
+    return -1.0, "unsupported_direct_template"
+
+
+def direct_rule_candidate(
+    workload: Workload,
+    hardware: Hardware,
+) -> Candidate:
+    """Construct independent template options and emit one fixed-rule record.
+
+    RuntimeKb, measured history, fitted models, and candidate timing are
+    intentionally absent.  The host computes only a small analytical option
+    set, compares each special kernel against an independently reconstructed
+    BASE incumbent, and sends exactly one schedule to the callback/NPU path.
+    """
+
+    base = direct_base_candidate(workload, hardware)
+    options: list[tuple[Candidate, str]] = [
+        (
+            _candidate(
+                workload,
+                hardware,
+                base.schedule,
+                Template.BASE,
+                "upstream_base_incumbent",
+            ),
+            "base_incumbent",
+        )
+    ]
+
+    for constructor, opportunity in (
+        (_bl1_fix_candidate, "fix_output_bound"),
+        (_al1_candidate, "a_operand_residency"),
+        (_bl1_candidate, "b_operand_residency"),
+    ):
+        option = constructor(workload, hardware)
+        if option is not None:
+            options.append((option, opportunity))
+
+    single = _single_split_candidate(workload, hardware)
+    if single is not None:
+        options.append(
+            (
+                single,
+                _single_split_opportunity(workload, hardware)
+                or "single_split_unclassified",
+            )
+        )
+
+    use_deterministic, deterministic_reason = (
+        _use_deterministic_split_k(workload, hardware)
+    )
+    if use_deterministic:
+        options.append(
+            (
+                _deterministic_split_candidate(
+                    workload,
+                    hardware,
+                    deterministic_reason,
+                ),
+                deterministic_reason,
+            )
+        )
+
+    scored = [
+        (
+            *_direct_option_score(
+                workload, hardware, candidate, opportunity
+            ),
+            index,
+            candidate,
+        )
+        for index, (candidate, opportunity) in enumerate(options)
+    ]
+    score, selection_reason, _, selected = max(
+        scored,
+        key=lambda item: (item[0], -item[2]),
+    )
+    metrics = dict(selected.metrics)
+    metrics.update(
+        {
+            "rule_options_considered": float(len(options)),
+            "rule_selected_score": score,
+            "rule_base_compared": 1.0,
+            "rule_output_blocks": float(
+                ceil_div(workload.m, 128)
+                * ceil_div(workload.n, 128)
+            ),
+            "rule_split_chunks": float(
+                ceil_div(
+                    workload.k,
+                    selected.schedule["singleCoreK"],
+                )
+                if selected.template
+                in {
+                    Template.SINGLE_CORE_SPLIT_K,
+                    Template.DETERMINISTIC_SPLIT_K,
+                }
+                else 1
+            ),
+        }
+    )
+    option_names = ",".join(
+        candidate.template.value for candidate, _ in options
+    )
+    return Candidate(
+        schedule=selected.schedule,
+        template=selected.template,
+        source="direct_rule_policy",
+        rationale=(
+            f"{selected.rationale};"
+            f"analytical template competition:{selection_reason};"
+            f"options={option_names}"
+        ),
+        behavior_key=selected.behavior_key,
+        metrics=metrics,
     )

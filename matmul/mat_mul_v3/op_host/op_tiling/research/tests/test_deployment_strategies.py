@@ -450,6 +450,105 @@ class DeploymentStrategiesTest(unittest.TestCase):
             DIRECT_RULE_TRUSTED_WINNER_STRUCTURAL_NEAR,
         )
 
+    def test_direct_rule_historical_replay_bounds_known_regressions(
+        self,
+    ) -> None:
+        config = RESEARCH / "config"
+        observations, _ = load_feedback(
+            soc="Ascend910B3",
+            aic_cores=20,
+            observation_paths=sorted(
+                config.glob("measured_observations*.csv")
+            ),
+            exclusion_paths=sorted(
+                config.glob("measured_fingerprints*.csv")
+            ),
+        )
+        for path in sorted(config.glob("paired_measurements*.csv")):
+            loaded, _ = load_resume_feedback(
+                path,
+                "Ascend910B3",
+                20,
+                "8.1.RC1+toolkit-7.7.0.1.225",
+            )
+            observations.extend(loaded)
+
+        preferred = {}
+        for observation in observations:
+            key = (
+                observation.workload.identity(),
+                observation.schedule.signature(),
+            )
+            quality = (
+                int(observation.structured_verified),
+                int(observation.verified),
+                int(
+                    observation.source
+                    not in {"runtime_rejected", "runtime_verified"}
+                ),
+                observation.record_id,
+            )
+            if key not in preferred or quality > preferred[key][0]:
+                preferred[key] = (quality, observation)
+
+        by_workload = defaultdict(list)
+        for _, observation in preferred.values():
+            if (
+                observation.verified
+                and observation.source
+                not in {"runtime_rejected", "runtime_verified"}
+            ):
+                by_workload[observation.workload.identity()].append(
+                    observation
+                )
+
+        replay = []
+        for workload_observations in by_workload.values():
+            workload = workload_observations[0].workload
+            candidate = direct_rule_candidate(workload, self.hardware)
+            ratios = [
+                observation.measured_ratio
+                for observation in workload_observations
+                if schedules_execution_equivalent(
+                    candidate.schedule, observation.schedule
+                )
+            ]
+            if ratios:
+                replay.append(
+                    (candidate.template, median(ratios))
+                )
+
+        outcomes = Counter(
+            "winner"
+            if ratio < 0.99
+            else "regression"
+            if ratio > 1.01
+            else "within_noise"
+            for _, ratio in replay
+        )
+        self.assertEqual(
+            outcomes,
+            Counter(
+                {
+                    "winner": 5,
+                    "within_noise": 21,
+                    "regression": 7,
+                }
+            ),
+        )
+        self.assertLess(
+            math.prod(ratio for _, ratio in replay)
+            ** (1.0 / len(replay)),
+            1.0,
+        )
+        self.assertTrue(
+            all(
+                ratio <= 1.01
+                for template, ratio in replay
+                if template == Template.DETERMINISTIC_SPLIT_K
+            )
+        )
+
     def test_runtime_kb_contains_exact_records_not_rule_ranges(
         self,
     ) -> None:
@@ -633,7 +732,7 @@ class DeploymentStrategiesTest(unittest.TestCase):
             ).valid
         )
 
-    def test_direct_rule_matches_callback_split_for_net_log33(
+    def test_direct_rule_avoids_measured_deterministic_regression(
         self,
     ) -> None:
         workload = Workload(
@@ -649,19 +748,38 @@ class DeploymentStrategiesTest(unittest.TestCase):
         candidate = direct_rule_candidate(workload, self.hardware)
 
         self.assertEqual(candidate.source, "direct_rule_policy")
-        self.assertEqual(
-            candidate.template, Template.DETERMINISTIC_SPLIT_K
-        )
-        self.assertEqual(
-            candidate.schedule.signature_text(),
-            "20:512:384:384:128:128:128:6:9:1:3:0:"
-            "3:3:2:2:2:1:1:1:1:0:3",
-        )
+        self.assertEqual(candidate.template, Template.BASE)
+        self.assertEqual(candidate.metrics["rule_base_compared"], 1.0)
         self.assertTrue(
             validate_schedule(
                 workload, candidate.schedule, self.hardware
             ).valid
         )
+
+    def test_direct_rule_reconstructs_source_single_split_geometry(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="single_source_geometry",
+            m=2368,
+            n=2880,
+            k=29696,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        candidate = direct_rule_candidate(workload, self.hardware)
+
+        self.assertEqual(
+            candidate.template, Template.SINGLE_CORE_SPLIT_K
+        )
+        self.assertEqual(
+            candidate.schedule.signature_text(),
+            "20:240:1536:512:128:128:128:8:8:2:1:1:"
+            "4:4:2:2:2:1:1:10:2:0:2",
+        )
+        self.assertEqual(candidate.metrics["rule_options_considered"], 2.0)
 
     def test_direct_rule_covers_every_upstream_template_regime(
         self,

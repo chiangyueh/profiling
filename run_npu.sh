@@ -174,16 +174,16 @@ V19_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log33.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260807-offline-rule-induction-v21"
+echo "  script:     run_npu.sh 20260807-hardware-template-competition-v22"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      dual_structure_preserving_model_vs_template_rule_v6"
+echo "  scope:      dual_data_driven_vs_hardware_template_rule_v7"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  strategy_A: evidence_bounded_data_driven"
 echo "    summary:  ${MODEL_SUMMARY}"
 echo "    resume:   ${MODEL_RESUME}"
 echo "    log:      ${MODEL_LOG}"
-echo "  strategy_B: direct_template_rule"
+echo "  strategy_B: stateless_hardware_template_competition"
 echo "    summary:  ${RULE_SUMMARY}"
 echo "    resume:   ${RULE_RESUME}"
 echo "    log:      ${RULE_LOG}"
@@ -487,7 +487,7 @@ run_strategy \
 MODEL_RC="$?"
 
 run_strategy \
-    "[4/4] Strategy B: fixed-rule direct template selection ..." \
+    "[4/4] Strategy B: stateless hardware template competition ..." \
     direct_template_rule \
     direct-rule \
     "${RULE_CANDIDATES}" \

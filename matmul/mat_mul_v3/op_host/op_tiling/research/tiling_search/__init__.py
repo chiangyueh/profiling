@@ -22,6 +22,7 @@ from .deployment import (
     DIRECT_BASE_L2_RESIDENT_RATIO,
     DIRECT_BASE_RULE_VERSION,
     direct_base_candidate,
+    direct_rule_candidate,
 )
 from .orchestrator import CandidateEngine, SearchConfig
 from .one_shot import (
@@ -80,4 +81,5 @@ __all__ = [
     "select_one_shot_candidate",
     "validate_bank_relative_selector",
     "direct_base_candidate",
+    "direct_rule_candidate",
 ]

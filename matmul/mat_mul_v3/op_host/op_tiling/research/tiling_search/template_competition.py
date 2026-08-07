@@ -108,11 +108,18 @@ def compare_templates(
         and effect_upper_ratio <= 0.99
         and conservative_floor <= 1.05
     )
-    competitive = (
-        same_template or hardware_opportunity or evidence_opportunity
+    same_template_viable = (
+        same_template and conservative_floor <= 1.05
     )
-    if same_template:
-        reason = "same_template"
+    competitive = (
+        same_template_viable
+        or hardware_opportunity
+        or evidence_opportunity
+    )
+    if same_template_viable:
+        reason = "same_template_hardware_viable"
+    elif same_template:
+        reason = "same_template_hardware_dominated"
     elif parallelism_gain:
         reason = "bank_underfilled_parallelism_gain"
     elif reduction_escape:

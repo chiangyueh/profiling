@@ -107,6 +107,7 @@ STRICT_NUMERIC_PREFLIGHT_MODES = {
 DEPLOYMENT_CUSTOM_SOURCES = {
     "compact_data_driven",
     "direct_base_policy",
+    "direct_rule_policy",
     "one_shot_bank_relative",
     "one_shot_custom_policy",
 }
@@ -519,6 +520,32 @@ def safe_run_runner(*args, **kwargs) -> dict[str, str]:
         }
 
 
+def retry_safe_run_runner(
+    *args,
+    attempts: int,
+    retry_label: str,
+    **kwargs,
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for attempt in range(1, attempts + 1):
+        call_args = list(args)
+        if len(call_args) > 4:
+            call_args[4] = (
+                Path(call_args[4]) / f"control_attempt_{attempt}"
+            )
+        result = safe_run_runner(*call_args, **kwargs)
+        if truthy(result.get("success")):
+            return result
+        if attempt < attempts:
+            print(
+                f"CONTROL_RETRY {retry_label} "
+                f"attempt={attempt + 1}/{attempts} "
+                f"reason={result.get('error', '')[:160]}"
+            )
+            time.sleep(0.25)
+    return result
+
+
 def comparison(
     candidate_ms: float,
     candidate_std: float,
@@ -852,6 +879,7 @@ def summarize(
             if source["candidate_source"] in {
                 "compact_data_driven",
                 "direct_base_policy",
+                "direct_rule_policy",
                 "one_shot_research_candidate",
                 "one_shot_bank_incumbent",
                 "one_shot_bank_relative",
@@ -1057,6 +1085,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--numeric-preflight-max-mib", type=int, default=512)
     parser.add_argument("--baseline-drift-pct", type=float, default=3.0)
     parser.add_argument("--pair-block-size", type=int, default=4)
+    parser.add_argument("--pair-attempts", type=int, default=3)
     return parser.parse_args()
 
 
@@ -1064,6 +1093,8 @@ def main() -> None:
     args = parse_args()
     if args.pair_block_size <= 0:
         raise ProfileError("--pair-block-size must be positive")
+    if args.pair_attempts <= 0:
+        raise ProfileError("--pair-attempts must be positive")
     if args.baseline_repeat <= 0 or args.baseline_samples <= 0:
         raise ProfileError("baseline repeat and samples must be positive")
     if (
@@ -1089,6 +1120,15 @@ def main() -> None:
         for row in existing
         if measurement_completed(row)
     }
+    for candidate in searched:
+        record = records.get(
+            measurement_key(args.soc, args.aic, args.toolkit, candidate)
+        )
+        if record is None:
+            continue
+        for column, value in candidate.items():
+            if column in MEASUREMENT_COLUMNS:
+                record[column] = value
     run_id = time.strftime("%Y%m%d_%H%M%S")
 
     with tempfile.TemporaryDirectory(
@@ -1127,6 +1167,7 @@ def main() -> None:
             f"npu_searched_pending={pending_total} "
             f"resume_exact={len(records)} "
             f"paired_measurement=blocked_pre_post:{args.pair_block_size} "
+            f"pair_attempts={args.pair_attempts} "
             f"baseline_sampling={args.baseline_repeat}x"
             f"{args.baseline_samples} numeric_preflight=full"
         )
@@ -1176,16 +1217,19 @@ def main() -> None:
                 continue
             official_before: dict[str, str] | None = None
             bank_before: dict[str, str] | None = None
-            for block_start in range(
-                0, len(pending), args.pair_block_size
-            ):
+            block_start = 0
+            pair_attempt = 1
+            while block_start < len(pending):
                 block = pending[
                     block_start:block_start + args.pair_block_size
                 ]
                 block_number = block_start // args.pair_block_size + 1
-                block_dir = pair_dir / f"pair_block_{block_number}"
+                block_dir = (
+                    pair_dir
+                    / f"pair_block_{block_number}_attempt_{pair_attempt}"
+                )
                 if official_before is None:
-                    official_before = safe_run_runner(
+                    official_before = retry_safe_run_runner(
                         args.runner,
                         args.candidates,
                         workload_id,
@@ -1197,6 +1241,8 @@ def main() -> None:
                         args.baseline_samples,
                         args.numeric_preflight_max_mib,
                         True,
+                        attempts=args.pair_attempts,
+                        retry_label=f"{workload_id}:official_pre",
                     )
                 official = official_before
                 if not truthy(official.get("success")):
@@ -1209,7 +1255,7 @@ def main() -> None:
                     )
                     break
                 if bank_before is None:
-                    bank_before = safe_run_runner(
+                    bank_before = retry_safe_run_runner(
                         args.runner,
                         args.candidates,
                         workload_id,
@@ -1221,6 +1267,8 @@ def main() -> None:
                         args.baseline_samples,
                         args.numeric_preflight_max_mib,
                         True,
+                        attempts=args.pair_attempts,
+                        retry_label=f"{workload_id}:bank_pre",
                     )
                 bank = bank_before
                 if not truthy(bank.get("success")):
@@ -1298,7 +1346,7 @@ def main() -> None:
                         list(records.values()),
                     )
 
-                official_post = safe_run_runner(
+                official_post = retry_safe_run_runner(
                     args.runner,
                     args.candidates,
                     workload_id,
@@ -1310,8 +1358,10 @@ def main() -> None:
                     args.baseline_samples,
                     args.numeric_preflight_max_mib,
                     True,
+                    attempts=args.pair_attempts,
+                    retry_label=f"{workload_id}:official_post",
                 )
-                bank_post = safe_run_runner(
+                bank_post = retry_safe_run_runner(
                     args.runner,
                     args.candidates,
                     workload_id,
@@ -1323,6 +1373,8 @@ def main() -> None:
                     args.baseline_samples,
                     args.numeric_preflight_max_mib,
                     True,
+                    attempts=args.pair_attempts,
+                    retry_label=f"{workload_id}:bank_post",
                 )
                 if not truthy(official_post.get("success")):
                     blocked_workloads += 1
@@ -1358,6 +1410,7 @@ def main() -> None:
                 print(
                     f"PAIR_REFERENCE {workload_id} "
                     f"block={block_number} candidates={len(block)} "
+                    f"attempt={pair_attempt}/{args.pair_attempts} "
                     f"official_ms={official['median_ms']}/"
                     f"{official_post['median_ms']} "
                     f"bank_ms={bank['median_ms']}/"
@@ -1365,6 +1418,28 @@ def main() -> None:
                     f"drift_pct={official_drift:.6g}/{bank_drift:.6g} "
                     f"validated={int(pair_valid)}"
                 )
+                retry_pair = (
+                    not pair_valid
+                    and pair_attempt < args.pair_attempts
+                    and any(
+                        truthy(measured.get("success"))
+                        for _, measured, _, _ in block_measurements
+                    )
+                )
+                if retry_pair:
+                    print(
+                        f"PAIR_RETRY {workload_id} "
+                        f"block={block_number} "
+                        f"next_attempt={pair_attempt + 1}/"
+                        f"{args.pair_attempts} "
+                        f"drift_pct={official_drift:.6g}/"
+                        f"{bank_drift:.6g}"
+                    )
+                    official_before = None
+                    bank_before = None
+                    pair_attempt += 1
+                    time.sleep(0.25)
+                    continue
                 official_reference = conservative_reference(
                     official, official_post
                 )
@@ -1462,6 +1537,8 @@ def main() -> None:
                     MEASUREMENT_COLUMNS,
                     list(records.values()),
                 )
+                block_start += len(block)
+                pair_attempt = 1
         if blocked_workloads:
             print(
                 "profile_blocked_workloads "

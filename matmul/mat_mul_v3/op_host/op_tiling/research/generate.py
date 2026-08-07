@@ -34,7 +34,7 @@ from tiling_search import (
     OneShotDecision,
     SearchConfig,
     Workload,
-    direct_base_candidate,
+    direct_rule_candidate,
     plan_template_race,
     select_adaptive_calibration_candidates,
     select_calibration_candidates,
@@ -850,7 +850,7 @@ def main() -> None:
     )
     if direct_deployment:
         print(
-            "DIRECT_BASE_RULE "
+            "DIRECT_TEMPLATE_RULE "
             f"version={DIRECT_BASE_RULE_VERSION} "
             "runtime_history=0 model=0 candidate_pool=1 "
             f"audit_paired={DIRECT_BASE_AUDIT_PAIRED_RECORDS} "
@@ -860,7 +860,7 @@ def main() -> None:
             f"{DIRECT_BASE_AUDIT_WINNER_WORKLOADS} "
             f"audit_bank_workloads={DIRECT_BASE_AUDIT_BANK_WORKLOADS} "
             f"l2_resident_ratio={DIRECT_BASE_L2_RESIDENT_RATIO:.12f} "
-            "rules=geometry,l1,core,l2"
+            "rules=template,geometry,l1,core,l2"
         )
     latency_observations = sum(
         observation.source
@@ -1173,13 +1173,13 @@ def main() -> None:
         generation_start = host_tiling_start
         if direct_deployment:
             try:
-                direct_candidate = direct_base_candidate(
+                direct_candidate = direct_rule_candidate(
                     workload,
                     hardware,
                 )
             except Exception as exception:
                 print(
-                    "DIRECT_BASE_BLOCKED "
+                    "DIRECT_RULE_BLOCKED "
                     f"{workload.workload_id} "
                     "stage=construction "
                     f"reason={str(exception)[:240]} action=continue"
@@ -1260,7 +1260,7 @@ def main() -> None:
         ) / 1_000_000.0
         if direct_deployment and not callback_accepted:
             print(
-                "DIRECT_BASE_BLOCKED "
+                "DIRECT_RULE_BLOCKED "
                 f"{workload.workload_id} "
                 "reason=exact_callback_rejected action=continue"
             )
@@ -1535,7 +1535,10 @@ def main() -> None:
                 for report in result.reports
             )
             if result is not None
-            else "BASE:raw=1,common=1,template=1,emitted=1"
+            else (
+                f"{ordered[0].template.value}:"
+                "raw=1,common=1,template=1,emitted=1"
+            )
         )
         print(
             "SEARCH_WORKLOAD "
@@ -1637,11 +1640,11 @@ def main() -> None:
         elif direct_deployment:
             selected = accepted[0][0]
             print(
-                "DIRECT_BASE_DECISION "
+                "DIRECT_RULE_DECISION "
                 f"{workload.workload_id} "
                 f"template={selected.template.value} "
                 "history_rows_used=0 candidate_pool=1 "
-                "formula=upstream_base_l1_core_l2_fallback "
+                "formula=source_template_then_geometry_l1_core_l2 "
                 "bank_signature_exact="
                 f"{int(selected.schedule == bank.schedule)} "
                 f"signature={selected.schedule.signature_text()}"

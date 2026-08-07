@@ -50,6 +50,36 @@ class ProfileIdentityTest(unittest.TestCase):
         self.assertEqual(result["preflight_mode"], "runner_exception")
         self.assertIn("isolated probe failure", result["error"])
 
+    def test_control_retry_uses_fresh_work_directory(self) -> None:
+        failed = {"success": "0", "error": "temporary allocation failure"}
+        passed = {"success": "1", "median_ms": "1.0"}
+        with patch.object(
+            PROFILE,
+            "safe_run_runner",
+            side_effect=(failed, passed),
+        ) as runner:
+            with patch.object(PROFILE.time, "sleep"):
+                result = PROFILE.retry_safe_run_runner(
+                    "runner",
+                    "candidates",
+                    "workload",
+                    {},
+                    Path("/tmp/pair"),
+                    attempts=3,
+                    retry_label="workload:official",
+                )
+
+        self.assertEqual(result["success"], "1")
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(
+            runner.call_args_list[0].args[4],
+            Path("/tmp/pair/control_attempt_1"),
+        )
+        self.assertEqual(
+            runner.call_args_list[1].args[4],
+            Path("/tmp/pair/control_attempt_2"),
+        )
+
     def test_resume_identity_covers_runtime_shape_role_and_schedule(self) -> None:
         base = PROFILE.measurement_key(
             "Ascend910B3", 20, "8.1.RC1", self.row

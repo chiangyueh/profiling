@@ -173,16 +173,16 @@ V14_FEEDBACK="${RESEARCH}/config/paired_measurements_net_log31.csv"
 
 echo
 echo "NPU run"
-echo "  script:     run_npu.sh 20260807-dual-model-vs-direct-rule-v17"
+echo "  script:     run_npu.sh 20260807-dual-model-vs-template-rule-v18"
 echo "  upstream:   CANN ops-nn 8.5.0 matmul/mat_mul_v3"
-echo "  scope:      dual_compact_model_vs_direct_rule_base"
+echo "  scope:      dual_compact_model_vs_direct_template_rule"
 echo "  mode:       ${MODE}"
 echo "  workloads:  ${WORKLOADS}"
 echo "  strategy_A: compact_data_driven"
 echo "    summary:  ${MODEL_SUMMARY}"
 echo "    resume:   ${MODEL_RESUME}"
 echo "    log:      ${MODEL_LOG}"
-echo "  strategy_B: direct_rule_base"
+echo "  strategy_B: direct_template_rule"
 echo "    summary:  ${RULE_SUMMARY}"
 echo "    resume:   ${RULE_RESUME}"
 echo "    log:      ${RULE_LOG}"
@@ -411,6 +411,7 @@ profile_stage() {
         --baseline-samples "${BASELINE_SAMPLES:-${SAMPLES:-15}}" \
         --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-512}" \
         --baseline-drift-pct "${BASELINE_DRIFT_PCT:-3}" \
+        --pair-attempts "${PAIR_ATTEMPTS:-3}" \
         --pair-block-size "${pair_block_size}"
 }
 
@@ -484,8 +485,8 @@ run_strategy \
 MODEL_RC="$?"
 
 run_strategy \
-    "[4/4] Strategy B: fixed-rule direct BASE ..." \
-    direct_rule_base \
+    "[4/4] Strategy B: fixed-rule direct template selection ..." \
+    direct_template_rule \
     direct-base \
     "${RULE_CANDIDATES}" \
     "${RULE_ALL}" \

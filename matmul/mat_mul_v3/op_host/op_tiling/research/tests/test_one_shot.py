@@ -82,6 +82,18 @@ class _UnsafeRelativeSafetyModel:
         )
 
 
+class _SafeRelativeSafetyModel:
+    def predict(self, workload, bank, candidate, hardware, **_):
+        del workload, bank, candidate, hardware
+        return BankRelativeSafetyPrediction(
+            samples=8,
+            rejected=0,
+            risk=0.0,
+            nearest_distance=0.1,
+            support=1.0,
+        )
+
+
 class _ExpectedRatioModel:
     def predict(self, workload, bank, candidate, hardware, **_):
         del workload, bank, hardware
@@ -957,6 +969,22 @@ class OneShotSelectionTest(unittest.TestCase):
                 safety_model=_UnsafeRelativeSafetyModel(),
             )
 
+    def test_relative_safety_cannot_override_absolute_runtime_risk(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "no runtime-safe independent candidate"
+        ):
+            select_one_shot_candidate(
+                self.workload,
+                [self.custom],
+                self.incumbent,
+                (),
+                self.hardware,
+                cost_model=_AlwaysRiskyModel(),
+                safety_model=_SafeRelativeSafetyModel(),
+            )
+
     def test_cross_template_requires_stronger_independent_support(self) -> None:
         split = Candidate(
             schedule=self.bank.replace(tilingEnable=3),
@@ -1059,6 +1087,80 @@ class OneShotSelectionTest(unittest.TestCase):
         self.assertGreater(competition.compute_floor_ratio, 9.0)
         self.assertEqual(
             competition.reason, "no_cross_template_advantage"
+        )
+
+    def test_same_template_low_core_candidate_is_hardware_dominated(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="net_log32_dense_counterexample",
+            m=3456,
+            n=4096,
+            k=6144,
+            dtype="fp16",
+            trans_a=True,
+            trans_b=False,
+            max_cores=20,
+        )
+        bank = Schedule.from_signature(
+            "20:128:256:6144:128:256:64:16:8:1:1:0:"
+            "8:4:2:2:1:2:1:14:16:0:0"
+        )
+        low_core = bank.replace(
+            usedCoreNum=2,
+            l2MTileCnt=27,
+            l2NTileCnt=8,
+            l2MTileBlock=1,
+            l2NTileBlock=2,
+        )
+        competition = compare_templates(
+            workload,
+            bank,
+            low_core,
+            behavior_vector(workload, bank, self.hardware),
+            behavior_vector(workload, low_core, self.hardware),
+            self.hardware,
+            effect_samples=8,
+            effect_support=0.30,
+            effect_upper_ratio=1.02,
+        )
+        self.assertTrue(competition.same_template)
+        self.assertFalse(competition.competitive)
+        self.assertGreater(competition.conservative_floor_ratio, 9.0)
+        self.assertEqual(
+            competition.reason, "same_template_hardware_dominated"
+        )
+
+        incumbent = Candidate(
+            schedule=bank,
+            template=Template.BASE,
+            source="bank_incumbent",
+            rationale="bank",
+        )
+        reconstructed = Candidate(
+            schedule=bank,
+            template=Template.BASE,
+            source="contract_coupled_policy",
+            rationale="independent bank reconstruction",
+        )
+        challenger = Candidate(
+            schedule=low_core,
+            template=Template.BASE,
+            source="contract_coupled_policy",
+            rationale="low-core challenger",
+        )
+        decision = select_one_shot_candidate(
+            workload,
+            [challenger, reconstructed],
+            incumbent,
+            (),
+            self.hardware,
+            cost_model=_RuntimeModel(),
+        )
+        self.assertEqual(decision.candidate.schedule, bank)
+        self.assertEqual(
+            decision.selection_policy,
+            "independent_bank_reconstruction",
         )
 
     def test_underfilled_bank_allows_split_k_parallelism_probe(self) -> None:

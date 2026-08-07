@@ -25,6 +25,7 @@ from tiling_search import (
     Template,
     Workload,
     direct_base_candidate,
+    direct_rule_candidate,
 )
 from generate import load_resume_feedback
 from tiling_search.contracts import ceil_div, template_of, validate_schedule
@@ -271,6 +272,54 @@ class DeploymentStrategiesTest(unittest.TestCase):
                         workload, candidate.schedule, self.hardware
                     ).valid
                 )
+
+    def test_direct_rule_keeps_dense_output_on_base(self) -> None:
+        workload = Workload(
+            workload_id="dense_deep_k",
+            m=2368,
+            n=2880,
+            k=31744,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        candidate = direct_rule_candidate(workload, self.hardware)
+
+        self.assertEqual(candidate.source, "direct_rule_policy")
+        self.assertEqual(candidate.template, Template.BASE)
+        self.assertEqual(candidate.metrics["model_enabled"], 0.0)
+        self.assertEqual(candidate.metrics["candidate_pool_size"], 1.0)
+
+    def test_direct_rule_uses_split_k_for_net_log32_counterexample(
+        self,
+    ) -> None:
+        workload = Workload(
+            workload_id="oneshot_v5_08",
+            m=512,
+            n=320,
+            k=30720,
+            dtype="fp16",
+            trans_a=False,
+            trans_b=False,
+            max_cores=20,
+        )
+        candidate = direct_rule_candidate(workload, self.hardware)
+
+        self.assertEqual(candidate.source, "direct_rule_policy")
+        self.assertEqual(
+            candidate.template, Template.DETERMINISTIC_SPLIT_K
+        )
+        self.assertEqual(
+            candidate.schedule.signature_text(),
+            "20:384:320:384:128:128:128:9:6:3:1:1:"
+            "3:3:2:2:2:1:1:2:1:0:3",
+        )
+        self.assertTrue(
+            validate_schedule(
+                workload, candidate.schedule, self.hardware
+            ).valid
+        )
 
     def test_compact_frontier_is_bounded_and_template_aware(self) -> None:
         workload = Workload(

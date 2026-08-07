@@ -92,13 +92,13 @@ def main() -> None:
                 preferred = "compact_data_driven"
                 counts["model"] += 1
             else:
-                preferred = "direct_rule_base"
+                preferred = "direct_template_rule"
                 counts["rule"] += 1
         elif trusted(model_row):
             preferred = "compact_data_driven_only_trusted"
             counts["model"] += 1
         elif trusted(rule_row):
-            preferred = "direct_rule_base_only_trusted"
+            preferred = "direct_template_rule_only_trusted"
             counts["rule"] += 1
         else:
             preferred = "no_trusted_pair"

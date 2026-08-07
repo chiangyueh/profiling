@@ -1882,9 +1882,8 @@ def select_one_shot_candidate(
         changed = transition.changed_fields
         cross_template = candidate.template != incumbent.template
         runtime_safe = execution_equivalent or (
-            _is_bank_relative_runtime_safe(relative_safety)
-            if relative_safety.support >= 0.15
-            else _is_runtime_safe(runtime)
+            _is_runtime_safe(runtime)
+            and _is_bank_relative_runtime_safe(relative_safety)
         )
         deployable = (
             not execution_equivalent
@@ -2007,7 +2006,7 @@ def select_one_shot_candidate(
         )
 
     def deployment_score(item) -> tuple:
-        candidate, _, prediction, _, _, _, _, _ = item
+        candidate, _, prediction, _, _, _, _, competition = item
         transition = bank_transition(
             incumbent.schedule, candidate.schedule
         )
@@ -2015,7 +2014,11 @@ def select_one_shot_candidate(
             0.02 if candidate.template != incumbent.template else 0.0
         )
         return (
-            prediction.upper_ratio + cross_template_penalty,
+            max(
+                prediction.upper_ratio,
+                competition.conservative_floor_ratio,
+            )
+            + cross_template_penalty,
             prediction.robust_ratio,
             transition.risk_tier,
             candidate.schedule.signature(),
@@ -2054,10 +2057,12 @@ def select_one_shot_candidate(
             if math.isfinite(prediction.upper_ratio)
             else 100.0
         )
+        conservative = max(
+            predicted,
+            competition.conservative_floor_ratio,
+        )
         if competition.same_template:
-            conservative = predicted + 0.025 * math.log(
-                max(1.0, finite_upper)
-            )
+            conservative += 0.025 * math.log(max(1.0, finite_upper))
             if (
                 prediction.samples
                 and prediction.support < 0.15
@@ -2102,7 +2107,7 @@ def select_one_shot_candidate(
             _,
             _,
             _,
-            _,
+            competition,
         ) = min(strong_evidence, key=deployment_score)
         acquisition = deployment_score(
             (
@@ -2113,7 +2118,7 @@ def select_one_shot_candidate(
                 None,
                 True,
                 True,
-                None,
+                competition,
             )
         )[0]
         deployment_candidate = original
@@ -2133,19 +2138,7 @@ def select_one_shot_candidate(
             )
             and item[7].competitive
         ]
-        same_template_pool = [
-            item
-            for item in eligible
-            if (
-                not schedules_execution_equivalent(
-                    incumbent.schedule, item[0].schedule
-                )
-                and item[0].template == incumbent.template
-            )
-        ]
-        selection_pool = (
-            research_pool or same_template_pool or eligible
-        )
+        selection_pool = research_pool or eligible
         (
             original,
             vector,
@@ -2163,11 +2156,8 @@ def select_one_shot_candidate(
                 prediction,
                 runtime,
                 relative_safety,
-                (
-                    _is_bank_relative_runtime_safe(relative_safety)
-                    if relative_safety.support >= 0.15
-                    else _is_runtime_safe(runtime)
-                ),
+                _is_runtime_safe(runtime)
+                and _is_bank_relative_runtime_safe(relative_safety),
                 True,
                 competition,
             )

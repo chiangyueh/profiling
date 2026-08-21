@@ -554,9 +554,12 @@ ProfileSummary ProfileOfficial(
                 "aclnnMatmul");
         };
 
-        LogStage(workload, "preflight_launch");
+        LogStage(workload, "preflight_launch_begin");
         launch();
+        LogStage(workload, "preflight_launch_returned");
+        LogStage(workload, "preflight_sync_begin");
         CheckAcl(aclrtSynchronizeStream(stream), "official preflight synchronize");
+        LogStage(workload, "preflight_sync_done");
         const size_t outputBytes = ElementBytes(workload.dtype);
         constexpr int64_t coverageGrid = 9;
         std::set<int64_t> sampleIndices;

@@ -177,6 +177,7 @@ def main() -> None:
     printed_workloads = 0
     tiling_times: dict[str, list[float]] = {
         "original_callback": [],
+        "runtime_kb_seed": [],
         "solver_select": [],
         "solver_callback": [],
         "solver_total": [],
@@ -188,6 +189,7 @@ def main() -> None:
         candidate = candidate_by_key.get((workload_id, searched_rank), {})
         for key, column in (
             ("original_callback", "tiling_official_callback_ms"),
+            ("runtime_kb_seed", "tiling_runtime_kb_seed_ms"),
             ("solver_select", "tiling_solver_select_ms"),
             ("solver_callback", "tiling_solver_callback_ms"),
             ("solver_total", "tiling_solver_total_ms"),
@@ -255,6 +257,7 @@ def main() -> None:
         print(
             "  tiling_cpu_ms "
             f"original_callback={compact_number(candidate.get('tiling_official_callback_ms', ''))} "
+            f"runtime_kb_seed={compact_number(candidate.get('tiling_runtime_kb_seed_ms', ''))} "
             f"solver_select={compact_number(candidate.get('tiling_solver_select_ms', ''))} "
             f"solver_callback={compact_number(candidate.get('tiling_solver_callback_ms', ''))} "
             f"callback_count={clean(candidate.get('tiling_solver_callback_count', ''))} "
@@ -320,6 +323,7 @@ def main() -> None:
             "TILING_TIME_TOTAL "
             f"records={len(tiling_times['solver_total'])} "
             f"original_callback_mean_ms={mean.get('original_callback', float('nan')):.6g} "
+            f"runtime_kb_seed_mean_ms={mean.get('runtime_kb_seed', float('nan')):.6g} "
             f"solver_select_mean_ms={mean.get('solver_select', float('nan')):.6g} "
             f"solver_callback_mean_ms={mean.get('solver_callback', float('nan')):.6g} "
             f"solver_total_mean_ms={mean['solver_total']:.6g} "

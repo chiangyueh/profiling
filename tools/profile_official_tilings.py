@@ -19,7 +19,7 @@ import refine_matmul_v3_candidates as matmul_contract
 
 PROFILE_COLUMNS = [
     "workload_id", "rank", "source", "candidate_role",
-    "m", "n", "k", "dtype", "trans_a", "trans_b", "execution_mode",
+    "m", "n", "k", "dtype", "trans_a", "trans_b", "max_cores", "execution_mode",
     "used_core_num", "hint_single_core_m", "hint_single_core_n", "hint_single_core_k",
     "hint_base_m", "hint_base_n", "hint_base_k",
     "official_base_m", "official_base_n", "official_base_k",
@@ -1299,7 +1299,7 @@ def candidate_profile(
     # not contain shape fields. Keep every candidate row self-identifying so a
     # rejected candidate cannot invalidate ranking for the whole workload.
     for field in (
-        "workload_id", "m", "n", "k", "dtype", "trans_a", "trans_b",
+        "workload_id", "m", "n", "k", "dtype", "trans_a", "trans_b", "max_cores",
     ):
         value = candidate.get(field, "")
         if value != "":

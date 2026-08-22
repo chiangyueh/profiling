@@ -16,8 +16,18 @@ from collections import Counter, defaultdict
 from typing import Any
 
 
-SOURCE_CANDIDATE_LIMIT = 20_000
+FORMAL_LATENCY_TARGET = 20_000
 FASG_NATIVE_STRATEGIES = 8
+# The complete source strategy registry is audited for every FASG workload.
+# These three original strategies have overlapping, documented capability for
+# the source-multi-tiling lattice below: fp16, BNSD, equal Q/KV head counts,
+# and both sequence lengths below 1024.  They are not synthetic variants.
+FASG_MULTI_TILING_SOURCE_CLASSES = (
+    "FlashAttentionScoreGradTilingS1s2Bn2",
+    "FlashAttentionScoreGradTilingS1s2Bn2gs1s2",
+    "FlashAttentionScoreGradTilingS1s2Bn2gs1s2SameAb",
+)
+FASG_MULTI_TILING_RESERVE_SHAPES = 11_000
 
 
 def row(op: str, index: int, tags: str, **parameters: Any) -> dict[str, Any]:
@@ -103,6 +113,51 @@ def attention_grad_workloads() -> list[dict[str, Any]]:
                 q_seq=q_seq, kv_seq=kv_seq, head_dim=head_dim)
             for index, (batch, q_heads, kv_heads, q_seq, kv_seq, head_dim, dtype, layout, tags)
             in enumerate(cases)]
+
+
+def attention_grad_multi_tiling_reserve(start_index: int) -> list[dict[str, Any]]:
+    """Return a fixed, legal geometry lattice for source multi-tiling.
+
+    This is a shape-coverage lattice, not a product of *tiling fields*.  All
+    levels below were reviewed against the three source ``IsCapable`` rules:
+    fp16, BNSD, Q heads equal KV heads, 16-aligned head dimension, and Q/KV
+    sequence length strictly below 1024.  A coprime walk gives each factor a
+    balanced deterministic distribution in every prefix while keeping the
+    requested reserve finite and without random sampling.
+    """
+    batches = (1, 2, 4)
+    heads = (1, 2, 4, 8, 16)
+    sequences = (16, 32, 48, 63, 64, 65, 80, 96, 112, 127,
+                 128, 129, 160, 192, 224, 256, 320, 384, 448, 512)
+    head_dims = (64, 128)
+    total = len(batches) * len(heads) * len(sequences) * len(sequences) * len(head_dims)
+    if FASG_MULTI_TILING_RESERVE_SHAPES > total:
+        raise ValueError("FASG multi-tiling reserve exceeds its reviewed shape lattice")
+    # 119 and 12,000 are coprime: the walk visits distinct legal geometries
+    # before cycling, and is deterministic across resumes and machines.
+    if total != 12_000:
+        raise ValueError("unexpected FASG reviewed lattice cardinality")
+    output: list[dict[str, Any]] = []
+    for ordinal in range(FASG_MULTI_TILING_RESERVE_SHAPES):
+        code = (ordinal * 119) % total
+        head_dim = head_dims[code % len(head_dims)]
+        code //= len(head_dims)
+        kv_seq = sequences[code % len(sequences)]
+        code //= len(sequences)
+        q_seq = sequences[code % len(sequences)]
+        code //= len(sequences)
+        q_heads = heads[code % len(heads)]
+        code //= len(heads)
+        batch = batches[code]
+        output.append(row(
+            "flash_attention_score_grad", start_index + ordinal,
+            "source_multi_tiling,fp16,bnsd,reviewed_lattice,"
+            "q_heads_equal_kv_heads,q_seq_lt1024,kv_seq_lt1024",
+            dtype="fp16", layout="BNSD", batch=batch, q_heads=q_heads,
+            kv_heads=q_heads, q_seq=q_seq, kv_seq=kv_seq, head_dim=head_dim,
+            source_candidate_requirement="at_least_two_distinct_original_source_tilings",
+        ))
+    return output
 
 
 def fused_attention_workloads() -> list[dict[str, Any]]:
@@ -210,7 +265,9 @@ def index_workloads(op: str) -> list[dict[str, Any]]:
 
 
 def catalog() -> list[dict[str, Any]]:
-    output = attention_grad_workloads() + fused_attention_workloads()
+    attention = attention_grad_workloads()
+    output = attention + attention_grad_multi_tiling_reserve(len(attention))
+    output += fused_attention_workloads()
     output += index_workloads("gather_elements")
     output += index_workloads("scatter_elements")
     validate(output)
@@ -219,7 +276,12 @@ def catalog() -> list[dict[str, Any]]:
 
 def native_attempts(workload: dict[str, Any]) -> int:
     if workload["op"] == "flash_attention_score_grad":
-        return FASG_NATIVE_STRATEGIES
+        # The registry has eight original strategies (reported separately),
+        # but only these three have overlapping source capability for the
+        # controlled BNSD/fp16 comparison lane.  Calling a strategy that the
+        # original IsCapable predicate rules out is neither a viable tiling nor
+        # useful data, so it is not launched for every shape.
+        return len(FASG_MULTI_TILING_SOURCE_CLASSES)
     return 1
 
 
@@ -239,8 +301,6 @@ def validate(workloads: list[dict[str, Any]]) -> None:
                 raise ValueError("illegal index geometry: {}".format(item["workload_id"]))
             if any(item["index_shape"][i] > item["shape"][i] for i in range(rank) if i != axis):
                 raise ValueError("illegal non-axis index shape: {}".format(item["workload_id"]))
-    if sum(native_attempts(item) for item in workloads) > SOURCE_CANDIDATE_LIMIT:
-        raise ValueError("candidate attempt budget exceeded")
 
 
 def audit(workloads: list[dict[str, Any]]) -> dict[str, Any]:
@@ -253,14 +313,17 @@ def audit(workloads: list[dict[str, Any]]) -> dict[str, Any]:
         tags[item["op"]].update(item["coverage"])
     return {
         "schema": "non_matmul_source_candidate_catalog_v1",
-        "generation": "explicit_reviewed_geometry_families_no_random_no_tile_enumeration",
+        "generation": "reviewed_explicit_families_plus_fixed_legal_shape_lattice_no_random_no_tile_enumeration",
         "matmul_included": False,
         "semantic_workloads": len(workloads),
         "workloads_per_op": dict(sorted(per_op.items())),
-        "maximum_original_source_candidate_attempts": sum(attempts.values()),
+        "source_discovery_upper_bound": sum(attempts.values()),
+        "full_fasg_original_strategy_registry_count": FASG_NATIVE_STRATEGIES,
         "attempts_per_op": dict(sorted(attempts.items())),
-        "maximum_total_candidate_records": SOURCE_CANDIDATE_LIMIT,
-        "actual_candidate_count_rule": "count only source strategies whose unchanged original tiling succeeds, then whose execution passes output comparison",
+        "formal_latency_target": FORMAL_LATENCY_TARGET,
+        "formal_latency_count_rule": "count only output-validated executions; FlashAttentionScoreGrad requires at least two distinct original raw tilings for one semantic shape",
+        "fasg_multi_tiling_source_classes": list(FASG_MULTI_TILING_SOURCE_CLASSES),
+        "fasg_multi_tiling_reserve_shapes": FASG_MULTI_TILING_RESERVE_SHAPES,
         "blocked_without_matching_910b_source": ["transpose", "gather_v2"],
         "coverage_tags_per_op": {name: dict(sorted(counter.items())) for name, counter in sorted(tags.items())},
     }

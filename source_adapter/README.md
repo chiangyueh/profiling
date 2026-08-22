@@ -25,10 +25,13 @@ are **not used** by the non-MatMul collection described below.
   admitted to the training set.
 
 The public 8.1.RC1 advanced-operator tag has eight registered
-`FlashAttentionScoreGrad` strategies. This is the actual count in that pinned
-source—not the larger count in a newer extracted tree. The collector creates an
-isolated overlay for each. Whether one succeeds for a specific workload is
-decided by its unmodified original legality checks.
+`FlashAttentionScoreGrad` strategies. This is the actual registry count in
+that pinned source—not the larger count in a newer extracted tree. The
+collector creates an isolated overlay for all eight so that this inventory is
+auditable. The 20,000-record multi-tiling lane builds only the three original
+strategies whose own `IsCapable` predicates overlap on its reviewed fp16/BNSD
+geometry lattice. It does not call source strategies known to be ineligible
+for that lane.
 
 Run this read-only audit first:
 
@@ -86,9 +89,9 @@ strategy class, and `ASCEND_CUSTOM_OPP_PATH` root in a small manifest. It never
 writes under the toolkit's OPP directory.
 
 `run_non_matmul_candidate_campaign.py` is the only measurement controller for
-these overlays. It requires all eight isolated strategy-package manifests, so a
-missing strategy cannot silently reduce the candidate set to the first
-successful source route. It writes only JSONL result records and creates each
+these overlays. It requires exactly the three audited, overlapping original
+strategy packages; their class names are checked, so another strategy cannot
+silently replace one. It writes compact JSONL workload groups and creates each
 FASG full-output reference under a temporary directory for the duration of one
 workload; no trace or output tensor is retained after the comparison.
 
@@ -99,17 +102,16 @@ no MatMul records:
 python3 source_adapter/non_matmul_candidate_catalog.py --audit
 ```
 
-It contains 207 explicit, non-random workload geometries. The maximum is 648
-original-source strategy attempts (63 FASG geometries × 8 registered original
-strategies, plus source-native single-path workloads); the actual retained
-count is lower because unsuccessful original strategies and failed output
-comparisons are recorded as rejections, not converted into synthetic tilings.
-Before an FASG kernel is timed, the isolated source package is invoked once in
-host-side tiling-only mode. The raw identity is recorded and used to deduplicate
-identical original tilings across strategies. A distinct identity must recur in
-the subsequent timed invocation and pass full output comparison before its
-device-event latency is admitted. The campaign-wide hard ceiling remains
-20,000 records.
+It contains 11,207 deterministic legal geometries: the reviewed cross-op
+coverage families plus an 11,000-shape fp16/BNSD FASG geometry lattice. This is
+a fixed shape lattice, **not** a tiling-field product or random sampler. The
+source registry remains eight strategies, while the three overlapping original
+strategies are independently invoked for each multi-tiling shape. Before an
+FASG kernel is timed, each source path is invoked once in host-side
+tiling-only mode. A group is admitted only when at least two distinct raw
+tilings recur in timed execution and both full outputs match the installed
+reference. At normal completion, the compact groups contain exactly 20,000
+formal device-event latency records. Rejected groups carry no latency datum.
 
 After the one-time official source preparation, the normal NPU entry point is
 still one full command (selecting a physical device maps it to worker device
@@ -120,14 +122,14 @@ CANN_OPS_ADV_SOURCE=/path/outside/profiling/cann-ops-adv-8.1rc1 \
   ./run_npu.sh --mode full -d 1
 ```
 
-It creates the eight isolated strategy overlays, source packages, and custom
-OPP roots under the ignored `.benchmark_state/` directory; it never modifies
-the installed toolkit.  Its only durable measurement output is the scoped
-`results/non_matmul_source_candidate_v1/<contract>/progress.jsonl`.  Each
-FASG workload has at most nine rows (one installed reference and eight original
-strategy attempts); each other semantic workload has exactly one source-native
-row.  This makes the current plan exactly 711 result rows, well below the
-20,000 ceiling, with no tile enumeration.
+It creates eight isolated strategy overlays but builds and installs only the
+three overlapping original strategy packages, one at a time, under the ignored
+`.benchmark_state/` directory; it never modifies the installed toolkit. Its
+only durable measurement output is
+`results/non_matmul_source_candidate_v2/<contract>/progress.jsonl`. Each JSONL
+row is a compact semantic workload group; its `valid_latency` array contains
+only output-validated source-generated candidates. The campaign stops exactly
+at 20,000 such entries, with no tile enumeration.
 
 The pinned public source is `ascend/cann-ops` commit `c214b710edbe24017dc7dc92170a50bd8ff38171`, selected because it predates the installed CANN 8.1.RC1 build.  The source tree itself and every build artifact stay outside this repository.
 

@@ -186,9 +186,9 @@ cd "${ROOT}"
 usage() {
     cat <<'USAGE'
 Usage:
-  ./run_npu.sh --check-server [--verbose]
-  ./run_npu.sh --mode smoke [--workloads FILE] [--output-stem STEM]
-  ./run_npu.sh --mode full  [--workloads FILE] [--output-stem STEM]
+  ./run_npu.sh --check-server [--device PHYSICAL_NPU_ID] [--verbose]
+  ./run_npu.sh --mode smoke [--device PHYSICAL_NPU_ID] [--workloads FILE] [--output-stem STEM]
+  ./run_npu.sh --mode full  [--device PHYSICAL_NPU_ID] [--workloads FILE] [--output-stem STEM]
 
 Modes:
   smoke  Quick NPU validation: official baseline, bank control, and one
@@ -198,7 +198,9 @@ Modes:
 
 Environment overrides:
   CANN_ROOT optionally selects a toolkit root; official set_env.sh is preferred
-  DEVICE_ID, SOC_VERSION
+  PHYSICAL_NPU_ID defaults to 1 and selects the physical NPU; the application
+  always uses logical DEVICE_ID=0 after ASCEND_RT_VISIBLE_DEVICES mapping
+  SOC_VERSION
   BEAM_WIDTH, TABU_ITERS, LNS_ROUNDS, TOP_K, MAX_CORE_ROUNDS, MODEL_RATIO_LIMIT
   SEARCH_SCOPE defaults to bottleneck_guided_v1
   RANK_LIMIT, WARMUP, REPEAT, SAMPLES
@@ -221,6 +223,7 @@ MODE="${MODE:-smoke}"
 WORKLOADS_CSV=""
 RESULT_STEM=""
 CHECK_SERVER=0
+PHYSICAL_NPU_ID="${PHYSICAL_NPU_ID:-1}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -231,6 +234,10 @@ while [[ $# -gt 0 ]]; do
         --verbose)
             RUN_VERBOSE=1
             shift
+            ;;
+        -d|--device)
+            PHYSICAL_NPU_ID="${2:?missing physical NPU ID for --device}"
+            shift 2
             ;;
         --mode)
             MODE="${2:?missing value for --mode}"
@@ -255,6 +262,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ ! "${PHYSICAL_NPU_ID}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid physical NPU ID: ${PHYSICAL_NPU_ID}" >&2
+    exit 1
+fi
+export ASCEND_RT_VISIBLE_DEVICES="${PHYSICAL_NPU_ID}"
+export DEVICE_ID=0
+echo "NPU mapping: physical ${PHYSICAL_NPU_ID} -> logical DEVICE_ID=0"
 
 if [[ "${CHECK_SERVER}" == "1" ]]; then
     mkdir -p results results/logs

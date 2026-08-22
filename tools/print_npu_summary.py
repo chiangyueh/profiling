@@ -142,6 +142,11 @@ def main() -> None:
     parser.add_argument("--summary", type=Path, required=True)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument(
+        "--workloads",
+        type=Path,
+        help="optional workload catalog used to restore reporting-only metadata",
+    )
+    parser.add_argument(
         "--all-workloads",
         action="store_true",
         help="print every workload instead of only analysis-relevant rows",
@@ -155,6 +160,10 @@ def main() -> None:
 
     summaries = read_csv(args.summary)
     candidates = read_csv(args.candidates)
+    workload_caps = {
+        row.get("workload_id", ""): row.get("max_cores", "")
+        for row in read_csv(args.workloads)
+    } if args.workloads else {}
     candidate_by_key = {
         (row.get("workload_id", ""), row.get("rank", "")): row
         for row in candidates
@@ -253,7 +262,7 @@ def main() -> None:
         print(
             f"  shape={shape} dtype={clean(summary.get('dtype', ''))}"
             f" trans={clean(summary.get('trans_a', ''))}{clean(summary.get('trans_b', ''))}"
-            f" core_cap={clean(candidate.get('max_cores', ''))}"
+            f" core_cap={clean(candidate.get('max_cores', '') or workload_caps.get(workload_id, ''))}"
             f" tpl={clean(candidate.get('kernel_template', ''))}"
             f" T={tiling}"
             f" S={single}"

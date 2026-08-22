@@ -575,6 +575,7 @@ if [[ "${PRINT_RESULTS:-1}" == "1" ]]; then
     if ! python3 "${ROOT}/tools/print_npu_summary.py" \
         --summary "${RESULT_STEM}_summary.csv" \
         --candidates "${RESULT_STEM}_candidates.csv" \
+        --workloads "${WORKLOADS_CSV}" \
         "${PRINT_SUMMARY_ARGS[@]}"; then
         echo "warning: compact result rendering failed; result CSV files are valid"
     fi

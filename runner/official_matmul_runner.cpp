@@ -35,6 +35,7 @@ struct Options {
     int32_t repeat = 50;
     int32_t samples = 15;
     int32_t numericPreflightMaxMiB = 4;
+    bool preflightOnly = false;
 };
 
 struct Workload {
@@ -607,6 +608,11 @@ ProfileSummary ProfileOfficial(
             }
         }
         summary.preflightPassed = true;
+        if (options.preflightOnly) {
+            summary.success = true;
+            LogStage(workload, "preflight_complete");
+            return summary;
+        }
 
         LogStage(workload, "warmup");
         for (int32_t i = 0; i < options.warmup; ++i) launch();
@@ -720,7 +726,7 @@ std::unordered_map<std::string, std::string> ParseArgs(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
         if (key == "--help" || key == "-h" || key == "--validate-input" ||
-            key == "--acl-only") {
+            key == "--acl-only" || key == "--preflight-only") {
             args[key] = "1";
             continue;
         }
@@ -764,6 +770,7 @@ void PrintUsage()
         << "  --only-workload ID\n"
         << "  --workload-limit N\n"
         << "  --numeric-preflight-max-mib N\n"
+        << "  --preflight-only     launch once, synchronize, and validate output; no timing\n"
         << "  --acl-only            initialize the linked ACL runtime without profiling\n"
         << "  --validate-input       validate input and CSV schema without ACL/NPU\n";
 }
@@ -790,6 +797,7 @@ int main(int argc, char **argv)
         options.samples = GetInt(args, "--samples", options.samples);
         options.numericPreflightMaxMiB =
             GetInt(args, "--numeric-preflight-max-mib", options.numericPreflightMaxMiB);
+        options.preflightOnly = args.count("--preflight-only") != 0;
         if (options.warmup < 0 || options.repeat <= 0 || options.samples <= 0) {
             throw std::runtime_error("warmup/repeat/samples values are invalid");
         }
@@ -839,8 +847,12 @@ int main(int argc, char **argv)
                 WriteProfileRow(output, workload, summary, options);
                 std::cout << "official_done " << workload.id
                           << " supported=" << summary.supported
-                          << " success=" << summary.success
-                          << " median_ms=" << std::setprecision(12) << summary.median;
+                          << " success=" << summary.success;
+                if (options.preflightOnly) {
+                    std::cout << " preflight_only=1";
+                } else {
+                    std::cout << " median_ms=" << std::setprecision(12) << summary.median;
+                }
                 if (!summary.error.empty()) std::cout << " reason=" << summary.error;
                 std::cout << std::endl;
                 if (summary.supported && !summary.success) {

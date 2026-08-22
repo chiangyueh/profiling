@@ -188,13 +188,13 @@ usage() {
 Usage:
   ./run_npu.sh --check-server [--device PHYSICAL_NPU_ID] [--verbose]
   ./run_npu.sh --mode smoke [--device PHYSICAL_NPU_ID] [--workloads FILE] [--output-stem STEM]
-  ./run_npu.sh --mode full  [--device PHYSICAL_NPU_ID] [--workloads FILE] [--output-stem STEM]
+  ./run_npu.sh --mode full  [--device PHYSICAL_NPU_ID] [--workloads FILE]
 
 Modes:
   smoke  Quick NPU validation: official baseline, bank control, and one
          bottleneck-transition candidate.
-  full   Incremental validation of source-supported transition candidates;
-         exact prior measurements are reused.
+  full   One real-NPU MatMulV3 runnability check: launch once, synchronize,
+         and validate its output. No search, warmup, timing, history, or reuse.
 
 Environment overrides:
   CANN_ROOT optionally selects a toolkit root; official set_env.sh is preferred
@@ -224,6 +224,7 @@ WORKLOADS_CSV=""
 RESULT_STEM=""
 CHECK_SERVER=0
 PHYSICAL_NPU_ID="${PHYSICAL_NPU_ID:-1}"
+PHASE_COUNT=4
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -302,23 +303,13 @@ case "${MODE}" in
         DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
         ;;
     full)
-        WORKLOADS_CSV="${WORKLOADS_CSV:-${WORKLOADS:-config/workloads.csv}}"
-        RESULT_STEM="${RESULT_STEM:-results/npu_full}"
-        DEFAULT_BEAM_WIDTH=16
-        DEFAULT_TABU_ITERS=0
-        DEFAULT_LNS_ROUNDS=0
-        DEFAULT_TOP_K=6
-        DEFAULT_MAX_CORE_ROUNDS=0
-        DEFAULT_MODEL_RATIO_LIMIT=1.03
-        DEFAULT_RANK_LIMIT=6
-        DEFAULT_WARMUP=10
-        DEFAULT_REPEAT=50
-        DEFAULT_SAMPLES=15
-        DEFAULT_PROFILE_STALL_TIMEOUT_SEC=60
+        # A full invocation is deliberately a one-workload viability check.
+        # The runner executes the installed MatMulV3 once and checks C, then exits.
+        WORKLOADS_CSV="${WORKLOADS_CSV:-${WORKLOADS:-config/workloads_smoke.csv}}"
+        RESULT_STEM="${RESULT_STEM:-results/matmul_viability}"
+        DEFAULT_SEARCH_SCOPE=not_run
         DEFAULT_NUMERIC_PREFLIGHT_MAX_MIB=4
-        DEFAULT_PROFILE_PROGRESS_EVERY=10
-        DEFAULT_SEARCH_SCOPE=bottleneck_guided_v1
-        DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=46
+        PHASE_COUNT=3
         ;;
     *)
         echo "Invalid --mode: ${MODE}. Expected smoke or full." >&2
@@ -338,18 +329,23 @@ echo "NPU run"
 echo "  script:    run_npu.sh ${RUN_NPU_VERSION}"
 echo "  root:      ${ROOT}"
 echo "  mode:      ${MODE}"
-echo "  scope:     ${SEARCH_SCOPE:-${DEFAULT_SEARCH_SCOPE}}"
 echo "  workloads: ${WORKLOADS_CSV}"
-echo "  summary:   ${RESULT_STEM}_summary.csv"
-echo "  candidates: ${RESULT_STEM}_candidates.csv"
-echo "  resume:    ${RESULT_STEM}_resume.csv"
+if [[ "${MODE}" == "full" ]]; then
+    echo "  operation: installed MatMulV3, one preflight launch and output check"
+    echo "  timing:    disabled (no warmup, samples, candidate search, or history reuse)"
+else
+    echo "  scope:     ${SEARCH_SCOPE:-${DEFAULT_SEARCH_SCOPE}}"
+    echo "  summary:   ${RESULT_STEM}_summary.csv"
+    echo "  candidates: ${RESULT_STEM}_candidates.csv"
+    echo "  resume:    ${RESULT_STEM}_resume.csv"
+fi
 echo "  log:       ${RUN_LOG}"
 echo
 
 ENV_LOG="${ROOT}/results/logs/env_$(date +%Y%m%d_%H%M%S).log"
 LAST_PHASE_LOG="${ENV_LOG}"
 ERROR_ALREADY_REPORTED=0
-echo -n "[0/4] Setup CANN environment ... "
+echo -n "[0/${PHASE_COUNT}] Setup CANN environment ... "
 if {
     echo "phase0=no_acl_probe"
     # shellcheck disable=SC1091
@@ -378,7 +374,7 @@ echo "  cann_root:    ${CANN_ROOT}"
 
 SOC_ENV_FILE="${ROOT}/results/logs/detected_soc_$(date +%Y%m%d_%H%M%S).env"
 SOC_DETECT_LOG="${ROOT}/results/logs/detect_soc_$(date +%Y%m%d_%H%M%S).log"
-run_quiet_phase "[1/4] Detect NPU SoC" "${SOC_DETECT_LOG}" \
+run_quiet_phase "[1/${PHASE_COUNT}] Detect NPU SoC" "${SOC_DETECT_LOG}" \
     "${ROOT}/scripts/detect_soc.sh" "${SOC_ENV_FILE}"
 
 # shellcheck disable=SC1090
@@ -387,7 +383,41 @@ export ASCENDC_SOC_VERSION SOC_VERSION DETECTED_NPU_SOC DETECTED_NPU_SOC_SOURCE 
 echo "  detected_soc: ${DETECTED_NPU_SOC} (${DETECTED_NPU_SOC_SOURCE})"
 echo "  ascendc_soc:  ${ASCENDC_SOC_VERSION}"
 
-run_quiet_phase "[2/4] Build tiling host/official runner" "${ROOT}/results/logs/build_$(date +%Y%m%d_%H%M%S).log" \
+if [[ "${MODE}" == "full" ]]; then
+    run_quiet_phase "[2/${PHASE_COUNT}] Build official MatMulV3 runner" "${ROOT}/results/logs/build_$(date +%Y%m%d_%H%M%S).log" \
+        env BUILD_COMPONENTS=runner "${ROOT}/scripts/build_all.sh"
+
+    VIABILITY_LOG="${ROOT}/results/logs/matmul_viability_$(date +%Y%m%d_%H%M%S).log"
+    LAST_PHASE_LOG="${VIABILITY_LOG}"
+    ERROR_ALREADY_REPORTED=0
+    echo "[3/${PHASE_COUNT}] Run one official MatMulV3 viability preflight"
+    set +e
+    "${ROOT}/build/official_matmul_runner" \
+        --candidates "${WORKLOADS_CSV}" \
+        --workload-limit 1 \
+        --output /dev/null \
+        --samples-output /dev/null \
+        --device "${DEVICE_ID}" \
+        --warmup 0 \
+        --repeat 1 \
+        --samples 1 \
+        --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-${DEFAULT_NUMERIC_PREFLIGHT_MAX_MIB}}" \
+        --preflight-only 2>&1 | tee "${VIABILITY_LOG}"
+    viability_rc=${PIPESTATUS[0]}
+    set -e
+    if [[ "${viability_rc}" -ne 0 ]]; then
+        echo "MATMUL_VIABILITY_FAIL physical_device=${PHYSICAL_NPU_ID} logical_device=${DEVICE_ID}"
+        print_error_lines "${VIABILITY_LOG}"
+        ERROR_ALREADY_REPORTED=1
+        exit "${viability_rc}"
+    fi
+    echo "MATMUL_VIABILITY_PASS physical_device=${PHYSICAL_NPU_ID} logical_device=${DEVICE_ID} workload=npu_smoke_fp16"
+    echo "NPU runnability check completed"
+    echo "  log: ${RUN_LOG}"
+    exit 0
+fi
+
+run_quiet_phase "[2/${PHASE_COUNT}] Build tiling host/official runner" "${ROOT}/results/logs/build_$(date +%Y%m%d_%H%M%S).log" \
     "${ROOT}/scripts/build_all.sh"
 
 SEARCH_WORK_DIR="$(mktemp -d "${ROOT}/results/.search_${MODE}.XXXXXX")"

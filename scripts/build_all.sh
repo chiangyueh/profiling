@@ -4,6 +4,12 @@ set -eo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$ROOT/build"
 mkdir -p "$BUILD"
+BUILD_COMPONENTS="${BUILD_COMPONENTS:-all}"
+
+if [[ "${BUILD_COMPONENTS}" != "all" && "${BUILD_COMPONENTS}" != "runner" ]]; then
+    echo "fatal: BUILD_COMPONENTS must be 'all' or 'runner'" >&2
+    exit 2
+fi
 
 source "$ROOT/scripts/env.sh"
 
@@ -59,42 +65,60 @@ HOST_SOURCES=(
     "$ROOT/host/src/main.cpp"
 )
 
-echo "[1/2] Building official-CANN tiling search host"
-HOST_OBJ_DIR="$BUILD/host_obj"
-mkdir -p "$HOST_OBJ_DIR"
-: >"$BUILD/host_build.log"
-HOST_OBJECTS=()
-for source_file in "${HOST_SOURCES[@]}"; do
-    object_file="$HOST_OBJ_DIR/$(basename "${source_file%.cpp}").o"
-    run_logged "$BUILD/host_build.log" "compile $(basename "$source_file")" \
-        g++ "${COMMON_HOST[@]}" -c "$source_file" -o "$object_file"
-    HOST_OBJECTS+=("$object_file")
-done
-run_logged "$BUILD/host_build.log" "link matmul_tiling_search" \
-    g++ "${HOST_OBJECTS[@]}" \
+if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
+    echo "[1/2] Building official-CANN tiling search host"
+    HOST_OBJ_DIR="$BUILD/host_obj"
+    mkdir -p "$HOST_OBJ_DIR"
+    : >"$BUILD/host_build.log"
+    HOST_OBJECTS=()
+    for source_file in "${HOST_SOURCES[@]}"; do
+        object_file="$HOST_OBJ_DIR/$(basename "${source_file%.cpp}").o"
+        run_logged "$BUILD/host_build.log" "compile $(basename "$source_file")" \
+            g++ "${COMMON_HOST[@]}" -c "$source_file" -o "$object_file"
+        HOST_OBJECTS+=("$object_file")
+    done
+    run_logged "$BUILD/host_build.log" "link matmul_tiling_search" \
+        g++ "${HOST_OBJECTS[@]}" \
         -L"$CANN_LIB" -Wl,-rpath,"$CANN_LIB" \
         -ltiling_api -lplatform -lregister -lgraph -lgraph_base \
         -lascendcl -lascendalog -lc_sec -ldl -lpthread \
         -o "$BUILD/matmul_tiling_search"
+else
+    echo "[1/2] Skipping tiling search host (runner-only build)"
+fi
 
-echo "[2/2] Building official MatMulV3 runner and tuning-bank probe"
+if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
+    echo "[2/2] Building official MatMulV3 runner and tuning-bank probe"
+else
+    echo "[2/2] Building official MatMulV3 runner"
+fi
 SOC_BUILD_NAME="$(printf '%s' "$ASCENDC_SOC_VERSION" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' '_')"
 NPU_BUILD="$BUILD/npu_cmake_${SOC_BUILD_NAME}"
 if [[ -d "$NPU_BUILD" ]]; then
     find "$NPU_BUILD" -mindepth 1 -delete
 fi
 : >"$BUILD/kernel_build.log"
-run_logged "$BUILD/kernel_build.log" "configure official runner and bank probe" \
+run_logged "$BUILD/kernel_build.log" "configure official runner" \
     cmake -S "$ROOT/cmake_npu" -B "$NPU_BUILD" \
         -DASCEND_CANN_PACKAGE_PATH="$CANN_ROOT" \
         -DCMAKE_BUILD_TYPE=Release
 
-run_logged "$BUILD/kernel_build.log" "compile official runner and bank probe" \
-    cmake --build "$NPU_BUILD" --target official_matmul_runner tiling_bank_probe \
-        --parallel "${BUILD_JOBS:-1}"
+NPU_TARGETS=(official_matmul_runner)
+if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
+    NPU_TARGETS+=(tiling_bank_probe)
+fi
+run_logged "$BUILD/kernel_build.log" "compile official runner" \
+    cmake --build "$NPU_BUILD" --target "${NPU_TARGETS[@]}" \
+    --parallel "${BUILD_JOBS:-1}"
 cp "$NPU_BUILD/official_matmul_runner" "$BUILD/official_matmul_runner"
-cp "$NPU_BUILD/tiling_bank_probe" "$BUILD/tiling_bank_probe"
+if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
+    cp "$NPU_BUILD/tiling_bank_probe" "$BUILD/tiling_bank_probe"
+fi
 : >"$BUILD/runner_build.log"
 
-file "$BUILD/matmul_tiling_search" "$BUILD/official_matmul_runner" "$BUILD/tiling_bank_probe"
+if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
+    file "$BUILD/matmul_tiling_search" "$BUILD/official_matmul_runner" "$BUILD/tiling_bank_probe"
+else
+    file "$BUILD/official_matmul_runner"
+fi
 echo "Build completed: $BUILD"

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
+import statistics
 from collections import Counter
 from pathlib import Path
 
@@ -125,6 +127,14 @@ def clean(value: str) -> str:
     return value.replace(" ", "_") if value else "NA"
 
 
+def finite_number(value: str) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Print a compact, copyable report from an NPU MatMul run."
@@ -165,11 +175,26 @@ def main() -> None:
     optimization_results: Counter[str] = Counter()
     evidence_results: dict[str, Counter[str]] = {}
     printed_workloads = 0
+    tiling_times: dict[str, list[float]] = {
+        "original_callback": [],
+        "solver_select": [],
+        "solver_callback": [],
+        "solver_total": [],
+    }
     for index, summary in enumerate(summaries, 1):
         workload_id = summary.get("workload_id", "")
         evidence = evidence_group(workload_id)
         searched_rank = summary.get("best_searched_rank", "")
         candidate = candidate_by_key.get((workload_id, searched_rank), {})
+        for key, column in (
+            ("original_callback", "tiling_official_callback_ms"),
+            ("solver_select", "tiling_solver_select_ms"),
+            ("solver_callback", "tiling_solver_callback_ms"),
+            ("solver_total", "tiling_solver_total_ms"),
+        ):
+            value = finite_number(candidate.get(column, ""))
+            if value is not None:
+                tiling_times[key].append(value)
         verdict = summary.get("primary_verdict", "") or "unknown"
         verdicts[verdict] += 1
         optimization = (
@@ -279,6 +304,28 @@ def main() -> None:
         f"no_searched_candidate={no_candidate} "
         f"optimization_other={optimization_other}"
     )
+    if tiling_times["solver_total"]:
+        mean = {
+            key: statistics.fmean(values)
+            for key, values in tiling_times.items()
+            if values
+        }
+        median = statistics.median(tiling_times["solver_total"])
+        ratio = (
+            mean["solver_total"] / mean["original_callback"]
+            if mean.get("original_callback", 0.0) > 0.0
+            else float("nan")
+        )
+        print(
+            "TILING_TIME_TOTAL "
+            f"records={len(tiling_times['solver_total'])} "
+            f"original_callback_mean_ms={mean.get('original_callback', float('nan')):.6g} "
+            f"solver_select_mean_ms={mean.get('solver_select', float('nan')):.6g} "
+            f"solver_callback_mean_ms={mean.get('solver_callback', float('nan')):.6g} "
+            f"solver_total_mean_ms={mean['solver_total']:.6g} "
+            f"solver_total_median_ms={median:.6g} "
+            f"solver_over_original_callback={ratio:.6g}"
+        )
     if args.direct_comparison_only:
         print("NPU_RESULT_END")
         return

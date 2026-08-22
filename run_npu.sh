@@ -366,7 +366,7 @@ echo "  root:      ${ROOT}"
 echo "  mode:      ${MODE}"
 echo "  workloads: ${WORKLOADS_CSV}"
 if [[ "${MODE}" == "full" ]]; then
-    echo "  comparison: one installed MatMulV3 baseline + one rank-1 solver tiling per shape"
+    echo "  comparison: one installed MatMulV3 baseline + one selected solver tiling per shape"
     echo "  solver:     hardware capacity/traffic/cycle model + official RuntimeKb callback"
     echo "  coverage:   100 fixed small/medium/large M,N,K combinations; fp16/bf16/fp32; NN/NT/TN/TT; core caps 1,2,4,8,12,16,20"
     echo "  timing:     NPU execution latency and per-shape CPU tiling wall time are both recorded"

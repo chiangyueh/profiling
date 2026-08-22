@@ -175,6 +175,8 @@ def main() -> None:
     optimization_results: Counter[str] = Counter()
     evidence_results: dict[str, Counter[str]] = {}
     printed_workloads = 0
+    callback_layout_changed = 0
+    callback_layout_unchanged = 0
     tiling_times: dict[str, list[float]] = {
         "original_callback": [],
         "runtime_kb_seed": [],
@@ -187,6 +189,11 @@ def main() -> None:
         evidence = evidence_group(workload_id)
         searched_rank = summary.get("best_searched_rank", "")
         candidate = candidate_by_key.get((workload_id, searched_rank), {})
+        if candidate:
+            if candidate.get("callback_derived_diff_vs_default", "").strip():
+                callback_layout_changed += 1
+            else:
+                callback_layout_unchanged += 1
         for key, column in (
             ("original_callback", "tiling_official_callback_ms"),
             ("runtime_kb_seed", "tiling_runtime_kb_seed_ms"),
@@ -306,6 +313,13 @@ def main() -> None:
         f"optimization_not_improved={not_improved} "
         f"no_searched_candidate={no_candidate} "
         f"optimization_other={optimization_other}"
+    )
+    print(
+        "CALLBACK_LAYOUT_TOTAL "
+        f"selected={callback_layout_changed + callback_layout_unchanged} "
+        f"derived_layout_changed={callback_layout_changed} "
+        f"derived_layout_unchanged={callback_layout_unchanged} "
+        f"no_selected_candidate={no_candidate}"
     )
     if tiling_times["solver_total"]:
         mean = {

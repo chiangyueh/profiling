@@ -24,7 +24,7 @@ RESUME_CSV="${OUT_STEM}_resume.csv"
 RESUME_RUN_ID="$(date +%Y%m%d_%H%M%S)"
 HISTORY_CSV="${MEASUREMENT_HISTORY:-results/npu_full_ocr_measurements.csv}"
 HISTORY_ARGS=()
-if [[ -f "${HISTORY_CSV}" ]]; then
+if [[ "${DISABLE_MEASUREMENT_HISTORY:-0}" != "1" && -f "${HISTORY_CSV}" ]]; then
     HISTORY_ARGS=(--history "${HISTORY_CSV}")
 fi
 
@@ -84,12 +84,17 @@ finalize_results() {
     if [[ ! -s "${PROFILE_CSV}" || "$(wc -l <"${PROFILE_CSV}")" -le 1 ]]; then
         return 1
     fi
+    local comparison_args=()
+    if [[ "${SKIP_BANK_SEED_CONTROL:-0}" == "1" ]]; then
+        comparison_args=(--official-only-comparison)
+    fi
     if ! python3 tools/rank_npu_results.py \
         --input "${PROFILE_CSV}" \
         --official-input "${OFFICIAL_PROFILE_CSV}" \
         --output "${RANKED_CSV}" \
         --summary "${BEST_CSV}" \
         --comparison "${SUMMARY_CSV}" \
+        "${comparison_args[@]}" \
         >/dev/null; then
         return 1
     fi
@@ -144,6 +149,10 @@ if [[ "${REQUIRE_EXACT_RESUME_PREFIX:-0}" -gt 0 ]]; then
         "${REQUIRE_EXACT_RESUME_PREFIX}"
     )
 fi
+PROFILE_MODE_ARGS=()
+if [[ "${SKIP_BANK_SEED_CONTROL:-0}" == "1" ]]; then
+    PROFILE_MODE_ARGS=(--skip-bank-seed-control)
+fi
 
 profile_rc=0
 if python3 tools/profile_official_tilings.py \
@@ -158,6 +167,7 @@ if python3 tools/profile_official_tilings.py \
     "${HISTORY_ARGS[@]}" \
     "${PROFILE_HISTORY_ARGS[@]}" \
     "${RESUME_GUARD_ARGS[@]}" \
+    "${PROFILE_MODE_ARGS[@]}" \
     --cann-root "${CANN_ROOT}" \
     --soc "${ASCENDC_SOC_VERSION:-${SOC_VERSION}}" \
     --aic-cores "${PLATFORM_AIC_CORES}" \

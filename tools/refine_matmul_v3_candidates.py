@@ -3110,6 +3110,34 @@ def broad_base_transition_proposals(
     return proposals
 
 
+def hardware_breakpoint_candidate_proposals(
+    workload: Workload,
+    seed: Seed,
+    hardware: Hardware,
+    seed_estimate: ModelEstimate,
+    profile: BottleneckProfile,
+) -> list[CandidateProposal]:
+    """Return source-legal capacity/pipeline transitions without history."""
+    family = template_name(seed.bank.knowledge)
+    proposals = (
+        broad_base_transition_proposals(
+            workload, seed, hardware, seed_estimate, profile
+        )
+        if family == "BASE"
+        else split_template_proposals(workload, seed, hardware)
+    )
+    return [
+        CandidateProposal(
+            knowledge=proposal.knowledge,
+            guidance="hardware_" + proposal.guidance,
+            rationale=proposal.rationale,
+            transition_gain=proposal.transition_gain,
+            resume_policy="allow_new",
+        )
+        for proposal in proposals
+    ]
+
+
 def split_template_proposals(
     workload: Workload,
     seed: Seed,
@@ -3633,6 +3661,7 @@ def constraint_aware_beam(
                     "skinny_n_ablation_",
                     "skinny_n_boundary_",
                     "skinny_n_low_k_",
+                    "hardware_",
                     "official_seed_",
                     "bottleneck_",
                 )
@@ -4168,6 +4197,7 @@ def main() -> int:
         "--optimization-scope",
         choices=(
             "bottleneck_guided_v1",
+            "hardware_breakpoints_v1",
             "official_local_v2",
             "skinny_n_large_k_v1",
             "all_templates_validation",
@@ -4311,6 +4341,23 @@ def main() -> int:
                 template_spaces.setdefault(
                     template_name(proposal.knowledge), []
                 ).append(proposal.knowledge)
+        elif args.optimization_scope == "hardware_breakpoints_v1":
+            proposals = hardware_breakpoint_candidate_proposals(
+                workload,
+                seed,
+                hardware,
+                bank_seed_estimate,
+                bottleneck,
+            )
+            proposal_by_signature = {
+                knowledge_signature(proposal.knowledge): proposal
+                for proposal in proposals
+            }
+            template_spaces = {}
+            for proposal in proposals:
+                template_spaces.setdefault(
+                    template_name(proposal.knowledge), []
+                ).append(proposal.knowledge)
         else:
             template_spaces = all_template_candidate_spaces(
                 workload,
@@ -4369,6 +4416,8 @@ def main() -> int:
                     (
                         "cann81_bottleneck_guided_v1"
                         if args.optimization_scope == "bottleneck_guided_v1"
+                        else "cann81_hardware_breakpoints_v1"
+                        if args.optimization_scope == "hardware_breakpoints_v1"
                         else "cann81_skinny_n_v1_beam_tabu_lns"
                         if args.optimization_scope == "skinny_n_large_k_v1"
                         else (
@@ -4419,6 +4468,7 @@ def main() -> int:
             )
             if args.optimization_scope in {
                 "bottleneck_guided_v1",
+                "hardware_breakpoints_v1",
                 "official_local_v2",
                 "skinny_n_large_k_v1",
             }:

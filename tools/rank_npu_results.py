@@ -181,6 +181,11 @@ def main() -> None:
         type=Path,
         default=Path("results/npu_baseline_comparison.csv"),
     )
+    parser.add_argument(
+        "--official-only-comparison",
+        action="store_true",
+        help="rank searched tilings only against the installed official baseline",
+    )
     args = parser.parse_args()
 
     required = {
@@ -499,12 +504,27 @@ def main() -> None:
         if best_searched is not None:
             official_verdict = comparison["primary_verdict"]
             bank_verdict = comparison["bank_seed_verdict"]
-            (
-                optimization_result,
-                selection_reason,
-                combined_verdict,
-            ) = optimization_decision(official_verdict, bank_verdict)
-            if optimization_result != "baseline_unavailable":
+            if args.official_only_comparison:
+                if official_verdict in {"improved", "within_noise", "regressed"}:
+                    optimization_result = (
+                        "improved" if official_verdict == "improved" else "not_improved"
+                    )
+                    selection_reason = "official_only_solver_comparison"
+                    combined_verdict = official_verdict
+                else:
+                    optimization_result = "baseline_unavailable"
+                    selection_reason = "official_operator_baseline_not_available"
+                    combined_verdict = official_verdict
+            else:
+                (
+                    optimization_result,
+                    selection_reason,
+                    combined_verdict,
+                ) = optimization_decision(official_verdict, bank_verdict)
+            if (
+                optimization_result != "baseline_unavailable"
+                and not args.official_only_comparison
+            ):
                 comparison["primary_reference"] = (
                     "official_operator+bank_seed_control"
                 )

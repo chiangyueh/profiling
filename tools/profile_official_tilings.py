@@ -1558,6 +1558,11 @@ def main() -> int:
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--rank-limit", type=int, default=20)
     parser.add_argument("--numeric-preflight-max-mib", type=int, default=4)
+    parser.add_argument(
+        "--skip-bank-seed-control",
+        action="store_true",
+        help="profile only searched solver candidates, not a bank-seed control",
+    )
     parser.add_argument("--timeout-sec", type=int, default=60)
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument(
@@ -1661,6 +1666,7 @@ def main() -> int:
             or (
                 row.get("candidate_role") == "bank_seed_control"
                 and int(row.get("rank", "-1")) == 0
+                and not args.skip_bank_seed_control
             )
         )
         and row.get("dtype", "").lower() in {"fp16", "bf16", "fp32"}
@@ -2002,7 +2008,7 @@ def main() -> int:
                 flush=True,
             )
 
-            controls = [
+            controls = [] if args.skip_bank_seed_control else [
                 row
                 for row in rows
                 if row.get("candidate_role") == "bank_seed_control"

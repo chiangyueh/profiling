@@ -20,7 +20,7 @@ RAW_ALL_OUTPUT="${SEARCH_ALL_OUTPUT}.generic.csv"
 RAW_LOG="${SEARCH_ALL_OUTPUT}.generic.log"
 HISTORY_CSV="${MEASUREMENT_HISTORY:-results/npu_full_ocr_measurements.csv}"
 HISTORY_ARGS=()
-if [[ -f "${HISTORY_CSV}" ]]; then
+if [[ "${DISABLE_MEASUREMENT_HISTORY:-0}" != "1" && -f "${HISTORY_CSV}" ]]; then
     HISTORY_ARGS=(--history "${HISTORY_CSV}")
 fi
 

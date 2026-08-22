@@ -136,6 +136,11 @@ def main() -> None:
         action="store_true",
         help="print every workload instead of only analysis-relevant rows",
     )
+    parser.add_argument(
+        "--direct-comparison-only",
+        action="store_true",
+        help="print only this campaign's solver-versus-official comparison",
+    )
     args = parser.parse_args()
 
     summaries = read_csv(args.summary)
@@ -265,6 +270,9 @@ def main() -> None:
         f"no_searched_candidate={no_candidate} "
         f"optimization_other={optimization_other}"
     )
+    if args.direct_comparison_only:
+        print("NPU_RESULT_END")
+        return
     for evidence in (
         "known_anchor",
         "skinny_n_initial_holdout",

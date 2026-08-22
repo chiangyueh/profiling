@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260729-n48-paired-base-n64-crossover"
+RUN_NPU_VERSION="20260822-unseen5-hardware-cost-v1"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -188,24 +188,23 @@ usage() {
 Usage:
   ./run_npu.sh --check-server [--device PHYSICAL_NPU_ID] [--verbose]
   ./run_npu.sh --mode smoke [--device PHYSICAL_NPU_ID] [--workloads FILE] [--output-stem STEM]
-  ./run_npu.sh --mode full  [--device PHYSICAL_NPU_ID] [--workloads FILE]
+  ./run_npu.sh --mode full  [--device PHYSICAL_NPU_ID]
 
 Modes:
   smoke  Quick NPU validation: official baseline, bank control, and one
          bottleneck-transition candidate.
-  full   One real-NPU MatMulV3 runnability check: launch once, synchronize,
-         and validate its output. No search, warmup, timing, history, or reuse.
+  full   Five fixed unseen shapes: original installed MatMulV3 versus one
+         hardware-cost-solver tiling per shape. No legacy history is loaded.
 
 Environment overrides:
   CANN_ROOT optionally selects a toolkit root; official set_env.sh is preferred
   PHYSICAL_NPU_ID defaults to 1 and selects the physical NPU; the application
   always uses logical DEVICE_ID=0 after ASCEND_RT_VISIBLE_DEVICES mapping
   SOC_VERSION
-  BEAM_WIDTH, TABU_ITERS, LNS_ROUNDS, TOP_K, MAX_CORE_ROUNDS, MODEL_RATIO_LIMIT
-  SEARCH_SCOPE defaults to bottleneck_guided_v1
-  RANK_LIMIT, WARMUP, REPEAT, SAMPLES
+  The following search and profiling overrides apply to smoke mode only:
+  BEAM_WIDTH, TABU_ITERS, LNS_ROUNDS, TOP_K, MAX_CORE_ROUNDS, MODEL_RATIO_LIMIT,
+  SEARCH_SCOPE, RANK_LIMIT, WARMUP, REPEAT, SAMPLES,
   NUMERIC_PREFLIGHT_MAX_MIB, PROFILE_STALL_TIMEOUT_SEC, PROFILE_PROGRESS_EVERY
-  REQUIRE_EXACT_RESUME_PREFIX protects prior full-run workloads from remeasurement
   PROFILE_SHOW_WORKLOADS=1 prints every workload result during live profiling
   PROFILE_SHOW_REUSE=1 prints reused-history lines in the compact live output
   KEEP_DETAILS=1 preserves search/profile internals in results/*_details/
@@ -225,6 +224,9 @@ RESULT_STEM=""
 CHECK_SERVER=0
 PHYSICAL_NPU_ID="${PHYSICAL_NPU_ID:-1}"
 PHASE_COUNT=4
+WORKLOADS_WERE_OVERRIDDEN=0
+DISABLE_LEGACY_HISTORY=0
+SKIP_BANK_SEED_CONTROL=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -246,6 +248,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --workloads)
             WORKLOADS_CSV="${2:?missing value for --workloads}"
+            WORKLOADS_WERE_OVERRIDDEN=1
             shift 2
             ;;
         --output-stem)
@@ -303,13 +306,45 @@ case "${MODE}" in
         DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
         ;;
     full)
-        # A full invocation is deliberately a one-workload viability check.
-        # The runner executes the installed MatMulV3 once and checks C, then exits.
-        WORKLOADS_CSV="${WORKLOADS_CSV:-${WORKLOADS:-config/workloads_smoke.csv}}"
-        RESULT_STEM="${RESULT_STEM:-results/matmul_viability}"
-        DEFAULT_SEARCH_SCOPE=not_run
+        if [[ "${WORKLOADS_WERE_OVERRIDDEN}" == "1" || -n "${WORKLOADS:-}" ]]; then
+            echo "--mode full has a fixed five-shape unseen contract; --workloads is not allowed" >&2
+            exit 1
+        fi
+        WORKLOADS_CSV="config/workloads_unseen_5.csv"
+        RESULT_STEM="results/unseen5_hardware_solver_v1"
+        DEFAULT_BEAM_WIDTH=16
+        DEFAULT_TABU_ITERS=0
+        DEFAULT_LNS_ROUNDS=0
+        DEFAULT_TOP_K=1
+        DEFAULT_MAX_CORE_ROUNDS=0
+        DEFAULT_MODEL_RATIO_LIMIT=1.03
+        DEFAULT_RANK_LIMIT=1
+        DEFAULT_WARMUP=2
+        DEFAULT_REPEAT=20
+        DEFAULT_SAMPLES=7
+        DEFAULT_PROFILE_STALL_TIMEOUT_SEC=60
         DEFAULT_NUMERIC_PREFLIGHT_MAX_MIB=4
-        PHASE_COUNT=3
+        DEFAULT_PROFILE_PROGRESS_EVERY=1
+        DEFAULT_SEARCH_SCOPE=hardware_breakpoints_v1
+        DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
+        DISABLE_LEGACY_HISTORY=1
+        SKIP_BANK_SEED_CONTROL=1
+        # The five-shape comparison is a fixed contract: one solver tiling
+        # and the same measurement budget for every shape.
+        BEAM_WIDTH=16
+        TABU_ITERS=0
+        LNS_ROUNDS=0
+        TOP_K=1
+        MAX_CORE_ROUNDS=0
+        MODEL_RATIO_LIMIT=1.03
+        RANK_LIMIT=1
+        WARMUP=2
+        REPEAT=20
+        SAMPLES=7
+        PROFILE_STALL_TIMEOUT_SEC=60
+        NUMERIC_PREFLIGHT_MAX_MIB=4
+        PROFILE_PROGRESS_EVERY=1
+        SEARCH_SCOPE=hardware_breakpoints_v1
         ;;
     *)
         echo "Invalid --mode: ${MODE}. Expected smoke or full." >&2
@@ -331,8 +366,10 @@ echo "  root:      ${ROOT}"
 echo "  mode:      ${MODE}"
 echo "  workloads: ${WORKLOADS_CSV}"
 if [[ "${MODE}" == "full" ]]; then
-    echo "  operation: installed MatMulV3, one preflight launch and output check"
-    echo "  timing:    disabled (no warmup, samples, candidate search, or history reuse)"
+    echo "  comparison: one installed MatMulV3 baseline + one rank-1 solver tiling per shape"
+    echo "  solver:     hardware capacity/traffic/cycle model + official RuntimeKb callback"
+    echo "  history:    legacy measurement history disabled; local exact resume only"
+    echo "  sampling:   2 warmups + 7 event samples, 20 launches/sample"
 else
     echo "  scope:     ${SEARCH_SCOPE:-${DEFAULT_SEARCH_SCOPE}}"
     echo "  summary:   ${RESULT_STEM}_summary.csv"
@@ -383,40 +420,6 @@ export ASCENDC_SOC_VERSION SOC_VERSION DETECTED_NPU_SOC DETECTED_NPU_SOC_SOURCE 
 echo "  detected_soc: ${DETECTED_NPU_SOC} (${DETECTED_NPU_SOC_SOURCE})"
 echo "  ascendc_soc:  ${ASCENDC_SOC_VERSION}"
 
-if [[ "${MODE}" == "full" ]]; then
-    run_quiet_phase "[2/${PHASE_COUNT}] Build official MatMulV3 runner" "${ROOT}/results/logs/build_$(date +%Y%m%d_%H%M%S).log" \
-        env BUILD_COMPONENTS=runner "${ROOT}/scripts/build_all.sh"
-
-    VIABILITY_LOG="${ROOT}/results/logs/matmul_viability_$(date +%Y%m%d_%H%M%S).log"
-    LAST_PHASE_LOG="${VIABILITY_LOG}"
-    ERROR_ALREADY_REPORTED=0
-    echo "[3/${PHASE_COUNT}] Run one official MatMulV3 viability preflight"
-    set +e
-    "${ROOT}/build/official_matmul_runner" \
-        --candidates "${WORKLOADS_CSV}" \
-        --workload-limit 1 \
-        --output /dev/null \
-        --samples-output /dev/null \
-        --device "${DEVICE_ID}" \
-        --warmup 0 \
-        --repeat 1 \
-        --samples 1 \
-        --numeric-preflight-max-mib "${NUMERIC_PREFLIGHT_MAX_MIB:-${DEFAULT_NUMERIC_PREFLIGHT_MAX_MIB}}" \
-        --preflight-only 2>&1 | tee "${VIABILITY_LOG}"
-    viability_rc=${PIPESTATUS[0]}
-    set -e
-    if [[ "${viability_rc}" -ne 0 ]]; then
-        echo "MATMUL_VIABILITY_FAIL physical_device=${PHYSICAL_NPU_ID} logical_device=${DEVICE_ID}"
-        print_error_lines "${VIABILITY_LOG}"
-        ERROR_ALREADY_REPORTED=1
-        exit "${viability_rc}"
-    fi
-    echo "MATMUL_VIABILITY_PASS physical_device=${PHYSICAL_NPU_ID} logical_device=${DEVICE_ID} workload=npu_smoke_fp16"
-    echo "NPU runnability check completed"
-    echo "  log: ${RUN_LOG}"
-    exit 0
-fi
-
 run_quiet_phase "[2/${PHASE_COUNT}] Build tiling host/official runner" "${ROOT}/results/logs/build_$(date +%Y%m%d_%H%M%S).log" \
     "${ROOT}/scripts/build_all.sh"
 
@@ -433,6 +436,7 @@ run_quiet_phase "[3/4] Search tiling candidates" "${SEARCH_LOG}" \
         MAX_CORE_ROUNDS="${MAX_CORE_ROUNDS:-${DEFAULT_MAX_CORE_ROUNDS}}" \
         MODEL_RATIO_LIMIT="${MODEL_RATIO_LIMIT:-${DEFAULT_MODEL_RATIO_LIMIT}}" \
         SEARCH_SCOPE="${SEARCH_SCOPE:-${DEFAULT_SEARCH_SCOPE}}" \
+        DISABLE_MEASUREMENT_HISTORY="${DISABLE_LEGACY_HISTORY}" \
         SEARCH_OUTPUT="${SEARCH_CANDIDATES_CSV}" \
         SEARCH_ALL_OUTPUT="${SEARCH_ALL_CSV}" \
         SEARCH_TILING_DIR="${SEARCH_TILING_DIR}" \
@@ -489,6 +493,8 @@ profile_env=(
     "NUMERIC_PREFLIGHT_MAX_MIB=${NUMERIC_PREFLIGHT_MAX_MIB:-${DEFAULT_NUMERIC_PREFLIGHT_MAX_MIB}}"
     "PROFILE_STALL_TIMEOUT_SEC=${PROFILE_STALL_TIMEOUT_SEC:-${DEFAULT_PROFILE_STALL_TIMEOUT_SEC}}"
     "PROFILE_PROGRESS_EVERY=${PROFILE_PROGRESS_EVERY:-${DEFAULT_PROFILE_PROGRESS_EVERY}}"
+    "DISABLE_MEASUREMENT_HISTORY=${DISABLE_LEGACY_HISTORY}"
+    "SKIP_BANK_SEED_CONTROL=${SKIP_BANK_SEED_CONTROL}"
     "REQUIRE_EXACT_RESUME_PREFIX=${REQUIRE_EXACT_RESUME_PREFIX:-$(
         if [[ "${MODE}" == "full" && "${WORKLOADS_CSV}" == "config/workloads.csv" && -s "${RESULT_STEM}_resume.csv" ]]; then
             printf '%s' "${DEFAULT_REQUIRE_EXACT_RESUME_PREFIX}"
@@ -559,7 +565,9 @@ SEARCH_WORK_DIR=""
 if [[ "${PRINT_RESULTS:-1}" == "1" ]]; then
     echo
     PRINT_SUMMARY_ARGS=()
-    if [[ "${PRINT_ALL_RESULTS:-0}" == "1" ]]; then
+    if [[ "${MODE}" == "full" ]]; then
+        PRINT_SUMMARY_ARGS=(--all-workloads --direct-comparison-only)
+    elif [[ "${PRINT_ALL_RESULTS:-0}" == "1" ]]; then
         PRINT_SUMMARY_ARGS=(--all-workloads)
     fi
     if ! python3 "${ROOT}/tools/print_npu_summary.py" \

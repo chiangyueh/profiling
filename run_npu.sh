@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_NPU_VERSION="20260822-unseen5-hardware-cost-v1"
+RUN_NPU_VERSION="20260822-tiling-coverage100-v1"
 mkdir -p "${ROOT}/results/logs"
 RUN_LOG="${ROOT}/results/logs/run_npu_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${RUN_LOG}") 2>&1
@@ -193,8 +193,8 @@ Usage:
 Modes:
   smoke  Quick NPU validation: official baseline, bank control, and one
          bottleneck-transition candidate.
-  full   Five fixed unseen shapes: original installed MatMulV3 versus one
-         hardware-cost-solver tiling per shape. No legacy history is loaded.
+  full   100 fixed MatMul coverage shapes: original installed MatMulV3 versus
+         one hardware-cost-solver tiling per shape. No legacy history is loaded.
 
 Environment overrides:
   CANN_ROOT optionally selects a toolkit root; official set_env.sh is preferred
@@ -307,11 +307,11 @@ case "${MODE}" in
         ;;
     full)
         if [[ "${WORKLOADS_WERE_OVERRIDDEN}" == "1" || -n "${WORKLOADS:-}" ]]; then
-            echo "--mode full has a fixed five-shape unseen contract; --workloads is not allowed" >&2
+            echo "--mode full has a fixed 100-shape tiling coverage contract; --workloads is not allowed" >&2
             exit 1
         fi
-        WORKLOADS_CSV="config/workloads_unseen_5.csv"
-        RESULT_STEM="results/unseen5_hardware_solver_v1"
+        WORKLOADS_CSV="config/workloads_tiling_coverage_100.csv"
+        RESULT_STEM="results/tiling_coverage_100_v1"
         DEFAULT_BEAM_WIDTH=16
         DEFAULT_TABU_ITERS=0
         DEFAULT_LNS_ROUNDS=0
@@ -329,7 +329,7 @@ case "${MODE}" in
         DEFAULT_REQUIRE_EXACT_RESUME_PREFIX=0
         DISABLE_LEGACY_HISTORY=1
         SKIP_BANK_SEED_CONTROL=1
-        # The five-shape comparison is a fixed contract: one solver tiling
+        # The coverage comparison is a fixed contract: one solver tiling
         # and the same measurement budget for every shape.
         BEAM_WIDTH=16
         TABU_ITERS=0
@@ -368,6 +368,8 @@ echo "  workloads: ${WORKLOADS_CSV}"
 if [[ "${MODE}" == "full" ]]; then
     echo "  comparison: one installed MatMulV3 baseline + one rank-1 solver tiling per shape"
     echo "  solver:     hardware capacity/traffic/cycle model + official RuntimeKb callback"
+    echo "  coverage:   100 fixed small/medium/large M,N,K combinations; fp16/bf16/fp32; NN/NT/TN/TT; core caps 1,2,4,8,12,16,20"
+    echo "  timing:     NPU execution latency and per-shape CPU tiling wall time are both recorded"
     echo "  history:    legacy measurement history disabled; local exact resume only"
     echo "  sampling:   2 warmups + 7 event samples, 20 launches/sample"
 else

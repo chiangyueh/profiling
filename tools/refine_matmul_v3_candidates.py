@@ -8,6 +8,7 @@ import json
 import math
 import statistics
 import struct
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,13 @@ EXTRA_COLUMNS = [
     "callback_derived_diff_vs_default",
     "callback_derived_diff_vs_bank_seed",
     "search_history_match",
+    "tiling_official_callback_ms",
+    "tiling_runtime_kb_seed_ms",
+    "tiling_solver_select_ms",
+    "tiling_solver_callback_ms",
+    "tiling_solver_callback_count",
+    "tiling_solver_extra_ms",
+    "tiling_solver_total_ms",
 ]
 
 DTYPE_NAME = {
@@ -139,6 +147,8 @@ class CallbackTiling:
 class Seed:
     default: CallbackTiling
     bank: CallbackTiling
+    default_callback_ms: float
+    bank_callback_ms: float
 
     @property
     def key(self) -> int:
@@ -492,9 +502,18 @@ def invoke_official_callback(
 
 
 def parse_seed(workload: Workload) -> Seed:
+    start = time.perf_counter_ns()
     default = invoke_official_callback(workload)
+    default_callback_ms = (time.perf_counter_ns() - start) / 1_000_000.0
+    start = time.perf_counter_ns()
     bank = invoke_official_callback(workload, default.knowledge)
-    return Seed(default=default, bank=bank)
+    bank_callback_ms = (time.perf_counter_ns() - start) / 1_000_000.0
+    return Seed(
+        default=default,
+        bank=bank,
+        default_callback_ms=default_callback_ms,
+        bank_callback_ms=bank_callback_ms,
+    )
 
 
 def raw_knowledge(row: dict[str, str]) -> dict[str, int]:
@@ -3110,6 +3129,99 @@ def broad_base_transition_proposals(
     return proposals
 
 
+def coverage_schedule_proposals(
+    workload: Workload,
+    seed: Seed,
+    hardware: Hardware,
+    seed_estimate: ModelEstimate,
+) -> list[CandidateProposal]:
+    """Construct source-legal schedules spanning the declared coverage axes.
+
+    These are explicit coverage actions, not optimization claims.  They are
+    used only when no capacity, pipeline, or reuse transition applies, so a
+    coverage run still compares a real alternative tiling for every shape.
+    """
+    if template_name(seed.bank.knowledge) != "BASE":
+        return []
+    core_cap = min(workload.max_cores, hardware.aic_cores)
+    seed_knowledge = seed.bank.knowledge
+    candidates: list[tuple[str, dict[str, int]]] = []
+
+    # Keep the official inner tiling and vary only L2 grouping/traversal.
+    # l2_schedules derives each count/block pair from the documented L2
+    # equations and is therefore safer than unconstrained field mutation.
+    for candidate in l2_schedules(workload, seed_knowledge, seed, hardware):
+        candidates.append(("l2_schedule", candidate))
+
+    # iterateOrder is a MatMulV3 cube-loop field.  Test the opposite source
+    # defined order while all allocation, L1, and L2 quantities stay fixed.
+    candidate = dict(seed_knowledge)
+    candidate["iterateOrder"] = 1 - candidate["iterateOrder"]
+    candidates.append(("cube_iterate_order", candidate))
+
+    # usedCoreNum is part of the RuntimeKb contract.  The coverage matrix
+    # explicitly asks for several core limits, so retain legal lower values
+    # even if the analytical model predicts no throughput improvement.
+    for cores in sorted({1, 2, 4, 8, 12, 16, core_cap}):
+        if cores > core_cap:
+            continue
+        candidate = dict(seed_knowledge)
+        candidate["usedCoreNum"] = cores
+        candidates.append(("core_cap", candidate))
+
+    # When a complete output grid is legal with the seed's baseK, include it
+    # as the geometry axis; unlike the inner-K changes above, this changes
+    # both core assignment and outer M/N tiles.
+    for m_parts in range(1, core_cap + 1):
+        n_parts = ceil_div(core_cap, m_parts)
+        base_m = align_up(ceil_div(workload.m, m_parts), 16)
+        base_n = align_up(ceil_div(workload.n, n_parts), 16)
+        candidate = configure_base_candidate(
+            workload,
+            seed,
+            hardware,
+            base_m,
+            base_n,
+            seed_knowledge["baseK"],
+        )
+        if candidate is not None:
+            candidates.append(("balanced_output_grid", candidate))
+
+    proposals: list[CandidateProposal] = []
+    seen: set[tuple[int, ...]] = set()
+    for axis, candidate in candidates:
+        signature = knowledge_signature(candidate)
+        if (
+            signature == knowledge_signature(seed_knowledge)
+            or signature in seen
+            or not hard_legal(workload, candidate, hardware)
+        ):
+            continue
+        seen.add(signature)
+        estimate = analytical_score(workload, candidate, hardware)
+        guidance = {
+            "l2_schedule": "coverage_l2_partition_or_order",
+            "cube_iterate_order": "coverage_cube_iterate_order",
+            "core_cap": "coverage_used_core_num",
+            "balanced_output_grid": "coverage_balanced_output_grid",
+        }[axis]
+        proposals.append(
+            CandidateProposal(
+                knowledge=candidate,
+                guidance=guidance,
+                rationale=(
+                    "source-legal MatMulV3 coverage axis; this is a tiling "
+                    "comparison, not a predicted speedup"
+                ),
+                transition_gain=(
+                    1.0 - estimate.cycles / max(1.0, seed_estimate.cycles)
+                ),
+                resume_policy="allow_new",
+            )
+        )
+    return proposals
+
+
 def hardware_breakpoint_candidate_proposals(
     workload: Workload,
     seed: Seed,
@@ -3126,6 +3238,12 @@ def hardware_breakpoint_candidate_proposals(
         if family == "BASE"
         else split_template_proposals(workload, seed, hardware)
     )
+    if not proposals and family == "BASE":
+        coverage = coverage_schedule_proposals(
+            workload, seed, hardware, seed_estimate
+        )
+        if coverage:
+            proposals = coverage
     return [
         CandidateProposal(
             knowledge=proposal.knowledge,
@@ -4305,6 +4423,7 @@ def main() -> int:
         if workload.dtype not in DTYPE_NAME:
             continue
         seed = seeds[workload.workload_id]
+        solver_started = time.perf_counter_ns()
         bank_path_diff = callback_derived_diff(
             seed.default, seed.bank
         )
@@ -4493,20 +4612,28 @@ def main() -> int:
         seen: set[tuple[int, ...]] = set()
         failures = 0
         first_failure = ""
+        solver_callback_ns = 0
+        solver_callback_count = 0
 
         def try_callback(state: State) -> bool:
             nonlocal failures, first_failure
+            nonlocal solver_callback_ns, solver_callback_count
             signature = knowledge_signature(state.knowledge)
             if signature in seen:
                 return False
             seen.add(signature)
+            callback_started = time.perf_counter_ns()
             try:
                 callback = validate_callback(workload, state)
             except Exception as exception:
+                solver_callback_ns += time.perf_counter_ns() - callback_started
+                solver_callback_count += 1
                 failures += 1
                 if not first_failure:
                     first_failure = str(exception).replace("\n", " ")[:240]
                 return False
+            solver_callback_ns += time.perf_counter_ns() - callback_started
+            solver_callback_count += 1
             update_callback_columns(
                 state,
                 callback,
@@ -4518,33 +4645,44 @@ def main() -> int:
             accepted.append(state)
             return True
 
-        # First secure one valid representative of every generated template.
-        for template in sorted(callback_beams):
-            for state in callback_beams[template]:
-                if try_callback(state):
+        if args.optimization_scope == "hardware_breakpoints_v1":
+            # The coverage campaign needs exactly one executable candidate per
+            # shape. Validate candidates in model order and stop at the first
+            # exact RuntimeKb fixed point; probing one candidate from every
+            # template only inflates tiling time without affecting rank one.
+            for state in states:
+                try_callback(state)
+                if len(accepted) >= args.top_k:
                     break
+        else:
+            # Other research scopes retain their multi-template validation
+            # frontier because they can profile more than one rank.
+            for template in sorted(callback_beams):
+                for state in callback_beams[template]:
+                    if try_callback(state):
+                        break
 
-        remaining = sorted(
-            (
-                state
-                for template_states in callback_beams.values()
-                for state in template_states
-                if knowledge_signature(state.knowledge) not in seen
-            ),
-            key=lambda state: (
-                state.normalized_score,
-                knowledge_signature(state.knowledge),
-            ),
-        )
-        callback_target = (
-            len(states)
-            if args.optimization_scope == "bottleneck_guided_v1"
-            else args.top_k
-        )
-        for state in remaining:
-            try_callback(state)
-            if len(accepted) >= callback_target:
-                break
+            remaining = sorted(
+                (
+                    state
+                    for template_states in callback_beams.values()
+                    for state in template_states
+                    if knowledge_signature(state.knowledge) not in seen
+                ),
+                key=lambda state: (
+                    state.normalized_score,
+                    knowledge_signature(state.knowledge),
+                ),
+            )
+            callback_target = (
+                len(states)
+                if args.optimization_scope == "bottleneck_guided_v1"
+                else args.top_k
+            )
+            for state in remaining:
+                try_callback(state)
+                if len(accepted) >= callback_target:
+                    break
 
         history_correction, history_matches = calibrate_from_history(
             workload,
@@ -4559,11 +4697,15 @@ def main() -> int:
             key=state_sort_key
         )
         callback_valid = len(accepted)
-        eligible = [
-            state
-            for state in accepted
-            if not dominated_by_bank_seed(state.knowledge, seed)
-        ]
+        eligible = (
+            list(accepted)
+            if args.optimization_scope == "hardware_breakpoints_v1"
+            else [
+                state
+                for state in accepted
+                if not dominated_by_bank_seed(state.knowledge, seed)
+            ]
+        )
         if (
             completed_frontier
             and args.optimization_scope == "bottleneck_guided_v1"
@@ -4612,6 +4754,23 @@ def main() -> int:
             if len(chosen) >= args.top_k:
                 break
 
+        solver_elapsed_ms = (
+            (time.perf_counter_ns() - solver_started) / 1_000_000.0
+        )
+        solver_callback_ms = solver_callback_ns / 1_000_000.0
+        timing = {
+            "tiling_official_callback_ms": f"{seed.default_callback_ms:.9g}",
+            "tiling_runtime_kb_seed_ms": f"{seed.bank_callback_ms:.9g}",
+            "tiling_solver_select_ms": f"{max(0.0, solver_elapsed_ms - solver_callback_ms):.9g}",
+            "tiling_solver_callback_ms": f"{solver_callback_ms:.9g}",
+            "tiling_solver_callback_count": str(solver_callback_count),
+            "tiling_solver_extra_ms": f"{(seed.bank_callback_ms + solver_elapsed_ms):.9g}",
+            "tiling_solver_total_ms": f"{(seed.default_callback_ms + seed.bank_callback_ms + solver_elapsed_ms):.9g}",
+        }
+        control.row.update(timing)
+        for state in states:
+            state.row.update(timing)
+
         for rank, state in enumerate(chosen, 1):
             if (
                 completed_frontier
@@ -4642,6 +4801,8 @@ def main() -> int:
             f"history_matches={history_matches} "
             f"history_correction={history_correction:.4g} "
             f"callback_rejected={failures} "
+            f"tiling_cpu_ms=official:{seed.default_callback_ms:.6g},"
+            f"solver_total:{seed.default_callback_ms + seed.bank_callback_ms + solver_elapsed_ms:.6g} "
             f"{bottleneck.summary()} "
             f"actions="
             f"{','.join(state.guidance for state in chosen) or 'none'} "

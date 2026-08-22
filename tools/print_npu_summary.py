@@ -153,13 +153,13 @@ def main() -> None:
 
     verdicts: Counter[str] = Counter()
     print("NPU_RESULT_BEGIN")
-    print("LEGEND ms=searched/bank_seed_control/official")
-    print("LEGEND speedup=official_or_bank_ms/searched_ms (>1 is faster)")
+    print("LEGEND npu_ms=solver/original_matmul_v3; speedup=original/solver (>1 is faster)")
+    print("LEGEND tiling_cpu_ms is host wall time: original callback versus the full solver path")
+    print("LEGEND solver_total=original callback + RuntimeKb seed + model selection + selected-candidate callback")
     print("LEGEND tpl=MatMulV3 template T=baseMxbaseNxbaseK S=kernel_single_MxN")
-    print("LEGEND C=cores G=output_block_grid")
+    print("LEGEND C=selected cores (cap is the tested solver core limit) G=output_block_grid")
     print("LEGEND L2=tile_count_MxN(blocks_per_tile_MxN)")
-    print("LEGEND optimization=whether the searched tiling beats the official baseline")
-    print("LEGEND evidence=known anchor, unseen holdout, prior regression, or broad")
+    print("LEGEND verdict uses the measured noise threshold; model internals remain in CSV only")
     total = len(summaries)
     width = max(2, len(str(total)))
     optimization_results: Counter[str] = Counter()
@@ -214,11 +214,12 @@ def main() -> None:
         )
         print(
             f"[{index:0{width}d}/{total:0{width}d}] {clean(workload_id)} "
-            f"rank={clean(searched_rank)} {clean(verdict)} "
-            f"optimization={clean(optimization)} evidence={evidence}"
+            f"verdict={clean(verdict)} optimization={clean(optimization)}"
         )
         print(
-            f"  {shape} {clean(summary.get('dtype', ''))}"
+            f"  shape={shape} dtype={clean(summary.get('dtype', ''))}"
+            f" trans={clean(summary.get('trans_a', ''))}{clean(summary.get('trans_b', ''))}"
+            f" core_cap={clean(candidate.get('max_cores', ''))}"
             f" tpl={clean(candidate.get('kernel_template', ''))}"
             f" T={tiling}"
             f" S={single}"
@@ -227,26 +228,34 @@ def main() -> None:
             f" L2={l2_count}({l2_block})"
         )
         print(
-            f"  cause={clean(candidate.get('search_bottleneck', ''))}/"
-            f"{clean(candidate.get('search_guidance', ''))}"
-            f" model_ratio={compact_number(candidate.get('search_model_ratio_vs_bank_seed', ''))}"
-            f" calibration={compact_number(candidate.get('search_model_calibration', ''))}"
-            f" model_confidence={clean(candidate.get('search_model_confidence', ''))}"
-            f" resume={clean(candidate.get('search_resume_policy', ''))}"
+            "  tiling_cpu_ms "
+            f"original_callback={compact_number(candidate.get('tiling_official_callback_ms', ''))} "
+            f"solver_select={compact_number(candidate.get('tiling_solver_select_ms', ''))} "
+            f"solver_callback={compact_number(candidate.get('tiling_solver_callback_ms', ''))} "
+            f"callback_count={clean(candidate.get('tiling_solver_callback_count', ''))} "
+            f"solver_total={compact_number(candidate.get('tiling_solver_total_ms', ''))}"
         )
         print(
-            "  ms="
+            "  npu_ms solver="
             f"{compact_number(summary.get('best_searched_median_ms', ''))}/"
-            f"{compact_number(summary.get('bank_seed_median_ms', ''))}/"
             f"{compact_number(summary.get('official_operator_median_ms', ''))}"
             " std="
             f"{compact_number(summary.get('best_searched_stddev_ms', ''))}/"
             f"{compact_number(summary.get('official_operator_stddev_ms', ''))}"
             f" speedup={compact_number(summary.get('speedup_vs_official_operator', ''))}"
-            f" speedup_vs_bank={compact_number(summary.get('speedup_vs_bank_seed', ''))}"
             f" delta={compact_number(summary.get('latency_change_pct_vs_official_operator', ''))}%"
+            f" noise={compact_number(summary.get('official_operator_noise_threshold_pct', ''))}%"
         )
-        print(f"  decision={clean(summary.get('selection_reason', ''))}")
+        cause = "/".join(
+            value
+            for value in (
+                clean(candidate.get("search_bottleneck", "")),
+                clean(candidate.get("search_guidance", "")),
+            )
+            if value != "NA"
+        )
+        if cause:
+            print(f"  selected_by={cause}")
 
     ordered = ("improved", "within_noise", "regressed")
     totals = " ".join(f"{key}={verdicts.pop(key, 0)}" for key in ordered)

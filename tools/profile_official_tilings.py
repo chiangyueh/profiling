@@ -39,6 +39,10 @@ PROFILE_COLUMNS = [
     "search_model_confidence", "search_history_match",
     "callback_tiling_sha256", "callback_derived_diff_vs_default",
     "callback_derived_diff_vs_bank_seed",
+    "tiling_official_callback_ms", "tiling_runtime_kb_seed_ms",
+    "tiling_solver_select_ms", "tiling_solver_callback_ms",
+    "tiling_solver_callback_count", "tiling_solver_extra_ms",
+    "tiling_solver_total_ms",
     "measurement_source",
 ]
 SAMPLE_COLUMNS = ["workload_id", "rank", "candidate_role", "sample", "latency_ms"]
@@ -1333,6 +1337,13 @@ def candidate_profile(
         "callback_tiling_sha256": "callback_tiling_sha256",
         "callback_derived_diff_vs_default": "callback_derived_diff_vs_default",
         "callback_derived_diff_vs_bank_seed": "callback_derived_diff_vs_bank_seed",
+        "tiling_official_callback_ms": "tiling_official_callback_ms",
+        "tiling_runtime_kb_seed_ms": "tiling_runtime_kb_seed_ms",
+        "tiling_solver_select_ms": "tiling_solver_select_ms",
+        "tiling_solver_callback_ms": "tiling_solver_callback_ms",
+        "tiling_solver_callback_count": "tiling_solver_callback_count",
+        "tiling_solver_extra_ms": "tiling_solver_extra_ms",
+        "tiling_solver_total_ms": "tiling_solver_total_ms",
     }
     for destination, origin in mapping.items():
         result[destination] = candidate.get(origin, "")
@@ -2169,10 +2180,9 @@ def main() -> int:
                 if show_progress:
                     print(
                         f"candidate_start [{candidate_index}/{searched_count}] "
-                        f"{workload_id} rank={rank} "
+                        f"{workload_id} "
                         f"cause={candidate.get('search_bottleneck', '')}/"
                         f"{candidate.get('search_guidance', '')} "
-                        f"model={candidate.get('search_model_ratio_vs_bank_seed', '')} "
                         f"resume={candidate.get('search_resume_policy', '')} "
                         f"{schedule_text(candidate, knowledge)}",
                         flush=True,
@@ -2290,11 +2300,10 @@ def main() -> int:
                     )
                     print(
                         f"candidate_done [{candidate_index}/{searched_count}] "
-                        f"{workload_id} rank={rank} {schedule_text(candidate, knowledge)} "
+                        f"{workload_id} {schedule_text(candidate, knowledge)} "
                         f"ms={compact(candidate_ms)} std={compact(as_float(profiled, 'stddev_ms'))} "
                         f"speedup_vs_official={compact(official_speedup)} "
                         f"speedup_vs_bank={compact(bank_speedup)} "
-                        f"model_ratio={candidate.get('search_model_ratio_vs_bank_seed', 'NA')} "
                         f"delta_vs_bank={compact(delta_pct)}% "
                         f"noise={compact(noise_pct)}% "
                         f"status_vs_bank={status} "
@@ -2310,7 +2319,7 @@ def main() -> int:
             )
             has_best = math.isfinite(best_ms)
             print(
-                f"WORKLOAD_RESULT {workload_id} best_rank={best_rank or 'none'} "
+                f"WORKLOAD_RESULT {workload_id} "
                 f"best_ms={compact(best_ms) if has_best else 'NA'} "
                 f"bank_control_ms={compact(bank_control_ms)} "
                 f"official_ms={compact(as_float(official_baseline, 'median_ms'))} "

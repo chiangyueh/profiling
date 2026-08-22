@@ -1,0 +1,110 @@
+{
+  "schema": "non_matmul_original_strategy_collection_v1",
+  "purpose": "Collect finite candidates emitted by original non-MatMul operator strategy code. A candidate is never a manually assembled tiling or a Cartesian combination of tiling fields.",
+  "target": {
+    "soc": "Ascend910B3",
+    "cann_version": "8.1.RC1"
+  },
+  "collection_contract": {
+    "matmul_included": false,
+    "candidate_unit": "one isolated execution of one original source strategy with the unchanged operator TilingContext",
+    "accepted_candidate": "the original strategy returns success, the resulting operator execution completes, and its output passes the reference comparison",
+    "deduplication": "only after recording the source strategy and the complete raw tiling identity; until raw identity extraction is available, retain attempts rather than pretending that two strategies are identical",
+    "forbidden": [
+      "altering a tile, block dimension, workspace size, or tiling key after source generation",
+      "enumerating tile-field products",
+      "using RuntimeKb, a callback, CCE measurements, or a cost model to choose a candidate",
+      "treating blockDim as co-running-core contention",
+      "inventing L2/cache observations"
+    ],
+    "record_from_source_or_runtime": [
+      "operator source strategy identifier",
+      "source strategy priority or dispatch branch",
+      "original tiling success/failure",
+      "tiling key, block dimension, workspace and raw tiling digest when exposed by the source/runtime",
+      "reference-comparison result",
+      "device-event latency only after correctness succeeds"
+    ]
+  },
+  "sources": {
+    "cann_ops_adv": {
+      "url": "https://gitee.com/ascend/cann-ops-adv.git",
+      "tag": "v1.0-8.1.RC1.alpha001",
+      "commit": "d9b54c8395cfa31ab5c35cfa4225e0fb35ee5553",
+      "local_cache_hint": "/usr/local/Ascend/.source_cache/cann-ops-adv-8.1rc1"
+    },
+    "cann_ops": {
+      "url": "https://gitee.com/ascend/cann-ops.git",
+      "commit": "c214b710edbe24017dc7dc92170a50bd8ff38171",
+      "local_cache_hint": "/usr/local/Ascend/.source_cache/cann-ops-8.1rc1"
+    },
+    "extracted_installed_source": {
+      "local_cache_hint": "/home/CCE_EXTRACT/ops_cce",
+      "provenance": "source extracted from the installed operator package; used only where the public 8.1 source does not expose the matching 910B implementation"
+    }
+  },
+  "operators": {
+    "flash_attention_score_grad": {
+      "source": "cann_ops_adv",
+      "relative_root": "src/transformer/flash_attention_score_grad",
+      "status": "collector_overlay_ready",
+      "registration_macro": "REGISTER_TILING_TEMPLATE",
+      "registration_operator": "FlashAttentionScoreGrad",
+      "expected_strategy_count": 8,
+      "pinned_files": {
+        "ophost/flash_attention_score_grad_tiling.cpp": "ecd77bd3de27e48d5184d97eb635ede20183d5841af3d69342f06e2578115e4a",
+        "ophost/flash_attention_score_grad_tiling_bngs1s2_b.cpp": "b4b927d8eede05cb7570ed14c669cb0bbc55d8241313813bea1e8af457baa05c",
+        "ophost/flash_attention_score_grad_tiling_ngs1s2_bn.cpp": "f23e5607920676caa882a0916df67986ea3c855b0d8b1bd2b18a2d53878ce389",
+        "ophost/flash_attention_score_grad_tiling_s1s2_bn2.cpp": "c7a00c521cb978fadbb575284c4e3d09eb9ac654da5348f2408d8854e48ae07b",
+        "ophost/flash_attention_score_grad_tiling_s1s2_bn2gs1s2.cpp": "a71ed86aee024855f155659ae30c412656efc9b3b8c95374800c205d4f751769",
+        "ophost/flash_attention_score_grad_tiling_s1s2_bn2gs1s2_sab.cpp": "e2f2039154724a09e36599cbc799fa304354eb7f9eb0c4709209717121167ef0",
+        "ophost/flash_attention_score_grad_tiling_unpadded_attension.cpp": "998aa5b42fe6ecb651bcdd02a20373314e2edbb2cbc04c765def4561be3e9548"
+      },
+      "overlay_method": "disable only the other source registration invocations; do not edit strategy classes, predicates, dispatcher, kernel, or generated tiling fields"
+    },
+    "fused_infer_attention_score": {
+      "source": "cann_ops_adv",
+      "relative_root": "src/transformer/fused_infer_attention_score",
+      "status": "native_dispatch_inventory_ready",
+      "pinned_files": {
+        "ophost/fused_infer_attention_score_tiling.cpp": "0d1e75dca04281714ce066a0a7632e9d1fc58b15fb9a443edae275708b4a67ce"
+      },
+      "native_dispatch": [
+        "incre_flash_attention_adapter_when_original_sequence_predicate_is_true",
+        "prompt_flash_attention_when_original_sequence_predicate_is_false"
+      ],
+      "note": "These are source-selected algorithm branches. They are recorded as separate source paths, not force-run as interchangeable tilings for an invalid semantic shape."
+    },
+    "scatter_elements_v2": {
+      "source": "cann_ops",
+      "relative_root": "src/index/scatter_elements_v2",
+      "status": "single_original_tiler_inventory_ready",
+      "pinned_files": {
+        "op_host/scatter_elements_v2_tiling.cc": "af4fa87f4760e73b93a31a301827e9e2c286c58f3ff32a0be7344adf2c5543f7"
+      },
+      "native_dispatch": ["ScatterElementsV2Tiling::RunKernelTiling"],
+      "note": "The pinned source exposes one tiler. The campaign records exactly one source candidate per semantic workload; it does not manufacture alternatives."
+    },
+    "gather_elements_v2": {
+      "source": "extracted_installed_source",
+      "relative_root": "gather_elements_v2",
+      "status": "two_source_predicates_inventory_ready",
+      "pinned_files": {
+        "op_host/gather_elements_v2_tiling.cpp": "c7bb8d76d1741b5c3212a8de9f28bf6f9de5fe2f7d012bfa90780b25e6f12793"
+      },
+      "native_dispatch": [
+        "GatherElementsV2Tiling::SetKernelTiling_for_non_last_axis",
+        "GatherElementsV2LastDimTiling_for_last_axis"
+      ],
+      "note": "The two paths are selected by the original axis predicate. For any one semantic axis only its original path is eligible."
+    },
+    "transpose": {
+      "status": "blocked_missing_matching_910b_tiling_source",
+      "reason": "The extracted source tree has no matching 910B tiling implementation. Relabelling an arch or changing headers would not be source-preserving."
+    },
+    "gather_v2": {
+      "status": "blocked_no_910b_source_route",
+      "reason": "The extracted source explicitly lacks an Ascend910B source route. It must not be faked by a header/CMake change."
+    }
+  }
+}

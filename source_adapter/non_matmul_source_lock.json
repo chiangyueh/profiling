@@ -9,7 +9,7 @@
     "matmul_included": false,
     "candidate_unit": "one isolated execution of one original source strategy with the unchanged operator TilingContext",
     "accepted_candidate": "the original strategy returns success, the resulting operator execution completes, and its output passes the reference comparison",
-    "deduplication": "only after recording the source strategy and the complete raw tiling identity; until raw identity extraction is available, retain attempts rather than pretending that two strategies are identical",
+    "deduplication": "after the isolated original source strategy reports the complete raw tiling identity (tiling key, block dimension, byte count and raw digest); identical identities are measured once and linked to every strategy that generated them",
     "forbidden": [
       "altering a tile, block dimension, workspace size, or tiling key after source generation",
       "enumerating tile-field products",
@@ -60,7 +60,7 @@
         "ophost/flash_attention_score_grad_tiling_s1s2_bn2gs1s2_sab.cpp": "e2f2039154724a09e36599cbc799fa304354eb7f9eb0c4709209717121167ef0",
         "ophost/flash_attention_score_grad_tiling_unpadded_attension.cpp": "998aa5b42fe6ecb651bcdd02a20373314e2edbb2cbc04c765def4561be3e9548"
       },
-      "overlay_method": "disable only the other source registration invocations; do not edit strategy classes, predicates, dispatcher, kernel, or generated tiling fields"
+      "overlay_method": "disable only the other source registration invocations; do not edit strategy classes, predicates, kernel, or generated tiling fields. Add one audit-only return-status passthrough at the common entry to report already-generated raw tiling identity without changing context or dispatch result."
     },
     "fused_infer_attention_score": {
       "source": "cann_ops_adv",

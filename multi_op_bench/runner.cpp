@@ -19,6 +19,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -116,6 +117,11 @@ public:
         auto it = values_.find(name);
         if (it == values_.end()) throw std::runtime_error("missing --" + name);
         return it->second;
+    }
+
+    bool Has(const std::string &name) const
+    {
+        return values_.find(name) != values_.end();
     }
 
     int64_t Int(const std::string &name) const
@@ -310,7 +316,80 @@ struct Measurement {
     std::vector<double> samplesMs;
     uint64_t probeBytes = 0;
     uint64_t probeNonzeroBytes = 0;
+    uint64_t outputBytes = 0;
+    uint64_t outputDigest = 0;
+    bool outputReferenceChecked = false;
+    bool outputReferenceEqual = false;
 };
+
+uint64_t Fnv1a64(const std::vector<uint8_t> &data)
+{
+    uint64_t value = 1469598103934665603ULL;
+    for (uint8_t byte : data) {
+        value ^= byte;
+        value *= 1099511628211ULL;
+    }
+    return value;
+}
+
+void FillAttentionPattern(DeviceBuffer &buffer, aclDataType dtype, uint64_t count, uint32_t pattern)
+{
+    if (dtype == ACL_FLOAT) {
+        std::vector<float> host(count);
+        for (uint64_t index = 0; index < count; ++index) {
+            host[index] = (static_cast<float>((index + pattern) % 7U) + 1.0F) / 16.0F;
+        }
+        buffer.CopyFrom(host);
+        return;
+    }
+    if (dtype == ACL_FLOAT16 || dtype == ACL_BF16) {
+        // These are finite, positive, normal values in the two IEEE-like
+        // encodings. The input pattern is for correctness comparison only; it
+        // is never included in a timing interval.
+        const uint16_t fp16[] = {0x3000U, 0x3400U, 0x3800U, 0x3A00U, 0x3C00U, 0x3D00U, 0x3E00U};
+        const uint16_t bf16[] = {0x3E00U, 0x3E40U, 0x3E80U, 0x3EA0U, 0x3EC0U, 0x3F00U, 0x3F20U};
+        const uint16_t *table = dtype == ACL_FLOAT16 ? fp16 : bf16;
+        std::vector<uint16_t> host(count);
+        for (uint64_t index = 0; index < count; ++index) host[index] = table[(index + pattern) % 7U];
+        buffer.CopyFrom(host);
+        return;
+    }
+    throw std::runtime_error("attention pattern requires fp16, bf16, or fp32");
+}
+
+std::vector<uint8_t> SnapshotOutputs(const std::vector<const DeviceBuffer *> &outputs)
+{
+    std::vector<uint8_t> all;
+    for (const DeviceBuffer *output : outputs) {
+        const std::vector<uint8_t> part = output->CopyTo<uint8_t>();
+        const uint64_t size = static_cast<uint64_t>(part.size());
+        for (int byte = 0; byte < 8; ++byte) all.push_back(static_cast<uint8_t>((size >> (byte * 8)) & 0xFFU));
+        all.insert(all.end(), part.begin(), part.end());
+    }
+    return all;
+}
+
+void WriteReference(const std::string &path, const std::vector<uint8_t> &data)
+{
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream) throw std::runtime_error("cannot create output reference: " + path);
+    stream.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+    if (!stream) throw std::runtime_error("cannot write output reference: " + path);
+}
+
+std::vector<uint8_t> ReadReference(const std::string &path)
+{
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream) throw std::runtime_error("cannot read output reference: " + path);
+    const std::streamsize size = stream.tellg();
+    if (size < 0) throw std::runtime_error("cannot determine output reference size: " + path);
+    stream.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    if (size > 0 && !stream.read(reinterpret_cast<char *>(data.data()), size)) {
+        throw std::runtime_error("cannot read complete output reference: " + path);
+    }
+    return data;
+}
 
 template <class GetWorkspace, class Launch>
 Measurement Measure(aclrtStream stream, int warmup, int samples, DeviceBuffer &output,
@@ -573,6 +652,19 @@ Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream
     DeviceBuffer dy(Elements(qShape), dtype), attention(Elements(qShape), dtype);
     DeviceBuffer softmaxMax(Elements(softmaxShape), ACL_FLOAT), softmaxSum(Elements(softmaxShape), ACL_FLOAT);
     DeviceBuffer dq(Elements(qShape), dtype), dk(Elements(kvShape), dtype), dv(Elements(kvShape), dtype);
+    // A non-zero deterministic input makes a cross-overlay comparison
+    // meaningful. It is populated before warmup/measurement and is never
+    // included in the device-event interval.
+    FillAttentionPattern(q, dtype, Elements(qShape), 0);
+    FillAttentionPattern(k, dtype, Elements(kvShape), 1);
+    FillAttentionPattern(v, dtype, Elements(kvShape), 2);
+    FillAttentionPattern(dy, dtype, Elements(qShape), 3);
+    FillAttentionPattern(attention, dtype, Elements(qShape), 4);
+    std::vector<float> maxValues(Elements(softmaxShape));
+    for (uint64_t index = 0; index < maxValues.size(); ++index) {
+        maxValues[index] = (static_cast<float>(index % 5U) + 1.0F) / 8.0F;
+    }
+    softmaxMax.CopyFrom(maxValues);
     std::vector<float> sumValues(Elements(softmaxShape), 1.0F);
     softmaxSum.CopyFrom(sumValues);
     Tensor qTensor(q, dtype, qShape), kTensor(k, dtype, kvShape), vTensor(v, dtype, kvShape);
@@ -582,18 +674,40 @@ Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream
     std::vector<char> layoutText(layout.begin(), layout.end());
     layoutText.push_back('\0');
     const double scale = 1.0 / std::sqrt(static_cast<double>(headDim));
-    return Measure(stream, warmup, samples, dq,
-        [&](uint64_t *workspace, aclOpExecutor **executor) {
-            return aclnnFlashAttentionScoreGradGetWorkspaceSize(
-                qTensor.Get(), kTensor.Get(), vTensor.Get(), dyTensor.Get(),
-                nullptr, nullptr, nullptr, nullptr, maxTensor.Get(), sumTensor.Get(), nullptr, attentionTensor.Get(),
-                nullptr, scale, 1.0, std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max(),
-                qHeads, layoutText.data(), 0, 0, dqTensor.Get(), dkTensor.Get(), dvTensor.Get(), nullptr,
-                workspace, executor);
-        },
-        [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
-            return aclnnFlashAttentionScoreGrad(workspace, bytes, executor, launchStream);
-        });
+    const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
+        return aclnnFlashAttentionScoreGradGetWorkspaceSize(
+            qTensor.Get(), kTensor.Get(), vTensor.Get(), dyTensor.Get(),
+            nullptr, nullptr, nullptr, nullptr, maxTensor.Get(), sumTensor.Get(), nullptr, attentionTensor.Get(),
+            nullptr, scale, 1.0, std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max(),
+            qHeads, layoutText.data(), 0, 0, dqTensor.Get(), dkTensor.Get(), dvTensor.Get(), nullptr,
+            workspace, executor);
+    };
+    const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+        return aclnnFlashAttentionScoreGrad(workspace, bytes, executor, launchStream);
+    };
+    if (args.Has("source-tiling-only")) {
+        // This invokes the original host-side tiling path once and exits before
+        // allocating workspace or launching a kernel. The isolated overlay's
+        // audit-only passthrough writes the raw tiling identity to its temporary
+        // path; this is the finite-candidate discovery phase, not a latency.
+        Measurement result;
+        Executor executor;
+        Stage("source_tiling_get_workspace_begin");
+        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "FASG source tiling GetWorkspaceSize");
+        if (executor.ptr == nullptr) throw std::runtime_error("FASG source tiling returned null executor");
+        Stage("source_tiling_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
+        return result;
+    }
+    Measurement result = Measure(stream, warmup, samples, dq, getWorkspace, launch);
+    const std::vector<uint8_t> snapshot = SnapshotOutputs({&dq, &dk, &dv});
+    result.outputBytes = snapshot.size();
+    result.outputDigest = Fnv1a64(snapshot);
+    if (args.Has("write-reference")) WriteReference(args.Get("write-reference"), snapshot);
+    if (args.Has("compare-reference")) {
+        result.outputReferenceChecked = true;
+        result.outputReferenceEqual = snapshot == ReadReference(args.Get("compare-reference"));
+    }
+    return result;
 }
 
 Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream stream, int warmup, int samples)
@@ -711,7 +825,12 @@ int main(int argc, char **argv)
             std::cout << std::setprecision(12) << result.samplesMs[i];
         }
         std::cout << "],\"output_probe_bytes\":" << result.probeBytes
-                  << ",\"output_probe_nonzero_bytes\":" << result.probeNonzeroBytes << "}" << std::endl;
+                  << ",\"output_probe_nonzero_bytes\":" << result.probeNonzeroBytes
+                  << ",\"output_bytes\":" << result.outputBytes
+                  << ",\"output_digest_fnv1a64\":" << result.outputDigest
+                  << ",\"output_reference_checked\":" << (result.outputReferenceChecked ? "true" : "false")
+                  << ",\"output_reference_equal\":" << (result.outputReferenceEqual ? "true" : "false")
+                  << "}" << std::endl;
         Stage("process_exit", "isolated_worker_exit_without_global_device_reset");
         std::_Exit(0);
     } catch (const std::exception &error) {

@@ -3,10 +3,13 @@
 
 Each overlay is a new git worktree at the pinned public source revision.  It
 keeps exactly one original `REGISTER_TILING_TEMPLATE` registration and disables
-the other registrations.  No strategy class, predicate, dispatcher, kernel, or
-generated tiling field is changed.  Therefore a failed overlay means that the
-chosen original strategy rejected the original TilingContext; it is not
-converted into a synthetic candidate.
+the other registrations. No strategy class, predicate, kernel, or generated
+tiling field is changed. The FASG entry has one audit-only status passthrough:
+after the original dispatcher returns, it records the already-generated raw
+tiling identity only when a temporary audit-path environment variable is set.
+It never changes the context or return status. Therefore a failed overlay means
+that the chosen original strategy rejected the original TilingContext; it is
+not converted into a synthetic candidate.
 
 This script only creates source overlays and JSON manifests.  It neither
 downloads source nor compiles, launches, resets, or otherwise calls an NPU.
@@ -30,6 +33,69 @@ OP = LOCK["operators"]["flash_attention_score_grad"]
 SOURCE = LOCK["sources"]["cann_ops_adv"]
 MACRO = OP["registration_macro"]
 OPERATOR = OP["registration_operator"]
+ENTRY_RELATIVE = Path(OP["relative_root"]) / "ophost/flash_attention_score_grad_tiling.cpp"
+AUDIT_SENTINEL = "FASG_SOURCE_TILING_AUDIT_V1"
+
+
+def instrument_entry_source(source: str) -> str:
+    """Add an audit record while returning the original dispatcher status."""
+    if AUDIT_SENTINEL in source:
+        return source
+    original = """ASCENDC_EXTERN_C ge::graphStatus TilingFlashAttentionGradScore(gert::TilingContext *context)
+{
+    if (CheckParams(context) != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+    if (IsEmptyOutput(context)) {
+        FlashAttentionScoreGradTiling flashAttentionScoreGradTiling;
+        return flashAttentionScoreGradTiling.RunEmptyTiling(context);
+    } else {
+        return TilingRegistry::GetInstance().DoTilingImpl(context);
+    }
+}"""
+    replacement = r"""// FASG_SOURCE_TILING_AUDIT_V1: observational only; no tiling state is modified.
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+
+static uint64_t FASGSourceAuditHash(const uint8_t *data, size_t size)
+{
+    uint64_t value = 1469598103934665603ULL;
+    for (size_t index = 0; index < size; ++index) { value ^= data[index]; value *= 1099511628211ULL; }
+    return value;
+}
+
+static ge::graphStatus FASGSourceAuditResult(gert::TilingContext *context, ge::graphStatus status)
+{
+    const char *path = std::getenv("FASG_TILING_AUDIT_PATH");
+    if (path == nullptr || context == nullptr) { return status; }
+    auto *raw = context->GetRawTilingData();
+    const size_t rawSize = raw == nullptr ? 0U : raw->GetDataSize();
+    const auto *rawBytes = raw == nullptr ? nullptr : static_cast<const uint8_t *>(raw->GetData());
+    const uint64_t digest = rawBytes == nullptr ? 0ULL : FASGSourceAuditHash(rawBytes, rawSize);
+    std::FILE *output = std::fopen(path, "a");
+    if (output != nullptr) {
+        std::fprintf(output, "{\"schema\":\"fasg_raw_tiling_observation_v1\",\"status\":%d,\"tiling_key\":%llu,\"block_dim\":%u,\"raw_bytes\":%llu,\"raw_fnv1a64\":%llu}\n",
+                     static_cast<int>(status), static_cast<unsigned long long>(context->GetTilingKey()),
+                     context->GetBlockDim(), static_cast<unsigned long long>(rawSize),
+                     static_cast<unsigned long long>(digest));
+        std::fclose(output);
+    }
+    return status;
+}
+
+ASCENDC_EXTERN_C ge::graphStatus TilingFlashAttentionGradScore(gert::TilingContext *context)
+{
+    if (CheckParams(context) != ge::GRAPH_SUCCESS) { return FASGSourceAuditResult(context, ge::GRAPH_FAILED); }
+    if (IsEmptyOutput(context)) {
+        FlashAttentionScoreGradTiling flashAttentionScoreGradTiling;
+        return FASGSourceAuditResult(context, flashAttentionScoreGradTiling.RunEmptyTiling(context));
+    }
+    return FASGSourceAuditResult(context, TilingRegistry::GetInstance().DoTilingImpl(context));
+}"""
+    if source.count(original) != 1:
+        raise RuntimeError("cannot locate the exact original FASG tiling entry for instrumentation")
+    return source.replace(original, replacement)
 
 
 def digest(path: Path) -> str:
@@ -144,31 +210,67 @@ def overlay_source(text: str, rows: list[Registration], selected: Registration, 
     return text
 
 
-def modified_ranges_only_registrations(before: str, after: str, rows: list[Registration],
-                                       selected: Registration, relative: Path) -> bool:
-    # The replacement has a different length. Verify by reconstructing the one
-    # allowed transformation rather than relying on a diff heuristic. `selected`
-    # may belong to another source file, in which case every registration in this
-    # file must be disabled.
-    return overlay_source(before, rows, selected, relative) == after
+def allowed_overlay_source(before: str, rows: list[Registration], selected: Registration,
+                           relative: Path) -> str:
+    """Return the only permitted source content for one overlay file."""
+    after = overlay_source(before, rows, selected, relative)
+    if relative == ENTRY_RELATIVE:
+        after = instrument_entry_source(after)
+    return after
+
+
+def existing_overlay(source_root: Path, output: Path, selected: Registration,
+                     rows: list[Registration]) -> dict[str, object] | None:
+    """Return a verified existing overlay, or None when it has not been made.
+
+    This makes a stopped source-preparation stage resumable without accepting a
+    partially edited worktree. `version.info` is deliberately not checked here:
+    the package builder may have made its separately attested compatibility-only
+    metadata edit there. Every registration source plus the one audit entry
+    source must still equal the allowed collector transformation exactly.
+    """
+    if not output.exists():
+        return None
+    manifest_path = output / "source_candidate_overlay.json"
+    if not manifest_path.is_file():
+        raise RuntimeError("existing overlay has no provenance manifest: {}".format(output))
+    metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
+    required = {
+        "official_commit": SOURCE["commit"],
+        "strategy_class": selected.source_class,
+        "strategy_priority": selected.priority,
+        "algorithm_source_changes": False,
+    }
+    if any(metadata.get(key) != value for key, value in required.items()):
+        raise RuntimeError("existing overlay provenance does not match requested strategy: {}".format(output))
+    affected = {row.relative_path for row in rows} | {ENTRY_RELATIVE}
+    for relative in sorted(affected):
+        expected = allowed_overlay_source((source_root / relative).read_text(encoding="utf-8"), rows, selected, relative)
+        actual = (output / relative).read_text(encoding="utf-8")
+        if actual != expected:
+            raise RuntimeError("existing overlay source differs outside the allowed registration isolation: {}".format(
+                output / relative))
+    metadata["resumed_existing_overlay"] = True
+    return metadata
 
 
 def write_overlay(source_root: Path, output_parent: Path, selected: Registration, rows: list[Registration]) -> dict[str, object]:
     output = output_parent / ("fasg_" + selected.source_class.lower())
-    if output.exists():
-        raise RuntimeError("refuse to overwrite existing overlay: {}".format(output))
+    existing = existing_overlay(source_root, output, selected, rows)
+    if existing is not None:
+        return existing
     run(["git", "-C", str(source_root), "worktree", "add", "--detach", str(output), SOURCE["commit"]])
     changed: list[dict[str, str]] = []
-    for relative in sorted({row.relative_path for row in rows}):
+    affected = {row.relative_path for row in rows} | {ENTRY_RELATIVE}
+    for relative in sorted(affected):
         target = output / relative
         before = target.read_text(encoding="utf-8")
-        after = overlay_source(before, rows, selected, relative)
-        if not modified_ranges_only_registrations(before, after, rows, selected, relative):
-            raise RuntimeError("overlay safety check failed for {}".format(relative))
+        after = allowed_overlay_source(before, rows, selected, relative)
         if before != after:
             target.write_text(after, encoding="utf-8")
             changed.append({
                 "path": str(relative),
+                "kind": "source_tiling_observation" if relative == ENTRY_RELATIVE else "registration_isolation",
                 "sha256_before": hashlib.sha256(before.encode("utf-8")).hexdigest(),
                 "sha256_after": digest(target),
             })
@@ -189,8 +291,14 @@ def write_overlay(source_root: Path, output_parent: Path, selected: Registration
         "overlay": str(output),
         "source_status": status.splitlines(),
         "modified_registration_files": changed,
+        "instrumentation": {
+            "enabled": True,
+            "scope": "FASG entry return status plus already-generated raw tiling key/blockDim/bytes/digest",
+            "mechanism": "write one JSON line only when FASG_TILING_AUDIT_PATH is supplied",
+            "mutates_tiling_context": False,
+        },
         "algorithm_source_changes": False,
-        "candidate_rule": "run exactly this original strategy on an unchanged TilingContext; retain only success and later output-validated executions",
+        "candidate_rule": "run exactly this original strategy on an unchanged TilingContext; deduplicate only exact observed raw tiling identities and retain only later output-validated executions",
         "forbidden": LOCK["collection_contract"]["forbidden"],
     }
     (output / "source_candidate_overlay.json").write_text(

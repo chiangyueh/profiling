@@ -16,8 +16,11 @@ are **not used** by the non-MatMul collection described below.
   unchanged `TilingContext`.
 - No candidate field is edited and no tile-field Cartesian product is made.
 - Each strategy overlay retains one original registration and disables only the
-  other registrations. Strategy code, predicates, dispatchers, and kernels are
-  hash-locked.
+  other registrations. Strategy code, predicates, and kernels are hash-locked.
+  The common entry gets one audit-only return-status passthrough that records
+  the already-generated tiling key, blockDim, raw byte count, and raw digest to
+  a temporary file; it never writes a tiling field or changes the dispatcher
+  result.
 - A candidate must later execute and pass output comparison before latency is
   admitted to the training set.
 
@@ -69,7 +72,25 @@ python3 source_adapter/build_fasg_strategy_overlay.py \
 
 `--target package` is explicit and produces a source package for later
 `ASCEND_CUSTOM_OPP_PATH` execution. It is not automatically installed into the
-toolkit and it is not silently used by the old direct-ACLNN campaign.
+toolkit and it is not silently used by the old direct-ACLNN campaign. Each
+strategy must be installed into a different, initially empty custom-OPP root:
+
+```bash
+python3 source_adapter/install_fasg_strategy_package.py \
+  --build-manifest /path/outside/profiling/fasg-build-deterministic/source_candidate_build.json \
+  --destination /path/outside/profiling/custom-opp-deterministic
+```
+
+The installer refuses a non-empty destination and records the package SHA-256,
+strategy class, and `ASCEND_CUSTOM_OPP_PATH` root in a small manifest. It never
+writes under the toolkit's OPP directory.
+
+`run_non_matmul_candidate_campaign.py` is the only measurement controller for
+these overlays. It requires all eight isolated strategy-package manifests, so a
+missing strategy cannot silently reduce the candidate set to the first
+successful source route. It writes only JSONL result records and creates each
+FASG full-output reference under a temporary directory for the duration of one
+workload; no trace or output tensor is retained after the comparison.
 
 The separate semantic workload catalog is likewise source-aware and contains
 no MatMul records:
@@ -83,7 +104,30 @@ original-source strategy attempts (63 FASG geometries × 8 registered original
 strategies, plus source-native single-path workloads); the actual retained
 count is lower because unsuccessful original strategies and failed output
 comparisons are recorded as rejections, not converted into synthetic tilings.
-The campaign-wide hard ceiling remains 20,000 records.
+Before an FASG kernel is timed, the isolated source package is invoked once in
+host-side tiling-only mode. The raw identity is recorded and used to deduplicate
+identical original tilings across strategies. A distinct identity must recur in
+the subsequent timed invocation and pass full output comparison before its
+device-event latency is admitted. The campaign-wide hard ceiling remains
+20,000 records.
+
+After the one-time official source preparation, the normal NPU entry point is
+still one full command (selecting a physical device maps it to worker device
+zero):
+
+```bash
+CANN_OPS_ADV_SOURCE=/path/outside/profiling/cann-ops-adv-8.1rc1 \
+  ./run_npu.sh --mode full -d 1
+```
+
+It creates the eight isolated strategy overlays, source packages, and custom
+OPP roots under the ignored `.benchmark_state/` directory; it never modifies
+the installed toolkit.  Its only durable measurement output is the scoped
+`results/non_matmul_source_candidate_v1/<contract>/progress.jsonl`.  Each
+FASG workload has at most nine rows (one installed reference and eight original
+strategy attempts); each other semantic workload has exactly one source-native
+row.  This makes the current plan exactly 711 result rows, well below the
+20,000 ceiling, with no tile enumeration.
 
 The pinned public source is `ascend/cann-ops` commit `c214b710edbe24017dc7dc92170a50bd8ff38171`, selected because it predates the installed CANN 8.1.RC1 build.  The source tree itself and every build artifact stay outside this repository.
 

@@ -60,6 +60,11 @@ def package_subversion(cann_root: Path) -> str:
     return prefix + ".0"
 
 
+def vendor_name(strategy: str) -> str:
+    token = re.sub(r"[^a-z0-9]+", "_", strategy.lower())
+    return ("fasg_" + token)[:63].rstrip("_")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--overlay", required=True, type=Path)
@@ -68,7 +73,8 @@ def main() -> int:
     parser.add_argument("--cann-root", required=True, type=Path)
     parser.add_argument("--target", choices=("optiling", "package"), default="optiling")
     parser.add_argument("--jobs", type=int, default=1)
-    parser.add_argument("--vendor", default="fasg_source_candidate")
+    parser.add_argument("--vendor", default=None,
+                        help="isolated custom-OPP vendor name (default: derived from strategy class)")
     args = parser.parse_args()
     if args.jobs < 1:
         raise RuntimeError("--jobs must be positive")
@@ -78,10 +84,21 @@ def main() -> int:
     if not manifest_path.is_file():
         raise RuntimeError("overlay lacks source_candidate_overlay.json")
     manifest: dict[str, Any] = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("official_commit") != SOURCE["commit"] or manifest.get("algorithm_source_changes") is not False:
+    instrumentation = manifest.get("instrumentation", {})
+    audit_entry = args.overlay / "src/transformer/flash_attention_score_grad/ophost/flash_attention_score_grad_tiling.cpp"
+    if (
+        manifest.get("official_commit") != SOURCE["commit"]
+        or manifest.get("algorithm_source_changes") is not False
+        or instrumentation.get("enabled") is not True
+        or instrumentation.get("mutates_tiling_context") is not False
+        or "FASG_SOURCE_TILING_AUDIT_V1" not in audit_entry.read_text(encoding="utf-8")
+    ):
         raise RuntimeError("overlay provenance/invariant check failed")
     if not args.cann_root.is_dir():
         raise RuntimeError("CANN root does not exist: {}".format(args.cann_root))
+    selected_vendor = args.vendor or vendor_name(str(manifest["strategy_class"]))
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", selected_vendor):
+        raise RuntimeError("invalid vendor name: {}".format(selected_vendor))
 
     version_info = args.overlay / "version.info"
     original_version_digest = digest(version_info)
@@ -98,7 +115,7 @@ def main() -> int:
         "-DBUILD_OPEN_PROJECT=ON",
         "-DASCEND_COMPUTE_UNIT=ascend910b",
         "-DASCEND_OP_NAME=flash_attention_score_grad",
-        "-DVENDOR_NAME=" + args.vendor,
+        "-DVENDOR_NAME=" + selected_vendor,
         "-DCUSTOM_ASCEND_CANN_PACKAGE_PATH=" + str(args.cann_root),
     ])
     run(["cmake", "--build", str(args.build_dir), "--target", args.target,
@@ -106,16 +123,24 @@ def main() -> int:
     artifact = args.build_dir / "libcust_opmaster_rt2.0.so"
     if args.target == "optiling" and not artifact.is_file():
         raise RuntimeError("host tiling artifact is missing after successful build")
+    package_files = sorted(args.build_dir.glob("CANN-custom_ops-*.run"))
+    if args.target == "package" and len(package_files) != 1:
+        raise RuntimeError("expected exactly one source package, found {}".format(len(package_files)))
     output = {
         "schema": "fasg_original_strategy_build_v1",
         "operator": manifest["operator"],
         "strategy_class": manifest["strategy_class"],
         "strategy_priority": manifest["strategy_priority"],
         "matmul_included": False,
+        "source_tiling_observation_enabled": True,
+        "overlay_manifest_sha256": digest(manifest_path),
         "target": args.target,
+        "vendor": selected_vendor,
         "build_dir": str(args.build_dir),
         "host_tiling_artifact": str(artifact) if artifact.is_file() else None,
         "host_tiling_artifact_sha256": digest(artifact) if artifact.is_file() else None,
+        "source_package": str(package_files[0]) if package_files else None,
+        "source_package_sha256": digest(package_files[0]) if package_files else None,
         "metadata_compatibility_edit": {
             "path": str(version_info),
             "sha256_before": original_version_digest,

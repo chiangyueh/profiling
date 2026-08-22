@@ -1,0 +1,87 @@
+{
+  "schema": "source_preserving_tiling_adapter_v1",
+  "purpose": "Build and measure only tilings produced by an operator's own original source. This lock is intentionally not a performance model or a tiling database.",
+  "target": {
+    "soc": "Ascend910B3",
+    "cann_version": "8.1.RC1"
+  },
+  "invariants": {
+    "never_change_original_search": true,
+    "never_edit_candidate_tile_fields": true,
+    "never_read_cce_measurements_at_runtime": true,
+    "never_use_runtime_kb_or_callback_to_choose_a_candidate": true,
+    "candidate_identity": "source route + tiling key + exact raw tiling bytes + block dimension + workspace",
+    "deduplicate": "only exact candidate_identity duplicates may be removed",
+    "acceptance": "each candidate must pass original-reference output comparison before latency is recorded"
+  },
+  "official_source": {
+    "url": "https://gitee.com/ascend/cann-ops.git",
+    "commit": "c214b710edbe24017dc7dc92170a50bd8ff38171",
+    "selected_because": "latest public commit dated before the installed CANN 8.1.RC1 build timestamp",
+    "local_cache_hint": "/usr/local/Ascend/.source_cache/cann-ops-8.1rc1"
+  },
+  "operators": {
+    "mat_mul_v3": {
+      "source": "official_open",
+      "relative_root": "src/matmul/mat_mul_v3",
+      "status": "eligible_after_minimal_build_overlay",
+      "original_routes": [
+        "ALL",
+        "BASE",
+        "SINGLE_CORE_SPLIT_K",
+        "DETERMINISTIC_SPLIT_K"
+      ],
+      "all_route_semantics": "first successful original heuristic only; it is not a candidate enumerator",
+      "multi_tiling_method": "invoke each existing non-ALL route in an independent original tiling context; keep only distinct successful raw tilings",
+      "forbidden": [
+        "changing DoSelectTiling order or predicates",
+        "changing any MatmulTilingData field after original tiling",
+        "synthesizing a tile from a cost model",
+        "calling RuntimeKb or a callback to select a candidate"
+      ],
+      "pinned_files": {
+        "op_host/mat_mul_v3_base_tiling.cpp": "446b290eea0ab92b65301cc7c65d3e5b30afa13755e1bed571e7e02f7b2bb158",
+        "op_host/mat_mul_v3_common.h": "6cf05fef94f4175891cf33e88bc4ee8fe262b0abcac1eb4f61c726163041488e",
+        "op_host/mat_mul_v3_base_tiling.h": "62636bbb9fdcc75c3a308b19c2a9d97fd9270d533e4e3951714e99822123cb4f",
+        "op_host/mat_mul_v3_tiling.cpp": "387a8d514ddd68f5802042626aa7b22d4ba60d30811f6d5ad6b4f6d4e594fdd8",
+        "../../common/inc/tiling/tiling_base.h": "d3f1a16c97460b7902bf45fbbf1035c090adbb748536adebb92875f4261f33b2"
+      }
+    },
+    "scatter_elements_v2": {
+      "source": "official_open",
+      "relative_root": "src/index/scatter_elements_v2",
+      "status": "source_build_preflight_required",
+      "multi_tiling_method": "only modes or schedules already selected by its original source; no field-level edits"
+    },
+    "gather_elements_v2": {
+      "source": "extracted_original",
+      "relative_root": "gather_elements_v2",
+      "status": "source_build_preflight_required",
+      "multi_tiling_method": "only source-exposed original modes; reject if no distinct source tilings exist"
+    },
+    "flash_attention_score_grad": {
+      "source": "extracted_original",
+      "relative_root": "flash_attention_score_grad",
+      "status": "source_build_preflight_required",
+      "multi_tiling_method": "only source-exposed original modes; reject if no distinct source tilings exist"
+    },
+    "fused_infer_attention_score": {
+      "source": "extracted_original",
+      "relative_root": "fused_infer_attention_score",
+      "status": "source_build_preflight_required",
+      "multi_tiling_method": "only source-exposed original modes; reject if no distinct source tilings exist"
+    },
+    "transpose": {
+      "source": "extracted_original",
+      "relative_root": "transpose",
+      "status": "blocked_missing_910b_tiling_source",
+      "reason": "the extracted tree contains arch35 tiling code but no matching 910B/arch32 tiling implementation; changing a header or CMake label would not make that source valid"
+    },
+    "gather_v2": {
+      "source": "extracted_original",
+      "relative_root": "gather_v2",
+      "status": "blocked_no_910b_source_route",
+      "reason": "the extracted source explicitly treats Ascend910B as unsupported for this route; do not fake support by changing headers"
+    }
+  }
+}

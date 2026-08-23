@@ -337,6 +337,64 @@ def source_environment(base: dict[str, str], package: dict[str, Any], candidate:
     return environment
 
 
+def source_audit_emitted(path: Path, package: dict[str, Any], candidate: dict[str, Any]) -> tuple[bool, str]:
+    """Confirm that this process really loaded the source host tiler.
+
+    A non-success tiling status is allowed here: the preflight is about the
+    deployment/audit path, not about admitting a particular tiling.  It must,
+    however, emit the requested context and a complete raw identity.
+    """
+    rows = read_observations(path, str(package["instrumentation"]["audit_schema"]))
+    if not rows:
+        return False, "original-source overlay emitted no audit observation"
+    for row in rows:
+        try:
+            raw_identity(row)
+        except RuntimeError:
+            continue
+        if context_matches(row, candidate, package):
+            return True, ""
+    return False, "source audit did not identify the requested source context"
+
+
+def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
+                           packages: dict[str, list[dict[str, Any]]], caps: tuple[int, ...],
+                           base_env: dict[str, str]) -> list[dict[str, Any]]:
+    """Run the smallest real-NPU deployment gate before the 20k campaign.
+
+    It covers one installed viability launch for each operator and one
+    source-tiling audit call for every source package (all eight FASG
+    registrations plus the other three dispatchers).  A failed gate ends the
+    campaign before any semantic-shape search can create repeated rejects.
+    """
+    checks: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="source_tiling_preflight_") as temporary:
+        root = Path(temporary)
+        for op in sorted(planned):
+            workload = planned[op][0]
+            result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0), base_env)
+            reference_ok = rc == 0 and result.get("status") == "success"
+            checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "installed_reference_viability",
+                           "status": "passed" if reference_ok else "failed", "worker_wall_ms": wall,
+                           "failure": None if reference_ok else compact_failure(output)})
+            if not reference_ok:
+                continue
+            for package in packages[op]:
+                candidate = candidate_descriptor(package, caps[0])
+                audit = root / (op + "_" + stable_hash({"package": package["overlay_manifest_sha256"], "candidate": candidate}) + ".jsonl")
+                result, output, wall, rc = run_worker(
+                    worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only"],
+                    source_environment(base_env, package, candidate, audit))
+                observed, reason = source_audit_emitted(audit, package, candidate)
+                source_ok = rc == 0 and result.get("status") == "success" and observed
+                checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "source_tiler_audit",
+                               "strategy": candidate["id"], "aiv_core_cap": candidate["aiv_core_cap"],
+                               "status": "passed" if source_ok else "failed", "worker_return_code": rc,
+                               "worker_status": result.get("status"), "worker_wall_ms": wall,
+                               "failure": None if source_ok else (reason if not observed else compact_failure(output))})
+    return checks
+
+
 def plan_packages(manifests: list[dict[str, Any]], catalog: Any) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for package in manifests:
@@ -385,7 +443,14 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
     discovered: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
     successful_contexts = original_contexts = heuristic_contexts = 0
-    def attempt(package: dict[str, Any], candidate: dict[str, Any], kind: str) -> None:
+    def report(anchors: list[dict[str, Any]], source_audit_missing: bool = False) -> dict[str, Any]:
+        return {"attempted_source_contexts": original_contexts + heuristic_contexts,
+                "attempted_original_source_contexts": original_contexts,
+                "attempted_hardware_rule_heuristic_contexts": heuristic_contexts,
+                "successful_source_contexts": successful_contexts, "distinct_raw_tilings": len(discovered),
+                "heuristic_anchor_count": len(anchors), "source_audit_missing": source_audit_missing}
+
+    def attempt(package: dict[str, Any], candidate: dict[str, Any], kind: str) -> bool:
         nonlocal successful_contexts, original_contexts, heuristic_contexts
         if kind == "original": original_contexts += 1
         else: heuristic_contexts += 1
@@ -393,17 +458,25 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
         result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only"],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
+        if reason == "original-source overlay emitted no audit observation":
+            failures.append(candidate_label(candidate) + ": " + reason)
+            # This is a deployment/instrumentation failure, not an invalid
+            # tiling. Retrying its remaining caps would only create duplicate
+            # rejection records and cannot produce a formal candidate.
+            return True
         if rc != 0 or result.get("status") != "success" or not context_matches(observed, candidate, package):
             failures.append(candidate_label(candidate) + ": " + (reason or compact_failure(output)))
-            return
+            return False
         successful_contexts += 1
         identity = str(observed["raw_tiling_identity"])
         entry = discovered.setdefault(identity, {"candidate": candidate, "package": package, "source_origins": [],
                                                  "source_tiling_observation": observed, "discovery_wall_ms": wall})
         entry["source_origins"].append(candidate)
+        return False
     for package in packages:
         for cap in caps:
-            attempt(package, candidate_descriptor(package, cap), "original")
+            if attempt(package, candidate_descriptor(package, cap), "original"):
+                return discovered, report([], source_audit_missing=True), failures
     anchors: list[dict[str, Any]] = []
     envelope = packages[0]["hardware_envelope_heuristic"]
     if len(discovered) < minimum and envelope["enabled"] and all(package["hardware_envelope_heuristic"] == envelope for package in packages):
@@ -412,12 +485,9 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
         for anchor in anchors:
             for divisor in envelope["divisors"]:
                 package = by_id[str(anchor["id"])]
-                attempt(package, candidate_descriptor(package, int(anchor["aiv_core_cap"]), int(divisor)), "heuristic")
-    report = {"attempted_source_contexts": original_contexts + heuristic_contexts,
-              "attempted_original_source_contexts": original_contexts, "attempted_hardware_rule_heuristic_contexts": heuristic_contexts,
-              "successful_source_contexts": successful_contexts, "distinct_raw_tilings": len(discovered),
-              "heuristic_anchor_count": len(anchors)}
-    return discovered, report, failures
+                if attempt(package, candidate_descriptor(package, int(anchor["aiv_core_cap"]), int(divisor)), "heuristic"):
+                    return discovered, report(anchors, source_audit_missing=True), failures
+    return discovered, report(anchors), failures
 
 
 def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, Any]], caps: tuple[int, ...], minimum: int,
@@ -427,6 +497,9 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
     if rc != 0 or reference.get("status") != "success" or not reference_path.is_file():
         return "rejected", {"rejection_reason": "installed reference execution failed", "failure": compact_failure(output), "worker_wall_ms": wall}
     discovered, discovery, failures = discover_group(args, workload, packages, caps, minimum, base_env, group_key, temp, catalog)
+    if discovery.get("source_audit_missing"):
+        return "rejected", {"rejection_reason": "source tiling audit was absent; this is a deployment failure, not a tiling rejection",
+                              "source_discovery": discovery, "discovery_failures": failures}
     if len(discovered) < minimum:
         return "rejected", {"rejection_reason": "fewer than 20 distinct raw tilings from the complete source search", "source_discovery": discovery, "discovery_failures": failures}
     verified: list[dict[str, Any]] = []
@@ -529,10 +602,22 @@ def main() -> int:
         "historical_latency_or_tiling_records_read": 0, "cce_data_or_cost_model_read": 0,
         "timing": {"warmup": args.warmup, "samples": args.samples, "kind": "device_event_only"},
         "no_host_timeout_or_forced_worker_kill": True, "temporary_reference_storage": "/tmp only",
+        "preflight": "one installed viability launch per operator plus one source-audit call per host-tiler package; any failure stops before semantic-shape discovery",
         "log_directory": str(args.log_dir), "log_rotation_max_bytes": MAX_LOG_BYTES,
     }
     writer.append({**begin, "record_type": "campaign_begin"})
     print("SOURCE_TILING_CAMPAIGN_BEGIN " + json.dumps(begin, ensure_ascii=False, sort_keys=True), flush=True)
+    preflight = source_audit_preflight(args, planned, packages, caps, base_env)
+    for check in preflight:
+        writer.append({"schema": SCHEMA, "record_type": "campaign_preflight", **check})
+    preflight_failures = [check for check in preflight if check["status"] != "passed"]
+    if preflight_failures:
+        failure = {"schema": SCHEMA, "record_type": "campaign_preflight_failed", "status": "failed",
+                   "failure_count": len(preflight_failures), "checks": preflight_failures,
+                   "reason": "no semantic workload discovery was started because installed viability or source-audit loading failed"}
+        writer.append(failure)
+        print("SOURCE_TILING_CAMPAIGN_PREFLIGHT_FAILED " + json.dumps(failure, ensure_ascii=False, sort_keys=True), flush=True)
+        return 2
     max_len = max(len(rows) for rows in planned.values())
     for index in range(max_len):
         for op in budgets:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import platform
 import shutil
 import sys
 from pathlib import Path
@@ -98,6 +99,9 @@ def main() -> int:
         raise RuntimeError("installed built-in OPP root is missing: {}".format(args.installed_op_impl))
     if not args.destination.is_dir() or any(args.destination.iterdir()):
         raise RuntimeError("destination must be an existing empty directory: {}".format(args.destination))
+    host_arch = platform.machine()
+    if host_arch not in ("aarch64", "x86_64"):
+        raise RuntimeError("unsupported CANN host architecture: {}".format(host_arch))
     vendor = "source_" + str(build["cmake_op_name"]).lower().replace("-", "_")
     vendor_root = args.destination / "vendors" / vendor
     destination = vendor_root / "op_impl" / "ai_core" / "tbe"
@@ -109,7 +113,10 @@ def main() -> int:
     if digest(host_master) != build.get("host_tiling_artifact_sha256") or digest(host_compat) != build.get("host_tiling_compat_artifact_sha256"):
         raise RuntimeError("host tiling artifact hash mismatches its build manifest")
     copied: list[dict[str, str]] = []
-    copied.append(copy_file(host_master, destination / "op_tiling/lib/linux/x86_64/libcust_opmaster_rt2.0.so"))
+    # CANN resolves the host tiler under the architecture of the process that
+    # calls ACLNN.  The NPU host here is aarch64; a hard-coded x86_64 path
+    # silently falls back to the installed tiler and cannot emit our audit.
+    copied.append(copy_file(host_master, destination / "op_tiling" / "lib" / "linux" / host_arch / "libcust_opmaster_rt2.0.so"))
     copied.append(copy_file(host_compat, destination / "op_tiling/liboptiling.so"))
 
     installed_tbe = args.installed_op_impl / "ai_core" / "tbe"
@@ -152,6 +159,7 @@ def main() -> int:
         # parent installation root.  Keep it explicit so the runtime cannot
         # silently fall through to the installed host tiler.
         "custom_opp_vendor_root": str(vendor_root),
+        "host_tiling_arch": host_arch,
         "source_package": str(delivery), "source_package_sha256": digest(delivery),
         "source_tiling_observation_enabled": True, "source_compile_info_core_budget_enumeration": True,
         "source_hardware_envelope_heuristic_enumeration": build["source_hardware_envelope_heuristic_enumeration"],

@@ -151,7 +151,17 @@ DeviceDoOpTilingFusedInferAttentionScore(gert::TilingContext *context)
 }'''
     if source.count(original_wrapper) != 1:
         raise RuntimeError("cannot locate FIAS source tiling entry for audit")
-    return source.replace(original_wrapper, replacement_wrapper)
+    original_incre_wrapper = '''__attribute__((visibility("default"))) ge::graphStatus DeviceDoOpTilingIncreFlashAttention(gert::TilingContext *context)
+{
+    return TilingIncreFlashAttention(context);
+}'''
+    replacement_incre_wrapper = '''__attribute__((visibility("default"))) ge::graphStatus DeviceDoOpTilingIncreFlashAttention(gert::TilingContext *context)
+{
+    return FIASSourceAuditResult(context, TilingIncreFlashAttention(context));
+}'''
+    if source.count(original_incre_wrapper) != 1:
+        raise RuntimeError("cannot locate FIAS decode source tiling entry for audit")
+    return source.replace(original_wrapper, replacement_wrapper).replace(original_incre_wrapper, replacement_incre_wrapper)
 
 
 def instrument_ifa_tiler(source: str) -> str:

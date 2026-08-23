@@ -99,7 +99,8 @@ def main() -> int:
     if not args.destination.is_dir() or any(args.destination.iterdir()):
         raise RuntimeError("destination must be an existing empty directory: {}".format(args.destination))
     vendor = "source_" + str(build["cmake_op_name"]).lower().replace("-", "_")
-    destination = args.destination / "vendors" / vendor / "op_impl" / "ai_core" / "tbe"
+    vendor_root = args.destination / "vendors" / vendor
+    destination = vendor_root / "op_impl" / "ai_core" / "tbe"
 
     host_master = Path(str(build.get("host_tiling_artifact", "")))
     host_compat = Path(str(build.get("host_tiling_compat_artifact", "")))
@@ -147,6 +148,10 @@ def main() -> int:
         "cmake_op_name": build["cmake_op_name"], "source_family": build["source_family"],
         "strategy_class": build.get("strategy_class"), "strategy_priority": build.get("strategy_priority"),
         "official_commit": build["official_commit"], "vendor": vendor, "custom_opp_root": str(root),
+        # CANN resolves a package from this vendor directory, not from the
+        # parent installation root.  Keep it explicit so the runtime cannot
+        # silently fall through to the installed host tiler.
+        "custom_opp_vendor_root": str(vendor_root),
         "source_package": str(delivery), "source_package_sha256": digest(delivery),
         "source_tiling_observation_enabled": True, "source_compile_info_core_budget_enumeration": True,
         "source_hardware_envelope_heuristic_enumeration": build["source_hardware_envelope_heuristic_enumeration"],

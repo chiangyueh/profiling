@@ -306,8 +306,13 @@ class Executor {
 public:
     ~Executor()
     {
+        // For a normal (non-repeatable) ACLNN executor, CANN consumes and
+        // releases it in the second-stage aclnnXxx call.  It is ours to
+        // destroy only when GetWorkspaceSize succeeded but no launch was
+        // made (the source-tiling-only path, or a failed launch).
         if (ptr != nullptr) aclDestroyAclOpExecutor(ptr);
     }
+    void MarkConsumedByOneShotLaunch() { ptr = nullptr; }
     aclOpExecutor *ptr = nullptr;
 };
 
@@ -432,6 +437,7 @@ Measurement Measure(aclrtStream stream, int warmup, int samples, DeviceBuffer &o
         Stage("verification_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
         Stage("verification_launch_begin");
         CheckAclnn(launch(workspace.Data(), result.workspaceBytes, executor.ptr, stream), "operator verification launch");
+        executor.MarkConsumedByOneShotLaunch();
         Stage("verification_launch_returned");
         Stage("verification_sync_begin");
         // This is an actual viability launch, not a host watchdog probe.
@@ -452,6 +458,7 @@ Measurement Measure(aclrtStream stream, int warmup, int samples, DeviceBuffer &o
         Stage("warmup_get_workspace_done", "workspace_bytes=" + std::to_string(workspaceBytes));
         Stage("warmup_launch_begin", "index=" + std::to_string(i));
         CheckAclnn(launch(workspace.Data(), workspaceBytes, executor.ptr, stream), "operator warmup launch");
+        executor.MarkConsumedByOneShotLaunch();
         Stage("warmup_launch_returned", "index=" + std::to_string(i));
         Stage("warmup_sync_begin", "index=" + std::to_string(i));
         CheckAcl(aclrtSynchronizeStream(stream), "warmup synchronize");
@@ -477,6 +484,7 @@ Measurement Measure(aclrtStream stream, int warmup, int samples, DeviceBuffer &o
             Stage("sample_begin", "index=" + std::to_string(i));
             CheckAcl(aclrtRecordEvent(start, stream), "aclrtRecordEvent start");
             CheckAclnn(launch(workspace.Data(), workspaceBytes, executor.ptr, stream), "operator sample launch");
+            executor.MarkConsumedByOneShotLaunch();
             Stage("sample_launch_returned", "index=" + std::to_string(i));
             CheckAcl(aclrtRecordEvent(end, stream), "aclrtRecordEvent end");
             Stage("sample_stream_sync_begin", "index=" + std::to_string(i));

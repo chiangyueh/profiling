@@ -215,7 +215,7 @@ def validate_custom_manifest(path: Path) -> dict[str, Any]:
         raise RuntimeError("missing custom OPP manifest: {}".format(path))
     item: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     required = ("schema", "operator", "cmake_op_name", "source_family", "official_commit", "vendor",
-                "custom_opp_root", "source_package_sha256", "source_tiling_observation_enabled",
+                "custom_opp_root", "custom_opp_vendor_root", "source_package_sha256", "source_tiling_observation_enabled",
                 "source_compile_info_core_budget_enumeration", "source_hardware_envelope_heuristic_enumeration",
                 "hardware_envelope_heuristic", "instrumentation", "overlay_manifest_sha256")
     if any(key not in item for key in required) or item["schema"] != "source_candidate_custom_opp_v1":
@@ -244,7 +244,8 @@ def validate_custom_manifest(path: Path) -> dict[str, Any]:
                                            tuple(envelope.get("divisors", ())) != (2, 4, 8) or int(envelope.get("max_anchors", 0)) < 1))):
         raise RuntimeError("custom package hardware-envelope provenance is invalid")
     custom_root = Path(str(item["custom_opp_root"]))
-    if not (custom_root / "vendors" / str(item["vendor"])).is_dir():
+    vendor_root = Path(str(item["custom_opp_vendor_root"]))
+    if vendor_root != custom_root / "vendors" / str(item["vendor"]) or not vendor_root.is_dir():
         raise RuntimeError("isolated custom OPP vendor root is missing: {}".format(custom_root))
     item["runtime_op"] = runtime_op
     compatibility = item.get("compatibility_port")
@@ -324,7 +325,10 @@ def context_matches(observation: dict[str, Any] | None, candidate: dict[str, Any
 
 def source_environment(base: dict[str, str], package: dict[str, Any], candidate: dict[str, Any], audit: Path) -> dict[str, str]:
     environment = dict(base)
-    environment["ASCEND_CUSTOM_OPP_PATH"] = str(package["custom_opp_root"])
+    # CANN loads a package from vendors/<vendor>, rather than its enclosing
+    # installation root.  Pointing at the parent silently selects the
+    # installed tiler and produces no source-audit record.
+    environment["ASCEND_CUSTOM_OPP_PATH"] = str(package["custom_opp_vendor_root"])
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
     environment[str(package["instrumentation"]["source_budget_environment"])] = str(candidate["aiv_core_cap"])
     envelope = package["hardware_envelope_heuristic"]

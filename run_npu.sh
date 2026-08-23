@@ -144,8 +144,8 @@ PACKAGE_BUILD_PARENT="${STATE}/package_builds"
 CUSTOM_OPP_PARENT="${STATE}/custom_opp"
 RUNNER_BUILD="${STATE}/runner_build"
 RESULTS="${ROOT}/results/non_matmul_source_candidate_v5/${SOURCE_ID}"
-PROGRESS="${RESULTS}/progress.jsonl"
-mkdir -p "${OVERLAY_PARENT}" "${PACKAGE_BUILD_PARENT}" "${CUSTOM_OPP_PARENT}" "${RUNNER_BUILD}" "${RESULTS}"
+LOGS="${RESULTS}/logs"
+mkdir -p "${OVERLAY_PARENT}" "${PACKAGE_BUILD_PARENT}" "${CUSTOM_OPP_PARENT}" "${RUNNER_BUILD}" "${LOGS}"
 
 echo "Non-MatMul original-source tiling candidate campaign"
 echo "  target:             physical NPU ${PHYSICAL_DEVICE} -> worker logical NPU 0"
@@ -157,10 +157,10 @@ echo "  excluded:           MatMul; Transpose/GatherV2 without matching original
 echo "  semantic workloads: about 1,200 reviewed deterministic legal geometries"
 echo "  source search:      every original dispatcher/strategy × source AIV caps 1..20; capacity heuristics only after that set is below 20 identities"
 echo "  formal group gate:  at least 20 distinct, successful, output-validated tilings per shape; complete groups only"
-echo "  formal data target: at most 20,000 output-validated device-event latency records"
+echo "  formal data target: 20,000 output-validated device-event latency records (6k FASG, 6k FIAS, 4k Gather, 4k Scatter)"
 echo "  measurement:        ${WARMUP} warmups + ${SAMPLES} device-event samples; no host timeout/kill"
 echo "  build pressure:      one source host-tiler build at a time; installed dynamic device source compiles only an actually launched key"
-echo "  output:             ${PROGRESS} (JSONL only; temporary full references under /tmp)"
+echo "  output:             ${LOGS}/1.log, 2.log, ... (JSONL records; each file <= 50 MiB)"
 echo "  resume:             admitted/rejected workload groups are never rerun; only incomplete groups resume"
 
 python3 "${ROOT}/source_adapter/non_matmul_candidate_catalog.py" --audit | sed 's/^/SOURCE_CANDIDATE_CATALOG /'
@@ -277,6 +277,6 @@ cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
 cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel "${BUILD_JOBS}"
 
 PYTHONPATH="${ROOT}/multi_op_bench" python3 "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
-    --runner "${RUNNER_BUILD}/multi_op_npu_runner" --progress "${PROGRESS}" \
+    --runner "${RUNNER_BUILD}/multi_op_npu_runner" --log-dir "${LOGS}" \
     --device 0 --warmup "${WARMUP}" --samples "${SAMPLES}" \
     "${candidate_manifest_args[@]}"

@@ -31,6 +31,10 @@ ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
 SCHEMA = "non_matmul_source_candidate_measurement_v5"
+# The campaign is intentionally append-only so an interrupted physical-NPU
+# run can resume without losing its completed groups.  A single log is kept
+# below this limit; the next numeric log is opened before an oversized write.
+MAX_LOG_BYTES = 50 * 1024 * 1024
 OPERATOR_RUNTIME_NAMES = {
     "FlashAttentionScoreGrad": "flash_attention_score_grad",
     "FusedInferAttentionScore": "fused_infer_attention_score",
@@ -111,14 +115,53 @@ def compact_failure(output: str) -> str:
     return (records[-1] if records else output[-2500:])[:2500]
 
 
-def emit(handle: Any, row: dict[str, Any]) -> None:
-    encoded = json.dumps(row, ensure_ascii=False, sort_keys=True)
-    handle.write(encoded + "\n")
-    handle.flush()
-    # Keep the terminal useful during a 20k-record background campaign.  The
-    # complete per-candidate tiling identities, output checks and latency
-    # samples are retained only in progress.jsonl; echoing them would turn the
-    # terminal into hundreds of megabytes of duplicated data.
+class RotatingJsonl:
+    """Append JSON lines to numbered logs without ever exceeding 50 MiB."""
+
+    def __init__(self, directory: Path, maximum_bytes: int = MAX_LOG_BYTES) -> None:
+        self.directory = directory
+        self.maximum_bytes = maximum_bytes
+        self.directory.mkdir(parents=True, exist_ok=True)
+        numbers = [int(path.stem) for path in self.directory.glob("*.log") if path.stem.isdigit()]
+        self.index = max(numbers, default=1)
+
+    def append(self, row: dict[str, Any]) -> Path:
+        encoded = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+        if len(encoded) > self.maximum_bytes:
+            raise RuntimeError("one campaign record exceeds the 50 MiB log limit")
+        path = self.directory / f"{self.index}.log"
+        existing = path.stat().st_size if path.is_file() else 0
+        if existing and existing + len(encoded) > self.maximum_bytes:
+            self.index += 1
+            path = self.directory / f"{self.index}.log"
+        with path.open("ab") as handle:
+            handle.write(encoded)
+            handle.flush()
+        return path
+
+
+def emit(writer: RotatingJsonl, row: dict[str, Any]) -> None:
+    """Write every formal point and every candidate rejection as log records.
+
+    The workload summary is deliberately separate from its formal candidates:
+    this makes a missing candidate observable rather than silently hidden in
+    a nested progress blob, while resume still keys solely on the summary.
+    """
+    common = {"schema": row["schema"], "group_key": row["group_key"], "workload": row["workload"]}
+    for rank, candidate in enumerate(row.get("valid_latency", []), start=1):
+        writer.append({**common, "record_type": "formal_latency_candidate", "rank": rank,
+                       "candidate": candidate})
+    for phase in ("discovery", "verification", "measurement"):
+        for detail in row.get(f"{phase}_failures", []):
+            writer.append({**common, "record_type": "candidate_rejected", "phase": phase,
+                           "reason": detail})
+    summary = dict(row)
+    summary.pop("valid_latency", None)
+    summary["record_type"] = "workload"
+    writer.append(summary)
+    # Keep the terminal useful during a 20k-record background campaign.  Full
+    # identities, output checks, latency samples, and rejection causes stay
+    # in the rotating logs rather than being duplicated to the terminal.
     workload = row.get("workload", {})
     discovery = row.get("source_discovery", {})
     summary = {
@@ -132,19 +175,29 @@ def emit(handle: Any, row: dict[str, Any]) -> None:
     print("SOURCE_TILING_GROUP_RESULT " + json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
 
 
-def read_progress(path: Path) -> tuple[set[str], dict[str, int], int]:
+def iter_log_rows(directory: Path) -> Any:
+    if not directory.is_dir():
+        return
+    paths = sorted((path for path in directory.glob("*.log") if path.stem.isdigit()), key=lambda path: int(path.stem))
+    for path in paths:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    # A host interruption can leave only the final line
+                    # incomplete.  Earlier append-only records remain valid.
+                    continue
+
+
+def read_progress(directory: Path) -> tuple[set[str], dict[str, int], int]:
     completed: set[str] = set()
     admitted: dict[str, int] = {}
     rejected = 0
-    if not path.is_file():
-        return completed, admitted, rejected
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for row in iter_log_rows(directory):
         workload = row.get("workload", {})
-        if (row.get("schema") != SCHEMA or row.get("status") not in ("admitted", "rejected", "budget_skipped") or
+        if (row.get("schema") != SCHEMA or row.get("record_type") != "workload" or
+                row.get("status") not in ("admitted", "rejected", "budget_skipped") or
                 not isinstance(row.get("group_key"), str) or not isinstance(workload, dict) or
                 workload.get("op") not in RUNTIME_OPERATOR_NAMES):
             continue
@@ -371,7 +424,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
         return "rejected", {"rejection_reason": "installed reference execution failed", "failure": compact_failure(output), "worker_wall_ms": wall}
     discovered, discovery, failures = discover_group(args, workload, packages, caps, minimum, base_env, group_key, temp, catalog)
     if len(discovered) < minimum:
-        return "rejected", {"rejection_reason": "fewer than 20 distinct raw tilings from the complete source search", "source_discovery": discovery, "discovery_failures": failures[:5]}
+        return "rejected", {"rejection_reason": "fewer than 20 distinct raw tilings from the complete source search", "source_discovery": discovery, "discovery_failures": failures}
     verified: list[dict[str, Any]] = []
     verification_failures: list[str] = []
     for identity, item in discovered.items():
@@ -387,7 +440,8 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
         verified.append({**item, "verification_result": result, "verification_wall_ms": wall, "verification_tiling_observation": observed})
     if len(verified) < minimum:
         return "rejected", {"rejection_reason": "fewer than 20 distinct source tilings passed exact output validation", "source_discovery": discovery,
-                              "successful_verified_distinct_tilings": len(verified), "verification_failures": verification_failures[:5]}
+                              "successful_verified_distinct_tilings": len(verified), "discovery_failures": failures,
+                              "verification_failures": verification_failures}
     if len(verified) > ceiling:
         return "budget_skipped", {"reason": "atomic group would exceed its operator/global record ceiling", "source_discovery": discovery,
                                    "successful_verified_distinct_tilings": len(verified), "remaining_record_budget": ceiling}
@@ -413,21 +467,25 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
     if len(measured) < minimum:
         return "rejected", {"rejection_reason": "fewer than 20 source tilings completed real measurement", "source_discovery": discovery,
                               "successful_verified_distinct_tilings": len(verified), "successful_measured_distinct_tilings": len(measured),
-                              "measurement_failures": measurement_failures[:5]}
+                              "discovery_failures": failures, "verification_failures": verification_failures,
+                              "measurement_failures": measurement_failures}
     return "admitted", {"valid_latency_count": len(measured), "valid_latency": measured, "source_discovery": discovery,
-                         "rejected_candidate_count": len(measurement_failures),
+                         "discovery_failures": failures, "verification_failures": verification_failures,
+                         "measurement_failures": measurement_failures,
+                         "rejected_candidate_count": len(failures) + len(verification_failures) + len(measurement_failures),
                          "source_rule": "complete original-source candidate set, then only the package-declared source-visible capacity envelope when that set has fewer than 20 identities; failed candidates do not count; no raw-field generation"}
 
 
-def summarize(path: Path) -> dict[str, Any]:
-    _, per_op, rejected = read_progress(path)
+def summarize(directory: Path) -> dict[str, Any]:
+    _, per_op, rejected = read_progress(directory)
     return {"formal_valid_latency_records": sum(per_op.values()), "formal_valid_latency_records_per_op": per_op, "rejected_groups": rejected}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runner", required=True, type=Path)
-    parser.add_argument("--progress", required=True, type=Path)
+    parser.add_argument("--log-dir", required=True, type=Path,
+                        help="append-only numbered JSONL logs; each file is capped at 50 MiB")
     parser.add_argument("--device", required=True, type=int)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--samples", type=int, default=5)
@@ -442,8 +500,8 @@ def main() -> int:
     if minimum != 20 or not caps or sum(budgets.values()) != int(audit["formal_latency_target"]):
         raise RuntimeError("campaign requires 20 candidates per group and an exact global 20,000-record ceiling")
     packages = plan_packages([validate_custom_manifest(path) for path in args.custom_opp_manifest], catalog)
-    args.progress.parent.mkdir(parents=True, exist_ok=True)
-    completed, admitted_by_op, prior_rejected = read_progress(args.progress)
+    writer = RotatingJsonl(args.log_dir)
+    completed, admitted_by_op, prior_rejected = read_progress(args.log_dir)
     if any(admitted_by_op.get(op, 0) > budgets[op] for op in budgets):
         raise RuntimeError("existing progress exceeds a per-operator formal record ceiling")
     base_env = dict(os.environ)
@@ -459,7 +517,7 @@ def main() -> int:
                 base_env.pop(str(envelope["environment"]), None)
     runner_hash = digest_file(args.runner)
     planned = {op: [row for row in workloads if row["op"] == op] for op in budgets}
-    print("SOURCE_TILING_CAMPAIGN_BEGIN " + json.dumps({
+    begin = {
         "schema": SCHEMA, "matmul_included": False, "formal_latency_ceiling": int(audit["formal_latency_target"]),
         "formal_record_budget_per_op": budgets, "per_shape_minimum_successful_distinct_tilings": minimum,
         "candidate_collection": "complete original-source set; declared local hardware-rule capacity envelope only after original set is below 20",
@@ -467,35 +525,40 @@ def main() -> int:
         "historical_latency_or_tiling_records_read": 0, "cce_data_or_cost_model_read": 0,
         "timing": {"warmup": args.warmup, "samples": args.samples, "kind": "device_event_only"},
         "no_host_timeout_or_forced_worker_kill": True, "temporary_reference_storage": "/tmp only",
-    }, ensure_ascii=False, sort_keys=True), flush=True)
+        "log_directory": str(args.log_dir), "log_rotation_max_bytes": MAX_LOG_BYTES,
+    }
+    writer.append({**begin, "record_type": "campaign_begin"})
+    print("SOURCE_TILING_CAMPAIGN_BEGIN " + json.dumps(begin, ensure_ascii=False, sort_keys=True), flush=True)
     max_len = max(len(rows) for rows in planned.values())
-    with args.progress.open("a", encoding="utf-8") as progress:
-        for index in range(max_len):
-            for op in budgets:
-                if index >= len(planned[op]) or admitted_by_op.get(op, 0) >= budgets[op]:
-                    continue
-                workload = planned[op][index]
-                group_key = stable_hash({"workload": workload, "runner_sha256": runner_hash,
-                                         "package_manifests": [p["overlay_manifest_sha256"] for p in packages[op]],
-                                         "source_aiv_caps": caps, "minimum": minimum, "schema": SCHEMA})
-                if group_key in completed:
-                    continue
-                remaining = min(budgets[op] - admitted_by_op.get(op, 0), int(audit["formal_latency_target"]) - sum(admitted_by_op.values()))
-                if remaining < minimum:
-                    continue
-                with tempfile.TemporaryDirectory(prefix=op + "_source_tiling_") as temporary:
-                    status, details = execute_group(args, workload, packages[op], caps, minimum, remaining,
-                                                    base_env, group_key, Path(temporary), catalog)
-                row = {"schema": SCHEMA, "group_key": group_key, "status": status, "workload": workload, **details}
-                if status != "admitted":
-                    row.setdefault("valid_latency_count", 0)
-                emit(progress, row)
-                completed.add(group_key)
-                if status == "admitted":
-                    admitted_by_op[op] = admitted_by_op.get(op, 0) + int(details["valid_latency_count"])
-    print("SOURCE_TILING_CAMPAIGN_END " + json.dumps({"schema": SCHEMA, "matmul_included": False,
+    for index in range(max_len):
+        for op in budgets:
+            if index >= len(planned[op]) or admitted_by_op.get(op, 0) >= budgets[op]:
+                continue
+            workload = planned[op][index]
+            group_key = stable_hash({"workload": workload, "runner_sha256": runner_hash,
+                                     "package_manifests": [p["overlay_manifest_sha256"] for p in packages[op]],
+                                     "source_aiv_caps": caps, "minimum": minimum, "schema": SCHEMA})
+            if group_key in completed:
+                continue
+            remaining = min(budgets[op] - admitted_by_op.get(op, 0), int(audit["formal_latency_target"]) - sum(admitted_by_op.values()))
+            if remaining < minimum:
+                continue
+            with tempfile.TemporaryDirectory(prefix=op + "_source_tiling_") as temporary:
+                status, details = execute_group(args, workload, packages[op], caps, minimum, remaining,
+                                                base_env, group_key, Path(temporary), catalog)
+            row = {"schema": SCHEMA, "group_key": group_key, "status": status, "workload": workload, **details}
+            if status != "admitted":
+                row.setdefault("valid_latency_count", 0)
+            emit(writer, row)
+            completed.add(group_key)
+            if status == "admitted":
+                admitted_by_op[op] = admitted_by_op.get(op, 0) + int(details["valid_latency_count"])
+    end = {"schema": SCHEMA, "matmul_included": False,
           "status": "complete" if sum(admitted_by_op.values()) == int(audit["formal_latency_target"]) else "completed_under_atomic_ceiling",
-          "summary": summarize(args.progress), "prior_rejected_groups": prior_rejected}, ensure_ascii=False, sort_keys=True), flush=True)
+          "summary": summarize(args.log_dir), "prior_rejected_groups": prior_rejected,
+          "log_directory": str(args.log_dir), "log_rotation_max_bytes": MAX_LOG_BYTES}
+    writer.append({**end, "record_type": "campaign_end"})
+    print("SOURCE_TILING_CAMPAIGN_END " + json.dumps(end, ensure_ascii=False, sort_keys=True), flush=True)
     return 0
 
 

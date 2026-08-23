@@ -88,5 +88,9 @@ ignored `.source_cache/`, then builds serially on the NPU host. It makes no
 network request and never reads `/home/CCE_EXTRACT`. The command does not
 impose a host-side timeout or kill a
 worker. Results are written below
-`results/non_matmul_source_candidate_v5/<contract>/progress.jsonl`; generated
+`results/non_matmul_source_candidate_v5/<contract>/logs/` as append-only
+numbered JSONL logs (`1.log`, `2.log`, ...). Each log is capped at 50 MiB.
+Every formal latency point is one `formal_latency_candidate` record; every
+candidate rejection has its own `candidate_rejected` record; and each
+semantic shape ends with one resumable `workload` summary record. Generated
 sources/builds remain below ignored `.benchmark_state/`.

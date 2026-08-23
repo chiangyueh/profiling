@@ -357,6 +357,33 @@ void FillAttentionPattern(DeviceBuffer &buffer, aclDataType dtype, uint64_t coun
     throw std::runtime_error("attention pattern requires fp16, bf16, or fp32");
 }
 
+void FillGeneralPattern(DeviceBuffer &buffer, aclDataType dtype, uint64_t count, uint32_t pattern)
+{
+    if (dtype == ACL_FLOAT || dtype == ACL_FLOAT16 || dtype == ACL_BF16) {
+        FillAttentionPattern(buffer, dtype, count, pattern);
+        return;
+    }
+    if (dtype == ACL_INT32) {
+        std::vector<int32_t> values(count);
+        for (uint64_t index = 0; index < count; ++index) values[index] = static_cast<int32_t>((index + pattern) % 251U);
+        buffer.CopyFrom(values);
+        return;
+    }
+    if (dtype == ACL_INT64) {
+        std::vector<int64_t> values(count);
+        for (uint64_t index = 0; index < count; ++index) values[index] = static_cast<int64_t>((index + pattern) % 251U);
+        buffer.CopyFrom(values);
+        return;
+    }
+    if (dtype == ACL_INT8) {
+        std::vector<int8_t> values(count);
+        for (uint64_t index = 0; index < count; ++index) values[index] = static_cast<int8_t>((index + pattern) % 97U);
+        buffer.CopyFrom(values);
+        return;
+    }
+    throw std::runtime_error("unsupported deterministic tensor pattern dtype");
+}
+
 std::vector<uint8_t> SnapshotOutputs(const std::vector<const DeviceBuffer *> &outputs)
 {
     std::vector<uint8_t> all;
@@ -596,15 +623,34 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
     const int64_t axis = NormalizeAxis(args.Int("axis"), shape.size());
     const aclDataType dtype = DType(args.Get("dtype")), indexDtype = DType(args.Get("index-dtype"));
     DeviceBuffer input(Elements(shape), dtype), index(Elements(indexShape), indexDtype), output(Elements(indexShape), dtype);
+    FillGeneralPattern(input, dtype, Elements(shape), 0);
     FillIndices(index, indexDtype, Elements(indexShape), shape[axis]);
     Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape), outputTensor(output, dtype, indexShape);
-    return Measure(stream, warmup, samples, output,
-        [&](uint64_t *workspace, aclOpExecutor **executor) {
-            return aclnnGatherGetWorkspaceSize(inputTensor.Get(), axis, indexTensor.Get(), outputTensor.Get(), workspace, executor);
-        },
-        [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
-            return aclnnGather(workspace, bytes, executor, launchStream);
-        });
+    const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
+        return aclnnGatherGetWorkspaceSize(inputTensor.Get(), axis, indexTensor.Get(), outputTensor.Get(), workspace, executor);
+    };
+    const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+        return aclnnGather(workspace, bytes, executor, launchStream);
+    };
+    if (args.Has("source-tiling-only")) {
+        Measurement result;
+        Executor executor;
+        Stage("source_tiling_get_workspace_begin");
+        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "GatherElements source tiling GetWorkspaceSize");
+        if (executor.ptr == nullptr) throw std::runtime_error("GatherElements source tiling returned null executor");
+        Stage("source_tiling_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
+        return result;
+    }
+    Measurement result = Measure(stream, warmup, samples, output, getWorkspace, launch);
+    const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
+    result.outputBytes = snapshot.size();
+    result.outputDigest = Fnv1a64(snapshot);
+    if (args.Has("write-reference")) WriteReference(args.Get("write-reference"), snapshot);
+    if (args.Has("compare-reference")) {
+        result.outputReferenceChecked = true;
+        result.outputReferenceEqual = snapshot == ReadReference(args.Get("compare-reference"));
+    }
+    return result;
 }
 
 Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int warmup, int samples)
@@ -616,17 +662,37 @@ Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int wa
     const aclDataType dtype = DType(args.Get("dtype")), indexDtype = DType(args.Get("index-dtype"));
     DeviceBuffer input(Elements(shape), dtype), index(Elements(indexShape), indexDtype);
     DeviceBuffer source(Elements(indexShape), dtype), output(Elements(shape), dtype);
+    FillGeneralPattern(input, dtype, Elements(shape), 0);
+    FillGeneralPattern(source, dtype, Elements(indexShape), 17);
     FillIndices(index, indexDtype, Elements(indexShape), shape[axis]);
     Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape);
     Tensor sourceTensor(source, dtype, indexShape), outputTensor(output, dtype, shape);
-    return Measure(stream, warmup, samples, output,
-        [&](uint64_t *workspace, aclOpExecutor **executor) {
-            return aclnnScatterGetWorkspaceSize(inputTensor.Get(), axis, indexTensor.Get(), sourceTensor.Get(), reduce,
-                                                outputTensor.Get(), workspace, executor);
-        },
-        [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
-            return aclnnScatter(workspace, bytes, executor, launchStream);
-        });
+    const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
+        return aclnnScatterGetWorkspaceSize(inputTensor.Get(), axis, indexTensor.Get(), sourceTensor.Get(), reduce,
+                                            outputTensor.Get(), workspace, executor);
+    };
+    const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+        return aclnnScatter(workspace, bytes, executor, launchStream);
+    };
+    if (args.Has("source-tiling-only")) {
+        Measurement result;
+        Executor executor;
+        Stage("source_tiling_get_workspace_begin");
+        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "ScatterElements source tiling GetWorkspaceSize");
+        if (executor.ptr == nullptr) throw std::runtime_error("ScatterElements source tiling returned null executor");
+        Stage("source_tiling_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
+        return result;
+    }
+    Measurement result = Measure(stream, warmup, samples, output, getWorkspace, launch);
+    const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
+    result.outputBytes = snapshot.size();
+    result.outputDigest = Fnv1a64(snapshot);
+    if (args.Has("write-reference")) WriteReference(args.Get("write-reference"), snapshot);
+    if (args.Has("compare-reference")) {
+        result.outputReferenceChecked = true;
+        result.outputReferenceEqual = snapshot == ReadReference(args.Get("compare-reference"));
+    }
+    return result;
 }
 
 std::vector<int64_t> AttentionShape(const std::string &layout, int64_t batch, int64_t heads,
@@ -723,24 +789,44 @@ Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream strea
     const auto kvShape = AttentionShape(layout, batch, kvHeads, kvSeq, headDim);
     DeviceBuffer q(Elements(qShape), dtype), k(Elements(kvShape), dtype), v(Elements(kvShape), dtype);
     DeviceBuffer output(Elements(qShape), dtype);
+    FillAttentionPattern(q, dtype, Elements(qShape), 0);
+    FillAttentionPattern(k, dtype, Elements(kvShape), 1);
+    FillAttentionPattern(v, dtype, Elements(kvShape), 2);
     Tensor qTensor(q, dtype, qShape), kTensor(k, dtype, kvShape), vTensor(v, dtype, kvShape);
     Tensor outputTensor(output, dtype, qShape);
     TensorList keyList({kTensor.Get()}), valueList({vTensor.Get()});
     std::vector<char> layoutText(layout.begin(), layout.end());
     layoutText.push_back('\0');
     const double scale = 1.0 / std::sqrt(static_cast<double>(headDim));
-    return Measure(stream, warmup, samples, output,
-        [&](uint64_t *workspace, aclOpExecutor **executor) {
-            return aclnnFusedInferAttentionScoreGetWorkspaceSize(
-                qTensor.Get(), keyList.Get(), valueList.Get(), nullptr, nullptr, nullptr, nullptr,
-                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                qHeads, scale, std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max(),
-                layoutText.data(), kvHeads, 0, 0, 0, 0, false, outputTensor.Get(), nullptr,
-                workspace, executor);
-        },
-        [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
-            return aclnnFusedInferAttentionScore(workspace, bytes, executor, launchStream);
-        });
+    const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
+        return aclnnFusedInferAttentionScoreGetWorkspaceSize(
+            qTensor.Get(), keyList.Get(), valueList.Get(), nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            qHeads, scale, std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max(),
+            layoutText.data(), kvHeads, 0, 0, 0, 0, false, outputTensor.Get(), nullptr, workspace, executor);
+    };
+    const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+        return aclnnFusedInferAttentionScore(workspace, bytes, executor, launchStream);
+    };
+    if (args.Has("source-tiling-only")) {
+        Measurement result;
+        Executor executor;
+        Stage("source_tiling_get_workspace_begin");
+        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "FIAS source tiling GetWorkspaceSize");
+        if (executor.ptr == nullptr) throw std::runtime_error("FIAS source tiling returned null executor");
+        Stage("source_tiling_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
+        return result;
+    }
+    Measurement result = Measure(stream, warmup, samples, output, getWorkspace, launch);
+    const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
+    result.outputBytes = snapshot.size();
+    result.outputDigest = Fnv1a64(snapshot);
+    if (args.Has("write-reference")) WriteReference(args.Get("write-reference"), snapshot);
+    if (args.Has("compare-reference")) {
+        result.outputReferenceChecked = true;
+        result.outputReferenceEqual = snapshot == ReadReference(args.Get("compare-reference"));
+    }
+    return result;
 }
 
 Measurement RunOperation(const Arguments &args, aclrtStream stream, int warmup, int samples)

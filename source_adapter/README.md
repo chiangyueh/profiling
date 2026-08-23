@@ -1,162 +1,90 @@
-# Source-preserving multi-tiling adapter
+# Non-MatMul source-tiling collector
 
-This directory is a guardrail for the next measurement path. It does not contain
-a cost model, prior measurements, RuntimeKb replay, callback timing, or CCE
-data.
+This is a data-collection path for ranking legal tilings of four non-MatMul
+operators on Ascend910B3:
 
-`source_lock.json` and its MatMulV3 scripts are legacy provenance tools. They
-are **not used** by the non-MatMul collection described below.
+- FlashAttentionScoreGrad — all eight original CANN 8.1 registered strategies.
+- FusedInferAttentionScore — its original decode/prefill dispatcher.
+- GatherElementsV2 — extracted CANN 8.3 source in a clearly labelled CANN 8.1
+  build compatibility layer.
+- ScatterElementsV2 — its original CANN 8.1 last-axis tiler.
 
-## Non-MatMul source-strategy collection
+MatMul is deliberately excluded. Transpose and GatherV2 remain excluded because
+there is no matching 910B source route; they are not relabelled as supported.
 
-`non_matmul_source_lock.json` defines the current collection contract:
+## Collection contract
 
-- MatMul is excluded.
-- A candidate is emitted only by an operator's original source strategy on its
-  unchanged `TilingContext`.
-- No candidate field is edited and no tile-field Cartesian product is made.
-- Each strategy overlay retains one original registration and disables only the
-  other registrations. Strategy code, predicates, and kernels are hash-locked.
-  The common entry gets one audit-only return-status passthrough that records
-  the already-generated tiling key, blockDim, raw byte count, and raw digest to
-  a temporary file; it never writes a tiling field or changes the dispatcher
-  result.
-- A candidate must later execute and pass output comparison before latency is
-  admitted to the training set.
+For every semantic shape, the controller first invokes the complete finite set
+of original source contexts: every retained source strategy/dispatcher and AIV
+core budget 1..20. A candidate is the raw tiling emitted by that source, not a
+manually constructed set of tile fields.
 
-The public 8.1.RC1 advanced-operator tag has eight registered
-`FlashAttentionScoreGrad` strategies. This is the actual registry count in
-that pinned source—not the larger count in a newer extracted tree. The
-collector creates an isolated overlay for all eight so that this inventory is
-auditable. The 20,000-record multi-tiling lane builds only the three original
-strategies whose own `IsCapable` predicates overlap on its reviewed fp16/BNSD
-geometry lattice. It does not call source strategies known to be ineligible
-for that lane.
+If and only if the complete original set yields fewer than 20 distinct raw
+identities, the controller revisits selected original contexts using only the
+operator-declared source-visible capacity envelope:
 
-Run this read-only audit first:
+- FASG: L2 scheduling capacity;
+- FIAS, GatherElements, ScatterElements: UB capacity.
 
-```bash
-python3 source_adapter/audit_non_matmul_sources.py \
-  --cann-ops-adv-root /path/outside/profiling/cann-ops-adv-8.1rc1 \
-  --cann-ops-root /path/outside/profiling/cann-ops-8.1rc1 \
-  --extracted-root /home/CCE_EXTRACT/ops_cce
-```
+The only heuristic values are divisors 2, 4, and 8. They lower the resource
+visible to the original tiler before it calculates its own fields, so a plan
+cannot demand more capacity than hardware provides. No output tiling field,
+tiling key, block dimension, or workspace is edited after source generation.
 
-If the public advanced-operator source is absent, fetch it explicitly once. It
-is never downloaded by a campaign command:
+A shape is admitted only when at least 20 distinct candidates execute, exactly
+match an installed-operator output reference, and complete device-event
+measurement. A failed candidate is recorded as rejected and does not count;
+it does not erase the other legal candidates. The global formal-record ceiling
+is 20,000, partitioned 6,000 / 6,000 / 4,000 / 4,000 across FASG, FIAS,
+GatherElements and ScatterElements.
 
-```bash
-python3 source_adapter/fetch_official_cann_ops_adv.py \
-  --destination /path/outside/profiling/cann-ops-adv-8.1rc1
-```
+The collector reads neither CCE data, historic latency/tiling records,
+RuntimeKb, callbacks, nor a cost model. Full reference tensors live only in a
+temporary directory; the durable output is compact JSONL.
 
-Create the finite original FASG strategy overlays outside this repository:
+## Sources and compatibility limits
 
-```bash
-python3 source_adapter/prepare_fasg_strategy_overlays.py \
-  --source-root /path/outside/profiling/cann-ops-adv-8.1rc1 \
-  --output-parent /path/outside/profiling/fasg-overlays
-```
+The source pins are in `non_matmul_source_lock.json`.
 
-Then build one overlay at a time. The source tag's `version.info` contains the
-pre-release marker `7.7.T8.0`, while the installed 8.1.RC1 package reports
-`7.7.0.1.<build>`. The build helper changes only this *overlay metadata* to
-`7.7.0.1.0`, allowing the source project's own compatibility check to run; it
-does not disable the check and does not alter tiling/kernel source. The emitted
-build manifest records both metadata hashes.
+- FASG/FIAS use public `cann-ops-adv` 8.1 RC1 source and the pinned public
+  `cann-ops` 8.1 build harness.
+- ScatterElements uses pinned public `cann-ops` 8.1 source.
+- Public 8.1 source does not provide the needed GatherElements route. Its
+  extracted source reports CANN 8.3 RC2. The compatibility preparer copies it
+  into a pinned 8.1 build parent and changes only the Ascend910B registration
+  scope, CMake target wiring, two missing 8.1-compatible logging/arithmetic
+  headers, and observational audit/resource inputs. It is not claimed to be
+  native 8.1; package build and exact real-NPU output equality are both hard
+  gates.
 
-```bash
-python3 source_adapter/build_fasg_strategy_overlay.py \
-  --overlay /path/outside/profiling/fasg-overlays/fasg_flashattentionscoregradtilingdeterministic \
-  --build-dir /path/outside/profiling/fasg-build-deterministic \
-  --cann-root /usr/local/Ascend/ascend-toolkit/latest \
-  --target optiling --jobs 1
-```
+The advanced source tree has original op-host sources but no top-level CMake
+project. Its detached overlay uses the pinned public 8.1 build harness,
+selects only the requested op-host directories, and copies one unchanged,
+hash-attested public packaging helper (`gen_ops_filter.sh`). This is build
+plumbing only; it does not alter a tiler or a kernel.
 
-`--target package` is explicit and produces a source package for later
-`ASCEND_CUSTOM_OPP_PATH` execution. It is not automatically installed into the
-toolkit and it is not silently used by the old direct-ACLNN campaign. Each
-strategy must be installed into a different, initially empty custom-OPP root:
+No build or package is installed into the toolkit. Each source overlay builds
+only its host tiler into an isolated custom OPP root under ignored state. The
+root copies the exact installed dynamic device source/configuration for that
+operator, so CANN compiles only the actually launched tiling key; it does not
+eagerly precompile the release matrix of keys.
 
-```bash
-python3 source_adapter/install_fasg_strategy_package.py \
-  --build-manifest /path/outside/profiling/fasg-build-deterministic/source_candidate_build.json \
-  --destination /path/outside/profiling/custom-opp-deterministic
-```
+For FASG, the eight isolated overlays have different host tiling registrations.
+Each root carries its own source-built host tiler and the same exact installed
+dynamic device source. It neither shares a tiler nor modifies device code.
 
-The installer refuses a non-empty destination and records the package SHA-256,
-strategy class, and `ASCEND_CUSTOM_OPP_PATH` root in a small manifest. It never
-writes under the toolkit's OPP directory.
+## Run
 
-`run_non_matmul_candidate_campaign.py` is the only measurement controller for
-these overlays. It requires exactly the three audited, overlapping original
-strategy packages; their class names are checked, so another strategy cannot
-silently replace one. It writes compact JSONL workload groups and creates each
-FASG full-output reference under a temporary directory for the duration of one
-workload; no trace or output tensor is retained after the comparison.
-
-The separate semantic workload catalog is likewise source-aware and contains
-no MatMul records:
+The normal entry point is one command. It uses physical device 1 by default
+and maps it to worker logical device 0.
 
 ```bash
-python3 source_adapter/non_matmul_candidate_catalog.py --audit
+./run_npu.sh --mode full -d 1
 ```
 
-It contains 11,207 deterministic legal geometries: the reviewed cross-op
-coverage families plus an 11,000-shape fp16/BNSD FASG geometry lattice. This is
-a fixed shape lattice, **not** a tiling-field product or random sampler. The
-source registry remains eight strategies, while the three overlapping original
-strategies are independently invoked for each multi-tiling shape. Before an
-FASG kernel is timed, each source path is invoked once in host-side
-tiling-only mode. A group is admitted only when at least two distinct raw
-tilings recur in timed execution and both full outputs match the installed
-reference. At normal completion, the compact groups contain exactly 20,000
-formal device-event latency records. Rejected groups carry no latency datum.
-
-After the one-time official source preparation, the normal NPU entry point is
-still one full command (selecting a physical device maps it to worker device
-zero):
-
-```bash
-CANN_OPS_ADV_SOURCE=/path/outside/profiling/cann-ops-adv-8.1rc1 \
-  ./run_npu.sh --mode full -d 1
-```
-
-It creates eight isolated strategy overlays but builds and installs only the
-three overlapping original strategy packages, one at a time, under the ignored
-`.benchmark_state/` directory; it never modifies the installed toolkit. Its
-only durable measurement output is
-`results/non_matmul_source_candidate_v2/<contract>/progress.jsonl`. Each JSONL
-row is a compact semantic workload group; its `valid_latency` array contains
-only output-validated source-generated candidates. The campaign stops exactly
-at 20,000 such entries, with no tile enumeration.
-
-The pinned public source is `ascend/cann-ops` commit `c214b710edbe24017dc7dc92170a50bd8ff38171`, selected because it predates the installed CANN 8.1.RC1 build.  The source tree itself and every build artifact stay outside this repository.
-
-If this official sparse checkout is not already present, fetch it explicitly once (it is never fetched by `run_npu.sh`):
-
-```bash
-python3 source_adapter/fetch_official_cann_ops.py \
-  --destination /path/outside/profiling/cann-ops-8.1rc1
-```
-
-For MatMulV3, the official `ALL` path is **not** a candidate list: it stops at its first successful heuristic.  A correct comparison invokes each of the source-defined routes (`BASE`, `SINGLE_CORE_SPLIT_K`, `DETERMINISTIC_SPLIT_K`) in separate original tiling contexts, deduplicates only exact raw tilings, and replays each unchanged tiling with its matching original kernel.  A candidate is kept only after output comparison against the original operator succeeds.
-
-No code may change `DoSelectTiling`, alter raw tiling fields, invent a tile, or use callback/RuntimeKb/CCE data to select a candidate.  Operators lacking a native 910B source route are blocked rather than relabelled as supported.
-
-Run the read-only prerequisite check before creating any build overlay:
-
-```bash
-python3 source_adapter/audit_sources.py \
-  --official-root /path/to/cann-ops-8.1rc1 \
-  --extracted-root /home/CCE_EXTRACT/ops_cce
-```
-
-For each original MatMulV3 route, create a separate, disposable worktree outside the repository.  This does not compile or use an NPU; it preserves the original `mat_mul_v3_base_tiling.cpp` hash and replaces only the registration wrapper.
-
-```bash
-python3 source_adapter/prepare_matmul_route_overlay.py \
-  --official-root /path/to/cann-ops-8.1rc1 \
-  --output /path/to/route-base \
-  --route BASE
-```
+Set `CANN_OPS_ADV_SOURCE`, `CANN_OPS_SOURCE`, or
+`CANN_GATHER_ELEMENTS_EXTRACT_SOURCE` only when their defaults are unavailable.
+The command builds serially and does not impose a host-side timeout or kill a
+worker. Results are written below
+`results/non_matmul_source_candidate_v5/<contract>/progress.jsonl`; generated
+sources/builds remain below ignored `.benchmark_state/`.

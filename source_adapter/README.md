@@ -82,9 +82,11 @@ and maps it to worker logical device 0.
 ./run_npu.sh --mode full -d 1
 ```
 
-Set `CANN_OPS_ADV_SOURCE`, `CANN_OPS_SOURCE`, or
-`CANN_GATHER_ELEMENTS_EXTRACT_SOURCE` only when their defaults are unavailable.
-The command builds serially and does not impose a host-side timeout or kill a
+The pinned, uncompiled source snapshots are shipped under
+`source_adapter/vendor_source/`. `full` expands them only into this checkout's
+ignored `.source_cache/`, then builds serially on the NPU host. It makes no
+network request and never reads `/home/CCE_EXTRACT`. The command does not
+impose a host-side timeout or kill a
 worker. Results are written below
 `results/non_matmul_source_candidate_v5/<contract>/progress.jsonl`; generated
 sources/builds remain below ignored `.benchmark_state/`.

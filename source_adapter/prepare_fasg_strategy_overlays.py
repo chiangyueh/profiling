@@ -94,13 +94,7 @@ def source_build_harness(harness_root: Path, cmake_op_name: str) -> tuple[str, d
     ``prepare.sh`` helper from compiling the whole source tree. No source
     rule, tiling field, or kernel algorithm is introduced by this harness.
     """
-    head = run(["git", "-C", str(harness_root), "rev-parse", "HEAD"])
-    if head != HARNESS_SOURCE["commit"]:
-        raise RuntimeError("build-harness source revision mismatch: expected={} actual={}".format(
-            HARNESS_SOURCE["commit"], head))
-    status = run(["git", "-C", str(harness_root), "status", "--porcelain", "--untracked-files=no"])
-    if status:
-        raise RuntimeError("build-harness source worktree is modified")
+    require_repo_source_bundle(harness_root, "cann_ops", HARNESS_SOURCE["commit"])
     source_path = harness_root / "CMakeLists.txt"
     if not source_path.is_file() or digest(source_path) != HARNESS_SOURCE["build_harness_cmake_sha256"]:
         raise RuntimeError("pinned public build-harness CMakeLists.txt is absent or mismatched")
@@ -207,6 +201,23 @@ endforeach ()'''.format(name=cmake_op_name, ops=scoped_ops, dirs=scoped_dirs, ho
         },
         "generated_cmake_sha256": hashlib.sha256(transformed.encode("utf-8")).hexdigest(),
     }
+
+
+def require_repo_source_bundle(source_root: Path, kind: str, official_commit: str) -> None:
+    """Validate one repository-shipped source snapshot before deriving edits."""
+    attestation = source_root / ".source_bundle_attestation.json"
+    if not attestation.is_file():
+        raise RuntimeError("source snapshot lacks repository-bundle attestation: {}".format(source_root))
+    try:
+        value = json.loads(attestation.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError("source snapshot attestation is invalid: {}".format(error)) from error
+    if (value.get("schema") != "repo_source_bundle_v1" or value.get("bundle_kind") != kind or
+            value.get("official_commit") != official_commit or value.get("network_calls") != 0):
+        raise RuntimeError("source snapshot does not attest pinned {} source".format(kind))
+    status = run(["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=no"])
+    if status:
+        raise RuntimeError("private source snapshot is modified: {}".format(source_root))
 
 
 def materialize_build_support_files(output: Path, harness_root: Path | None,
@@ -444,12 +455,7 @@ def registrations(source_root: Path) -> list[Registration]:
 
 
 def require_pinned_source(source_root: Path) -> list[Registration]:
-    head = run(["git", "-C", str(source_root), "rev-parse", "HEAD"])
-    if head != SOURCE["commit"]:
-        raise RuntimeError("source revision mismatch: expected={} actual={}".format(SOURCE["commit"], head))
-    status = run(["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=no"])
-    if status:
-        raise RuntimeError("source worktree is modified; refuse to derive an overlay from it")
+    require_repo_source_bundle(source_root, "cann_ops_adv", SOURCE["commit"])
     for relative, expected in OP["pinned_files"].items():
         actual = digest(source_root / OP["relative_root"] / relative)
         if actual != expected:
@@ -540,7 +546,7 @@ def write_overlay(source_root: Path, output_parent: Path, selected: Registration
     existing = existing_overlay(source_root, output, selected, rows, harness_text, harness_provenance)
     if existing is not None:
         return existing
-    run(["git", "-C", str(source_root), "worktree", "add", "--detach", str(output), SOURCE["commit"]])
+    run(["git", "-C", str(source_root), "worktree", "add", "--detach", str(output), "HEAD"])
     changed: list[dict[str, str]] = []
     affected = {row.relative_path for row in rows} | {ENTRY_RELATIVE}
     for relative in sorted(affected):

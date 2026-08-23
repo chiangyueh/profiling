@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from prepare_fasg_strategy_overlays import (digest, materialize_build_support_files,
-                                            run, source_build_harness)
+                                            require_repo_source_bundle, run, source_build_harness)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -42,12 +42,7 @@ UB_SENTINEL = "FIAS_SOURCE_UB_CAP_V1"
 
 
 def require_pinned_source(source_root: Path) -> None:
-    head = run(["git", "-C", str(source_root), "rev-parse", "HEAD"])
-    if head != SOURCE["commit"]:
-        raise RuntimeError("source revision mismatch: expected={} actual={}".format(SOURCE["commit"], head))
-    status = run(["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=no"])
-    if status:
-        raise RuntimeError("source worktree is modified; refuse to derive an overlay from it")
+    require_repo_source_bundle(source_root, "cann_ops_adv", SOURCE["commit"])
     for relative, expected in OP["pinned_files"].items():
         actual_path = source_root / OP_ROOT / relative
         if not actual_path.is_file() or digest(actual_path) != expected:
@@ -250,7 +245,7 @@ def write_overlay(source_root: Path, output_parent: Path, harness_root: Path, ha
     existing = existing_overlay(source_root, output, harness_text, harness_provenance)
     if existing is not None:
         return existing
-    run(["git", "-C", str(source_root), "worktree", "add", "--detach", str(output), SOURCE["commit"]])
+    run(["git", "-C", str(source_root), "worktree", "add", "--detach", str(output), "HEAD"])
     changed: list[dict[str, str]] = []
     transforms = {
         FIAS_RELATIVE: instrument_fias_tiler,

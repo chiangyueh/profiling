@@ -20,6 +20,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from prepare_fasg_strategy_overlays import require_repo_source_bundle
+
 
 ROOT = Path(__file__).resolve().parent
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
@@ -55,10 +57,7 @@ def run(argv: list[str]) -> str:
 
 
 def require_parent(path: Path) -> None:
-    if run(["git", "-C", str(path), "rev-parse", "HEAD"]) != PARENT["commit"]:
-        raise RuntimeError("CANN-8.1 parent revision mismatch")
-    if run(["git", "-C", str(path), "status", "--porcelain", "--untracked-files=no"]):
-        raise RuntimeError("CANN-8.1 parent worktree is modified")
+    require_repo_source_bundle(path, "cann_ops", PARENT["commit"])
     if not (path / "CMakeLists.txt").is_file():
         raise RuntimeError("CANN-8.1 parent lacks its root CMakeLists.txt")
 
@@ -403,7 +402,7 @@ def prepare(parent: Path, extracted: Path, output_parent: Path) -> dict[str, Any
     resume = existing(extracted, output)
     if resume is not None:
         return resume
-    run(["git", "-C", str(parent), "worktree", "add", "--detach", str(output), PARENT["commit"]])
+    run(["git", "-C", str(parent), "worktree", "add", "--detach", str(output), "HEAD"])
     root_cmake = output / "CMakeLists.txt"
     root_cmake.write_text(scoped_root_cmake(root_cmake.read_text(encoding="utf-8")), encoding="utf-8")
     target_root = output / OVERLAY_OP_ROOT

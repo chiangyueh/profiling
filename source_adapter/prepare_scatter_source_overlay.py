@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from prepare_fasg_strategy_overlays import require_repo_source_bundle
+
 
 ROOT = Path(__file__).resolve().parent
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
@@ -47,10 +49,7 @@ def run(argv: list[str]) -> str:
 
 
 def require_pinned_source(source_root: Path) -> None:
-    if run(["git", "-C", str(source_root), "rev-parse", "HEAD"]) != SOURCE["commit"]:
-        raise RuntimeError("source revision mismatch")
-    if run(["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=no"]):
-        raise RuntimeError("source worktree is modified")
+    require_repo_source_bundle(source_root, "cann_ops", SOURCE["commit"])
     for relative, expected in OP["pinned_files"].items():
         path = source_root / OP["relative_root"] / relative
         if not path.is_file() or digest(path) != expected:
@@ -209,7 +208,7 @@ def write_overlay(source_root: Path, output_parent: Path) -> dict[str, Any]:
     existing = existing_overlay(source_root, output)
     if existing is not None:
         return existing
-    run(["git", "-C", str(source_root), "worktree", "add", "--detach", str(output), SOURCE["commit"]])
+    run(["git", "-C", str(source_root), "worktree", "add", "--detach", str(output), "HEAD"])
     root_cmake = output / "CMakeLists.txt"
     root_cmake.write_text(scoped_root_cmake(root_cmake.read_text(encoding="utf-8")), encoding="utf-8")
     target = output / RELATIVE

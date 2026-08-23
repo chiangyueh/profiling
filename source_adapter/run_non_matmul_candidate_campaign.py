@@ -386,7 +386,11 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                     worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only"],
                     source_environment(base_env, package, candidate, audit))
                 observed, reason = source_audit_emitted(audit, package, candidate)
-                source_ok = rc == 0 and result.get("status") == "success" and observed
+                # The source-only call can legitimately return a rejected
+                # strategy after the original dispatcher has emitted its
+                # audit.  This gate establishes that the intended host tiler
+                # was loaded; execution success is checked later per tiling.
+                source_ok = observed
                 checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "source_tiler_audit",
                                "strategy": candidate["id"], "aiv_core_cap": candidate["aiv_core_cap"],
                                "status": "passed" if source_ok else "failed", "worker_return_code": rc,

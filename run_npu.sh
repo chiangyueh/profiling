@@ -131,6 +131,7 @@ SOURCE_ID="$({
         "${ROOT}/source_adapter/build_source_candidate_overlay.py" \
         "${ROOT}/source_adapter/materialize_repo_source_bundle.py" \
         "${ROOT}/source_adapter/materialize_installed_dynamic_opp.py" \
+        "${ROOT}/source_adapter/reset_incomplete_private_state.py" \
         "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py"
     sha256sum "${ROOT}/source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz" \
         "${ROOT}/source_adapter/vendor_source/cann_ops_adv_8_1rc1.tar.gz" \
@@ -231,9 +232,11 @@ for overlay_manifest in "${overlay_manifests[@]}"; do
     build_log="${STATE}/${label}_host_tiler_build.log"
     if [[ ! -f "${build_manifest}" ]]; then
         if [[ -e "${build_dir}" ]]; then
-            echo "fatal: incomplete source host-tiler build exists and is intentionally not overwritten: ${build_dir}" >&2
-            echo "       inspect ${build_log}; remove only that explicit build directory before rerunning." >&2
-            exit 1
+            # A missing manifest means this exact private build never completed.
+            # Rebuild it from scratch, preserving the previous log under STATE.
+            python3 "${ROOT}/source_adapter/reset_incomplete_private_state.py" \
+                --parent "${PACKAGE_BUILD_PARENT}" --target "${build_dir}" \
+                --required-absent "${build_manifest}" --kind host_tiler_build
         fi
         echo "SOURCE_HOST_TILER_BUILD_BEGIN source=${label}"
         if ! python3 "${ROOT}/source_adapter/build_source_candidate_overlay.py" \
@@ -249,10 +252,12 @@ for overlay_manifest in "${overlay_manifests[@]}"; do
     materialize_log="${STATE}/${label}_dynamic_opp_materialize.log"
     if [[ ! -f "${custom_manifest}" ]]; then
         if [[ -e "${custom_root}" ]]; then
-            if [[ -n "$(find "${custom_root}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-                echo "fatal: incomplete isolated dynamic custom OPP root exists and is intentionally not merged: ${custom_root}" >&2
-                exit 1
-            fi
+            # Never merge incomplete assets into a package.  This helper may
+            # touch only this direct child of the private campaign state.
+            python3 "${ROOT}/source_adapter/reset_incomplete_private_state.py" \
+                --parent "${CUSTOM_OPP_PARENT}" --target "${custom_root}" \
+                --required-absent "${custom_manifest}" --kind dynamic_opp_root
+            mkdir -p "${custom_root}"
         else
             mkdir -p "${custom_root}"
         fi

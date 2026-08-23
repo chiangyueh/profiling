@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Deterministic non-MatMul workloads for original-source candidate collection.
+"""Deterministic non-MatMul workloads for source-rule candidate collection.
 
-This is a semantic workload catalog, not a tiling generator. Candidate counts
-come solely from the pinned source inventory: FASG has eight registrations;
-FusedInferAttentionScore, GatherElementsV2 and ScatterElementsV2 choose only
-the source path their original predicates admit.  No Cartesian tiling search is
-present here.
+This is a semantic workload catalog, not a tiling-field generator.  A formal
+shape group is admitted only after its operator-specific source collector has
+found, executed, and output-validated at least twenty *distinct* tilings.  A
+collector may rerun an original tiler with a documented source input such as
+its AIV/AIC core budget, but it must never manufacture raw tiling fields or
+sample random tile values.
 """
 
 from __future__ import annotations
@@ -18,16 +19,58 @@ from typing import Any
 
 FORMAL_LATENCY_TARGET = 20_000
 FASG_NATIVE_STRATEGIES = 8
-# The complete source strategy registry is audited for every FASG workload.
-# These three original strategies have overlapping, documented capability for
-# the source-multi-tiling lattice below: fp16, BNSD, equal Q/KV head counts,
-# and both sequence lengths below 1024.  They are not synthetic variants.
-FASG_MULTI_TILING_SOURCE_CLASSES = (
+# A single shape must retain the complete accepted candidate set, never a
+# convenient subset of two or three results.  These are all registrations in
+# the pinned FASG source tree.  Source predicates still decide whether an
+# individual registration is eligible for a particular semantic shape.
+FASG_SOURCE_STRATEGY_CLASSES = (
+    "FlashAttentionScoreGradTilingDeterministic",
+    "FlashAttentionScoreGradTilingSameABDeterministic",
+    "FlashAttentionScoreGradTilingUnpaddedAttension",
+    "FlashAttentionScoreGradUbngs1s2BbTiling",
+    "FlashAttentionScoreGradUngs1s2BbnTiling",
     "FlashAttentionScoreGradTilingS1s2Bn2",
     "FlashAttentionScoreGradTilingS1s2Bn2gs1s2",
     "FlashAttentionScoreGradTilingS1s2Bn2gs1s2SameAb",
 )
-FASG_MULTI_TILING_RESERVE_SHAPES = 11_000
+# Ascend910B3 exposes twenty AIV cores.  The source collector derives the
+# matching AIC budget from the runtime's own AIC:AIV ratio, and feeds that
+# compile-info budget into the unmodified strategy calculations.  There is no
+# random choice and no post-generation raw-tiling mutation.
+FASG_SOURCE_AIV_CAPS = tuple(range(1, 21))
+# The exact original strategy/core-budget collection is always attempted first.
+# These divisors are only a second-stage source-input heuristic if that complete
+# set produced fewer than twenty distinct raw tilings.  A smaller source-visible
+# L2 scheduling envelope can only produce tile plans that fit within actual L2;
+# it neither claims a cache mapping nor changes a generated tile field.
+FASG_L2_ENVELOPE_HEURISTIC_DIVISORS = (2, 4, 8)
+FASG_L2_ENVELOPE_HEURISTIC_MAX_ANCHORS = 16
+SOURCE_HARDWARE_ENVELOPE_HEURISTICS = {
+    "flash_attention_score_grad": {"resource": "source_visible_l2_scheduling_budget", "divisors": (2, 4, 8), "max_anchors": 16},
+    "fused_infer_attention_score": {"resource": "source_visible_ub_capacity", "divisors": (2, 4, 8), "max_anchors": 16},
+    "gather_elements": {"resource": "source_visible_ub_capacity", "divisors": (2, 4, 8), "max_anchors": 16},
+    "scatter_elements": {"resource": "source_visible_ub_capacity", "divisors": (2, 4, 8), "max_anchors": 16},
+}
+MIN_SUCCESSFUL_TILINGS_PER_SHAPE = 20
+# The campaign needs enough independent legal shapes to reach its 6,000-record
+# FASG allocation even when a successful group has only the required twenty
+# distinct tilings.  It does *not* need thousands of speculative shapes: an
+# oversized catalog would spend most of a real-NPU campaign proving that
+# groups cannot reach the twenty-tiling gate.  The explicit cases below plus
+# this 320-shape reviewed lattice provide 383 FASG semantic workloads.
+FASG_MULTI_TILING_RESERVE_SHAPES = 320
+# All listed values are source inputs, not tiling-field values.  Each source
+# collector is responsible for rejecting a cap above its runtime core count.
+SOURCE_AIV_CAPS = tuple(range(1, 21))
+# Atomic groups can make each exact number unattainable; these are ceilings per
+# operator, and their sum is the global 20,000 formal-record ceiling.  The
+# scheduler rotates operators so FASG cannot consume the whole budget first.
+FORMAL_RECORD_BUDGET_PER_OP = {
+    "flash_attention_score_grad": 6_000,
+    "fused_infer_attention_score": 6_000,
+    "gather_elements": 4_000,
+    "scatter_elements": 4_000,
+}
 
 
 def row(op: str, index: int, tags: str, **parameters: Any) -> dict[str, Any]:
@@ -119,7 +162,7 @@ def attention_grad_multi_tiling_reserve(start_index: int) -> list[dict[str, Any]
     """Return a fixed, legal geometry lattice for source multi-tiling.
 
     This is a shape-coverage lattice, not a product of *tiling fields*.  All
-    levels below were reviewed against the three source ``IsCapable`` rules:
+    levels below were reviewed against the FASG source's input constraints:
     fp16, BNSD, Q heads equal KV heads, 16-aligned head dimension, and Q/KV
     sequence length strictly below 1024.  A coprime walk gives each factor a
     balanced deterministic distribution in every prefix while keeping the
@@ -155,7 +198,7 @@ def attention_grad_multi_tiling_reserve(start_index: int) -> list[dict[str, Any]
             "q_heads_equal_kv_heads,q_seq_lt1024,kv_seq_lt1024",
             dtype="fp16", layout="BNSD", batch=batch, q_heads=q_heads,
             kv_heads=q_heads, q_seq=q_seq, kv_seq=kv_seq, head_dim=head_dim,
-            source_candidate_requirement="at_least_two_distinct_original_source_tilings",
+            source_candidate_requirement="at_least_20_distinct_successful_source_rule_tilings",
         ))
     return output
 
@@ -232,11 +275,58 @@ def fused_attention_workloads() -> list[dict[str, Any]]:
         (2, 16, 4, 96, 384, 64, "fp16", "BSND", "bsnd,prefill,gqa"),
         (2, 16, 4, 96, 384, 64, "fp16", "BSH", "bsh,prefill,gqa"),
     ]
-    return [row("fused_infer_attention_score", index, tags + "," + dtype + "," + layout.lower(),
+    output = [row("fused_infer_attention_score", index, tags + "," + dtype + "," + layout.lower(),
                 dtype=dtype, layout=layout, batch=batch, q_heads=q_heads, kv_heads=kv_heads,
                 q_seq=q_seq, kv_seq=kv_seq, head_dim=head_dim)
             for index, (batch, q_heads, kv_heads, q_seq, kv_seq, head_dim, dtype, layout, tags)
             in enumerate(cases + extras)]
+    return output + fused_attention_multi_tiling_reserve(len(output))
+
+
+def fused_attention_multi_tiling_reserve(start_index: int) -> list[dict[str, Any]]:
+    """A fixed legal FIAS geometry lattice, not a tiling-field search.
+
+    The original FIAS semantic dispatcher is called for these inputs.  The
+    lattice deliberately spans decode and prefill, MHA/GQA/MQA, three batch
+    levels, small/medium/large sequence boundaries and both common head
+    dimensions.  All tuples satisfy the source-visible head divisibility and
+    16-element head-dimension constraints; unsupported runtime combinations
+    are still rejected by the installed reference before any candidate count.
+    """
+    head_pairs = ((1, 1), (4, 4), (8, 8), (8, 2), (16, 4), (16, 1))
+    batches = (1, 2, 4)
+    query_lengths = (1, 16, 64, 128, 256)
+    kv_lengths = (64, 128, 256, 512, 1024, 2048)
+    head_dims = (64, 128)
+    total = len(head_pairs) * len(batches) * len(query_lengths) * len(kv_lengths) * len(head_dims)
+    reserve = 320
+    if reserve > total:
+        raise ValueError("FIAS reviewed lattice is unexpectedly too small")
+    output: list[dict[str, Any]] = []
+    # 313 is coprime with 1,080, so every prefix covers every dimension before
+    # revisiting a geometry.  This is deterministic enumeration, not random
+    # sampling and not a search over opaque tiling fields.
+    for ordinal in range(reserve):
+        code = (ordinal * 313) % total
+        head_dim = head_dims[code % len(head_dims)]
+        code //= len(head_dims)
+        kv_seq = kv_lengths[code % len(kv_lengths)]
+        code //= len(kv_lengths)
+        q_seq = query_lengths[code % len(query_lengths)]
+        code //= len(query_lengths)
+        batch = batches[code % len(batches)]
+        code //= len(batches)
+        q_heads, kv_heads = head_pairs[code]
+        route = "decode" if q_seq == 1 else "prefill"
+        relation = "mha" if q_heads == kv_heads else ("mqa" if kv_heads == 1 else "gqa")
+        output.append(row(
+            "fused_infer_attention_score", start_index + ordinal,
+            "reviewed_lattice,source_multi_tiling,fp16,bnsd," + route + "," + relation,
+            dtype="fp16", layout="BNSD", batch=batch, q_heads=q_heads,
+            kv_heads=kv_heads, q_seq=q_seq, kv_seq=kv_seq, head_dim=head_dim,
+            source_candidate_requirement="at_least_20_distinct_successful_source_rule_tilings",
+        ))
+    return output
 
 
 def index_workloads(op: str) -> list[dict[str, Any]]:
@@ -255,12 +345,76 @@ def index_workloads(op: str) -> list[dict[str, Any]]:
     modes = (("fp16", "int32"), ("bf16", "int64"), ("fp32", "int32"), ("int32", "int64"))
     output: list[dict[str, Any]] = []
     for case_index, (shape, axis, index_shape, tags) in enumerate(cases):
+        # The pinned public 8.1 ScatterElementsV2 source has a documented
+        # last-axis-only route.  Other axes belong to a different operator
+        # implementation and are not silently relabelled as candidates here.
+        if op == "scatter_elements" and (axis + len(shape)) % len(shape) != len(shape) - 1:
+            continue
         rotated = modes[case_index % len(modes):] + modes[:case_index % len(modes)]
-        for dtype, index_dtype in rotated:
-            extra = "reduce_assign" if op == "scatter_elements" else ""
+        for mode_index, (dtype, index_dtype) in enumerate(rotated):
+            reduce = (case_index + mode_index) % 2 if op == "scatter_elements" else None
+            extra = ("reduce_assign" if reduce == 0 else "reduce_add") if op == "scatter_elements" else ""
             output.append(row(op, len(output), ",".join(value for value in (tags, dtype, index_dtype, extra) if value),
                               dtype=dtype, index_dtype=index_dtype, shape=shape, axis=axis,
-                              index_shape=index_shape, **({"reduce": 0} if op == "scatter_elements" else {})))
+                              index_shape=index_shape, **({"reduce": reduce} if op == "scatter_elements" else {})))
+    return output + index_multi_tiling_reserve(op, len(output))
+
+
+def index_multi_tiling_reserve(op: str, start_index: int) -> list[dict[str, Any]]:
+    """Fixed last-axis index geometries shared by Gather/Scatter.
+
+    ScatterElementsV2's pinned source accepts only the last-axis route, so the
+    common reserve stays on that documented route.  GatherElements retains its
+    first/middle-axis coverage in ``index_workloads`` above.  Each row is a
+    complete legal operator invocation (including dtype/index dtype/reduce),
+    never a hand-written tiling candidate.
+    """
+    ranks = (
+        (1, ()),
+        (2, (17,)),
+        (2, (64,)),
+        (3, (4, 17)),
+        (3, (8, 64)),
+        (3, (31, 65)),
+        (4, (2, 17, 33)),
+        (4, (4, 16, 64)),
+        (4, (2, 64, 128)),
+        (5, (2, 4, 16, 64)),
+        (5, (1, 8, 32, 128)),
+        (5, (3, 15, 63, 129)),
+    )
+    axis_extents = (17, 31, 63, 65, 127, 129, 257, 513)
+    index_extents = (1, 3, 15, 17, 31, 63, 65, 127)
+    modes = (("fp16", "int32"), ("bf16", "int64"), ("fp32", "int32"), ("int32", "int64"))
+    base_count = 48
+    output: list[dict[str, Any]] = []
+    # A fixed coprime walk over documented rank/axis/dtype boundaries.  All
+    # non-axis index extents equal their input extent; the final index extent
+    # is always in range, so these are legal before the runtime preflight.
+    for ordinal in range(base_count):
+        code = (ordinal * 37) % (len(ranks) * len(axis_extents))
+        rank, prefix = ranks[code % len(ranks)]
+        code //= len(ranks)
+        axis_extent = axis_extents[code]
+        shape = list(prefix) + [axis_extent]
+        if len(shape) != rank:
+            raise ValueError("invalid reviewed index lattice rank")
+        index_extent = index_extents[(ordinal * 5 + rank) % len(index_extents)]
+        index_shape = list(prefix) + [min(index_extent, axis_extent)]
+        for mode_index, (dtype, index_dtype) in enumerate(modes):
+            reduce = (ordinal + mode_index) % 2 if op == "scatter_elements" else None
+            reduction = "reduce_assign" if reduce == 0 else "reduce_add"
+            output.append(row(
+                op, start_index + len(output),
+                ",".join(value for value in (
+                    "reviewed_lattice", "source_multi_tiling", "last_axis", "tail",
+                    f"rank{rank}", dtype, index_dtype,
+                    reduction if op == "scatter_elements" else "",
+                ) if value),
+                dtype=dtype, index_dtype=index_dtype, shape=shape, axis=rank - 1,
+                index_shape=index_shape,
+                **({"reduce": reduce} if op == "scatter_elements" else {}),
+            ))
     return output
 
 
@@ -276,13 +430,12 @@ def catalog() -> list[dict[str, Any]]:
 
 def native_attempts(workload: dict[str, Any]) -> int:
     if workload["op"] == "flash_attention_score_grad":
-        # The registry has eight original strategies (reported separately),
-        # but only these three have overlapping source capability for the
-        # controlled BNSD/fp16 comparison lane.  Calling a strategy that the
-        # original IsCapable predicate rules out is neither a viable tiling nor
-        # useful data, so it is not launched for every shape.
-        return len(FASG_MULTI_TILING_SOURCE_CLASSES)
-    return 1
+        # Every original registration is tried subject to its own original
+        # predicate, and each source tiler is rerun for the complete finite
+        # runtime-derived AIV budget lattice.  Exact raw identities are
+        # deduplicated only after source generation.
+        return len(FASG_SOURCE_STRATEGY_CLASSES) * len(FASG_SOURCE_AIV_CAPS)
+    return len(SOURCE_AIV_CAPS)
 
 
 def validate(workloads: list[dict[str, Any]]) -> None:
@@ -311,6 +464,10 @@ def audit(workloads: list[dict[str, Any]]) -> dict[str, Any]:
     tags: dict[str, Counter[str]] = defaultdict(Counter)
     for item in workloads:
         tags[item["op"]].update(item["coverage"])
+    if sum(FORMAL_RECORD_BUDGET_PER_OP.values()) != FORMAL_LATENCY_TARGET:
+        raise ValueError("per-operator formal record budgets must total 20,000")
+    if set(FORMAL_RECORD_BUDGET_PER_OP) != set(per_op):
+        raise ValueError("every collected operator needs an explicit formal record budget")
     return {
         "schema": "non_matmul_source_candidate_catalog_v1",
         "generation": "reviewed_explicit_families_plus_fixed_legal_shape_lattice_no_random_no_tile_enumeration",
@@ -321,8 +478,18 @@ def audit(workloads: list[dict[str, Any]]) -> dict[str, Any]:
         "full_fasg_original_strategy_registry_count": FASG_NATIVE_STRATEGIES,
         "attempts_per_op": dict(sorted(attempts.items())),
         "formal_latency_target": FORMAL_LATENCY_TARGET,
-        "formal_latency_count_rule": "count only output-validated executions; FlashAttentionScoreGrad requires at least two distinct original raw tilings for one semantic shape",
-        "fasg_multi_tiling_source_classes": list(FASG_MULTI_TILING_SOURCE_CLASSES),
+        "formal_record_budget_per_op": FORMAL_RECORD_BUDGET_PER_OP,
+        "formal_latency_count_rule": "count only output-validated executions; every admitted shape has at least 20 distinct successful source-rule raw tilings and retains its complete successful set",
+        "minimum_successful_tilings_per_shape": MIN_SUCCESSFUL_TILINGS_PER_SHAPE,
+        "fasg_source_strategy_classes": list(FASG_SOURCE_STRATEGY_CLASSES),
+        "fasg_source_aiv_caps": list(FASG_SOURCE_AIV_CAPS),
+        "fasg_l2_envelope_heuristic_divisors": list(FASG_L2_ENVELOPE_HEURISTIC_DIVISORS),
+        "fasg_l2_envelope_heuristic_max_anchors": FASG_L2_ENVELOPE_HEURISTIC_MAX_ANCHORS,
+        "source_hardware_envelope_heuristics": {
+            op: {**details, "divisors": list(details["divisors"])}
+            for op, details in sorted(SOURCE_HARDWARE_ENVELOPE_HEURISTICS.items())
+        },
+        "source_aiv_caps": list(SOURCE_AIV_CAPS),
         "fasg_multi_tiling_reserve_shapes": FASG_MULTI_TILING_RESERVE_SHAPES,
         "blocked_without_matching_910b_source": ["transpose", "gather_v2"],
         "coverage_tags_per_op": {name: dict(sorted(counter.items())) for name, counter in sorted(tags.items())},

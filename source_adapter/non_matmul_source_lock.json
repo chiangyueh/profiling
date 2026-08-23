@@ -7,7 +7,7 @@
   },
   "collection_contract": {
     "matmul_included": false,
-    "candidate_unit": "one isolated execution of one original source strategy with the unchanged operator TilingContext",
+    "candidate_unit": "one isolated execution of one original source strategy for one documented source-input budget; every raw tiling field remains owned by that source strategy",
     "accepted_candidate": "the original strategy returns success, the resulting operator execution completes, and its output passes the reference comparison",
     "deduplication": "after the isolated original source strategy reports the complete raw tiling identity (tiling key, block dimension, byte count and raw digest); identical identities are measured once and linked to every strategy that generated them",
     "forbidden": [
@@ -36,11 +36,13 @@
     "cann_ops": {
       "url": "https://gitee.com/ascend/cann-ops.git",
       "commit": "c214b710edbe24017dc7dc92170a50bd8ff38171",
+      "build_harness_cmake_sha256": "732deb1a5c93f4725587d4e6e8bb2d5a3046310aa31353c363b1df699a21b961",
       "local_cache_hint": "/usr/local/Ascend/.source_cache/cann-ops-8.1rc1"
     },
     "extracted_installed_source": {
       "local_cache_hint": "/home/CCE_EXTRACT/ops_cce",
-      "provenance": "source extracted from the installed operator package; used only where the public 8.1 source does not expose the matching 910B implementation"
+      "provenance": "source extracted from the installed operator package; used only where the public 8.1 source does not expose the matching 910B implementation",
+      "source_version": "CANN 8.3.RC2 reported by extracted run.sh"
     }
   },
   "operators": {
@@ -60,14 +62,15 @@
         "ophost/flash_attention_score_grad_tiling_s1s2_bn2gs1s2_sab.cpp": "e2f2039154724a09e36599cbc799fa304354eb7f9eb0c4709209717121167ef0",
         "ophost/flash_attention_score_grad_tiling_unpadded_attension.cpp": "998aa5b42fe6ecb651bcdd02a20373314e2edbb2cbc04c765def4561be3e9548"
       },
-      "overlay_method": "disable only the other source registration invocations; do not edit strategy classes, predicates, kernel, or generated tiling fields. Add one audit-only return-status passthrough at the common entry to report already-generated raw tiling identity without changing context or dispatch result."
+      "overlay_method": "isolate one source registration; do not edit strategy classes, predicates, kernel, or generated tiling fields. Add an audit-only return-status passthrough. For finite candidate discovery only, accept FASG_SOURCE_AIV_CAP before source tiling and derive the matching AIC budget from the runtime's own AIC:AIV ratio; invalid caps fail closed. If the complete original-source core-budget set is still below the per-shape minimum, an explicitly labelled hardware-envelope heuristic may reduce only the source-visible L2 scheduling budget by a divisor that is no smaller than the actual physical allocation; the original source formulas generate all resulting fields."
     },
     "fused_infer_attention_score": {
       "source": "cann_ops_adv",
       "relative_root": "src/transformer/fused_infer_attention_score",
-      "status": "native_dispatch_inventory_ready",
+      "status": "collector_overlay_ready",
       "pinned_files": {
-        "ophost/fused_infer_attention_score_tiling.cpp": "0d1e75dca04281714ce066a0a7632e9d1fc58b15fb9a443edae275708b4a67ce"
+        "ophost/fused_infer_attention_score_tiling.cpp": "0d1e75dca04281714ce066a0a7632e9d1fc58b15fb9a443edae275708b4a67ce",
+        "../incre_flash_attention/ophost/incre_flash_attention_tiling.cc": "6b58bd6d5f8ffb581444c984d842e37e77058b5e7dc247a281d4223061b3e2db"
       },
       "native_dispatch": [
         "incre_flash_attention_adapter_when_original_sequence_predicate_is_true",
@@ -78,25 +81,37 @@
     "scatter_elements_v2": {
       "source": "cann_ops",
       "relative_root": "src/index/scatter_elements_v2",
-      "status": "single_original_tiler_inventory_ready",
+      "status": "collector_overlay_ready",
       "pinned_files": {
         "op_host/scatter_elements_v2_tiling.cc": "af4fa87f4760e73b93a31a301827e9e2c286c58f3ff32a0be7344adf2c5543f7"
       },
       "native_dispatch": ["ScatterElementsV2Tiling::RunKernelTiling"],
-      "note": "The pinned source exposes one tiler. The campaign records exactly one source candidate per semantic workload; it does not manufacture alternatives."
+      "note": "The pinned source exposes one tiler. A finite runtime-bounded AIV budget is passed to that original tiler before its own split calculation; no field is changed afterwards. The source itself only accepts its documented last-axis route."
     },
     "gather_elements_v2": {
       "source": "extracted_installed_source",
       "relative_root": "gather_elements_v2",
-      "status": "two_source_predicates_inventory_ready",
+      "status": "cann_8_3_source_with_cann_8_1_build_compatibility_overlay_ready",
       "pinned_files": {
-        "op_host/gather_elements_v2_tiling.cpp": "c7bb8d76d1741b5c3212a8de9f28bf6f9de5fe2f7d012bfa90780b25e6f12793"
+        "op_host/gather_elements_v2_tiling.cpp": "c7bb8d76d1741b5c3212a8de9f28bf6f9de5fe2f7d012bfa90780b25e6f12793",
+        "op_host/gather_elements_v2_last_dim_tiling.h": "c5c10605e8e2621e3c8fec9e8844b5c541b65877b2037d5c3991689e4f31ec5c",
+        "op_host/gather_elements_v2_tiling.h": "f1a79773c768c1c287fde5716bd4bc750c57880b6404e2c267483bdeaf947387",
+        "op_host/gather_elements_v2_def.cpp": "431420b1c590062c893a6ec37e0225a931b50ddc287dd19794fb6d8da8e761ad",
+        "op_host/op_api/aclnn_gather.cpp": "83252611e797c02e42e176951381933aabdf3da584c6647a9b01607e8c2638af",
+        "op_host/op_api/aclnn_gather.h": "0cbe937bbd9452ab83d3ecacd745176c820673e377ca495a623fa1e4d8d4bec5",
+        "op_host/op_api/gather_elements_v2.cpp": "1b250e753f0f5ec192539ef681fd043bfbe02b035274ce30dffcb4d4e5f52a81",
+        "op_host/op_api/gather_elements_v2.h": "b9b8a07c279c7f42a24d15bb20dcf7788ade57acbec2644c5e50959084329c83",
+        "op_kernel/gather_elements_v2.cpp": "498b490ca98f249fcaf630dc7617996077950a8675790020e2c568f5bb3e77c5",
+        "op_kernel/gather_elements_v2_common.h": "9416b4da2d863798f4ae2e547867dce2f40e9c3d191937e24ec583602531175a",
+        "op_kernel/gather_elements_v2_last_dim.h": "caf8774a67ba31a55ef29be6b785545a877eea0eb856777d588f00f6f94a858c",
+        "op_kernel/gather_elements_v2_scalar.h": "d7038ab1282e3a89aaecc2123a5b5c6bd3e6ce041703dfcbc63c34a0fbace77f",
+        "op_kernel/gather_elements_v2_transpose.h": "cc2ec40a9f9d3cfce1021e356e4e8f2a5f27e1528caaeb2ff1796a6a530c0d75"
       },
       "native_dispatch": [
         "GatherElementsV2Tiling::SetKernelTiling_for_non_last_axis",
         "GatherElementsV2LastDimTiling_for_last_axis"
       ],
-      "note": "The two paths are selected by the original axis predicate. For any one semantic axis only its original path is eligible."
+      "note": "The two paths are selected by the original axis predicate. For any one semantic axis only its original path is eligible. This is explicitly a CANN-8.3-source/CANN-8.1-build compatibility port, not a claim of native 8.1 source equivalence; package build and exact installed-output equality are mandatory before a formal record."
     },
     "transpose": {
       "status": "blocked_missing_matching_910b_tiling_source",

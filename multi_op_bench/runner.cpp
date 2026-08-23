@@ -13,13 +13,17 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <dlfcn.h>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits.h>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -104,11 +108,27 @@ class Arguments {
 public:
     Arguments(int argc, char **argv)
     {
-        for (int i = 1; i < argc; i += 2) {
-            if (i + 1 >= argc || std::string(argv[i]).rfind("--", 0) != 0) {
-                throw std::runtime_error("arguments must be --name value pairs");
+        for (int i = 1; i < argc;) {
+            const std::string argument(argv[i]);
+            if (argument.rfind("--", 0) != 0) {
+                throw std::runtime_error("arguments must begin with --");
             }
-            values_[std::string(argv[i]).substr(2)] = argv[i + 1];
+            const std::string name = argument.substr(2);
+            // Source discovery is the one intentional boolean option.  The
+            // controller used to pass it bare while this parser accepted only
+            // pairs, so the process exited before aclInit and never called a
+            // source tiler. Keep the exception explicit rather than allowing
+            // arbitrary misspelled flags to become silently accepted.
+            if (name == "source-tiling-only") {
+                flags_.insert(name);
+                ++i;
+                continue;
+            }
+            if (i + 1 >= argc || std::string(argv[i + 1]).rfind("--", 0) == 0) {
+                throw std::runtime_error("argument --" + name + " requires a value");
+            }
+            values_[name] = argv[i + 1];
+            i += 2;
         }
     }
 
@@ -121,7 +141,7 @@ public:
 
     bool Has(const std::string &name) const
     {
-        return values_.find(name) != values_.end();
+        return values_.find(name) != values_.end() || flags_.find(name) != flags_.end();
     }
 
     int64_t Int(const std::string &name) const
@@ -152,6 +172,103 @@ public:
 
 private:
     std::map<std::string, std::string> values_;
+    std::set<std::string> flags_;
+};
+
+std::string CanonicalPath(const std::string &path)
+{
+    char resolved[PATH_MAX]{};
+    if (realpath(path.c_str(), resolved) == nullptr) {
+        throw std::runtime_error("cannot resolve path: " + path);
+    }
+    return resolved;
+}
+
+class SourceOperationApi {
+public:
+    explicit SourceOperationApi(const Arguments &args)
+    {
+        if (!args.Has("source-opapi")) {
+            if (args.Has("source-tiling-only")) {
+                throw std::runtime_error("--source-tiling-only requires an explicit --source-opapi package API");
+            }
+            return;
+        }
+        if (!args.Has("source-opsproto") || !args.Has("source-optiling")) {
+            throw std::runtime_error("explicit source API requires --source-opapi, --source-opsproto, and --source-optiling");
+        }
+        opapiPath_ = CanonicalPath(args.Get("source-opapi"));
+        const std::string opsprotoPath = CanonicalPath(args.Get("source-opsproto"));
+        const std::string optilingPath = CanonicalPath(args.Get("source-optiling"));
+        opsproto_ = Open(opsprotoPath, RTLD_NOW | RTLD_GLOBAL, "source opsproto");
+        optiling_ = Open(optilingPath, RTLD_NOW | RTLD_GLOBAL, "source optiling");
+        opapi_ = Open(opapiPath_, RTLD_NOW | RTLD_LOCAL, "source opapi");
+
+        const std::string op = args.Get("op");
+        if (op == "gather_elements") {
+            gatherGetWorkspace_ = Resolve<decltype(gatherGetWorkspace_)>("aclnnGatherGetWorkspaceSize");
+            gatherLaunch_ = Resolve<decltype(gatherLaunch_)>("aclnnGather");
+        } else if (op == "scatter_elements") {
+            scatterGetWorkspace_ = Resolve<decltype(scatterGetWorkspace_)>("aclnnScatterGetWorkspaceSize");
+            scatterLaunch_ = Resolve<decltype(scatterLaunch_)>("aclnnScatter");
+        } else if (op == "flash_attention_score_grad") {
+            fasgGetWorkspace_ = Resolve<decltype(fasgGetWorkspace_)>("aclnnFlashAttentionScoreGradGetWorkspaceSize");
+            fasgLaunch_ = Resolve<decltype(fasgLaunch_)>("aclnnFlashAttentionScoreGrad");
+        } else if (op == "fused_infer_attention_score") {
+            fiasGetWorkspace_ = Resolve<decltype(fiasGetWorkspace_)>("aclnnFusedInferAttentionScoreGetWorkspaceSize");
+            fiasLaunch_ = Resolve<decltype(fiasLaunch_)>("aclnnFusedInferAttentionScore");
+        } else {
+            throw std::runtime_error("explicit source API is unsupported for op: " + op);
+        }
+    }
+
+    bool Enabled() const { return opapi_ != nullptr; }
+    const std::string &LibraryPath() const { return opapiPath_; }
+
+    decltype(&aclnnGatherGetWorkspaceSize) gatherGetWorkspace_ = nullptr;
+    decltype(&aclnnGather) gatherLaunch_ = nullptr;
+    decltype(&aclnnScatterGetWorkspaceSize) scatterGetWorkspace_ = nullptr;
+    decltype(&aclnnScatter) scatterLaunch_ = nullptr;
+    decltype(&aclnnFlashAttentionScoreGradGetWorkspaceSize) fasgGetWorkspace_ = nullptr;
+    decltype(&aclnnFlashAttentionScoreGrad) fasgLaunch_ = nullptr;
+    decltype(&aclnnFusedInferAttentionScoreGetWorkspaceSize) fiasGetWorkspace_ = nullptr;
+    decltype(&aclnnFusedInferAttentionScore) fiasLaunch_ = nullptr;
+
+private:
+    static void *Open(const std::string &path, int flags, const std::string &label)
+    {
+        dlerror();
+        void *handle = dlopen(path.c_str(), flags);
+        const char *error = dlerror();
+        if (handle == nullptr || error != nullptr) {
+            throw std::runtime_error(label + " dlopen failed for " + path + ": " +
+                                     (error == nullptr ? "unknown error" : std::string(error)));
+        }
+        return handle;
+    }
+
+    template <typename Function>
+    Function Resolve(const char *symbol) const
+    {
+        dlerror();
+        void *address = dlsym(opapi_, symbol);
+        const char *error = dlerror();
+        if (address == nullptr || error != nullptr) {
+            throw std::runtime_error("source opapi symbol missing: " + std::string(symbol) + ": " +
+                                     (error == nullptr ? "unknown error" : std::string(error)));
+        }
+        Dl_info source{};
+        if (dladdr(address, &source) == 0 || source.dli_fname == nullptr ||
+            CanonicalPath(source.dli_fname) != opapiPath_) {
+            throw std::runtime_error("source opapi symbol resolved outside its explicit package: " + std::string(symbol));
+        }
+        return reinterpret_cast<Function>(address);
+    }
+
+    void *opsproto_ = nullptr;
+    void *optiling_ = nullptr;
+    void *opapi_ = nullptr;
+    std::string opapiPath_;
 };
 
 size_t ElementBytes(aclDataType dtype)
@@ -624,7 +741,8 @@ Measurement RunGatherV2(const Arguments &args, aclrtStream stream, int warmup, i
         });
 }
 
-Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int warmup, int samples)
+Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int warmup, int samples,
+                              const SourceOperationApi *source)
 {
     const auto shape = args.Shape("shape"), indexShape = args.Shape("index-shape");
     if (shape.size() != indexShape.size()) throw std::runtime_error("gather-elements rank mismatch");
@@ -635,9 +753,11 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
     FillIndices(index, indexDtype, Elements(indexShape), shape[axis]);
     Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape), outputTensor(output, dtype, indexShape);
     const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
+        if (source != nullptr) return source->gatherGetWorkspace_(inputTensor.Get(), axis, indexTensor.Get(), outputTensor.Get(), workspace, executor);
         return aclnnGatherGetWorkspaceSize(inputTensor.Get(), axis, indexTensor.Get(), outputTensor.Get(), workspace, executor);
     };
     const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+        if (source != nullptr) return source->gatherLaunch_(workspace, bytes, executor, launchStream);
         return aclnnGather(workspace, bytes, executor, launchStream);
     };
     if (args.Has("source-tiling-only")) {
@@ -661,7 +781,8 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
     return result;
 }
 
-Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int warmup, int samples)
+Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int warmup, int samples,
+                               const SourceOperationApi *sourceApi)
 {
     const auto shape = args.Shape("shape"), indexShape = args.Shape("index-shape");
     if (shape.size() != indexShape.size()) throw std::runtime_error("scatter-elements rank mismatch");
@@ -676,10 +797,13 @@ Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int wa
     Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape);
     Tensor sourceTensor(source, dtype, indexShape), outputTensor(output, dtype, shape);
     const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
+        if (sourceApi != nullptr) return sourceApi->scatterGetWorkspace_(inputTensor.Get(), axis, indexTensor.Get(), sourceTensor.Get(), reduce,
+                                                                          outputTensor.Get(), workspace, executor);
         return aclnnScatterGetWorkspaceSize(inputTensor.Get(), axis, indexTensor.Get(), sourceTensor.Get(), reduce,
                                             outputTensor.Get(), workspace, executor);
     };
     const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+        if (sourceApi != nullptr) return sourceApi->scatterLaunch_(workspace, bytes, executor, launchStream);
         return aclnnScatter(workspace, bytes, executor, launchStream);
     };
     if (args.Has("source-tiling-only")) {
@@ -713,7 +837,8 @@ std::vector<int64_t> AttentionShape(const std::string &layout, int64_t batch, in
     throw std::runtime_error("unsupported attention layout: " + layout);
 }
 
-Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream, int warmup, int samples)
+Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream, int warmup, int samples,
+                                       const SourceOperationApi *source)
 {
     const int64_t batch = args.Int("batch"), qHeads = args.Int("q-heads"), kvHeads = args.Int("kv-heads");
     const int64_t qSeq = args.Int("q-seq"), kvSeq = args.Int("kv-seq"), headDim = args.Int("head-dim");
@@ -749,6 +874,14 @@ Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream
     layoutText.push_back('\0');
     const double scale = 1.0 / std::sqrt(static_cast<double>(headDim));
     const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
+        if (source != nullptr) {
+            return source->fasgGetWorkspace_(
+                qTensor.Get(), kTensor.Get(), vTensor.Get(), dyTensor.Get(),
+                nullptr, nullptr, nullptr, nullptr, maxTensor.Get(), sumTensor.Get(), nullptr, attentionTensor.Get(),
+                nullptr, scale, 1.0, std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max(),
+                qHeads, layoutText.data(), 0, 0, dqTensor.Get(), dkTensor.Get(), dvTensor.Get(), nullptr,
+                workspace, executor);
+        }
         return aclnnFlashAttentionScoreGradGetWorkspaceSize(
             qTensor.Get(), kTensor.Get(), vTensor.Get(), dyTensor.Get(),
             nullptr, nullptr, nullptr, nullptr, maxTensor.Get(), sumTensor.Get(), nullptr, attentionTensor.Get(),
@@ -757,6 +890,7 @@ Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream
             workspace, executor);
     };
     const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+        if (source != nullptr) return source->fasgLaunch_(workspace, bytes, executor, launchStream);
         return aclnnFlashAttentionScoreGrad(workspace, bytes, executor, launchStream);
     };
     if (args.Has("source-tiling-only")) {
@@ -784,7 +918,8 @@ Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream
     return result;
 }
 
-Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream stream, int warmup, int samples)
+Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream stream, int warmup, int samples,
+                                        const SourceOperationApi *source)
 {
     const int64_t batch = args.Int("batch"), qHeads = args.Int("q-heads"), kvHeads = args.Int("kv-heads");
     const int64_t qSeq = args.Int("q-seq"), kvSeq = args.Int("kv-seq"), headDim = args.Int("head-dim");
@@ -807,6 +942,13 @@ Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream strea
     layoutText.push_back('\0');
     const double scale = 1.0 / std::sqrt(static_cast<double>(headDim));
     const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
+        if (source != nullptr) {
+            return source->fiasGetWorkspace_(
+                qTensor.Get(), keyList.Get(), valueList.Get(), nullptr, nullptr, nullptr, nullptr,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                qHeads, scale, std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max(),
+                layoutText.data(), kvHeads, 0, 0, 0, 0, false, outputTensor.Get(), nullptr, workspace, executor);
+        }
         return aclnnFusedInferAttentionScoreGetWorkspaceSize(
             qTensor.Get(), keyList.Get(), valueList.Get(), nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -814,6 +956,7 @@ Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream strea
             layoutText.data(), kvHeads, 0, 0, 0, 0, false, outputTensor.Get(), nullptr, workspace, executor);
     };
     const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+        if (source != nullptr) return source->fiasLaunch_(workspace, bytes, executor, launchStream);
         return aclnnFusedInferAttentionScore(workspace, bytes, executor, launchStream);
     };
     if (args.Has("source-tiling-only")) {
@@ -837,16 +980,21 @@ Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream strea
     return result;
 }
 
-Measurement RunOperation(const Arguments &args, aclrtStream stream, int warmup, int samples)
+Measurement RunOperation(const Arguments &args, aclrtStream stream, int warmup, int samples,
+                         const SourceOperationApi *source)
 {
     const std::string op = args.Get("op");
+    if (source != nullptr && op != "gather_elements" && op != "scatter_elements" &&
+        op != "flash_attention_score_grad" && op != "fused_infer_attention_score") {
+        throw std::runtime_error("explicit source API is unavailable for op: " + op);
+    }
     if (op == "matmul") return RunMatmul(args, stream, warmup, samples);
     if (op == "transpose") return RunTranspose(args, stream, warmup, samples);
     if (op == "gather_v2") return RunGatherV2(args, stream, warmup, samples);
-    if (op == "gather_elements") return RunGatherElements(args, stream, warmup, samples);
-    if (op == "scatter_elements") return RunScatterElements(args, stream, warmup, samples);
-    if (op == "flash_attention_score_grad") return RunFlashAttentionScoreGrad(args, stream, warmup, samples);
-    if (op == "fused_infer_attention_score") return RunFusedInferAttentionScore(args, stream, warmup, samples);
+    if (op == "gather_elements") return RunGatherElements(args, stream, warmup, samples, source);
+    if (op == "scatter_elements") return RunScatterElements(args, stream, warmup, samples, source);
+    if (op == "flash_attention_score_grad") return RunFlashAttentionScoreGrad(args, stream, warmup, samples, source);
+    if (op == "fused_infer_attention_score") return RunFusedInferAttentionScore(args, stream, warmup, samples, source);
     throw std::runtime_error("unknown op: " + op);
 }
 
@@ -892,11 +1040,18 @@ int main(int argc, char **argv)
         if (socName != args.Get("expected-soc")) {
             throw std::runtime_error("unexpected SoC: " + socName + ", expected " + args.Get("expected-soc"));
         }
+        std::unique_ptr<SourceOperationApi> sourceApi;
+        if (args.Has("source-opapi")) {
+            Stage("source_api_load_begin");
+            sourceApi = std::make_unique<SourceOperationApi>(args);
+            if (!sourceApi->Enabled()) throw std::runtime_error("explicit source API did not load");
+            Stage("source_api_load_done", sourceApi->LibraryPath());
+        }
         Stage("stream_create_begin");
         CheckAcl(aclrtCreateStream(&stream), "aclrtCreateStream");
         Stage("stream_create_done");
         Stage("operation_prepare_begin");
-        Measurement result = RunOperation(args, stream, warmup, samples);
+        Measurement result = RunOperation(args, stream, warmup, samples, sourceApi.get());
         Stage("operation_measurement_done");
         CheckAcl(aclrtSynchronizeStream(stream), "final synchronize");
         Stage("final_sync_done");
@@ -904,6 +1059,7 @@ int main(int argc, char **argv)
         const double median = verificationOnly ? 0.0 : Median(result.samplesMs);
         std::cout << "MULTIOP_NPU_RESULT {\"schema\":\"multi_op_real_npu_v2\","
                   << "\"status\":\"success\",\"backend\":\"aclnn_real_npu\","
+                  << "\"execution_api\":\"" << (sourceApi ? "source_package_direct" : "installed_opapi") << "\","
                   << "\"measurement_kind\":\"" << (verificationOnly ? "viability_only" : "device_event_latency") << "\","
                   << "\"soc\":\"" << JsonEscape(socName) << "\","
                   << "\"workload_id\":\"" << JsonEscape(workloadId) << "\","

@@ -130,7 +130,7 @@ SOURCE_ID="$({
         "${ROOT}/source_adapter/prepare_scatter_source_overlay.py" \
         "${ROOT}/source_adapter/build_source_candidate_overlay.py" \
         "${ROOT}/source_adapter/materialize_repo_source_bundle.py" \
-        "${ROOT}/source_adapter/materialize_installed_dynamic_opp.py" \
+        "${ROOT}/source_adapter/install_full_source_candidate_package.py" \
         "${ROOT}/source_adapter/reset_incomplete_private_state.py" \
         "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py"
     sha256sum "${ROOT}/source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz" \
@@ -160,7 +160,7 @@ echo "  source search:      every original dispatcher/strategy × source AIV cap
 echo "  formal group gate:  at least 20 distinct, successful, output-validated tilings per shape; complete groups only"
 echo "  formal data target: 20,000 output-validated device-event latency records (6k FASG, 6k FIAS, 4k Gather, 4k Scatter)"
 echo "  measurement:        ${WARMUP} warmups + ${SAMPLES} device-event samples; no host timeout/kill"
-echo "  build pressure:      one source host-tiler build at a time; installed dynamic device source compiles only an actually launched key"
+echo "  build pressure:      one complete private source-package build at a time; no system CANN files are modified"
 echo "  output:             ${LOGS}/1.log, 2.log, ... (JSONL records; each file <= 50 MiB)"
 echo "  resume:             admitted/rejected workload groups are never rerun; only incomplete groups resume"
 
@@ -227,53 +227,52 @@ label_for_overlay() {
 for overlay_manifest in "${overlay_manifests[@]}"; do
     overlay="$(dirname "${overlay_manifest}")"
     label="$(label_for_overlay "${overlay_manifest}")"
-    build_dir="${PACKAGE_BUILD_PARENT}/${label}_host"
+    build_dir="${PACKAGE_BUILD_PARENT}/${label}_package"
     build_manifest="${build_dir}/source_candidate_build.json"
-    build_log="${STATE}/${label}_host_tiler_build.log"
+    build_log="${STATE}/${label}_source_package_build.log"
     if [[ ! -f "${build_manifest}" ]]; then
         if [[ -e "${build_dir}" ]]; then
             # A missing manifest means this exact private build never completed.
             # Rebuild it from scratch, preserving the previous log under STATE.
             python3 "${ROOT}/source_adapter/reset_incomplete_private_state.py" \
                 --parent "${PACKAGE_BUILD_PARENT}" --target "${build_dir}" \
-                --required-absent "${build_manifest}" --kind host_tiler_build
+                --required-absent "${build_manifest}" --kind source_package_build
         fi
-        echo "SOURCE_HOST_TILER_BUILD_BEGIN source=${label}"
+        echo "SOURCE_FULL_PACKAGE_BUILD_BEGIN source=${label}"
         if ! python3 "${ROOT}/source_adapter/build_source_candidate_overlay.py" \
             --overlay "${overlay}" --build-dir "${build_dir}" --cann-root "${CANN_ROOT}" \
-            --target optiling --jobs "${BUILD_JOBS}" >"${build_log}" 2>&1; then
+            --target package --jobs "${BUILD_JOBS}" >"${build_log}" 2>&1; then
             tail -100 "${build_log}" >&2 || true
             exit 1
         fi
-        echo "SOURCE_HOST_TILER_BUILD_END source=${label}"
+        echo "SOURCE_FULL_PACKAGE_BUILD_END source=${label}"
     fi
     custom_root="${CUSTOM_OPP_PARENT}/${label}"
     custom_manifest="${custom_root}/source_candidate_package.json"
-    materialize_log="${STATE}/${label}_dynamic_opp_materialize.log"
+    install_log="${STATE}/${label}_source_package_install.log"
     if [[ ! -f "${custom_manifest}" ]]; then
         if [[ -e "${custom_root}" ]]; then
             # Never merge incomplete assets into a package.  This helper may
             # touch only this direct child of the private campaign state.
             python3 "${ROOT}/source_adapter/reset_incomplete_private_state.py" \
                 --parent "${CUSTOM_OPP_PARENT}" --target "${custom_root}" \
-                --required-absent "${custom_manifest}" --kind dynamic_opp_root
+                --required-absent "${custom_manifest}" --kind source_package_root
             mkdir -p "${custom_root}"
         else
             mkdir -p "${custom_root}"
         fi
-        echo "SOURCE_DYNAMIC_OPP_MATERIALIZE_BEGIN source=${label}"
-        if ! python3 "${ROOT}/source_adapter/materialize_installed_dynamic_opp.py" \
-            --build-manifest "${build_manifest}" --installed-op-impl "${CANN_ROOT}/opp/built-in/op_impl" \
-            --destination "${custom_root}" >"${materialize_log}" 2>&1; then
-            tail -100 "${materialize_log}" >&2 || true
+        echo "SOURCE_FULL_PACKAGE_INSTALL_BEGIN source=${label}"
+        if ! python3 "${ROOT}/source_adapter/install_full_source_candidate_package.py" \
+            --build-manifest "${build_manifest}" --destination "${custom_root}" >"${install_log}" 2>&1; then
+            tail -100 "${install_log}" >&2 || true
             exit 1
         fi
-        echo "SOURCE_DYNAMIC_OPP_MATERIALIZE_END source=${label}"
+        echo "SOURCE_FULL_PACKAGE_INSTALL_END source=${label}"
     fi
     candidate_manifest_args+=(--custom-opp-manifest "${custom_manifest}")
 done
 if (( ${#candidate_manifest_args[@]} != 22 )); then
-    echo "fatal: expected eleven source host-tiler roots, found $((${#candidate_manifest_args[@]} / 2))" >&2
+    echo "fatal: expected eleven complete private source packages, found $((${#candidate_manifest_args[@]} / 2))" >&2
     exit 1
 fi
 

@@ -54,6 +54,8 @@ def main() -> int:
     source_text = source.read_text(encoding="utf-8")
     runner_text = args.runner_source.read_text(encoding="utf-8")
     cmake_text = args.runner_cmake.read_text(encoding="utf-8")
+    source_operator_type = "GatherElementsSourceCandidate"
+    source_module = "gather_elements_source_candidate"
     op_config = json.loads(config.read_text(encoding="utf-8")).get("GatherElements")
     require("aclopCompileAndExecute" in header_text,
             "CANN header does not publish aclopCompileAndExecute")
@@ -66,8 +68,8 @@ def main() -> int:
             "GatherElements OPP config has unexpected opInterface")
     require('@register_operator("GatherElements")' in source_text,
             "installed dynamic source does not register GatherElements")
-    require('aclopCompileAndExecute("GatherElements"' in runner_text,
-            "runner does not invoke GatherElements through generic OPP dispatch")
+    require("kGatherElementsSourceOperatorType" in runner_text and source_operator_type in runner_text,
+            "runner does not invoke the non-colliding GatherElements source operator type")
     require("acl_op_compiler" in cmake_text,
             "runner is not linked against libacl_op_compiler")
     overlay = None
@@ -75,8 +77,11 @@ def main() -> int:
         require(args.overlay_manifest.is_file(),
                 "missing private GatherElements overlay manifest: {}".format(args.overlay_manifest))
         overlay = json.loads(args.overlay_manifest.read_text(encoding="utf-8"))
-        require(overlay.get("schema") == "gather_elements_native_dynamic_overlay_v4",
+        require(overlay.get("schema") == "gather_elements_native_dynamic_overlay_v5",
                 "private GatherElements overlay has an unexpected schema")
+        require(overlay.get("source_operator_type") == source_operator_type and
+                overlay.get("source_module") == source_module,
+                "private overlay lacks the non-colliding source operator identity")
         custom_root = Path(str(overlay.get("custom_opp_root", "")))
         vendor = str(overlay.get("vendor", ""))
         vendor_root = Path(str(overlay.get("vendor_root", "")))
@@ -87,23 +92,33 @@ def main() -> int:
                 "private vendor root is not exactly under custom_opp/vendors")
         require(impl == vendor + "_impl",
                 "private source implementation directory is not <vendor>_impl")
-        require(source_file == vendor_root / "op_impl" / "ai_core" / "tbe" / impl / "dynamic" / "gather_elements.py",
+        require(source_file == vendor_root / "op_impl" / "ai_core" / "tbe" / impl / "dynamic" / (source_module + ".py"),
                 "private source file does not match the CANN custom-package layout")
         require(source_file.is_file(), "private instrumented GatherElements source is absent")
         require(custom_config.is_file(), "private GatherElements OPP config is absent")
-        private_config = json.loads(custom_config.read_text(encoding="utf-8")).get("GatherElements")
-        require(private_config == op_config,
-                "private GatherElements config is not an exact installed-source declaration copy")
+        private_config = json.loads(custom_config.read_text(encoding="utf-8")).get(source_operator_type)
+        expected_custom_config = dict(op_config)
+        expected_custom_config["opFile"] = {"value": source_module}
+        expected_custom_config["opInterface"] = {"value": "gather_elements"}
+        require(private_config == expected_custom_config,
+                "private GatherElements config is not the required renamed source declaration")
         private_source = source_file.read_text(encoding="utf-8")
         require("GATHER_ELEMENTS_NATIVE_DYNAMIC_SOURCE_AUDIT_V1" in private_source and
                 '"event": "module_imported"' in private_source and
-                "_ge_emit_import_audit()" in private_source,
+                "_ge_emit_import_audit()" in private_source and
+                '@register_operator("{}")'.format(source_operator_type) in private_source,
                 "private GatherElements source lacks its import-path audit marker")
         instrumentation = overlay.get("instrumentation")
         require(isinstance(instrumentation, dict) and
                 instrumentation.get("dispatch_environment") == "GATHER_ELEMENTS_SOURCE_DISPATCH" and
-                instrumentation.get("dispatch_value") == "aclop_compile_and_execute",
+                instrumentation.get("dispatch_value") == "aclop_compile_and_execute" and
+                instrumentation.get("source_budget_environment") == "GATHER_ELEMENTS_SOURCE_AIV_CAP",
                 "private source manifest lacks the explicit generic-dispatch contract")
+        envelope = overlay.get("hardware_envelope_heuristic")
+        require(isinstance(envelope, dict) and
+                envelope.get("environment") == "GATHER_ELEMENTS_SOURCE_UB_DIVISOR" and
+                envelope.get("audit_field") == "ub_cap_divisor",
+                "private source manifest has an invalid UB-envelope environment")
     print("GATHER_ELEMENTS_DISPATCH_CONTRACT " + json.dumps({
         "status": "passed",
         "dispatch_api": "aclopCompileAndExecute",
@@ -113,6 +128,7 @@ def main() -> int:
         "source": str(source),
         "config": str(config),
         "op_type": "GatherElements",
+        "source_operator_type": source_operator_type,
         "op_file": op_config["opFile"]["value"],
         "op_interface": op_config["opInterface"]["value"],
         "overlay_manifest": None if args.overlay_manifest is None else str(args.overlay_manifest),

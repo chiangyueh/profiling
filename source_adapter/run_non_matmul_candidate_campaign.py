@@ -26,8 +26,9 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_native_dynamic_measurement_v4"
-SOURCE_BACKEND = "acl_op_compiler_custom_opp_real_npu"
+SCHEMA = "gather_elements_native_dynamic_measurement_v5"
+SOURCE_BACKEND = "acl_op_compiler_custom_source_op_real_npu"
+SOURCE_OPERATOR_TYPE = "GatherElementsSourceCandidate"
 # The campaign is intentionally append-only so an interrupted physical-NPU
 # run can resume without losing its completed groups.  A single log is kept
 # below this limit; the next numeric log is opened before an oversized write.
@@ -94,6 +95,13 @@ def worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int
         rendered = ",".join(map(str, item)) if isinstance(item, list) else str(item)
         values += ["--" + field.replace("_", "-"), rendered]
     return values
+
+
+def source_worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int, samples: int) -> list[str]:
+    # Normal ACL cleanup is required only for the Python-source route: CANN's
+    # TBE compiler owns host workers that must finish before this subprocess
+    # exits.  It does not reset the device.
+    return worker_args(runner, workload, device, warmup, samples) + ["--normal-cleanup", "1"]
 
 
 def run_worker(arguments: list[str], environment: dict[str, str]) -> tuple[dict[str, Any], str, float, int]:
@@ -215,11 +223,13 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError("missing native GatherElements overlay manifest: {}".format(path))
     item: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-    required = ("schema", "operator", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
+    required = ("schema", "operator", "source_operator_type", "source_module", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
                 "installed_source", "installed_source_sha256", "installed_opp_root", "custom_opp_root", "vendor", "vendor_impl_directory", "vendor_root",
                 "source_file", "source_file_sha256", "instrumentation", "hardware_envelope_heuristic",
                 "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
-    if any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v4":
+    if (any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v5" or
+            item.get("source_operator_type") != SOURCE_OPERATOR_TYPE or
+            item.get("source_module") != "gather_elements_source_candidate"):
         raise RuntimeError("invalid native CANN GatherElements source-overlay manifest: {}".format(path))
     source_file = Path(str(item["source_file"]))
     if not source_file.is_file() or digest_file(source_file) != str(item["source_file_sha256"]):
@@ -234,7 +244,8 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
             inst.get("dispatch_value") != "aclop_compile_and_execute"):
         raise RuntimeError("native overlay does not attest its original-source candidate axes")
     envelope = item["hardware_envelope_heuristic"]
-    if (not isinstance(envelope, dict) or envelope.get("enabled") is not True or not envelope.get("environment") or
+    if (not isinstance(envelope, dict) or envelope.get("enabled") is not True or
+            envelope.get("environment") != "GATHER_ELEMENTS_SOURCE_UB_DIVISOR" or
             not envelope.get("audit_field") or tuple(envelope.get("divisors", ())) != (2, 4, 8) or
             int(envelope.get("max_anchors", 0)) < 1):
         raise RuntimeError("native overlay hardware-envelope provenance is invalid")
@@ -276,8 +287,11 @@ def source_tiling_identity(observation: dict[str, Any]) -> str:
 
 
 def successful_observation(path: Path, package: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-    rows = read_observations(path, str(package["instrumentation"]["audit_schema"]))
+    all_rows = read_observations(path, str(package["instrumentation"]["audit_schema"]))
+    rows = [row for row in all_rows if row.get("event") == "tiling_generated"]
     if not rows:
+        if any(row.get("event") == "module_imported" for row in all_rows):
+            return None, "private source was imported but did not emit a completed tiling audit"
         return None, "original-source overlay emitted no audit observation"
     identities = {source_tiling_identity(row) for row in rows}
     if len(identities) != 1:
@@ -312,7 +326,9 @@ def candidate_label(candidate: dict[str, Any]) -> str:
 
 
 def context_matches(observation: dict[str, Any] | None, candidate: dict[str, Any], package: dict[str, Any]) -> bool:
-    if observation is None or str(observation.get("aiv_core_cap")) != str(candidate["aiv_core_cap"]):
+    if (observation is None or observation.get("event") != "tiling_generated" or
+            observation.get("operator_type") != SOURCE_OPERATOR_TYPE or
+            str(observation.get("aiv_core_cap")) != str(candidate["aiv_core_cap"])):
         return False
     envelope = package["hardware_envelope_heuristic"]
     if envelope["enabled"]:
@@ -344,8 +360,11 @@ def source_audit_emitted(path: Path, package: dict[str, Any], candidate: dict[st
     deployment/audit path, not about admitting a particular tiling.  It must,
     however, emit the requested context and a complete source identity.
     """
-    rows = read_observations(path, str(package["instrumentation"]["audit_schema"]))
+    all_rows = read_observations(path, str(package["instrumentation"]["audit_schema"]))
+    rows = [row for row in all_rows if row.get("event") == "tiling_generated"]
     if not rows:
+        if any(row.get("event") == "module_imported" for row in all_rows):
+            return False, "private source was imported but did not emit a completed tiling audit"
         return False, "original-source overlay emitted no audit observation"
     for row in rows:
         try:
@@ -386,7 +405,7 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                 candidate = candidate_descriptor(package, caps[-1])
                 audit = root / (op + "_" + stable_hash({"package": package["source_file_sha256"], "candidate": candidate}) + ".jsonl")
                 result, output, wall, rc = run_worker(
-                    worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
+                    source_worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
                     source_environment(base_env, package, candidate, audit))
                 observed, reason = source_audit_emitted(audit, package, candidate)
                 source_ok = (observed and rc == 0 and result.get("status") == "success" and
@@ -469,7 +488,7 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
         if kind == "original": original_contexts += 1
         else: heuristic_contexts += 1
         audit = temp / ("discover_" + stable_hash({"g": group_key, "c": candidate}) + ".jsonl")
-        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
+        result, output, wall, rc = run_worker(source_worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
         if result.get("backend") != SOURCE_BACKEND:
@@ -527,7 +546,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
     for identity, item in discovered.items():
         candidate, package = item["candidate"], item["package"]
         audit = temp / ("verify_" + stable_hash({"g": group_key, "c": candidate}) + ".jsonl")
-        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0) + ["--compare-reference", str(reference_path)],
+        result, output, wall, rc = run_worker(source_worker_args(args.runner, workload, args.device, 0, 0) + ["--compare-reference", str(reference_path)],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
         equal = bool(result.get("output_reference_checked")) and bool(result.get("output_reference_equal"))
@@ -555,7 +574,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
             break
         candidate, package = item["candidate"], item["package"]
         audit = temp / ("measure_" + stable_hash({"g": group_key, "c": candidate}) + ".jsonl")
-        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, args.warmup, args.samples) + ["--compare-reference", str(reference_path)],
+        result, output, wall, rc = run_worker(source_worker_args(args.runner, workload, args.device, args.warmup, args.samples) + ["--compare-reference", str(reference_path)],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
         equal = bool(result.get("output_reference_checked")) and bool(result.get("output_reference_equal"))

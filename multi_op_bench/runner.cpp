@@ -33,6 +33,7 @@ std::string JsonEscape(const std::string &value);
 void CheckAcl(aclError rc, const std::string &what);
 std::string gWorkloadId = "unknown";
 std::string gBackend = "aclnn_real_npu";
+constexpr const char *kGatherElementsSourceOperatorType = "GatherElementsSourceCandidate";
 
 void Stage(const std::string &stage, const std::string &detail = "")
 {
@@ -584,9 +585,9 @@ Measurement Measure(aclrtStream stream, int warmup, int samples, DeviceBuffer &o
     return result;
 }
 
-// The generic compiler submits the dynamic custom-OPP kernel directly. Host
-// compilation is outside the returned device-event duration: events bracket
-// only the submitted stream work, and each iteration is synchronized.
+// The generic compiler submits the non-colliding dynamic custom-OPP kernel.
+// Host compilation is outside the returned device-event duration: events
+// bracket only submitted stream work, and each iteration is synchronized.
 template <class Launch>
 Measurement MeasureCompiledOp(aclrtStream stream, int warmup, int samples, DeviceBuffer &output, Launch launch)
 {
@@ -782,7 +783,7 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         throw std::runtime_error("GatherElements source audit/dispatch environment mismatch");
     }
     if (useCustomSource) {
-        gBackend = "acl_op_compiler_custom_opp_real_npu";
+        gBackend = "acl_op_compiler_custom_source_op_real_npu";
         OpTensorDesc inputDesc(dtype, shape), indexDesc(indexDtype, indexShape), outputDesc(dtype, indexShape);
         OpDataBuffer inputData(input), indexData(index), outputData(output);
         OpAttr attr;
@@ -792,10 +793,12 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         const aclTensorDesc *outputDescs[] = {outputDesc.Get()};
         aclDataBuffer *outputBuffers[] = {outputData.Get()};
         const auto launch = [&](aclrtStream launchStream) {
-            // This is the CANN API whose contract is to compile/execute the
-            // named operation. Its OPP lookup honors the private vendor;
-            // ACLNN's already-bound ``aclnnGather`` cannot do that.
-            return aclopCompileAndExecute("GatherElements", 2, inputDescs, inputBuffers,
+            // ``GatherElements`` is already registered by CANN and therefore
+            // wins its own direct single-op lookup.  The private source uses
+            // this non-colliding type, while retaining the original source's
+            // implementation and tiling body.  This forces the generic
+            // compiler to resolve the vendor OPP instead of the builtin.
+            return aclopCompileAndExecute(kGatherElementsSourceOperatorType, 2, inputDescs, inputBuffers,
                                           1, outputDescs, outputBuffers, attr.Get(),
                                           ACL_ENGINE_AICORE, ACL_COMPILE_SYS, nullptr, launchStream);
         };
@@ -1049,8 +1052,10 @@ int main(int argc, char **argv)
     std::string op = "unknown";
     std::string socName = "unknown";
     aclrtStream stream = nullptr;
+    bool normalCleanup = false;
     try {
         Arguments args(argc, argv);
+        normalCleanup = args.Has("normal-cleanup");
         workloadId = args.Get("workload-id");
         gWorkloadId = workloadId;
         op = args.Get("op");
@@ -1084,6 +1089,19 @@ int main(int argc, char **argv)
         Stage("operation_measurement_done");
         CheckAcl(aclrtSynchronizeStream(stream), "final synchronize");
         Stage("final_sync_done");
+        if (normalCleanup) {
+            // Generic Python-source compilation owns host-side TBE workers.
+            // Do normal process-local ACL cleanup so those workers can finish
+            // and emit their audit before the runner returns. This destroys
+            // only this process's stream; it does not reset the NPU.
+            Stage("normal_cleanup_stream_destroy_begin");
+            CheckAcl(aclrtDestroyStream(stream), "aclrtDestroyStream");
+            stream = nullptr;
+            Stage("normal_cleanup_stream_destroy_done");
+            Stage("normal_cleanup_acl_finalize_begin");
+            CheckAcl(aclFinalize(), "aclFinalize");
+            Stage("normal_cleanup_acl_finalize_done");
+        }
         const bool verificationOnly = result.samplesMs.empty();
         const double median = verificationOnly ? 0.0 : Median(result.samplesMs);
         std::cout << "MULTIOP_NPU_RESULT {\"schema\":\"multi_op_real_npu_v2\","
@@ -1109,9 +1127,20 @@ int main(int argc, char **argv)
                   << ",\"output_reference_checked\":" << (result.outputReferenceChecked ? "true" : "false")
                   << ",\"output_reference_equal\":" << (result.outputReferenceEqual ? "true" : "false")
                   << "}" << std::endl;
+        if (normalCleanup) {
+            Stage("process_exit", "normal_process_cleanup_without_global_device_reset");
+            return 0;
+        }
         Stage("process_exit", "isolated_worker_exit_without_global_device_reset");
         std::_Exit(0);
     } catch (const std::exception &error) {
+        if (normalCleanup) {
+            if (stream != nullptr) {
+                (void)aclrtDestroyStream(stream);
+                stream = nullptr;
+            }
+            (void)aclFinalize();
+        }
         Stage("failure", error.what());
         std::cout << "MULTIOP_NPU_RESULT {\"schema\":\"multi_op_real_npu_v2\","
                   << "\"status\":\"failed\",\"backend\":\"" << JsonEscape(gBackend) << "\","
@@ -1119,6 +1148,10 @@ int main(int argc, char **argv)
                   << "\"workload_id\":\"" << JsonEscape(workloadId) << "\","
                   << "\"op\":\"" << JsonEscape(op) << "\","
                   << "\"error\":\"" << JsonEscape(error.what()) << "\"}" << std::endl;
+        if (normalCleanup) {
+            Stage("process_exit", "normal_failed_process_cleanup_without_global_device_reset");
+            return 1;
+        }
         Stage("process_exit", "isolated_failed_worker_exit_without_global_device_reset");
         std::_Exit(1);
     }

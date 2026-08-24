@@ -10,8 +10,8 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/scripts/trace_gather_source_dispatch.sh -d PHYSICAL_NPU_ID
 
-Runs exactly one real-NPU GatherElements call through
-aclopCompileAndExecute("GatherElements"). The private source itself records
+Runs exactly one real-NPU GatherElements call through the non-colliding
+private type ``GatherElementsSourceCandidate``. The private source records
 the actual Python module path when CANN imports it. It does not run the
 5,000-record campaign, use timeout, kill a process, reset an NPU, or modify
 installed CANN files.
@@ -105,18 +105,20 @@ readarray -t OVERLAY_VALUES < <(python3 - "${PACKAGE_MANIFEST}" <<'PY'
 import json
 import sys
 item = json.load(open(sys.argv[1], encoding="utf-8"))
-for key in ("vendor_root", "source_file", "custom_opp_root"):
+for key in ("vendor_root", "source_file", "custom_opp_root", "source_operator_type"):
     print(item[key])
 PY
 )
 VENDOR_ROOT="${OVERLAY_VALUES[0]}"
 PRIVATE_SOURCE="${OVERLAY_VALUES[1]}"
 CUSTOM_OPP_ROOT="${OVERLAY_VALUES[2]}"
+SOURCE_OPERATOR_TYPE="${OVERLAY_VALUES[3]}"
 [[ -f "${PRIVATE_SOURCE}" ]] || { echo "fatal: private GatherElements source is absent: ${PRIVATE_SOURCE}" >&2; exit 1; }
 
 echo "private_custom_opp_root=${CUSTOM_OPP_ROOT}"
 echo "ASCEND_CUSTOM_OPP_PATH=${VENDOR_ROOT}"
 echo "private_source=${PRIVATE_SOURCE}"
+echo "source_operator_type=${SOURCE_OPERATOR_TYPE}"
 echo "private_config=${VENDOR_ROOT}/op_impl/ai_core/tbe/config/ascend910b/aic-ascend910b-ops-info.json"
 
 cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
@@ -126,7 +128,7 @@ RUNNER="${RUNNER_BUILD}/multi_op_npu_runner"
 [[ -x "${RUNNER}" ]] || { echo "fatal: runner was not built: ${RUNNER}" >&2; exit 1; }
 
 echo "===== linked runtime libraries ====="
-ldd "${RUNNER}" | rg 'libacl_op_compiler|libascendcl|libopapi|libnnopbase' || true
+ldd "${RUNNER}" | grep -E 'libacl_op_compiler|libascendcl|libopapi|libnnopbase' || true
 
 export ASCEND_CUSTOM_OPP_PATH="${VENDOR_ROOT}"
 export GATHER_ELEMENTS_TILING_AUDIT_PATH="${AUDIT_PATH}"
@@ -138,7 +140,7 @@ COMMAND=("${RUNNER}"
     --workload-id gather_elements_000 --op gather_elements --device 0
     --warmup 0 --samples 0 --expected-soc Ascend910B3
     --shape 64 --index-shape 17 --axis 0 --dtype fp16 --index-dtype int32
-    --source-tiling-only 1)
+    --source-tiling-only 1 --normal-cleanup 1)
 
 echo "===== exact environment supplied to the one source dispatch ====="
 printf 'ASCEND_OPP_PATH=%s\nASCEND_CUSTOM_OPP_PATH=%s\nGATHER_ELEMENTS_TILING_AUDIT_PATH=%s\nGATHER_ELEMENTS_SOURCE_DISPATCH=%s\nGATHER_ELEMENTS_SOURCE_AIV_CAP=%s\nGATHER_ELEMENTS_SOURCE_UB_DIVISOR=%s\n' \
@@ -165,12 +167,12 @@ else
     echo "MISSING: ${AUDIT_PATH}"
 fi
 
-python3 - "${RUNNER_LOG}" "${AUDIT_PATH}" "${PRIVATE_SOURCE}" "${NATIVE_SOURCE}" "${RUNNER_RC}" <<'PY'
+python3 - "${RUNNER_LOG}" "${AUDIT_PATH}" "${PRIVATE_SOURCE}" "${NATIVE_SOURCE}" "${SOURCE_OPERATOR_TYPE}" "${RUNNER_RC}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-runner_log, audit_path, private_source, installed_source, runner_rc = sys.argv[1:]
+runner_log, audit_path, private_source, installed_source, source_operator_type, runner_rc = sys.argv[1:]
 result = None
 for line in Path(runner_log).read_text(encoding="utf-8", errors="replace").splitlines():
     if line.startswith("MULTIOP_NPU_RESULT "):
@@ -194,7 +196,7 @@ source_import_expected_path = any(
     for row in import_rows
 )
 audit_matches = any(
-    row.get("event") == "tiling_generated" and
+    row.get("event") == "tiling_generated" and row.get("operator_type") == source_operator_type and
     row.get("aiv_core_cap") == 20 and row.get("ub_cap_divisor") == 1 and
     row.get("shape") == [64] and row.get("index_shape") == [17] and
     row.get("axis") == 0 and row.get("dtype") == "float16" and
@@ -202,7 +204,7 @@ audit_matches = any(
     for row in audit_rows
 )
 runner_success = isinstance(result, dict) and result.get("status") == "success"
-generic_route = isinstance(result, dict) and result.get("backend") == "acl_op_compiler_custom_opp_real_npu"
+generic_route = isinstance(result, dict) and result.get("backend") == "acl_op_compiler_custom_source_op_real_npu"
 if int(runner_rc) == 0 and runner_success and generic_route and audit_matches:
     verdict = "source_selected_and_audited"
 elif source_import_expected_path:
@@ -221,6 +223,7 @@ print("GATHER_ELEMENTS_RUNTIME_DISPATCH_PROBE " + json.dumps({
     "audit_expected_context_present": audit_matches,
     "private_source_expected_path": private_source,
     "installed_source_path": installed_source,
+    "source_operator_type": source_operator_type,
     "evidence_rule": "module_imported records the actual Python source path; only a matching tiling_generated row proves a completed source build",
 }, sort_keys=True))
 PY

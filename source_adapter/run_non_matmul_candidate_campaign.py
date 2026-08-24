@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_v2_cann81_prebuilt_measurement_v9"
+SCHEMA = "gather_elements_v2_cann81_prebuilt_measurement_v10"
 SOURCE_BACKEND = "private_cann81_prebuilt_ascendc_aclnn_real_npu"
 SOURCE_OPERATOR_TYPE = "GatherElementsV2"
 # The campaign is intentionally append-only so an interrupted physical-NPU
@@ -78,6 +79,35 @@ def parse_worker_result(output: str) -> dict[str, Any] | None:
     return None
 
 
+def parse_worker_stage(output: str) -> dict[str, Any] | None:
+    marker = "MULTIOP_NPU_STAGE "
+    for line in reversed(output.splitlines()):
+        if line.startswith(marker):
+            try:
+                return json.loads(line[len(marker):])
+            except json.JSONDecodeError:
+                return {"stage": "malformed_stage_record"}
+    return None
+
+
+def worker_termination(return_code: int, output: str) -> tuple[str, dict[str, Any] | None]:
+    stage = parse_worker_stage(output)
+    if return_code < 0:
+        number = -return_code
+        try:
+            name = signal.Signals(number).name
+        except ValueError:
+            name = "SIGNAL"
+        reason = "worker terminated by {}({})".format(name, number)
+    else:
+        reason = "worker exited with code {} without MULTIOP_NPU_RESULT".format(return_code)
+    if stage and stage.get("stage"):
+        reason += " after stage={}".format(stage["stage"])
+        if stage.get("detail"):
+            reason += " detail={}".format(stage["detail"])
+    return reason, stage
+
+
 def worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int, samples: int) -> list[str]:
     values = [str(runner), "--workload-id", workload["workload_id"], "--op", workload["op"],
               "--device", str(device), "--warmup", str(warmup), "--samples", str(samples),
@@ -98,10 +128,11 @@ def worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int
 
 
 def source_worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int, samples: int) -> list[str]:
-    # CANN owns compiler-side host workers for this package. Normal cleanup
-    # waits only for this worker's stream/compiler teardown; it never resets a
-    # device or touches another process.
-    return worker_args(runner, workload, device, warmup, samples) + ["--normal-cleanup", "1"]
+    # This is a precompiled C++/Ascend-C package: there are no Python/TBE
+    # compiler children to drain.  Use the same isolated-worker lifetime as
+    # the working MatMul path; the process exits after flushing its result and
+    # never resets the device or unloads CANN's process-local OpAPI state.
+    return worker_args(runner, workload, device, warmup, samples)
 
 
 def run_worker(arguments: list[str], environment: dict[str, str]) -> tuple[dict[str, Any], str, float, int]:
@@ -109,7 +140,10 @@ def run_worker(arguments: list[str], environment: dict[str, str]) -> tuple[dict[
     started = time.monotonic()
     done = subprocess.run(arguments, text=True, capture_output=True, env=environment, check=False)
     output = done.stdout + done.stderr
-    result = parse_worker_result(done.stdout) or {"status": "failed", "error": "worker emitted no MULTIOP_NPU_RESULT"}
+    result = parse_worker_result(done.stdout)
+    if result is None:
+        reason, stage = worker_termination(done.returncode, output)
+        result = {"status": "failed", "error": reason, "last_stage": stage}
     return result, output, (time.monotonic() - started) * 1000.0, done.returncode
 
 
@@ -420,11 +454,13 @@ def source_audit_emitted(path: Path, package: dict[str, Any], candidate: dict[st
 def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                            packages: dict[str, list[dict[str, Any]]], caps: tuple[int, ...],
                            base_env: dict[str, str]) -> list[dict[str, Any]]:
-    """Run the smallest real-NPU deployment gate before formal measurement.
+    """Prove each boundary from the working ACLNN path to the custom kernel.
 
-    It covers one installed viability launch and one source-tiling audit for
-    the selected operator.  A failed gate ends the campaign before any
-    semantic-shape search can create repeated rejects.
+    Each boundary runs in its own process, so a host-library or device crash
+    cannot erase the last known-good boundary.  The gates are deliberately
+    ordered: installed reference launch, private OpAPI load/symbol lookup,
+    private C++ GetWorkspace/host tiler, then precompiled kernel launch plus
+    exact output comparison.
     """
     checks: list[dict[str, Any]] = []
     temporary_root = args.log_dir.parent / "tmp"
@@ -433,37 +469,84 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
         root = Path(temporary)
         for op in sorted(planned):
             workload = planned[op][0]
-            result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0), base_env)
-            reference_ok = rc == 0 and result.get("status") == "success"
+            reference = root / (op + "_installed_reference.bin")
+            result, output, wall, rc = run_worker(
+                worker_args(args.runner, workload, args.device, 0, 0) + ["--write-reference", str(reference)], base_env)
+            reference_ok = (rc == 0 and result.get("status") == "success" and reference.is_file() and
+                            int(result.get("output_bytes") or 0) > 0)
             checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "installed_reference_viability",
                            "status": "passed" if reference_ok else "failed", "worker_wall_ms": wall,
                            "worker_return_code": rc, "worker_status": result.get("status"),
+                           "last_stage": parse_worker_stage(output),
                            "runner_error": None if reference_ok else result.get("error"),
                            "failure": None if reference_ok else runner_failure(result, output)})
             if not reference_ok:
                 continue
             for package in packages[op]:
-                # A 20-core native source launch is the deployment gate.  The
-                # lower caps are evaluated only after this path is proven.
                 candidate = candidate_descriptor(package, caps[-1])
-                audit = root / (op + "_" + stable_hash({"package": package["source_file_sha256"], "candidate": candidate}) + ".jsonl")
+
+                load_audit = root / (op + "_load_unused.jsonl")
                 result, output, wall, rc = run_worker(
-                    source_worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
-                    source_environment(base_env, package, candidate, audit))
-                observed, reason = source_audit_emitted(audit, package, candidate)
-                source_ok = (observed and rc == 0 and result.get("status") == "success" and
-                             result.get("backend") == SOURCE_BACKEND)
-                checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "source_tiler_audit",
+                    source_worker_args(args.runner, workload, args.device, 0, 0) + ["--source-load-only", "1"],
+                    source_environment(base_env, package, candidate, load_audit))
+                load_ok = (rc == 0 and result.get("status") == "success" and result.get("backend") == SOURCE_BACKEND)
+                checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "private_opapi_load",
                                "strategy": candidate["id"], "aiv_core_cap": candidate["aiv_core_cap"],
-                               "status": "passed" if source_ok else "failed", "worker_return_code": rc,
+                               "status": "passed" if load_ok else "failed", "worker_return_code": rc,
                                "worker_status": result.get("status"), "worker_wall_ms": wall,
-                               "runner_backend": result.get("backend"),
-                               "runner_error": None if source_ok else result.get("error"),
-                               "failure": None if source_ok else (
-                                   runner_failure(result, output) if (rc != 0 or result.get("status") != "success")
-                                   else (reason if not observed else
-                                         ("runner used unexpected backend: {}".format(result.get("backend"))
-                                          if result.get("backend") != SOURCE_BACKEND else compact_failure(output))))})
+                               "runner_backend": result.get("backend"), "last_stage": parse_worker_stage(output),
+                               "runner_error": None if load_ok else result.get("error"),
+                               "failure": None if load_ok else runner_failure(result, output)})
+                if not load_ok:
+                    continue
+
+                tiling_audit = root / (op + "_host_tiling_" + stable_hash(candidate) + ".jsonl")
+                result, output, wall, rc = run_worker(
+                    source_worker_args(args.runner, workload, args.device, 0, 0) + ["--source-host-tiling-only", "1"],
+                    source_environment(base_env, package, candidate, tiling_audit))
+                observed, reason = source_audit_emitted(tiling_audit, package, candidate)
+                tiling_ok = (observed and rc == 0 and result.get("status") == "success" and
+                             result.get("backend") == SOURCE_BACKEND)
+                checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "private_host_tiling",
+                               "strategy": candidate["id"], "aiv_core_cap": candidate["aiv_core_cap"],
+                               "status": "passed" if tiling_ok else "failed", "worker_return_code": rc,
+                               "worker_status": result.get("status"), "worker_wall_ms": wall,
+                               "runner_backend": result.get("backend"), "last_stage": parse_worker_stage(output),
+                               "runner_error": None if tiling_ok else result.get("error"),
+                               "failure": None if tiling_ok else (
+                                   runner_failure(result, output) if (rc != 0 or result.get("status") != "success") else reason)})
+                if not tiling_ok:
+                    continue
+
+                launch_audit = root / (op + "_kernel_launch_" + stable_hash(candidate) + ".jsonl")
+                result, output, wall, rc = run_worker(
+                    source_worker_args(args.runner, workload, args.device, 0, 0) +
+                    ["--source-tiling-only", "1", "--compare-reference", str(reference)],
+                    source_environment(base_env, package, candidate, launch_audit))
+                launch_observed, launch_reason = source_audit_emitted(launch_audit, package, candidate)
+                launch_ok = (launch_observed and rc == 0 and result.get("status") == "success" and
+                             result.get("backend") == SOURCE_BACKEND and
+                             result.get("output_reference_checked") is True and
+                             result.get("output_reference_equal") is True)
+                if not launch_ok and rc == 0 and result.get("status") == "success":
+                    if not launch_observed:
+                        launch_failure = launch_reason
+                    elif result.get("backend") != SOURCE_BACKEND:
+                        launch_failure = "runner used unexpected backend: {}".format(result.get("backend"))
+                    else:
+                        launch_failure = "private precompiled kernel output did not exactly match installed aclnnGather"
+                else:
+                    launch_failure = None if launch_ok else runner_failure(result, output)
+                checks.append({"operator": op, "workload_id": workload["workload_id"],
+                               "kind": "private_precompiled_kernel_launch",
+                               "strategy": candidate["id"], "aiv_core_cap": candidate["aiv_core_cap"],
+                               "status": "passed" if launch_ok else "failed", "worker_return_code": rc,
+                               "worker_status": result.get("status"), "worker_wall_ms": wall,
+                               "runner_backend": result.get("backend"), "last_stage": parse_worker_stage(output),
+                               "output_reference_checked": result.get("output_reference_checked"),
+                               "output_reference_equal": result.get("output_reference_equal"),
+                               "runner_error": None if launch_ok else result.get("error"),
+                               "failure": launch_failure})
     return checks
 
 
@@ -723,7 +806,7 @@ def main() -> int:
         "historical_latency_or_tiling_records_read": 0, "cce_data_or_cost_model_read": 0,
         "timing": {"warmup": args.warmup, "samples": args.samples, "kind": "device_event_only"},
         "no_host_timeout_or_forced_worker_kill": True, "temporary_reference_storage": str(temporary_root),
-        "preflight": "one installed viability launch plus one private CANN 8.1 C++ ACLNN/precompiled-kernel source audit; any failure stops before semantic-shape discovery",
+        "preflight": "ordered isolated gates: installed ACLNN reference, private C++ OpAPI load, private GetWorkspace/host tiler, precompiled kernel launch, exact output equality",
         "log_directory": str(args.log_dir), "log_rotation_max_bytes": MAX_LOG_BYTES,
     }
     writer.append({**begin, "record_type": "campaign_begin"})
@@ -747,12 +830,17 @@ def main() -> int:
         print("SOURCE_TILING_CAMPAIGN_PREFLIGHT_FAILED " + json.dumps({
             "kind": first.get("kind"), "worker_return_code": first.get("worker_return_code"),
             "runner_backend": first.get("runner_backend"), "failure": first.get("failure"),
+            "last_stage": first.get("last_stage"),
             "logs": str(args.log_dir)
         }, ensure_ascii=False, sort_keys=True), flush=True)
         return 2
     print("SOURCE_TILING_CAMPAIGN_PREFLIGHT_PASSED " + json.dumps({
-        "checks": len(preflight), "source_tiler_audits": sum(check["kind"] == "source_tiler_audit" for check in preflight),
+        "checks": [check["kind"] for check in preflight],
         "installed_reference_viability": sum(check["kind"] == "installed_reference_viability" for check in preflight),
+        "private_opapi_load": sum(check["kind"] == "private_opapi_load" for check in preflight),
+        "private_host_tiling": sum(check["kind"] == "private_host_tiling" for check in preflight),
+        "private_precompiled_kernel_launch": sum(
+            check["kind"] == "private_precompiled_kernel_launch" for check in preflight),
     }, sort_keys=True), flush=True)
     op = args.operator
     for workload in planned[op]:

@@ -107,13 +107,16 @@ SOURCE_ID="$({
 
 SOURCE_CACHE_PARENT="${ROOT}/.source_cache"
 CANN_OPS_SOURCE="${SOURCE_CACHE_PARENT}/cann_ops_8_1rc1"
-STATE="${ROOT}/.benchmark_state/gather_elements_v2_cann81_prebuilt_v9/${SOURCE_ID}"
+STATE_FAMILY="${ROOT}/.benchmark_state/gather_elements_v2_cann81_prebuilt_v10"
+LEGACY_STATE_FAMILY="${ROOT}/.benchmark_state/gather_elements_v2_cann81_prebuilt_v9"
+STATE="${STATE_FAMILY}/${SOURCE_ID}"
 PROJECT="${STATE}/project"
 PACKAGE_BUILD="${STATE}/package_build"
-PACKAGE_ROOT="${STATE}/output/packages/vendors/gather_elements_source"
+DEFAULT_PACKAGE_ROOT="${STATE}/output/packages/vendors/gather_elements_source"
+PACKAGE_ROOT="${DEFAULT_PACKAGE_ROOT}"
 PACKAGE_MANIFEST="${STATE}/gather_elements_v2_private_package.json"
 RUNNER_BUILD="${STATE}/runner_build"
-RESULTS="${ROOT}/results/gather_elements_v2_cann81_prebuilt_v9/${SOURCE_ID}"
+RESULTS="${ROOT}/results/gather_elements_v2_cann81_prebuilt_v10/${SOURCE_ID}"
 LOGS="${RESULTS}/logs"
 mkdir -p "${SOURCE_CACHE_PARENT}" "${STATE}" "${LOGS}"
 # Keep temporary files made by tools that honor the standard variables under
@@ -172,23 +175,114 @@ if [[ ! -f "${PROJECT}/gather_elements_v2_project.json" ]]; then
         --cann-ops-source "${CANN_OPS_SOURCE}" --cann-root "${CANN_ROOT}" --output "${PROJECT}"
 fi
 
-if [[ ! -f "${PACKAGE_BUILD}/CMakeCache.txt" ]]; then
-    run_logged "GATHER_PACKAGE_CONFIGURE" "${STATE}/package_configure.log" \
-        resource_limited cmake -S "${PROJECT}" -B "${PACKAGE_BUILD}" -G "Unix Makefiles" \
-        -DBUILD_OPEN_PROJECT=ON -DASCEND_COMPUTE_UNIT=ascend910b \
-        -DASCEND_OP_NAME=gather_elements_v2 -DVENDOR_NAME=gather_elements_source \
-        -DCUSTOM_ASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" -DCHECK_COMPATIBLE=OFF \
-        -DENABLE_OPS_KERNEL=ON -DENABLE_OPS_HOST=ON -DPREPARE_BUILD=OFF -DENABLE_CCACHE=OFF \
-        -DCMAKE_BUILD_TYPE=Release
+PACKAGE_READY=0
+if [[ -f "${PACKAGE_MANIFEST}" ]]; then
+    PACKAGE_ROOT="$(python3 - "${PACKAGE_MANIFEST}" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["package_root"])
+PY
+)"
+    run_logged "GATHER_PACKAGE_VALIDATE" "${STATE}/package_validate.log" \
+        python3 "${ROOT}/source_adapter/finalize_gather_elements_v2_package.py" \
+        --project "${PROJECT}" --package-root "${PACKAGE_ROOT}" \
+        --cann-root "${CANN_ROOT}" --manifest "${PACKAGE_MANIFEST}"
+    PACKAGE_READY=1
+else
+    # Runner/controller changes must not trigger another expensive Ascend-C
+    # package build.  Reuse a previously validated package only when its
+    # instrumented source hash, CANN 8.1 build identity, OpAPI, host tiler,
+    # and four precompiled 910B kernels all match; the finalizer revalidates
+    # the candidate against this freshly prepared project before use.
+    mapfile -t REUSE_MANIFESTS < <(python3 - "${PROJECT}" "${CANN_ROOT}" "${STATE_FAMILY}" "${LEGACY_STATE_FAMILY}" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+
+project, cann_root = map(Path, sys.argv[1:3])
+families = [Path(value) for value in sys.argv[3:]]
+source = project / "src/index/gather_elements_v2/op_host/gather_elements_v2_tiling.cpp"
+source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+cann_hash = hashlib.sha256((cann_root / "opp/version.info").read_bytes()).hexdigest()
+candidates = []
+for family in families:
+    if not family.is_dir():
+        continue
+    for manifest in family.glob("*/gather_elements_v2_private_package.json"):
+        try:
+            row = json.loads(manifest.read_text(encoding="utf-8"))
+            if (row.get("schema") != "gather_elements_v2_cann81_prebuilt_package_v2" or
+                    row.get("build_cann_version") != "8.1.RC1" or
+                    row.get("source_file_sha256") != source_hash or
+                    row.get("cann_version_file_sha256") != cann_hash or
+                    len(row.get("precompiled_device_kernels", [])) != 4):
+                continue
+            required = [row.get("package_root"), row.get("op_api_library"),
+                        row.get("op_tiling_library"), row.get("op_proto_library")]
+            required += [item.get("object") for item in row["precompiled_device_kernels"]]
+            required += [item.get("metadata") for item in row["precompiled_device_kernels"]]
+            if not all(value and Path(value).exists() for value in required):
+                continue
+            hashed = [
+                (row.get("op_api_library"), row.get("op_api_library_sha256")),
+                (row.get("op_tiling_library"), row.get("op_tiling_library_sha256")),
+                (row.get("op_proto_library"), row.get("op_proto_library_sha256")),
+                (row.get("ops_config"), row.get("ops_config_sha256")),
+                (row.get("kernel_binary_info_config"), row.get("kernel_binary_info_config_sha256")),
+                (row.get("kernel_operator_config"), row.get("kernel_operator_config_sha256")),
+            ]
+            for item in row["precompiled_device_kernels"]:
+                hashed += [(item.get("object"), item.get("object_sha256")),
+                           (item.get("metadata"), item.get("metadata_sha256"))]
+            if not all(path and expected and Path(path).is_file() and
+                       hashlib.sha256(Path(path).read_bytes()).hexdigest() == expected
+                       for path, expected in hashed):
+                continue
+            candidates.append((manifest.stat().st_mtime_ns, manifest))
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+for _, manifest in sorted(candidates, reverse=True):
+    print(manifest)
+PY
+)
+    for reusable_manifest in "${REUSE_MANIFESTS[@]}"; do
+        reusable_root="$(python3 - "${reusable_manifest}" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["package_root"])
+PY
+)"
+        echo "GATHER_PACKAGE_REUSE begin"
+        if python3 "${ROOT}/source_adapter/finalize_gather_elements_v2_package.py" \
+                --project "${PROJECT}" --package-root "${reusable_root}" \
+                --cann-root "${CANN_ROOT}" --manifest "${PACKAGE_MANIFEST}" \
+                >"${STATE}/package_reuse_validate.log" 2>&1; then
+            PACKAGE_ROOT="${reusable_root}"
+            PACKAGE_READY=1
+            echo "GATHER_PACKAGE_REUSE passed"
+            break
+        fi
+        echo "GATHER_PACKAGE_REUSE rejected"
+    done
 fi
-run_logged "GATHER_PACKAGE_BUILD" "${STATE}/package_build.log" \
-    resource_limited cmake --build "${PACKAGE_BUILD}" --parallel 1
-run_logged "GATHER_PACKAGE_INSTALL" "${STATE}/package_install.log" \
-    cmake --install "${PACKAGE_BUILD}"
-run_logged "GATHER_PACKAGE_VALIDATE" "${STATE}/package_validate.log" \
-    python3 "${ROOT}/source_adapter/finalize_gather_elements_v2_package.py" \
-    --project "${PROJECT}" --package-root "${PACKAGE_ROOT}" \
-    --cann-root "${CANN_ROOT}" --manifest "${PACKAGE_MANIFEST}"
+
+if (( PACKAGE_READY == 0 )); then
+    if [[ ! -f "${PACKAGE_BUILD}/CMakeCache.txt" ]]; then
+        run_logged "GATHER_PACKAGE_CONFIGURE" "${STATE}/package_configure.log" \
+            resource_limited cmake -S "${PROJECT}" -B "${PACKAGE_BUILD}" -G "Unix Makefiles" \
+            -DBUILD_OPEN_PROJECT=ON -DASCEND_COMPUTE_UNIT=ascend910b \
+            -DASCEND_OP_NAME=gather_elements_v2 -DVENDOR_NAME=gather_elements_source \
+            -DCUSTOM_ASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" -DCHECK_COMPATIBLE=OFF \
+            -DENABLE_OPS_KERNEL=ON -DENABLE_OPS_HOST=ON -DPREPARE_BUILD=OFF -DENABLE_CCACHE=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+    fi
+    run_logged "GATHER_PACKAGE_BUILD" "${STATE}/package_build.log" \
+        resource_limited cmake --build "${PACKAGE_BUILD}" --parallel 1
+    run_logged "GATHER_PACKAGE_INSTALL" "${STATE}/package_install.log" \
+        cmake --install "${PACKAGE_BUILD}"
+    run_logged "GATHER_PACKAGE_VALIDATE" "${STATE}/package_validate.log" \
+        python3 "${ROOT}/source_adapter/finalize_gather_elements_v2_package.py" \
+        --project "${PROJECT}" --package-root "${DEFAULT_PACKAGE_ROOT}" \
+        --cann-root "${CANN_ROOT}" --manifest "${PACKAGE_MANIFEST}"
+    PACKAGE_ROOT="${DEFAULT_PACKAGE_ROOT}"
+fi
 
 if [[ ! -f "${RUNNER_BUILD}/CMakeCache.txt" ]]; then
     run_logged "GATHER_RUNNER_CONFIGURE" "${STATE}/runner_configure.log" \

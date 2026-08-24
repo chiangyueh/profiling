@@ -34,12 +34,71 @@ std::string gWorkloadId = "unknown";
 std::string gBackend = "aclnn_real_npu";
 constexpr const char *kGatherElementsSourceOperatorType = "GatherElementsV2";
 
+using GatherElementsGetWorkspace = aclnnStatus (*)(const aclTensor *, const aclTensor *, int64_t,
+                                                    const aclTensor *, uint64_t *, aclOpExecutor **);
+using GatherElementsLaunch = aclnnStatus (*)(void *, uint64_t, aclOpExecutor *, aclrtStream);
+
+struct GatherElementsPrivateApi {
+    void *library = nullptr;
+    GatherElementsGetWorkspace getWorkspace = nullptr;
+    GatherElementsLaunch launch = nullptr;
+    std::string path;
+};
+
 void Stage(const std::string &stage, const std::string &detail = "")
 {
     std::cout << "MULTIOP_NPU_STAGE {\"workload_id\":\"" << JsonEscape(gWorkloadId)
               << "\",\"stage\":\"" << JsonEscape(stage) << "\"";
     if (!detail.empty()) std::cout << ",\"detail\":\"" << JsonEscape(detail) << "\"";
     std::cout << "}" << std::endl;
+}
+
+const GatherElementsPrivateApi &LoadGatherElementsPrivateApi(const char *libraryPath)
+{
+    // Match CANN 8.1's official custom-OpAPI loader: the library handle and
+    // resolved functions live for the whole worker process.  dlclose is
+    // intentionally absent because Nnopbase retains process-local state
+    // created by GetWorkspaceSize; unloading the code behind that state is
+    // unsafe.  The isolated worker exits immediately after one operation.
+    static GatherElementsPrivateApi *api = nullptr;
+    if (api != nullptr) {
+        if (api->path != libraryPath) {
+            throw std::runtime_error("private GatherElementsV2 OpAPI path changed within one worker");
+        }
+        return *api;
+    }
+
+    Stage("private_opapi_load_begin", libraryPath);
+    auto *loaded = new GatherElementsPrivateApi();
+    loaded->path = libraryPath;
+    loaded->library = dlopen(libraryPath, RTLD_LAZY | RTLD_LOCAL);
+    if (loaded->library == nullptr) {
+        const char *error = dlerror();
+        const std::string message = error == nullptr ? "unknown dlopen error" : error;
+        delete loaded;
+        throw std::runtime_error("cannot load private GatherElementsV2 C++ OpAPI: " + message);
+    }
+    Stage("private_opapi_load_done");
+
+    dlerror();
+    loaded->getWorkspace = reinterpret_cast<GatherElementsGetWorkspace>(
+        dlsym(loaded->library, "aclnnInnerGatherElementsV2GetWorkspaceSize"));
+    const char *workspaceSymbolError = dlerror();
+    if (loaded->getWorkspace == nullptr || workspaceSymbolError != nullptr) {
+        throw std::runtime_error("private GatherElementsV2 GetWorkspaceSize symbol is absent");
+    }
+    Stage("private_opapi_get_workspace_symbol_done");
+
+    dlerror();
+    loaded->launch = reinterpret_cast<GatherElementsLaunch>(
+        dlsym(loaded->library, "aclnnInnerGatherElementsV2"));
+    const char *launchSymbolError = dlerror();
+    if (loaded->launch == nullptr || launchSymbolError != nullptr) {
+        throw std::runtime_error("private GatherElementsV2 launch symbol is absent");
+    }
+    Stage("private_opapi_launch_symbol_done");
+    api = loaded;
+    return *api;
 }
 
 void DeviceException(aclrtExceptionInfo *info)
@@ -316,6 +375,7 @@ public:
         if (ptr != nullptr) aclDestroyAclOpExecutor(ptr);
     }
     void MarkConsumedByOneShotLaunch() { ptr = nullptr; }
+    void ReleaseToIsolatedProcessExit() { ptr = nullptr; }
     aclOpExecutor *ptr = nullptr;
 };
 
@@ -658,51 +718,51 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         if (libraryPath == nullptr || *libraryPath == '\0') {
             throw std::runtime_error("private GatherElementsV2 C++ OpAPI path is absent");
         }
-        void *library = dlopen(libraryPath, RTLD_NOW | RTLD_LOCAL);
-        if (library == nullptr) {
-            const char *error = dlerror();
-            throw std::runtime_error("cannot load private GatherElementsV2 C++ OpAPI: " +
-                                     std::string(error == nullptr ? "unknown dlopen error" : error));
-        }
-        using GetWorkspace = aclnnStatus (*)(const aclTensor *, const aclTensor *, int64_t,
-                                             const aclTensor *, uint64_t *, aclOpExecutor **);
-        using Launch = aclnnStatus (*)(void *, uint64_t, aclOpExecutor *, aclrtStream);
-        dlerror();
-        auto getWorkspace = reinterpret_cast<GetWorkspace>(dlsym(library, "aclnnInnerGatherElementsV2GetWorkspaceSize"));
-        const char *workspaceSymbolError = dlerror();
-        dlerror();
-        auto launch = reinterpret_cast<Launch>(dlsym(library, "aclnnInnerGatherElementsV2"));
-        const char *launchSymbolError = dlerror();
-        if (getWorkspace == nullptr || launch == nullptr || workspaceSymbolError != nullptr || launchSymbolError != nullptr) {
-            dlclose(library);
-            throw std::runtime_error("private GatherElementsV2 C++ OpAPI symbols are absent");
-        }
+        const GatherElementsPrivateApi &api = LoadGatherElementsPrivateApi(libraryPath);
         gBackend = "private_cann81_prebuilt_ascendc_aclnn_real_npu";
-        Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape), outputTensor(output, dtype, indexShape);
-        Measurement result;
-        try {
-            result = Measure(stream, args.Has("source-tiling-only") ? 0 : warmup,
-                             args.Has("source-tiling-only") ? 0 : samples, output,
-                [&](uint64_t *workspace, aclOpExecutor **executor) {
-                    return getWorkspace(inputTensor.Get(), indexTensor.Get(), axis, outputTensor.Get(), workspace, executor);
-                },
-                [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
-                    return launch(workspace, bytes, executor, launchStream);
-                });
-        } catch (...) {
-            dlclose(library);
-            throw;
+        if (args.Has("source-load-only")) {
+            Stage("private_opapi_load_probe_done");
+            return Measurement{};
         }
-        dlclose(library);
-        if (!args.Has("source-tiling-only")) {
-            const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
-            result.outputBytes = snapshot.size();
-            result.outputDigest = Fnv1a64(snapshot);
-            if (args.Has("write-reference")) WriteReference(args.Get("write-reference"), snapshot);
-            if (args.Has("compare-reference")) {
-                result.outputReferenceChecked = true;
-                result.outputReferenceEqual = snapshot == ReadReference(args.Get("compare-reference"));
+        Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape), outputTensor(output, dtype, indexShape);
+        const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
+            return api.getWorkspace(inputTensor.Get(), indexTensor.Get(), axis, outputTensor.Get(), workspace, executor);
+        };
+        const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+            return api.launch(workspace, bytes, executor, launchStream);
+        };
+        if (args.Has("source-host-tiling-only")) {
+            Measurement result;
+            Executor executor;
+            Stage("private_host_tiling_get_workspace_begin");
+            CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr),
+                       "private GatherElementsV2 GetWorkspaceSize probe");
+            if (executor.ptr == nullptr) {
+                throw std::runtime_error("private GatherElementsV2 GetWorkspaceSize returned null executor");
             }
+            Stage("private_host_tiling_get_workspace_done",
+                  "workspace_bytes=" + std::to_string(result.workspaceBytes));
+            // This probe deliberately stops between ACLNN's two stages.  Its
+            // isolated process exits immediately, so leave Nnopbase's
+            // executor space process-owned instead of invoking a cleanup path
+            // that a normal GetWorkspace+launch operation never takes.
+            executor.ReleaseToIsolatedProcessExit();
+            Stage("private_host_tiling_probe_done");
+            return result;
+        }
+        Measurement result;
+        result = Measure(stream, args.Has("source-tiling-only") ? 0 : warmup,
+                         args.Has("source-tiling-only") ? 0 : samples, output,
+                         getWorkspace, launch);
+        Stage("private_precompiled_kernel_execution_done");
+        const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
+        result.outputBytes = snapshot.size();
+        result.outputDigest = Fnv1a64(snapshot);
+        if (args.Has("write-reference")) WriteReference(args.Get("write-reference"), snapshot);
+        if (args.Has("compare-reference")) {
+            result.outputReferenceChecked = true;
+            result.outputReferenceEqual = snapshot == ReadReference(args.Get("compare-reference"));
+            Stage("private_output_compare_done", result.outputReferenceEqual ? "equal=true" : "equal=false");
         }
         return result;
     }

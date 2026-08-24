@@ -35,6 +35,13 @@ def last_runner_stage(output: str) -> str | None:
     return stages[-1] if stages else None
 
 
+def failure_stage(output: str) -> str | None:
+    """Keep the runner's actual error stage, rather than only its exit."""
+    stages = [line for line in output.splitlines()
+              if line.startswith("MULTIOP_NPU_STAGE ") and '"stage":"failure"' in line]
+    return stages[-1] if stages else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runner", required=True, type=Path)
@@ -68,10 +75,14 @@ def main() -> int:
         "status": "passed" if passed else "failed", "operator": runtime_op,
         "workload_id": workload["workload_id"], "worker_return_code": rc,
         "worker_status": result.get("status"), "worker_wall_ms": wall,
-        "failure": None if passed else (reason if not observed else module.compact_failure(output)),
+        "failure": None if passed else (
+            module.runner_failure(result, output) if (rc != 0 or result.get("status") != "success")
+            else (reason if not observed else module.compact_failure(output))),
+        "runner_error": None if passed else result.get("error"),
         # ``reason`` can be a secondary consequence of a native crash.  Keep
         # the last real runner transition on the same terminal/log record so
         # an operator does not need to recover a discarded subprocess trace.
+        "runner_failure_stage": None if passed else failure_stage(output),
         "last_runner_stage": None if passed else last_runner_stage(output),
     }
     print("GATHER_ELEMENTS_NATIVE_SOURCE_SMOKE " + json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)

@@ -127,11 +127,18 @@ def _ge_emit_audit(obj, x_dict, indices_dict, dim):
 
 
 def expected(output: Path, cann: Path, source: Path, config: Path) -> dict[str, Any]:
-    root = output / "runtime_opp"
+    # CANN 8.1's documented custom-operator loader keeps the installed OPP
+    # root in ASCEND_OPP_PATH and receives one vendor directory through
+    # ASCEND_CUSTOM_OPP_PATH.  Do not replace ASCEND_OPP_PATH with a synthetic
+    # root: that can bypass normal ACLNN operator resolution before this
+    # source is considered.
+    root = output / "custom_opp"
     vendor_root = root / "vendors" / VENDOR
     source_target = vendor_root / "op_impl" / "ai_core" / "tbe" / "impl" / "dynamic" / "gather_elements.py"
     return {
-        "schema": "gather_elements_native_dynamic_overlay_v1",
+        # v2 distinguishes the documented ASCEND_CUSTOM_OPP_PATH vendor
+        # layout from the older, invalid synthetic ASCEND_OPP_PATH overlay.
+        "schema": "gather_elements_native_dynamic_overlay_v2",
         "operator": "GatherElements",
         "runtime_op": "gather_elements",
         "source_kind": "installed_cann81_native_dynamic_source",
@@ -141,7 +148,8 @@ def expected(output: Path, cann: Path, source: Path, config: Path) -> dict[str, 
         "installed_source_sha256": digest(source),
         "installed_config": str(config),
         "installed_config_sha256": digest(config),
-        "runtime_opp_root": str(root),
+        "installed_opp_root": str(cann / "opp"),
+        "custom_opp_root": str(root),
         "vendor": VENDOR,
         "vendor_root": str(vendor_root),
         "source_file": str(source_target),
@@ -168,7 +176,7 @@ def validate_existing(output: Path, planned: dict[str, Any], original: str) -> d
         raise RuntimeError("incomplete private native GatherElements overlay exists")
     item = json.loads(manifest_path.read_text(encoding="utf-8"))
     for key in ("schema", "operator", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
-                "installed_source_sha256", "installed_config_sha256", "runtime_opp_root", "vendor", "vendor_root",
+                "installed_source_sha256", "installed_config_sha256", "installed_opp_root", "custom_opp_root", "vendor", "vendor_root",
                 "source_file", "instrumentation", "hardware_envelope_heuristic", "strategy_algorithm_changes",
                 "kernel_algorithm_changes", "formal_data_gate"):
         if item.get(key) != planned.get(key):
@@ -195,12 +203,10 @@ def prepare(cann: Path, output_parent: Path) -> dict[str, Any]:
         return prior
     if output.exists():
         raise RuntimeError("refuse to overwrite incomplete private native GatherElements overlay")
-    root = Path(planned["runtime_opp_root"])
+    root = Path(planned["custom_opp_root"])
     vendor_root = Path(planned["vendor_root"])
     root.mkdir(parents=True)
-    os.symlink(cann / "opp" / "built-in", root / "built-in", target_is_directory=True)
     (root / "vendors").mkdir()
-    (root / "vendors" / "config.ini").write_text("load_priority={}\n".format(VENDOR), encoding="utf-8")
     target = Path(planned["source_file"])
     target.parent.mkdir(parents=True)
     text = instrumentation(original)
@@ -226,7 +232,7 @@ def prepare(cann: Path, output_parent: Path) -> dict[str, Any]:
     config_target.parent.mkdir(parents=True)
     config_target.write_text(json.dumps({"GatherElements": config_data["GatherElements"]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     planned["source_file_sha256"] = digest(target)
-    planned["private_links"] = {"built_in": str(root / "built-in"), "impl_util": str(impl / "util")}
+    planned["private_links"] = {"impl_util": str(impl / "util")}
     (output / "native_dynamic_overlay.json").write_text(json.dumps(planned, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return planned
 

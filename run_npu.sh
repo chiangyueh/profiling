@@ -81,10 +81,10 @@ SOURCE_ID="$({
     readlink -f "${CANN_ROOT}"
 } | sha256sum | cut -c1-20)"
 
-STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v1/${SOURCE_ID}"
+STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v2/${SOURCE_ID}"
 OVERLAY_PARENT="${STATE}/overlays"
 RUNNER_BUILD="${STATE}/runner_build"
-RESULTS="${ROOT}/results/gather_elements_native_dynamic_v1/${SOURCE_ID}"
+RESULTS="${ROOT}/results/gather_elements_native_dynamic_v2/${SOURCE_ID}"
 LOGS="${RESULTS}/logs"
 mkdir -p "${OVERLAY_PARENT}" "${RUNNER_BUILD}" "${LOGS}"
 
@@ -92,7 +92,7 @@ echo "GatherElements native CANN dynamic-source campaign"
 echo "  target:        physical NPU ${PHYSICAL_DEVICE} -> worker logical NPU 0"
 echo "  formal target: ${RECORD_TARGET} real-NPU latency records"
 echo "  source:        ${NATIVE_SOURCE}"
-echo "  runtime API:   installed aclnnGather; source candidates select a private native-dynamic OPP overlay"
+echo "  runtime API:   installed aclnnGather; source candidates use a private CANN custom-OPP vendor overlay"
 echo "  reference:     identical aclnnGather call under the unmodified installed OPP path"
 echo "  output:        ${LOGS}/1.log, 2.log, ... (JSONL, each <= 50 MiB)"
 

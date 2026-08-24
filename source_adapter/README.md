@@ -14,12 +14,13 @@ host-tiler ABI cannot safely run inside the installed CANN 8.1 runtime.
 
 The collector uses the CANN 8.1 `GatherElements` dynamic Python source from
 the same installation that provides `aclnnGather`. Before execution it makes
-a private OPP overlay under `.benchmark_state/`:
+a private vendor overlay under `.benchmark_state/`:
 
-- `built-in` is a read-only symlink to the installed OPP tree;
 - only a patched copy of `impl/dynamic/gather_elements.py` and its one config
   record live in the private vendor directory;
-- `ASCEND_OPP_PATH` is set only in each isolated worker process;
+- each source worker keeps `ASCEND_OPP_PATH` pointed at the installed CANN
+  OPP tree and sets `ASCEND_CUSTOM_OPP_PATH` to that one private vendor
+  directory, which is CANN 8.1's documented custom-operator loader layout;
 - the installed CANN tree, global environment, device state, and processes
   are never modified.
 
@@ -41,7 +42,7 @@ One admitted shape contributes exactly 20 output-validated device-event
 latency records. The 5,000-record target therefore needs 250 admitted
 shapes. The catalog contains 404 source-supported deterministic legal
 GatherElements shapes. Logs are append-only JSONL below
-`results/gather_elements_native_dynamic_v1/<contract>/logs/`; each numbered
+`results/gather_elements_native_dynamic_v2/<contract>/logs/`; each numbered
 data log is capped at 50 MiB. The collector reads no CCE data, historic
 latency/tiling records, RuntimeKb, callbacks, or cost model.
 

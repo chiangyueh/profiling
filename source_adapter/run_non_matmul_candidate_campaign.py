@@ -26,7 +26,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_native_dynamic_measurement_v1"
+SCHEMA = "gather_elements_native_dynamic_measurement_v2"
 # The campaign is intentionally append-only so an interrupted physical-NPU
 # run can resume without losing its completed groups.  A single log is kept
 # below this limit; the next numeric log is opened before an oversized write.
@@ -107,6 +107,12 @@ def run_worker(arguments: list[str], environment: dict[str, str]) -> tuple[dict[
 def compact_failure(output: str) -> str:
     records = [line for line in output.splitlines() if line.startswith("MULTIOP_NPU_RESULT ")]
     return (records[-1] if records else output[-2500:])[:2500]
+
+
+def runner_failure(result: dict[str, Any], output: str) -> str:
+    """Prefer the runner's real error over a later missing-audit symptom."""
+    error = result.get("error")
+    return str(error) if error else compact_failure(output)
 
 
 class RotatingJsonl:
@@ -206,13 +212,13 @@ def read_progress(directory: Path) -> tuple[set[str], dict[str, int], int]:
 
 def validate_source_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        raise RuntimeError("missing custom OPP manifest: {}".format(path))
+        raise RuntimeError("missing native GatherElements overlay manifest: {}".format(path))
     item: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     required = ("schema", "operator", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
-                "installed_source", "installed_source_sha256", "runtime_opp_root", "vendor", "vendor_root",
+                "installed_source", "installed_source_sha256", "installed_opp_root", "custom_opp_root", "vendor", "vendor_root",
                 "source_file", "source_file_sha256", "instrumentation", "hardware_envelope_heuristic",
                 "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
-    if any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v1":
+    if any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v2":
         raise RuntimeError("invalid native CANN GatherElements source-overlay manifest: {}".format(path))
     source_file = Path(str(item["source_file"]))
     if not source_file.is_file() or digest_file(source_file) != str(item["source_file_sha256"]):
@@ -230,12 +236,12 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
             int(envelope.get("max_anchors", 0)) < 1):
         raise RuntimeError("native overlay hardware-envelope provenance is invalid")
     vendor_root = Path(str(item["vendor_root"]))
-    runtime_root = Path(str(item["runtime_opp_root"]))
-    if (not runtime_root.is_dir() or not vendor_root.is_dir() or
-            vendor_root != runtime_root / "vendors" / str(item["vendor"]) or
-            not (runtime_root / "built-in").is_symlink() or
-            not (runtime_root / "vendors" / "config.ini").is_file()):
-        raise RuntimeError("native GatherElements private OPP layout is incomplete")
+    custom_root = Path(str(item["custom_opp_root"]))
+    installed_root = Path(str(item["installed_opp_root"]))
+    source_parent = vendor_root / "op_impl" / "ai_core" / "tbe" / "impl" / "dynamic"
+    if (not custom_root.is_dir() or not installed_root.is_dir() or not vendor_root.is_dir() or
+            vendor_root != custom_root / "vendors" / str(item["vendor"]) or not source_parent.is_dir()):
+        raise RuntimeError("native GatherElements private custom-OPP layout is incomplete")
     if item["strategy_algorithm_changes"] is not False or item["kernel_algorithm_changes"] is not False:
         raise RuntimeError("native GatherElements overlay is not source-preserving")
     item["runtime_op"] = runtime_op
@@ -311,11 +317,12 @@ def context_matches(observation: dict[str, Any] | None, candidate: dict[str, Any
 
 def source_environment(base: dict[str, str], package: dict[str, Any], candidate: dict[str, Any], audit: Path) -> dict[str, str]:
     environment = dict(base)
-    # Native CANN dynamic-source dispatch selects the private OPP root.  Its
-    # built-in directory is an immutable link to the installed CANN tree;
-    # only this overlay's GatherElements Python source has priority.
-    environment.pop("ASCEND_CUSTOM_OPP_PATH", None)
-    environment["ASCEND_OPP_PATH"] = str(package["runtime_opp_root"])
+    # This is CANN 8.1's normal custom-OPP loader contract: retain the real
+    # installed OPP root and add exactly one private vendor directory for the
+    # source candidate.  The worker process is isolated, so it cannot leak
+    # this selection to other users or later reference workers.
+    environment["ASCEND_OPP_PATH"] = str(package["installed_opp_root"])
+    environment["ASCEND_CUSTOM_OPP_PATH"] = str(package["vendor_root"])
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
     environment[str(package["instrumentation"]["source_budget_environment"])] = str(candidate["aiv_core_cap"])
     envelope = package["hardware_envelope_heuristic"]
@@ -362,7 +369,9 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
             reference_ok = rc == 0 and result.get("status") == "success"
             checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "installed_reference_viability",
                            "status": "passed" if reference_ok else "failed", "worker_wall_ms": wall,
-                           "failure": None if reference_ok else compact_failure(output)})
+                           "worker_return_code": rc, "worker_status": result.get("status"),
+                           "runner_error": None if reference_ok else result.get("error"),
+                           "failure": None if reference_ok else runner_failure(result, output)})
             if not reference_ok:
                 continue
             for package in packages[op]:
@@ -379,7 +388,10 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                                "strategy": candidate["id"], "aiv_core_cap": candidate["aiv_core_cap"],
                                "status": "passed" if source_ok else "failed", "worker_return_code": rc,
                                "worker_status": result.get("status"), "worker_wall_ms": wall,
-                               "failure": None if source_ok else (reason if not observed else compact_failure(output))})
+                               "runner_error": None if source_ok else result.get("error"),
+                               "failure": None if source_ok else (
+                                   runner_failure(result, output) if (rc != 0 or result.get("status") != "success")
+                                   else (reason if not observed else compact_failure(output)))})
     return checks
 
 

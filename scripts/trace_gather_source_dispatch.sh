@@ -16,9 +16,8 @@ the actual Python module path when CANN imports it. It does not run the
 5,000-record campaign, use timeout, kill a process, reset an NPU, or modify
 installed CANN files.
 
-It creates one private probe directory under profiling/.benchmark_state and
-prints the decisive paths and source-audit result to the terminal. Paste the
-complete terminal output back for diagnosis.
+It creates one private probe directory under profiling/.benchmark_state. The
+terminal shows only the decisive status, NPU result, source audit, and verdict.
 USAGE
 }
 
@@ -73,33 +72,40 @@ AUDIT_PATH="${PROBE_DIR}/source_audit.jsonl"
 RUNNER_LOG="${PROBE_DIR}/runner.log"
 mkdir -p "${OVERLAY_PARENT}" "${RUNNER_BUILD}"
 
-echo "===== GatherElements single-dispatch runtime probe ====="
-echo "physical_device=${PHYSICAL_DEVICE}"
-echo "worker_logical_device=0"
-echo "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES}"
-echo "CANN_ROOT=${CANN_ROOT}"
-echo "ASCEND_OPP_PATH=${ASCEND_OPP_PATH}"
-echo "installed_source=${NATIVE_SOURCE}"
-echo "probe_directory=${PROBE_DIR}"
-echo "operation=GatherElements shape=[64] index_shape=[17] axis=0 dtype=fp16 index_dtype=int32"
-echo "dispatch_api=aclopCompileAndExecute"
-echo "This makes one NPU launch. It does not use timeout, kill, reset, or a full campaign."
+show_failure() {
+    local stage="$1"
+    local log="$2"
+    echo "GATHER_PROBE_FAILURE stage=${stage} log=${log}" >&2
+    tail -n 30 "${log}" >&2 || true
+    exit 1
+}
 
-python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
+echo "GATHER_PROBE_BEGIN physical_device=${PHYSICAL_DEVICE} logical_device=0 op=GatherElements shape=64 index_shape=17 axis=0 dtype=fp16"
+
+STATIC_PRE_LOG="${PROBE_DIR}/static_pre.log"
+if ! python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
     --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
-    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt"
+    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" >"${STATIC_PRE_LOG}" 2>&1; then
+    show_failure "static_contract_pre" "${STATIC_PRE_LOG}"
+fi
+echo "GATHER_PROBE_STATIC status=passed"
 
-echo "PRIVATE_OVERLAY_PREPARE_BEGIN"
-python3 "${ROOT}/source_adapter/prepare_gather_elements_native_dynamic.py" \
-    --cann-root "${CANN_ROOT}" --output-parent "${OVERLAY_PARENT}" | tee "${PROBE_DIR}/overlay_manifest.json"
-echo "PRIVATE_OVERLAY_PREPARE_END"
+OVERLAY_PREPARE_LOG="${PROBE_DIR}/overlay_prepare.log"
+if ! python3 "${ROOT}/source_adapter/prepare_gather_elements_native_dynamic.py" \
+    --cann-root "${CANN_ROOT}" --output-parent "${OVERLAY_PARENT}" >"${OVERLAY_PREPARE_LOG}" 2>&1; then
+    show_failure "private_overlay_prepare" "${OVERLAY_PREPARE_LOG}"
+fi
 
 OVERLAY="${OVERLAY_PARENT}/gather_elements_native_dynamic"
 PACKAGE_MANIFEST="${OVERLAY}/native_dynamic_overlay.json"
 [[ -f "${PACKAGE_MANIFEST}" ]] || { echo "fatal: private overlay manifest was not created" >&2; exit 1; }
-python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
+STATIC_POST_LOG="${PROBE_DIR}/static_post.log"
+if ! python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
     --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
-    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" --overlay-manifest "${PACKAGE_MANIFEST}"
+    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" \
+    --overlay-manifest "${PACKAGE_MANIFEST}" >"${STATIC_POST_LOG}" 2>&1; then
+    show_failure "static_contract_post" "${STATIC_POST_LOG}"
+fi
 
 readarray -t OVERLAY_VALUES < <(python3 - "${PACKAGE_MANIFEST}" <<'PY'
 import json
@@ -115,20 +121,20 @@ CUSTOM_OPP_ROOT="${OVERLAY_VALUES[2]}"
 SOURCE_OPERATOR_TYPE="${OVERLAY_VALUES[3]}"
 [[ -f "${PRIVATE_SOURCE}" ]] || { echo "fatal: private GatherElements source is absent: ${PRIVATE_SOURCE}" >&2; exit 1; }
 
-echo "private_custom_opp_root=${CUSTOM_OPP_ROOT}"
-echo "ASCEND_CUSTOM_OPP_PATH=${VENDOR_ROOT}"
-echo "private_source=${PRIVATE_SOURCE}"
-echo "source_operator_type=${SOURCE_OPERATOR_TYPE}"
-echo "private_config=${VENDOR_ROOT}/op_impl/ai_core/tbe/config/ascend910b/aic-ascend910b-ops-info.json"
+echo "GATHER_PROBE_OVERLAY status=passed source_operator_type=${SOURCE_OPERATOR_TYPE}"
 
-cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
-    -DCMAKE_BUILD_TYPE=Release -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}"
-cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1
+CMAKE_CONFIGURE_LOG="${PROBE_DIR}/cmake_configure.log"
+if ! cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
+    -DCMAKE_BUILD_TYPE=Release -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" >"${CMAKE_CONFIGURE_LOG}" 2>&1; then
+    show_failure "runner_configure" "${CMAKE_CONFIGURE_LOG}"
+fi
+CMAKE_BUILD_LOG="${PROBE_DIR}/cmake_build.log"
+if ! cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1 >"${CMAKE_BUILD_LOG}" 2>&1; then
+    show_failure "runner_build" "${CMAKE_BUILD_LOG}"
+fi
 RUNNER="${RUNNER_BUILD}/multi_op_npu_runner"
 [[ -x "${RUNNER}" ]] || { echo "fatal: runner was not built: ${RUNNER}" >&2; exit 1; }
-
-echo "===== linked runtime libraries ====="
-ldd "${RUNNER}" | grep -E 'libacl_op_compiler|libascendcl|libopapi|libnnopbase' || true
+echo "GATHER_PROBE_BUILD status=passed"
 
 export ASCEND_CUSTOM_OPP_PATH="${VENDOR_ROOT}"
 export GATHER_ELEMENTS_TILING_AUDIT_PATH="${AUDIT_PATH}"
@@ -142,29 +148,25 @@ COMMAND=("${RUNNER}"
     --shape 64 --index-shape 17 --axis 0 --dtype fp16 --index-dtype int32
     --source-tiling-only 1 --normal-cleanup 1)
 
-echo "===== exact environment supplied to the one source dispatch ====="
-printf 'ASCEND_OPP_PATH=%s\nASCEND_CUSTOM_OPP_PATH=%s\nGATHER_ELEMENTS_TILING_AUDIT_PATH=%s\nGATHER_ELEMENTS_SOURCE_DISPATCH=%s\nGATHER_ELEMENTS_SOURCE_AIV_CAP=%s\nGATHER_ELEMENTS_SOURCE_UB_DIVISOR=%s\n' \
-    "${ASCEND_OPP_PATH}" "${ASCEND_CUSTOM_OPP_PATH}" "${GATHER_ELEMENTS_TILING_AUDIT_PATH}" \
-    "${GATHER_ELEMENTS_SOURCE_DISPATCH}" "${GATHER_ELEMENTS_SOURCE_AIV_CAP}" "${GATHER_ELEMENTS_SOURCE_UB_DIVISOR}"
-echo "===== one generic-dispatch execution begins ====="
-printf 'command='
-printf ' %q' "${COMMAND[@]}"
-printf '\n'
+echo "GATHER_PROBE_NPU_BEGIN dispatch=aclopCompileAndExecute source_aiv_cap=20 ub_cap_divisor=1"
 
 # There is deliberately no timeout wrapper or forced kill. The private source
 # writes a module_imported record with its actual __file__ before BuildCCE.
 # The runner return code is retained for diagnosis after a failed call.
 set +e
-"${COMMAND[@]}" 2>&1 | tee "${RUNNER_LOG}"
-RUNNER_RC=${PIPESTATUS[0]}
+"${COMMAND[@]}" 2>&1 | tee "${RUNNER_LOG}" | grep -E \
+    '^MULTIOP_NPU_RESULT |^MULTIOP_NPU_STAGE .*"stage":"(source_verification_compile_execute_begin|source_verification_sync_done|normal_cleanup_acl_finalize_done|failure|process_exit)"'
+PIPELINE_RC=("${PIPESTATUS[@]}")
+RUNNER_RC=${PIPELINE_RC[0]}
 set -e
-echo "===== one generic-dispatch execution ended rc=${RUNNER_RC} ====="
+echo "GATHER_PROBE_NPU_END rc=${RUNNER_RC}"
 
-echo "===== source audit file ====="
 if [[ -f "${AUDIT_PATH}" ]]; then
-    cat "${AUDIT_PATH}"
+    while IFS= read -r audit_row; do
+        echo "GATHER_PROBE_AUDIT ${audit_row}"
+    done < "${AUDIT_PATH}"
 else
-    echo "MISSING: ${AUDIT_PATH}"
+    echo "GATHER_PROBE_AUDIT missing"
 fi
 
 python3 - "${RUNNER_LOG}" "${AUDIT_PATH}" "${PRIVATE_SOURCE}" "${NATIVE_SOURCE}" "${SOURCE_OPERATOR_TYPE}" "${RUNNER_RC}" <<'PY'
@@ -227,6 +229,3 @@ print("GATHER_ELEMENTS_RUNTIME_DISPATCH_PROBE " + json.dumps({
     "evidence_rule": "module_imported records the actual Python source path; only a matching tiling_generated row proves a completed source build",
 }, sort_keys=True))
 PY
-
-echo "probe_artifacts_retained=${PROBE_DIR}"
-echo "Paste the complete terminal output above; do not start the full campaign from this probe."

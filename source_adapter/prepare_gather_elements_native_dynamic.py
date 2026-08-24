@@ -2,10 +2,11 @@
 """Create an isolated, native-CANN GatherElements dynamic-source overlay.
 
 This deliberately uses the GatherElements implementation shipped by the
-*same* CANN 8.1 installation which provides ``aclnnGather``.  It avoids the
-invalid alternative of loading a CANN 8.3 host tiler into CANN 8.1's runtime.
-Only the original dynamic source receives bounded core/UB inputs and an
-observational audit; no installed file is edited.
+*same* CANN 8.1 installation as the reference.  The overlay is invoked by
+``aclopCompileAndExecute("GatherElements", ...)``: that generic compiler API
+performs OPP lookup, whereas the already-bound ``aclnnGather`` OpAPI entry
+does not. Only the original dynamic source receives bounded core/UB inputs
+and an observational audit; no installed file is edited.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ AUDIT_SCHEMA = "gather_elements_native_dynamic_source_observation_v1"
 AUDIT_ENV = "GATHER_ELEMENTS_TILING_AUDIT_PATH"
 CORE_ENV = "GATHER_ELEMENTS_SOURCE_AIV_CAP"
 UB_ENV = "GATHER_ELEMENTS_SOURCE_UB_DIVISOR"
+DISPATCH_ENV = "GATHER_ELEMENTS_SOURCE_DISPATCH"
 VENDOR = "source_gather_elements"
 
 
@@ -140,8 +142,9 @@ def expected(output: Path, cann: Path, source: Path, config: Path) -> dict[str, 
     impl_dir = VENDOR + "_impl"
     source_target = vendor_root / "op_impl" / "ai_core" / "tbe" / impl_dir / "dynamic" / "gather_elements.py"
     return {
-        # v3 also follows the template's required <vendor>_impl layout.
-        "schema": "gather_elements_native_dynamic_overlay_v3",
+        # v4 follows the template's required <vendor>_impl layout and is used
+        # only through ACL's generic OPP compiler dispatch contract.
+        "schema": "gather_elements_native_dynamic_overlay_v4",
         "operator": "GatherElements",
         "runtime_op": "gather_elements",
         "source_kind": "installed_cann81_native_dynamic_source",
@@ -161,6 +164,8 @@ def expected(output: Path, cann: Path, source: Path, config: Path) -> dict[str, 
             "enabled": True, "mutates_tiling_context": False,
             "audit_schema": AUDIT_SCHEMA, "audit_environment": AUDIT_ENV,
             "source_budget_environment": CORE_ENV,
+            "dispatch_environment": DISPATCH_ENV,
+            "dispatch_value": "aclop_compile_and_execute",
         },
         "hardware_envelope_heuristic": {
             "enabled": True, "environment": UB_ENV, "audit_field": "ub_cap_divisor",
@@ -168,7 +173,7 @@ def expected(output: Path, cann: Path, source: Path, config: Path) -> dict[str, 
         },
         "strategy_algorithm_changes": False,
         "kernel_algorithm_changes": False,
-        "formal_data_gate": "the native CANN 8.1 GatherElements dynamic source must compile, launch, and exactly match an installed aclnnGather reference",
+        "formal_data_gate": "the native CANN 8.1 GatherElements dynamic source must be selected by aclopCompileAndExecute, launch, and exactly match an installed aclnnGather reference",
     }
 
 

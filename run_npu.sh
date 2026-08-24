@@ -16,8 +16,9 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-Runs GatherElements only, through CANN 8.1's native dynamic source and the
-same aclnnGather API used by the installed runtime.
+Runs GatherElements only. The installed reference uses ``aclnnGather``; each
+source candidate uses CANN's generic ``aclopCompileAndExecute`` OPP dispatch,
+which is the API that can select the checkout-local dynamic source overlay.
 
 - 5,000 real-NPU device-event records (250 complete 20-candidate groups).
 - Each admitted candidate launches and output-matches an installed reference.
@@ -74,17 +75,17 @@ NATIVE_SOURCE="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/dynamic/gather
 SOURCE_ID="$({
     sha256sum "${ROOT}/run_npu.sh" "${ROOT}/multi_op_bench/CMakeLists.txt" "${ROOT}/multi_op_bench/runner.cpp" \
         "${ROOT}/source_adapter/non_matmul_candidate_catalog.py" \
+        "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
         "${ROOT}/source_adapter/prepare_gather_elements_native_dynamic.py" \
-        "${ROOT}/source_adapter/run_source_tiler_smoke.py" \
         "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py"
     sha256sum "${NATIVE_SOURCE}" "${CANN_ROOT}/opp/version.info"
     readlink -f "${CANN_ROOT}"
 } | sha256sum | cut -c1-20)"
 
-STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v3/${SOURCE_ID}"
+STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v4/${SOURCE_ID}"
 OVERLAY_PARENT="${STATE}/overlays"
 RUNNER_BUILD="${STATE}/runner_build"
-RESULTS="${ROOT}/results/gather_elements_native_dynamic_v3/${SOURCE_ID}"
+RESULTS="${ROOT}/results/gather_elements_native_dynamic_v4/${SOURCE_ID}"
 LOGS="${RESULTS}/logs"
 mkdir -p "${OVERLAY_PARENT}" "${RUNNER_BUILD}" "${LOGS}"
 
@@ -92,9 +93,15 @@ echo "GatherElements native CANN dynamic-source campaign"
 echo "  target:        physical NPU ${PHYSICAL_DEVICE} -> worker logical NPU 0"
 echo "  formal target: ${RECORD_TARGET} real-NPU latency records"
 echo "  source:        ${NATIVE_SOURCE}"
-echo "  runtime API:   installed aclnnGather; source candidates use a private CANN custom-OPP vendor overlay"
-echo "  reference:     identical aclnnGather call under the unmodified installed OPP path"
+echo "  source API:    aclopCompileAndExecute(GatherElements) with a private CANN custom-OPP vendor overlay"
+echo "  reference API: installed aclnnGather under the unmodified installed OPP path"
 echo "  output:        ${LOGS}/1.log, 2.log, ... (JSONL, each <= 50 MiB)"
+
+# A wrong API path was the cause of the prior no-audit failures.  Check every
+# local prerequisite before creating a build directory or touching the NPU.
+python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
+    --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
+    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt"
 
 OVERLAY="${OVERLAY_PARENT}/gather_elements_native_dynamic"
 PACKAGE_MANIFEST="${OVERLAY}/native_dynamic_overlay.json"
@@ -105,21 +112,18 @@ if [[ ! -f "${PACKAGE_MANIFEST}" ]]; then
         --cann-root "${CANN_ROOT}" --output-parent "${OVERLAY_PARENT}" >"${STATE}/overlay_prepare.log" 2>&1
     echo "NATIVE_DYNAMIC_OVERLAY_PREPARE_END operator=gather_elements"
 fi
+python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
+    --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
+    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" \
+    --overlay-manifest "${PACKAGE_MANIFEST}"
 
 cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
     -DCMAKE_BUILD_TYPE=Release -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}"
 cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1
 
-# This gate is an actual source-kernel launch and stream synchronization.
-SMOKE_LOG="${LOGS}/preflight_gather_elements.log"
-if ! python3 "${ROOT}/source_adapter/run_source_tiler_smoke.py" \
-    --runner "${RUNNER_BUILD}/multi_op_npu_runner" --device 0 \
-    --source-package-manifest "${PACKAGE_MANIFEST}" --work-dir "${STATE}/smoke" >"${SMOKE_LOG}" 2>&1; then
-    tail -120 "${SMOKE_LOG}" >&2 || true
-    exit 1
-fi
-grep '^GATHER_ELEMENTS_NATIVE_SOURCE_SMOKE ' "${SMOKE_LOG}"
-
+# The controller's sole preflight performs one installed-reference launch and
+# one generic custom-source launch/audit, then stops immediately on failure.
+# Keeping that gate in one place avoids duplicate NPU smoke executions.
 PYTHONPATH="${ROOT}/multi_op_bench" python3 "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
     --runner "${RUNNER_BUILD}/multi_op_npu_runner" --log-dir "${LOGS}" --device 0 \
     --warmup "${WARMUP}" --samples "${SAMPLES}" --operator gather_elements \

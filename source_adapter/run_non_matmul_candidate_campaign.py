@@ -26,7 +26,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_native_dynamic_measurement_v3"
+SCHEMA = "gather_elements_native_dynamic_measurement_v4"
+SOURCE_BACKEND = "acl_op_compiler_custom_opp_real_npu"
 # The campaign is intentionally append-only so an interrupted physical-NPU
 # run can resume without losing its completed groups.  A single log is kept
 # below this limit; the next numeric log is opened before an oversized write.
@@ -218,7 +219,7 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
                 "installed_source", "installed_source_sha256", "installed_opp_root", "custom_opp_root", "vendor", "vendor_impl_directory", "vendor_root",
                 "source_file", "source_file_sha256", "instrumentation", "hardware_envelope_heuristic",
                 "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
-    if any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v3":
+    if any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v4":
         raise RuntimeError("invalid native CANN GatherElements source-overlay manifest: {}".format(path))
     source_file = Path(str(item["source_file"]))
     if not source_file.is_file() or digest_file(source_file) != str(item["source_file_sha256"]):
@@ -228,7 +229,9 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
         raise RuntimeError("native overlay is not an allowed GatherElements source: {}".format(item["operator"]))
     inst = item["instrumentation"]
     if (not isinstance(inst, dict) or inst.get("enabled") is not True or inst.get("mutates_tiling_context") is not False or
-            not inst.get("audit_schema") or not inst.get("audit_environment") or not inst.get("source_budget_environment")):
+            not inst.get("audit_schema") or not inst.get("audit_environment") or not inst.get("source_budget_environment") or
+            inst.get("dispatch_environment") != "GATHER_ELEMENTS_SOURCE_DISPATCH" or
+            inst.get("dispatch_value") != "aclop_compile_and_execute"):
         raise RuntimeError("native overlay does not attest its original-source candidate axes")
     envelope = item["hardware_envelope_heuristic"]
     if (not isinstance(envelope, dict) or envelope.get("enabled") is not True or not envelope.get("environment") or
@@ -326,6 +329,7 @@ def source_environment(base: dict[str, str], package: dict[str, Any], candidate:
     environment["ASCEND_OPP_PATH"] = str(package["installed_opp_root"])
     environment["ASCEND_CUSTOM_OPP_PATH"] = str(package["vendor_root"])
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
+    environment[str(package["instrumentation"]["dispatch_environment"])] = str(package["instrumentation"]["dispatch_value"])
     environment[str(package["instrumentation"]["source_budget_environment"])] = str(candidate["aiv_core_cap"])
     envelope = package["hardware_envelope_heuristic"]
     if envelope["enabled"]:
@@ -385,15 +389,19 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                     worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
                     source_environment(base_env, package, candidate, audit))
                 observed, reason = source_audit_emitted(audit, package, candidate)
-                source_ok = observed and rc == 0 and result.get("status") == "success"
+                source_ok = (observed and rc == 0 and result.get("status") == "success" and
+                             result.get("backend") == SOURCE_BACKEND)
                 checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "source_tiler_audit",
                                "strategy": candidate["id"], "aiv_core_cap": candidate["aiv_core_cap"],
                                "status": "passed" if source_ok else "failed", "worker_return_code": rc,
                                "worker_status": result.get("status"), "worker_wall_ms": wall,
+                               "runner_backend": result.get("backend"),
                                "runner_error": None if source_ok else result.get("error"),
                                "failure": None if source_ok else (
                                    runner_failure(result, output) if (rc != 0 or result.get("status") != "success")
-                                   else (reason if not observed else compact_failure(output)))})
+                                   else (reason if not observed else
+                                         ("runner used unexpected backend: {}".format(result.get("backend"))
+                                          if result.get("backend") != SOURCE_BACKEND else compact_failure(output))))})
     return checks
 
 
@@ -464,6 +472,9 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
         result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
+        if result.get("backend") != SOURCE_BACKEND:
+            failures.append(candidate_label(candidate) + ": runner used unexpected backend {}".format(result.get("backend")))
+            return True
         if reason == "original-source overlay emitted no audit observation":
             failures.append(candidate_label(candidate) + ": " + reason)
             # This is a deployment/instrumentation failure, not an invalid
@@ -520,9 +531,11 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
         equal = bool(result.get("output_reference_checked")) and bool(result.get("output_reference_equal"))
-        if (rc != 0 or result.get("status") != "success" or not equal or
+        if (rc != 0 or result.get("status") != "success" or result.get("backend") != SOURCE_BACKEND or not equal or
                 not context_matches(observed, candidate, package) or observed.get("source_tiling_identity") != identity):
-            verification_failures.append(candidate_label(candidate) + ": " + (reason or "output/reference or source identity mismatch"))
+            verification_failures.append(candidate_label(candidate) + ": " + (
+                reason or ("unexpected backend {}".format(result.get("backend"))
+                           if result.get("backend") != SOURCE_BACKEND else "output/reference or source identity mismatch")))
             continue
         verified.append({**item, "verification_result": result, "verification_wall_ms": wall, "verification_tiling_observation": observed})
     if len(verified) < minimum:
@@ -546,9 +559,13 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
         equal = bool(result.get("output_reference_checked")) and bool(result.get("output_reference_equal"))
-        if (rc != 0 or result.get("status") != "success" or not equal or not context_matches(observed, candidate, package) or
+        if (rc != 0 or result.get("status") != "success" or result.get("backend") != SOURCE_BACKEND or not equal or
+                not context_matches(observed, candidate, package) or
                 observed.get("source_tiling_identity") != item["source_tiling_observation"]["source_tiling_identity"]):
-            measurement_failures.append(candidate_label(candidate) + ": " + (reason or "measurement output/reference or source identity mismatch"))
+            measurement_failures.append(candidate_label(candidate) + ": " + (
+                reason or ("unexpected backend {}".format(result.get("backend"))
+                           if result.get("backend") != SOURCE_BACKEND else
+                           "measurement output/reference or source identity mismatch")))
             continue
         compact = {key: value for key, value in item.items() if key != "package"}
         compact.update({"latency_result": result, "latency_tiling_observation": observed, "latency_worker_wall_ms": wall})
@@ -605,6 +622,7 @@ def main() -> int:
         for package in package_set:
             base_env.pop(str(package["instrumentation"]["audit_environment"]), None)
             base_env.pop(str(package["instrumentation"]["source_budget_environment"]), None)
+            base_env.pop(str(package["instrumentation"]["dispatch_environment"]), None)
     for package_set in packages.values():
         for package in package_set:
             envelope = package["hardware_envelope_heuristic"]

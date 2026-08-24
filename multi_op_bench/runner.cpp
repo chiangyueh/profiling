@@ -1,4 +1,6 @@
 #include <acl/acl.h>
+#include <acl/acl_op.h>
+#include <acl/acl_op_compiler.h>
 #include <aclnn/acl_meta.h>
 #include <aclnnop/aclnn_flash_attention_score_grad.h>
 #include <aclnnop/aclnn_fused_infer_attention_score.h>
@@ -30,6 +32,7 @@ namespace {
 std::string JsonEscape(const std::string &value);
 void CheckAcl(aclError rc, const std::string &what);
 std::string gWorkloadId = "unknown";
+std::string gBackend = "aclnn_real_npu";
 
 void Stage(const std::string &stage, const std::string &detail = "")
 {
@@ -266,6 +269,70 @@ public:
 
 private:
     aclTensor *ptr_ = nullptr;
+};
+
+// The ACL generic compiler API deliberately uses the legacy descriptor and
+// buffer handles. Keep their ownership separate from ACLNN tensors: source
+// calls use these handles while the installed reference remains ACLNN.
+class OpTensorDesc {
+public:
+    OpTensorDesc(aclDataType dtype, const std::vector<int64_t> &shape)
+    {
+        ptr_ = aclCreateTensorDesc(dtype, static_cast<int>(shape.size()), shape.data(), ACL_FORMAT_ND);
+        if (ptr_ == nullptr) throw std::runtime_error("aclCreateTensorDesc returned null");
+    }
+    OpTensorDesc(const OpTensorDesc &) = delete;
+    OpTensorDesc &operator=(const OpTensorDesc &) = delete;
+    ~OpTensorDesc()
+    {
+        if (ptr_ != nullptr) aclDestroyTensorDesc(ptr_);
+    }
+    const aclTensorDesc *Get() const { return ptr_; }
+
+private:
+    aclTensorDesc *ptr_ = nullptr;
+};
+
+class OpDataBuffer {
+public:
+    explicit OpDataBuffer(DeviceBuffer &buffer)
+    {
+        ptr_ = aclCreateDataBuffer(buffer.Data(), buffer.Bytes());
+        if (ptr_ == nullptr) throw std::runtime_error("aclCreateDataBuffer returned null");
+    }
+    OpDataBuffer(const OpDataBuffer &) = delete;
+    OpDataBuffer &operator=(const OpDataBuffer &) = delete;
+    ~OpDataBuffer()
+    {
+        if (ptr_ != nullptr) aclDestroyDataBuffer(ptr_);
+    }
+    aclDataBuffer *Get() const { return ptr_; }
+
+private:
+    aclDataBuffer *ptr_ = nullptr;
+};
+
+class OpAttr {
+public:
+    OpAttr()
+    {
+        ptr_ = aclopCreateAttr();
+        if (ptr_ == nullptr) throw std::runtime_error("aclopCreateAttr returned null");
+    }
+    OpAttr(const OpAttr &) = delete;
+    OpAttr &operator=(const OpAttr &) = delete;
+    ~OpAttr()
+    {
+        if (ptr_ != nullptr) aclopDestroyAttr(ptr_);
+    }
+    void SetInt(const char *name, int64_t value)
+    {
+        CheckAcl(aclopSetAttrInt(ptr_, name, value), std::string("aclopSetAttrInt ") + name);
+    }
+    const aclopAttr *Get() const { return ptr_; }
+
+private:
+    aclopAttr *ptr_ = nullptr;
 };
 
 class IntArray {
@@ -517,6 +584,74 @@ Measurement Measure(aclrtStream stream, int warmup, int samples, DeviceBuffer &o
     return result;
 }
 
+// The generic compiler submits the dynamic custom-OPP kernel directly. Host
+// compilation is outside the returned device-event duration: events bracket
+// only the submitted stream work, and each iteration is synchronized.
+template <class Launch>
+Measurement MeasureCompiledOp(aclrtStream stream, int warmup, int samples, DeviceBuffer &output, Launch launch)
+{
+    Measurement result;
+    const auto oneLaunch = [&](const std::string &phase, int index) {
+        const std::string suffix = index < 0 ? "" : ",index=" + std::to_string(index);
+        Stage(phase + "_compile_execute_begin", suffix);
+        CheckAcl(launch(stream), "aclopCompileAndExecute GatherElements");
+        Stage(phase + "_compile_execute_returned", suffix);
+    };
+    if (samples == 0) {
+        oneLaunch("source_verification", -1);
+        Stage("source_verification_sync_begin");
+        CheckAcl(aclrtSynchronizeStream(stream), "source verification stream synchronize");
+        Stage("source_verification_sync_done");
+        return result;
+    }
+    for (int i = 0; i < warmup; ++i) {
+        oneLaunch("source_warmup", i);
+        Stage("source_warmup_sync_begin", "index=" + std::to_string(i));
+        CheckAcl(aclrtSynchronizeStream(stream), "source warmup synchronize");
+        Stage("source_warmup_sync_done", "index=" + std::to_string(i));
+    }
+    aclrtEvent start = nullptr;
+    aclrtEvent end = nullptr;
+    Stage("source_event_create_begin");
+    CheckAcl(aclrtCreateEvent(&start), "aclrtCreateEvent source start");
+    try {
+        CheckAcl(aclrtCreateEvent(&end), "aclrtCreateEvent source end");
+        Stage("source_event_create_done");
+        for (int i = 0; i < samples; ++i) {
+            Stage("source_sample_begin", "index=" + std::to_string(i));
+            CheckAcl(aclrtRecordEvent(start, stream), "aclrtRecordEvent source start");
+            oneLaunch("source_sample", i);
+            CheckAcl(aclrtRecordEvent(end, stream), "aclrtRecordEvent source end");
+            Stage("source_sample_stream_sync_begin", "index=" + std::to_string(i));
+            CheckAcl(aclrtSynchronizeStream(stream), "source sample synchronize");
+            Stage("source_sample_stream_sync_done", "index=" + std::to_string(i));
+            float elapsedMs = 0.0F;
+            CheckAcl(aclrtEventElapsedTime(&elapsedMs, start, end), "aclrtEventElapsedTime source sample");
+            if (!std::isfinite(elapsedMs) || elapsedMs < 0.0F) {
+                throw std::runtime_error("invalid source device event time");
+            }
+            result.samplesMs.push_back(elapsedMs);
+        }
+        aclrtDestroyEvent(end);
+        aclrtDestroyEvent(start);
+    } catch (...) {
+        if (end != nullptr) aclrtDestroyEvent(end);
+        if (start != nullptr) aclrtDestroyEvent(start);
+        throw;
+    }
+    const size_t probeBytes = std::min<size_t>(output.Bytes(), 4096);
+    std::vector<uint8_t> probe(probeBytes);
+    if (probeBytes > 0) {
+        Stage("source_output_probe_begin");
+        CheckAcl(aclrtMemcpy(probe.data(), probe.size(), output.Data(), probeBytes,
+                             ACL_MEMCPY_DEVICE_TO_HOST), "aclrtMemcpy source output probe");
+        Stage("source_output_probe_done");
+    }
+    result.probeBytes = probeBytes;
+    result.probeNonzeroBytes = std::count_if(probe.begin(), probe.end(), [](uint8_t value) { return value != 0; });
+    return result;
+}
+
 int64_t NormalizeAxis(int64_t axis, size_t rank)
 {
     if (axis < 0) axis += static_cast<int64_t>(rank);
@@ -633,6 +768,52 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
     DeviceBuffer input(Elements(shape), dtype), index(Elements(indexShape), indexDtype), output(Elements(indexShape), dtype);
     FillGeneralPattern(input, dtype, Elements(shape), 0);
     FillIndices(index, indexDtype, Elements(indexShape), shape[axis]);
+    // A private source candidate explicitly opts into generic OPP dispatch.
+    // The reference has neither variable and therefore cannot accidentally
+    // take this path. An audit path without the dispatch contract is an error,
+    // never a silent ACLNN fallback.
+    const char *dispatch = std::getenv("GATHER_ELEMENTS_SOURCE_DISPATCH");
+    const bool auditRequested = std::getenv("GATHER_ELEMENTS_TILING_AUDIT_PATH") != nullptr;
+    const bool useCustomSource = dispatch != nullptr;
+    if (useCustomSource && std::string(dispatch) != "aclop_compile_and_execute") {
+        throw std::runtime_error("invalid GATHER_ELEMENTS_SOURCE_DISPATCH");
+    }
+    if (auditRequested != useCustomSource) {
+        throw std::runtime_error("GatherElements source audit/dispatch environment mismatch");
+    }
+    if (useCustomSource) {
+        gBackend = "acl_op_compiler_custom_opp_real_npu";
+        OpTensorDesc inputDesc(dtype, shape), indexDesc(indexDtype, indexShape), outputDesc(dtype, indexShape);
+        OpDataBuffer inputData(input), indexData(index), outputData(output);
+        OpAttr attr;
+        attr.SetInt("dim", axis);
+        const aclTensorDesc *inputDescs[] = {inputDesc.Get(), indexDesc.Get()};
+        const aclDataBuffer *inputBuffers[] = {inputData.Get(), indexData.Get()};
+        const aclTensorDesc *outputDescs[] = {outputDesc.Get()};
+        aclDataBuffer *outputBuffers[] = {outputData.Get()};
+        const auto launch = [&](aclrtStream launchStream) {
+            // This is the CANN API whose contract is to compile/execute the
+            // named operation. Its OPP lookup honors the private vendor;
+            // ACLNN's already-bound ``aclnnGather`` cannot do that.
+            return aclopCompileAndExecute("GatherElements", 2, inputDescs, inputBuffers,
+                                          1, outputDescs, outputBuffers, attr.Get(),
+                                          ACL_ENGINE_AICORE, ACL_COMPILE_SYS, nullptr, launchStream);
+        };
+        Measurement result = MeasureCompiledOp(stream, args.Has("source-tiling-only") ? 0 : warmup,
+                                               args.Has("source-tiling-only") ? 0 : samples, output, launch);
+        if (!args.Has("source-tiling-only")) {
+            const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
+            result.outputBytes = snapshot.size();
+            result.outputDigest = Fnv1a64(snapshot);
+            if (args.Has("write-reference")) WriteReference(args.Get("write-reference"), snapshot);
+            if (args.Has("compare-reference")) {
+                result.outputReferenceChecked = true;
+                result.outputReferenceEqual = snapshot == ReadReference(args.Get("compare-reference"));
+            }
+        }
+        return result;
+    }
+
     Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape), outputTensor(output, dtype, indexShape);
     const auto execute = [&](const auto &getWorkspace, const auto &launch) {
         if (args.Has("source-tiling-only")) {
@@ -653,10 +834,8 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         return result;
     };
 
-    // aclnnGather is the official ACLNN API for GatherElements: its published
-    // formula indexes one element per index position.  The installed reference
-    // and the private native-source overlay intentionally use this identical
-    // call; only ASCEND_OPP_PATH selects their dynamic source implementation.
+    // ``aclnnGather`` is intentionally used only for the installed reference.
+    // It is an OpAPI entry point, not the dynamic custom-OPP dispatch path.
     return execute(
         [&](uint64_t *workspace, aclOpExecutor **executor) {
             return aclnnGatherGetWorkspaceSize(inputTensor.Get(), axis, indexTensor.Get(), outputTensor.Get(), workspace, executor);
@@ -908,7 +1087,7 @@ int main(int argc, char **argv)
         const bool verificationOnly = result.samplesMs.empty();
         const double median = verificationOnly ? 0.0 : Median(result.samplesMs);
         std::cout << "MULTIOP_NPU_RESULT {\"schema\":\"multi_op_real_npu_v2\","
-                  << "\"status\":\"success\",\"backend\":\"aclnn_real_npu\","
+                  << "\"status\":\"success\",\"backend\":\"" << JsonEscape(gBackend) << "\","
                   << "\"measurement_kind\":\"" << (verificationOnly ? "viability_only" : "device_event_latency") << "\","
                   << "\"soc\":\"" << JsonEscape(socName) << "\","
                   << "\"workload_id\":\"" << JsonEscape(workloadId) << "\","
@@ -935,7 +1114,7 @@ int main(int argc, char **argv)
     } catch (const std::exception &error) {
         Stage("failure", error.what());
         std::cout << "MULTIOP_NPU_RESULT {\"schema\":\"multi_op_real_npu_v2\","
-                  << "\"status\":\"failed\",\"backend\":\"aclnn_real_npu\","
+                  << "\"status\":\"failed\",\"backend\":\"" << JsonEscape(gBackend) << "\","
                   << "\"soc\":\"" << JsonEscape(socName) << "\","
                   << "\"workload_id\":\"" << JsonEscape(workloadId) << "\","
                   << "\"op\":\"" << JsonEscape(op) << "\","

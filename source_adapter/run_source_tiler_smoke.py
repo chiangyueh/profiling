@@ -47,14 +47,14 @@ def main() -> int:
     module = campaign_module()
     package = module.validate_source_manifest(args.source_package_manifest)
     runtime_op = str(package["runtime_op"])
-    workloads, _, _ = module.load_catalog()
+    workloads, _, catalog = module.load_catalog()
     workload = next((item for item in workloads if item["op"] == runtime_op), None)
     if workload is None:
         raise RuntimeError("no legal smoke workload for {}".format(runtime_op))
     # The deployment gate must use the normal hardware core budget.  A cap of
     # one is a later candidate axis, not a valid proxy for whether the native
     # source can load or launch on this 20-core target.
-    candidate = module.candidate_descriptor(package, max(module.SOURCE_AIV_CAPS))
+    candidate = module.candidate_descriptor(package, max(catalog.SOURCE_AIV_CAPS))
     args.work_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="source_tiler_smoke_", dir=args.work_dir) as temporary:
         audit = Path(temporary) / "audit.jsonl"

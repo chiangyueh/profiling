@@ -33,7 +33,7 @@ std::string JsonEscape(const std::string &value);
 void CheckAcl(aclError rc, const std::string &what);
 std::string gWorkloadId = "unknown";
 std::string gBackend = "aclnn_real_npu";
-constexpr const char *kGatherElementsSourceOperatorType = "GatherElements";
+constexpr const char *kGatherElementsSourceOperatorType = "GatherElementsV2";
 
 void Stage(const std::string &stage, const std::string &detail = "")
 {
@@ -783,7 +783,11 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         throw std::runtime_error("GatherElements source audit/dispatch environment mismatch");
     }
     if (useCustomSource) {
-        gBackend = "acl_op_compiler_private_opp_source_real_npu";
+        const char *operatorType = std::getenv("GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE");
+        if (operatorType == nullptr || std::string(operatorType) != kGatherElementsSourceOperatorType) {
+            throw std::runtime_error("private GatherElementsV2 package operator-type environment mismatch");
+        }
+        gBackend = "acl_op_compiler_private_cann_package_source_real_npu";
         OpTensorDesc inputDesc(dtype, shape), indexDesc(indexDtype, indexShape), outputDesc(dtype, indexShape);
         OpDataBuffer inputData(input), indexData(index), outputData(output);
         OpAttr attr;
@@ -793,10 +797,9 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         const aclTensorDesc *outputDescs[] = {outputDesc.Get()};
         aclDataBuffer *outputBuffers[] = {outputData.Get()};
         const auto launch = [&](aclrtStream launchStream) {
-            // The private complete OPP view keeps CANN's registered
-            // GatherElements type and resolves its canonical dynamic Python
-            // module from the isolated worker environment. No synthetic type
-            // or missing op-proto is used.
+            // This is a real separately registered CANN operator type.  Its
+            // op-proto/op-tiling libraries and dynamic source live in one
+            // checkout-local vendor package selected only for this worker.
             return aclopCompileAndExecute(kGatherElementsSourceOperatorType, 2, inputDescs, inputBuffers,
                                           1, outputDescs, outputBuffers, attr.Get(),
                                           ACL_ENGINE_AICORE, ACL_COMPILE_SYS, nullptr, launchStream);

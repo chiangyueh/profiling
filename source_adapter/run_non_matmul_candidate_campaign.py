@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Collect output-validated native GatherElements source compile contexts.
+"""Collect output-validated private GatherElementsV2 source compile contexts.
 
-Every formal group evaluates the finite set of bounded inputs to CANN's
-original dynamic GatherElements source.  The source then produces the runtime
-flow-table normally; this controller never enumerates, edits, or replays its
-opaque fields. A group is admitted only when twenty distinct source compile
-contexts launch, exactly match the installed reference, and complete
-device-event measurement.
+Every formal group evaluates the finite set of bounded inputs to the private
+CANN package's original GatherElementsV2 host tiler. The controller never
+enumerates, edits, or replays opaque raw-tiling fields. A group is admitted
+only when twenty distinct source contexts launch, exactly match the installed
+reference, and complete device-event measurement.
 """
 
 from __future__ import annotations
@@ -27,17 +26,17 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_native_dynamic_measurement_v7"
-SOURCE_BACKEND = "acl_op_compiler_private_opp_source_real_npu"
-SOURCE_OPERATOR_TYPE = "GatherElements"
+SCHEMA = "gather_elements_v2_private_cann_package_measurement_v8"
+SOURCE_BACKEND = "acl_op_compiler_private_cann_package_source_real_npu"
+SOURCE_OPERATOR_TYPE = "GatherElementsV2"
 # The campaign is intentionally append-only so an interrupted physical-NPU
 # run can resume without losing its completed groups.  A single log is kept
 # below this limit; the next numeric log is opened before an oversized write.
 MAX_LOG_BYTES = 50 * 1024 * 1024
-# This executable campaign has one deliberate scope.  Keeping only the
-# native CANN operator name prevents an old GatherElementsV2 compatibility
-# route from being accepted by accident.
-OPERATOR_RUNTIME_NAMES = {"GatherElements": "gather_elements"}
+# This executable campaign has one deliberate scope.  The generic compiler
+# must select the separately registered private CANN operator, not the
+# installed Python GatherElements implementation that previously shadowed it.
+OPERATOR_RUNTIME_NAMES = {"GatherElementsV2": "gather_elements"}
 RUNTIME_OPERATOR_NAMES = {value: key for key, value in OPERATOR_RUNTIME_NAMES.items()}
 
 
@@ -99,9 +98,9 @@ def worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int
 
 
 def source_worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int, samples: int) -> list[str]:
-    # Normal ACL cleanup is required only for the Python-source route: CANN's
-    # TBE compiler owns host workers that must finish before this subprocess
-    # exits.  It does not reset the device.
+    # CANN owns compiler-side host workers for this package. Normal cleanup
+    # waits only for this worker's stream/compiler teardown; it never resets a
+    # device or touches another process.
     return worker_args(runner, workload, device, warmup, samples) + ["--normal-cleanup", "1"]
 
 
@@ -222,55 +221,61 @@ def read_progress(directory: Path) -> tuple[set[str], dict[str, int], int]:
 
 def validate_source_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        raise RuntimeError("missing native GatherElements overlay manifest: {}".format(path))
+        raise RuntimeError("missing private GatherElementsV2 package manifest: {}".format(path))
     item: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-    required = ("schema", "operator", "source_operator_type", "source_module", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
-                "installed_source", "installed_source_sha256", "installed_opp_root", "runtime_opp_root", "runtime_opp_layout",
-                "source_file", "source_file_sha256", "instrumentation", "hardware_envelope_heuristic",
-                "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
-    if (any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v7" or
+    required = ("schema", "operator", "source_operator_type", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
+                "project_root", "package_root", "custom_opp_root", "source_file", "source_file_sha256", "op_proto_library", "op_proto_library_sha256",
+                "op_tiling_library", "op_tiling_library_sha256", "ops_config", "ops_config_sha256", "dynamic_adapter",
+                "dynamic_adapter_sha256", "dynamic_kernel", "dynamic_kernel_sha256", "instrumentation",
+                "hardware_envelope_heuristic", "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
+    if (any(key not in item for key in required) or
+            item["schema"] != "gather_elements_v2_private_cann_package_v1" or
             item.get("source_operator_type") != SOURCE_OPERATOR_TYPE or
-            item.get("source_module") != "gather_elements"):
-        raise RuntimeError("invalid native CANN GatherElements source-overlay manifest: {}".format(path))
+            item.get("operator") != SOURCE_OPERATOR_TYPE or
+            item.get("runtime_op") != "gather_elements"):
+        raise RuntimeError("invalid private GatherElementsV2 CANN package manifest: {}".format(path))
     source_file = Path(str(item["source_file"]))
     if not source_file.is_file() or digest_file(source_file) != str(item["source_file_sha256"]):
-        raise RuntimeError("native GatherElements source overlay is missing or mismatched: {}".format(source_file))
+        raise RuntimeError("private GatherElementsV2 host tiler is missing or mismatched: {}".format(source_file))
+    package_root = Path(str(item["package_root"]))
+    project_root = Path(str(item["project_root"]))
+    custom_opp_root = Path(str(item["custom_opp_root"]))
+    if (not package_root.is_dir() or not project_root.is_dir() or not custom_opp_root.is_dir() or
+            custom_opp_root / "vendors" / str(item.get("vendor", "")) != package_root):
+        raise RuntimeError("private GatherElementsV2 package/project root is absent")
+    for value_key, hash_key in (("op_proto_library", "op_proto_library_sha256"),
+                                ("op_tiling_library", "op_tiling_library_sha256"),
+                                ("ops_config", "ops_config_sha256"),
+                                ("dynamic_adapter", "dynamic_adapter_sha256"),
+                                ("dynamic_kernel", "dynamic_kernel_sha256")):
+        artifact = Path(str(item[value_key]))
+        if not artifact.is_file() or digest_file(artifact) != str(item[hash_key]) or package_root not in artifact.parents:
+            raise RuntimeError("private GatherElementsV2 package artifact is missing or mismatched: {}".format(artifact))
     runtime_op = OPERATOR_RUNTIME_NAMES.get(str(item["operator"]))
     if runtime_op is None:
-        raise RuntimeError("native overlay is not an allowed GatherElements source: {}".format(item["operator"]))
+        raise RuntimeError("private package is not an allowed GatherElements source: {}".format(item["operator"]))
     inst = item["instrumentation"]
     if (not isinstance(inst, dict) or inst.get("enabled") is not True or inst.get("mutates_tiling_context") is not False or
             not inst.get("audit_schema") or not inst.get("audit_environment") or not inst.get("source_budget_environment") or
             inst.get("dispatch_environment") != "GATHER_ELEMENTS_SOURCE_DISPATCH" or
             inst.get("dispatch_value") != "aclop_compile_and_execute"):
-        raise RuntimeError("native overlay does not attest its original-source candidate axes")
+        raise RuntimeError("private package does not attest its original-source candidate axes")
     envelope = item["hardware_envelope_heuristic"]
     if (not isinstance(envelope, dict) or envelope.get("enabled") is not True or
             envelope.get("environment") != "GATHER_ELEMENTS_SOURCE_UB_DIVISOR" or
             not envelope.get("audit_field") or tuple(envelope.get("divisors", ())) != (2, 4, 8) or
             int(envelope.get("max_anchors", 0)) < 1):
-        raise RuntimeError("native overlay hardware-envelope provenance is invalid")
-    runtime_root = Path(str(item["runtime_opp_root"]))
-    installed_root = Path(str(item["installed_opp_root"]))
-    layout = item["runtime_opp_layout"]
-    if not isinstance(layout, dict):
-        raise RuntimeError("native GatherElements private OPP layout is not an object")
-    private_tbe_root = Path(str(layout.get("private_tbe_import_root", "")))
-    builtin = runtime_root / "built-in"
-    linked_entries = layout.get("linked_root_entries")
-    if (not runtime_root.is_dir() or not installed_root.is_dir() or not builtin.is_dir() or builtin.is_symlink() or
-            layout.get("mode") != "complete_private_opp_view_with_canonical_dynamic_module_override" or
-            private_tbe_root != builtin / "op_impl" / "ai_core" / "tbe" or
-            source_file != private_tbe_root / "impl" / "dynamic" / "gather_elements.py" or
-            not isinstance(linked_entries, list) or
-            sorted(linked_entries) != sorted(path.name for path in installed_root.iterdir() if path.name != "built-in")):
-        raise RuntimeError("native GatherElements private OPP layout is incomplete")
-    for name in linked_entries:
-        private_entry, installed_entry = runtime_root / str(name), installed_root / str(name)
-        if not private_entry.is_symlink() or private_entry.resolve() != installed_entry.resolve():
-            raise RuntimeError("native GatherElements private OPP root link is invalid: {}".format(name))
+        raise RuntimeError("private package hardware-envelope provenance is invalid")
+    config = json.loads(Path(str(item["ops_config"])).read_text(encoding="utf-8"))
+    entry = config.get(SOURCE_OPERATOR_TYPE)
+    if not isinstance(entry, dict) or entry.get("opFile", {}).get("value") != "gather_elements_v2" or \
+            entry.get("opInterface", {}).get("value") != "gather_elements_v2":
+        raise RuntimeError("private package lacks GatherElementsV2 generic-dispatch config")
+    version_file = Path(str(item["cann_root"])) / "opp" / "version.info"
+    if not version_file.is_file() or digest_file(version_file) != str(item["cann_version_file_sha256"]):
+        raise RuntimeError("private package was built against a different or missing CANN OPP installation")
     if item["strategy_algorithm_changes"] is not False or item["kernel_algorithm_changes"] is not False:
-        raise RuntimeError("native GatherElements overlay is not source-preserving")
+        raise RuntimeError("private GatherElementsV2 package is not source-preserving")
     item["runtime_op"] = runtime_op
     item["manifest_path"] = str(path)
     return item
@@ -301,9 +306,7 @@ def successful_observation(path: Path, package: dict[str, Any]) -> tuple[dict[st
     all_rows = read_observations(path, str(package["instrumentation"]["audit_schema"]))
     rows = [row for row in all_rows if row.get("event") == "tiling_generated"]
     if not rows:
-        if any(row.get("event") == "module_imported" for row in all_rows):
-            return None, "private source was imported but did not emit a completed tiling audit"
-        return None, "original-source overlay emitted no audit observation"
+        return None, "private GatherElementsV2 host tiler emitted no raw-tiling audit"
     identities = {source_compile_context_identity(row) for row in rows}
     if len(identities) != 1:
         return None, "one source execution emitted multiple compile-context identities"
@@ -349,15 +352,13 @@ def context_matches(observation: dict[str, Any] | None, candidate: dict[str, Any
 
 def source_environment(base: dict[str, str], package: dict[str, Any], candidate: dict[str, Any], audit: Path) -> dict[str, str]:
     environment = dict(base)
-    # This environment belongs only to the child worker passed to
-    # subprocess.run.  It makes CANN resolve the original registered module
-    # from the private full OPP view; it never changes the login shell, CANN,
-    # or another user's process.
-    environment["ASCEND_OPP_PATH"] = str(package["runtime_opp_root"])
-    environment.pop("ASCEND_CUSTOM_OPP_PATH", None)
-    import_root = str(package["runtime_opp_layout"]["private_tbe_import_root"])
-    previous_pythonpath = environment.get("PYTHONPATH", "")
-    environment["PYTHONPATH"] = import_root + (os.pathsep + previous_pythonpath if previous_pythonpath else "")
+    # This mapping is passed only to one subprocess.  It keeps the installed
+    # OPP root and adds one checkout-local vendor package through CANN's
+    # supported custom-OPP variable; it does not alter the login shell, CANN,
+    # or another user's process/environment.
+    environment["ASCEND_OPP_PATH"] = str(Path(str(package["cann_root"])) / "opp")
+    environment["ASCEND_CUSTOM_OPP_PATH"] = str(package["custom_opp_root"])
+    environment["GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE"] = SOURCE_OPERATOR_TYPE
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
     environment[str(package["instrumentation"]["dispatch_environment"])] = str(package["instrumentation"]["dispatch_value"])
     environment[str(package["instrumentation"]["source_budget_environment"])] = str(candidate["aiv_core_cap"])
@@ -377,9 +378,7 @@ def source_audit_emitted(path: Path, package: dict[str, Any], candidate: dict[st
     all_rows = read_observations(path, str(package["instrumentation"]["audit_schema"]))
     rows = [row for row in all_rows if row.get("event") == "tiling_generated"]
     if not rows:
-        if any(row.get("event") == "module_imported" for row in all_rows):
-            return False, "private source was imported but did not emit a completed tiling audit"
-        return False, "original-source overlay emitted no audit observation"
+        return False, "private GatherElementsV2 host tiler emitted no raw-tiling audit"
     for row in rows:
         try:
             source_compile_context_identity(row)
@@ -400,7 +399,9 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
     semantic-shape search can create repeated rejects.
     """
     checks: list[dict[str, Any]] = []
-    with tempfile.TemporaryDirectory(prefix="source_tiling_preflight_") as temporary:
+    temporary_root = args.log_dir.parent / "tmp"
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="source_tiling_preflight_", dir=str(temporary_root)) as temporary:
         root = Path(temporary)
         for op in sorted(planned):
             workload = planned[op][0]
@@ -452,16 +453,32 @@ def plan_packages(manifests: list[dict[str, Any]], selected_operator: str) -> di
 
 
 def source_supported_workload(workload: dict[str, Any]) -> bool:
-    """Filter before NPU work using the native GatherElements declaration.
+    """Filter before NPU work using the private GatherElementsV2 declaration.
 
     Its source declaration accepts x in fp16/bf16/fp32/int32 and index in
     int32.  Sending CANN-8.1's installed-only int64 index variants through
-    the native overlay would manufacture predictable rejects and cannot
-    contribute to the 5,000 real source-kernel measurements.
+    the private 910B package would manufacture predictable rejects and cannot
+    contribute to the 5,000 real source-kernel measurements.  At least twenty
+    output-parallel positions are also required: otherwise all caps above the
+    available parallelism collapse to the same raw tiling and cannot satisfy
+    the requested 20-way ranking set.
     """
-    return (workload.get("op") == "gather_elements" and
+    if not (workload.get("op") == "gather_elements" and
             workload.get("dtype") in ("fp16", "bf16", "fp32", "int32") and
-            workload.get("index_dtype") == "int32")
+            workload.get("index_dtype") == "int32"):
+        return False
+    shape = workload.get("index_shape")
+    axis = workload.get("axis")
+    if not isinstance(shape, list) or not shape or not isinstance(axis, int):
+        return False
+    normalized_axis = axis % len(shape)
+    output_parallelism = 1
+    for index, value in enumerate(shape):
+        if not isinstance(value, int) or value <= 0:
+            return False
+        if index != normalized_axis:
+            output_parallelism *= value
+    return output_parallelism >= 20
 
 
 def select_heuristic_anchors(discovered: dict[str, dict[str, Any]], maximum: int) -> list[dict[str, Any]]:
@@ -508,7 +525,7 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
         if result.get("backend") != SOURCE_BACKEND:
             failures.append(candidate_label(candidate) + ": runner used unexpected backend {}".format(result.get("backend")))
             return True
-        if reason == "original-source overlay emitted no audit observation":
+        if reason == "private GatherElementsV2 host tiler emitted no raw-tiling audit":
             failures.append(candidate_label(candidate) + ": " + reason)
             # This is a deployment/instrumentation failure, not an invalid
             # tiling. Retrying its remaining caps would only create duplicate
@@ -616,7 +633,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
                          "discovery_failures": failures, "verification_failures": verification_failures,
                          "measurement_failures": measurement_failures,
                          "rejected_candidate_count": len(failures) + len(verification_failures) + len(measurement_failures),
-                         "source_rule": "complete native-source discovery and validation, then deterministic timing of 20 validated source contexts; the declared UB envelope is used only when core-budget contexts are below 20; failed candidates do not count; no flow-table field generation"}
+                         "source_rule": "complete private GatherElementsV2 source discovery and validation, then deterministic timing of 20 validated source contexts; the declared UB envelope is used only when core-budget contexts are below 20; failed candidates do not count; no flow-table field generation"}
 
 
 def summarize(directory: Path) -> dict[str, Any]:
@@ -646,11 +663,14 @@ def main() -> int:
         raise RuntimeError("GatherElements requires an exact target of whole 20-tiling groups")
     packages = plan_packages([validate_source_manifest(path) for path in args.source_package_manifest], args.operator)
     writer = RotatingJsonl(args.log_dir)
+    temporary_root = args.log_dir.parent / "tmp"
+    temporary_root.mkdir(parents=True, exist_ok=True)
     completed, admitted_by_op, prior_rejected = read_progress(args.log_dir)
     if any(admitted_by_op.get(op, 0) > budgets[op] for op in budgets):
         raise RuntimeError("existing progress exceeds a per-operator formal record ceiling")
     base_env = dict(os.environ)
     base_env.pop("ASCEND_CUSTOM_OPP_PATH", None)
+    base_env.pop("GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE", None)
     for package_set in packages.values():
         for package in package_set:
             base_env.pop(str(package["instrumentation"]["audit_environment"]), None)
@@ -673,7 +693,7 @@ def main() -> int:
         "operators": {op: {"semantic_workloads": len(planned[op]), "source_package_count": len(packages[op])} for op in budgets},
         "historical_latency_or_tiling_records_read": 0, "cce_data_or_cost_model_read": 0,
         "timing": {"warmup": args.warmup, "samples": args.samples, "kind": "device_event_only"},
-        "no_host_timeout_or_forced_worker_kill": True, "temporary_reference_storage": "/tmp only",
+        "no_host_timeout_or_forced_worker_kill": True, "temporary_reference_storage": str(temporary_root),
         "preflight": "one installed viability launch per operator plus one source-audit call per host-tiler package; any failure stops before semantic-shape discovery",
         "log_directory": str(args.log_dir), "log_rotation_max_bytes": MAX_LOG_BYTES,
     }
@@ -714,7 +734,7 @@ def main() -> int:
         remaining = budgets[op] - admitted_by_op.get(op, 0)
         if remaining < minimum:
             break
-        with tempfile.TemporaryDirectory(prefix=op + "_source_tiling_") as temporary:
+        with tempfile.TemporaryDirectory(prefix=op + "_source_tiling_", dir=str(temporary_root)) as temporary:
             status, details = execute_group(args, workload, packages[op], caps, minimum,
                                             base_env, group_key, Path(temporary))
         row = {"schema": SCHEMA, "group_key": group_key, "status": status, "workload": workload, **details}
@@ -735,7 +755,10 @@ def main() -> int:
         "formal_valid_latency_records": end["summary"]["formal_valid_latency_records"],
         "rejected_groups": end["summary"]["rejected_groups"], "logs": str(args.log_dir)
     }, ensure_ascii=False, sort_keys=True), flush=True)
-    return 0
+    # A successful process must mean that the requested formal dataset exists,
+    # not merely that the finite catalog has been exhausted.  This prevents an
+    # under-target set of rejected or incomplete shapes from looking complete.
+    return 0 if end["status"] == "complete" else 2
 
 
 if __name__ == "__main__":

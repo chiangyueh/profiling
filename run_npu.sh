@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# One operator, one execution route: native CANN-8.1 GatherElements dynamic
-# source. The source overlay is private to this checkout; installed CANN is
-# only read through immutable links.
+# This campaign has one scope: a checkout-local, real CANN custom package for
+# GatherElementsV2.  The installed CANN files remain inputs; every explicit
+# build, package, temporary campaign artifact, and rotating JSONL log stays
+# below this checkout.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE=""
-PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-1}"
+PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-2}"
 WARMUP="${OP_NPU_WARMUP:-2}"
 SAMPLES="${OP_NPU_SAMPLES:-5}"
 RECORD_TARGET=5000
@@ -16,16 +17,14 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-Runs GatherElements only. The installed reference uses ``aclnnGather``; each
-source candidate uses CANN's generic ``aclopCompileAndExecute`` OPP dispatch,
-which is the API that can select the checkout-local dynamic source overlay.
+Runs GatherElements only: 5,000 output-validated real-NPU device-event
+records, from 250 shapes with exactly 20 distinct successful source tilings
+per admitted shape. Results are append-only JSONL files below profiling/results
+and each file is capped at 50 MiB.
 
-- 5,000 real-NPU device-event records (250 complete 20-candidate groups).
-- Each admitted candidate launches and output-matches an installed reference.
-- Candidate axes only lower the native source's published AIV/UB budgets.
-- Results are rotating JSONL files under profiling/results, each <= 50 MiB.
-- No installed CANN file, global OPP path, device state, process, or reset is
-  modified by this script.
+The script reads the installed CANN package but does not modify it, reset an
+NPU, kill a process, or persistently change an environment variable. Its CANN
+and compiler environment is private to this script and its child processes.
 USAGE
 }
 
@@ -58,6 +57,9 @@ for candidate in "${CANN_ROOT}/set_env.sh" "$(dirname "${CANN_ROOT}")/set_env.sh
     [[ -f "${candidate}" ]] && { ENV_FILE="${candidate}"; break; }
 done
 [[ -n "${ENV_FILE}" ]] || { echo "fatal: CANN environment script is missing under ${CANN_ROOT}" >&2; exit 1; }
+
+# This script is a child shell: source's exports end when it exits.  No login
+# shell, other process, device configuration, or installed CANN file changes.
 set +u
 source "${ENV_FILE}"
 set -u
@@ -67,84 +69,114 @@ export ASCEND_OPP_PATH="${CANN_ROOT}/opp"
 export ASCEND_RT_VISIBLE_DEVICES="${PHYSICAL_DEVICE}"
 export TILINGKEY_PAR_COMPILE=1
 export OMP_NUM_THREADS=1
-unset ASCEND_CUSTOM_OPP_PATH ASCENDC_CPU_DEBUG
+unset ASCEND_CUSTOM_OPP_PATH GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE \
+    GATHER_ELEMENTS_TILING_AUDIT_PATH GATHER_ELEMENTS_SOURCE_DISPATCH \
+    GATHER_ELEMENTS_SOURCE_AIV_CAP GATHER_ELEMENTS_SOURCE_UB_DIVISOR ASCENDC_CPU_DEBUG
 
-NATIVE_SOURCE="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/dynamic/gather_elements.py"
-[[ -f "${NATIVE_SOURCE}" ]] || { echo "fatal: installed native CANN GatherElements source is absent" >&2; exit 1; }
+for input_path in \
+    "${ROOT}/source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz" \
+    "${ROOT}/source_adapter/vendor_source/gather_elements_v2_source.zip" \
+    "${ROOT}/source_adapter/materialize_repo_source_bundle.py" \
+    "${ROOT}/source_adapter/prepare_gather_elements_v2_project.py" \
+    "${ROOT}/source_adapter/finalize_gather_elements_v2_package.py" \
+    "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
+    "${ROOT}/source_adapter/non_matmul_candidate_catalog.py" \
+    "${ROOT}/multi_op_bench/CMakeLists.txt" \
+    "${ROOT}/multi_op_bench/runner.cpp"; do
+    [[ -f "${input_path}" ]] || { echo "fatal: required repository input is absent: ${input_path}" >&2; exit 1; }
+done
 
 SOURCE_ID="$({
-    sha256sum "${ROOT}/run_npu.sh" "${ROOT}/multi_op_bench/CMakeLists.txt" "${ROOT}/multi_op_bench/runner.cpp" \
+    sha256sum "${ROOT}/run_npu.sh" \
+        "${ROOT}/source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz" \
+        "${ROOT}/source_adapter/vendor_source/gather_elements_v2_source.zip" \
+        "${ROOT}/source_adapter/materialize_repo_source_bundle.py" \
+        "${ROOT}/source_adapter/prepare_gather_elements_v2_project.py" \
+        "${ROOT}/source_adapter/finalize_gather_elements_v2_package.py" \
+        "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
         "${ROOT}/source_adapter/non_matmul_candidate_catalog.py" \
-        "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
-        "${ROOT}/source_adapter/prepare_gather_elements_native_dynamic.py" \
-        "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py"
-    sha256sum "${NATIVE_SOURCE}" "${CANN_ROOT}/opp/version.info"
+        "${ROOT}/multi_op_bench/CMakeLists.txt" "${ROOT}/multi_op_bench/runner.cpp"
+    sha256sum "${CANN_ROOT}/opp/version.info"
     readlink -f "${CANN_ROOT}"
 } | sha256sum | cut -c1-20)"
 
-STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v7/${SOURCE_ID}"
-OVERLAY_PARENT="${STATE}/overlays"
+SOURCE_CACHE_PARENT="${ROOT}/.source_cache"
+CANN_OPS_SOURCE="${SOURCE_CACHE_PARENT}/cann_ops_8_1rc1"
+STATE="${ROOT}/.benchmark_state/gather_elements_v2_private_package_v8/${SOURCE_ID}"
+PROJECT="${STATE}/project"
+PACKAGE_BUILD="${STATE}/package_build"
+PACKAGE_ROOT="${STATE}/output/packages/vendors/gather_elements_source"
+PACKAGE_MANIFEST="${STATE}/gather_elements_v2_private_package.json"
 RUNNER_BUILD="${STATE}/runner_build"
-RESULTS="${ROOT}/results/gather_elements_native_dynamic_v7/${SOURCE_ID}"
+RESULTS="${ROOT}/results/gather_elements_v2_private_package_v8/${SOURCE_ID}"
 LOGS="${RESULTS}/logs"
-mkdir -p "${OVERLAY_PARENT}" "${RUNNER_BUILD}" "${LOGS}"
-
-echo "GatherElements native CANN dynamic-source campaign"
-echo "  target:        physical NPU ${PHYSICAL_DEVICE} -> worker logical NPU 0"
-echo "  formal target: ${RECORD_TARGET} real-NPU latency records"
-echo "  source:        ${NATIVE_SOURCE}"
-echo "  source API:    aclopCompileAndExecute(GatherElements) through a complete private OPP view"
-echo "  reference API: installed aclnnGather under the unmodified installed OPP path"
-echo "  output:        ${LOGS}/1.log, 2.log, ... (JSONL, each <= 50 MiB)"
+mkdir -p "${SOURCE_CACHE_PARENT}" "${STATE}" "${LOGS}"
+# Keep temporary files made by tools that honor the standard variables under
+# the checkout as well. These exports are limited to this script and its
+# children and disappear when it exits.
+mkdir -p "${STATE}/tmp"
+export TMPDIR="${STATE}/tmp"
+export TMP="${TMPDIR}"
+export TEMP="${TMPDIR}"
 
 run_logged() {
     local label="$1"
     local log="$2"
     shift 2
+    echo "${label} begin"
     if "$@" >"${log}" 2>&1; then
-        echo "${label} status=passed"
+        echo "${label} passed"
         return 0
     fi
-    echo "${label} status=failed log=${log}" >&2
-    tail -n 30 "${log}" >&2 || true
+    echo "${label} failed; inspect=${log}" >&2
     return 1
 }
 
-# A wrong API path was the cause of the prior no-audit failures.  Check every
-# local prerequisite before creating a build directory or touching the NPU.
-run_logged "GATHER_STATIC_PRE" "${STATE}/contract_pre.log" \
-    python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
-    --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
-    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" \
-    --campaign-source "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
-    --launch-script "${ROOT}/run_npu.sh"
+echo "GATHER_ELEMENTS_CAMPAIGN begin device=${PHYSICAL_DEVICE} records=${RECORD_TARGET} logs=${LOGS}"
+echo "GATHER_ELEMENTS_CAMPAIGN scope=private_checkout_package installed_cann_read_only no_reset_no_kill"
 
-OVERLAY="${OVERLAY_PARENT}/gather_elements_native_dynamic"
-PACKAGE_MANIFEST="${OVERLAY}/native_dynamic_overlay.json"
-if [[ ! -f "${PACKAGE_MANIFEST}" ]]; then
-    [[ ! -e "${OVERLAY}" ]] || { echo "fatal: incomplete private native GatherElements overlay exists: ${OVERLAY}" >&2; exit 2; }
-    echo "NATIVE_DYNAMIC_OVERLAY_PREPARE_BEGIN operator=gather_elements"
-    python3 "${ROOT}/source_adapter/prepare_gather_elements_native_dynamic.py" \
-        --cann-root "${CANN_ROOT}" --output-parent "${OVERLAY_PARENT}" >"${STATE}/overlay_prepare.log" 2>&1
-    echo "NATIVE_DYNAMIC_OVERLAY_PREPARE_END operator=gather_elements"
+if [[ ! -d "${CANN_OPS_SOURCE}" ]]; then
+    run_logged "GATHER_SOURCE_CACHE" "${STATE}/source_cache.log" \
+        python3 "${ROOT}/source_adapter/materialize_repo_source_bundle.py" \
+        --kind cann_ops --destination "${CANN_OPS_SOURCE}"
+elif [[ ! -f "${CANN_OPS_SOURCE}/.source_bundle_attestation.json" ]]; then
+    echo "fatal: incomplete private source cache exists: ${CANN_OPS_SOURCE}" >&2
+    exit 2
 fi
-run_logged "GATHER_STATIC_POST" "${STATE}/contract_post.log" \
-    python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
-    --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
-    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" \
-    --campaign-source "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
-    --launch-script "${ROOT}/run_npu.sh" \
-    --overlay-manifest "${PACKAGE_MANIFEST}"
 
-run_logged "GATHER_RUNNER_CONFIGURE" "${STATE}/runner_configure.log" \
-    cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
-    -DCMAKE_BUILD_TYPE=Release -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}"
+if [[ ! -f "${PROJECT}/gather_elements_v2_project.json" ]]; then
+    [[ ! -e "${PROJECT}" ]] || { echo "fatal: incomplete private package project exists: ${PROJECT}" >&2; exit 2; }
+    run_logged "GATHER_PACKAGE_PREPARE" "${STATE}/package_prepare.log" \
+        python3 "${ROOT}/source_adapter/prepare_gather_elements_v2_project.py" \
+        --cann-ops-source "${CANN_OPS_SOURCE}" --cann-root "${CANN_ROOT}" --output "${PROJECT}"
+fi
+
+if [[ ! -f "${PACKAGE_BUILD}/CMakeCache.txt" ]]; then
+    run_logged "GATHER_PACKAGE_CONFIGURE" "${STATE}/package_configure.log" \
+        cmake -S "${PROJECT}" -B "${PACKAGE_BUILD}" -G "Unix Makefiles" \
+        -DBUILD_OPEN_PROJECT=ON -DASCEND_COMPUTE_UNIT=ascend910b \
+        -DASCEND_OP_NAME=gather_elements_v2 -DVENDOR_NAME=gather_elements_source \
+        -DCUSTOM_ASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" -DCHECK_COMPATIBLE=OFF \
+        -DENABLE_OPS_KERNEL=OFF -DPREPARE_BUILD=ON -DENABLE_CCACHE=OFF \
+        -DCMAKE_BUILD_TYPE=Release
+fi
+run_logged "GATHER_PACKAGE_BUILD" "${STATE}/package_build.log" \
+    cmake --build "${PACKAGE_BUILD}" --parallel 1
+run_logged "GATHER_PACKAGE_INSTALL" "${STATE}/package_install.log" \
+    cmake --install "${PACKAGE_BUILD}"
+run_logged "GATHER_PACKAGE_VALIDATE" "${STATE}/package_validate.log" \
+    python3 "${ROOT}/source_adapter/finalize_gather_elements_v2_package.py" \
+    --project "${PROJECT}" --package-root "${PACKAGE_ROOT}" \
+    --cann-root "${CANN_ROOT}" --manifest "${PACKAGE_MANIFEST}"
+
+if [[ ! -f "${RUNNER_BUILD}/CMakeCache.txt" ]]; then
+    run_logged "GATHER_RUNNER_CONFIGURE" "${STATE}/runner_configure.log" \
+        cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
+        -DCMAKE_BUILD_TYPE=Release -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}"
+fi
 run_logged "GATHER_RUNNER_BUILD" "${STATE}/runner_build.log" \
     cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1
 
-# The controller's sole preflight performs one installed-reference launch and
-# one private-OPP source launch/audit, then stops immediately on failure.
-# Keeping that gate in one place avoids duplicate NPU smoke executions.
 python3 "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
     --runner "${RUNNER_BUILD}/multi_op_npu_runner" --log-dir "${LOGS}" --device 0 \
     --warmup "${WARMUP}" --samples "${SAMPLES}" --operator gather_elements \

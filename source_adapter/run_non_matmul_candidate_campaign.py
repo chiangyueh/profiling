@@ -101,23 +101,6 @@ def worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int
     return values
 
 
-def source_worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int, samples: int,
-                       package: dict[str, Any]) -> list[str]:
-    """Invoke the source package by its three attested library paths.
-
-    `ASCEND_CUSTOM_OPP_PATH` only influences CANN's package lookup and cannot
-    establish which `aclnn*` entry point was called.  The runner therefore
-    dlopens these exact private files and resolves the operator symbols from
-    that handle; no installed-opapi fallback is permitted on this route.
-    """
-    libraries = package["package_libraries"]
-    return worker_args(runner, workload, device, warmup, samples) + [
-        "--source-opapi", str(libraries["opapi"]["path"]),
-        "--source-opsproto", str(libraries["opsproto"]["path"]),
-        "--source-optiling", str(libraries["optiling"]["path"]),
-    ]
-
-
 def run_worker(arguments: list[str], environment: dict[str, str]) -> tuple[dict[str, Any], str, float, int]:
     # No subprocess timeout: a forced host kill can poison a real device task.
     started = time.monotonic()
@@ -234,14 +217,12 @@ def validate_custom_manifest(path: Path) -> dict[str, Any]:
     required = ("schema", "operator", "cmake_op_name", "source_family", "official_commit", "vendor",
                 "custom_opp_root", "custom_opp_vendor_root", "source_package_sha256", "source_tiling_observation_enabled",
                 "source_compile_info_core_budget_enumeration", "source_hardware_envelope_heuristic_enumeration",
-                "hardware_envelope_heuristic", "instrumentation", "overlay_manifest_sha256", "package_libraries",
-                "execution_route")
-    if (any(key not in item for key in required) or item["schema"] != "source_candidate_full_package_v2" or
-            item["execution_route"] != "explicit_private_source_package_api"):
-        raise RuntimeError("invalid complete source-package manifest: {}".format(path))
+                "hardware_envelope_heuristic", "instrumentation", "overlay_manifest_sha256")
+    if any(key not in item for key in required) or item["schema"] != "source_candidate_custom_opp_v1":
+        raise RuntimeError("invalid source-host-tiler manifest: {}".format(path))
     source_package = Path(str(item.get("source_package", "")))
     if not source_package.is_file() or digest_file(source_package) != str(item["source_package_sha256"]):
-        raise RuntimeError("custom package dynamic-device asset attestation is missing or mismatched")
+        raise RuntimeError("custom OPP dynamic-device asset attestation is missing or mismatched")
     runtime_op = OPERATOR_RUNTIME_NAMES.get(str(item["operator"]))
     if runtime_op is None:
         raise RuntimeError("custom package is not an allowed non-MatMul operator: {}".format(item["operator"]))
@@ -262,19 +243,10 @@ def validate_custom_manifest(path: Path) -> dict[str, Any]:
     vendor_root = Path(str(item["custom_opp_vendor_root"]))
     if vendor_root != custom_root / "vendors" / str(item["vendor"]) or not vendor_root.is_dir():
         raise RuntimeError("isolated custom OPP vendor root is missing: {}".format(custom_root))
-    libraries = item["package_libraries"]
-    if not isinstance(libraries, dict) or set(libraries) != {"opapi", "opsproto", "optiling"}:
-        raise RuntimeError("source package must attest exactly opapi, opsproto, and optiling libraries")
-    for name, record in libraries.items():
-        if not isinstance(record, dict) or not record.get("path") or not record.get("sha256"):
-            raise RuntimeError("source package library attestation is incomplete: {}".format(name))
-        library = Path(str(record["path"]))
-        if not library.is_file() or digest_file(library) != str(record["sha256"]):
-            raise RuntimeError("source package library is missing or hash-mismatched: {}".format(library))
-        try:
-            library.resolve().relative_to(vendor_root.resolve())
-        except ValueError as error:
-            raise RuntimeError("source package library is outside its private vendor root: {}".format(library)) from error
+    delivery = item.get("device_kernel_delivery")
+    if (not isinstance(delivery, dict) or delivery.get("mode") != "installed_dynamic_source_passthrough" or
+            delivery.get("precompiled_all_tiling_keys") is not False or not delivery.get("formal_data_gate")):
+        raise RuntimeError("custom OPP must use installed dynamic device source without bulk key precompilation")
     item["runtime_op"] = runtime_op
     compatibility = item.get("compatibility_port")
     if compatibility is not None and (not isinstance(compatibility, dict) or
@@ -385,28 +357,6 @@ def source_audit_emitted(path: Path, package: dict[str, Any], candidate: dict[st
     return False, "source audit did not identify the requested source context"
 
 
-def source_execution_attested(result: dict[str, Any], output: str, package: dict[str, Any]) -> tuple[bool, str]:
-    """Require both an exact private opapi load and a matching result route."""
-    expected = str(Path(str(package["package_libraries"]["opapi"]["path"])).resolve())
-    loaded = False
-    for line in output.splitlines():
-        marker = "MULTIOP_NPU_STAGE "
-        if not line.startswith(marker):
-            continue
-        try:
-            stage = json.loads(line[len(marker):])
-        except json.JSONDecodeError:
-            continue
-        if stage.get("stage") == "source_api_load_done" and stage.get("detail") == expected:
-            loaded = True
-            break
-    if not loaded:
-        return False, "runner did not attest loading the explicit private source opapi"
-    if result.get("execution_api") != "source_package_direct":
-        return False, "runner result did not attest direct source-package execution"
-    return True, ""
-
-
 def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                            packages: dict[str, list[dict[str, Any]]], caps: tuple[int, ...],
                            base_env: dict[str, str]) -> list[dict[str, Any]]:
@@ -433,16 +383,15 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                 candidate = candidate_descriptor(package, caps[0])
                 audit = root / (op + "_" + stable_hash({"package": package["overlay_manifest_sha256"], "candidate": candidate}) + ".jsonl")
                 result, output, wall, rc = run_worker(
-                    source_worker_args(args.runner, workload, args.device, 0, 0, package) + ["--source-tiling-only", "1"],
+                    worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
                     source_environment(base_env, package, candidate, audit))
                 observed, reason = source_audit_emitted(audit, package, candidate)
-                executed, execution_reason = source_execution_attested(result, output, package)
-                source_ok = observed and executed and rc == 0 and result.get("status") == "success"
+                source_ok = observed and rc == 0 and result.get("status") == "success"
                 checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "source_tiler_audit",
                                "strategy": candidate["id"], "aiv_core_cap": candidate["aiv_core_cap"],
                                "status": "passed" if source_ok else "failed", "worker_return_code": rc,
                                "worker_status": result.get("status"), "worker_wall_ms": wall,
-                               "failure": None if source_ok else (reason if not observed else execution_reason if not executed else compact_failure(output))})
+                               "failure": None if source_ok else (reason if not observed else compact_failure(output))})
     return checks
 
 
@@ -506,19 +455,17 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
         if kind == "original": original_contexts += 1
         else: heuristic_contexts += 1
         audit = temp / ("discover_" + stable_hash({"g": group_key, "c": candidate}) + ".jsonl")
-        result, output, wall, rc = run_worker(source_worker_args(args.runner, workload, args.device, 0, 0, package) + ["--source-tiling-only", "1"],
+        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
-        executed, execution_reason = source_execution_attested(result, output, package)
         if reason == "original-source overlay emitted no audit observation":
             failures.append(candidate_label(candidate) + ": " + reason)
             # This is a deployment/instrumentation failure, not an invalid
             # tiling. Retrying its remaining caps would only create duplicate
             # rejection records and cannot produce a formal candidate.
             return True
-        if (rc != 0 or result.get("status") != "success" or not executed or
-                not context_matches(observed, candidate, package)):
-            failures.append(candidate_label(candidate) + ": " + (reason or execution_reason or compact_failure(output)))
+        if rc != 0 or result.get("status") != "success" or not context_matches(observed, candidate, package):
+            failures.append(candidate_label(candidate) + ": " + (reason or compact_failure(output)))
             return False
         successful_contexts += 1
         identity = str(observed["raw_tiling_identity"])
@@ -560,14 +507,13 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
     for identity, item in discovered.items():
         candidate, package = item["candidate"], item["package"]
         audit = temp / ("verify_" + stable_hash({"g": group_key, "c": candidate}) + ".jsonl")
-        result, output, wall, rc = run_worker(source_worker_args(args.runner, workload, args.device, 0, 0, package) + ["--compare-reference", str(reference_path)],
+        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0) + ["--compare-reference", str(reference_path)],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
-        executed, execution_reason = source_execution_attested(result, output, package)
         equal = bool(result.get("output_reference_checked")) and bool(result.get("output_reference_equal"))
-        if (rc != 0 or result.get("status") != "success" or not executed or not equal or
+        if (rc != 0 or result.get("status") != "success" or not equal or
                 not context_matches(observed, candidate, package) or observed.get("raw_tiling_identity") != identity):
-            verification_failures.append(candidate_label(candidate) + ": " + (reason or execution_reason or "output/reference or raw identity mismatch"))
+            verification_failures.append(candidate_label(candidate) + ": " + (reason or "output/reference or raw identity mismatch"))
             continue
         verified.append({**item, "verification_result": result, "verification_wall_ms": wall, "verification_tiling_observation": observed})
     if len(verified) < minimum:
@@ -582,14 +528,13 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
     for item in verified:
         candidate, package = item["candidate"], item["package"]
         audit = temp / ("measure_" + stable_hash({"g": group_key, "c": candidate}) + ".jsonl")
-        result, output, wall, rc = run_worker(source_worker_args(args.runner, workload, args.device, args.warmup, args.samples, package) + ["--compare-reference", str(reference_path)],
+        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, args.warmup, args.samples) + ["--compare-reference", str(reference_path)],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
-        executed, execution_reason = source_execution_attested(result, output, package)
         equal = bool(result.get("output_reference_checked")) and bool(result.get("output_reference_equal"))
-        if (rc != 0 or result.get("status") != "success" or not executed or not equal or not context_matches(observed, candidate, package) or
+        if (rc != 0 or result.get("status") != "success" or not equal or not context_matches(observed, candidate, package) or
                 observed.get("raw_tiling_identity") != item["source_tiling_observation"]["raw_tiling_identity"]):
-            measurement_failures.append(candidate_label(candidate) + ": " + (reason or execution_reason or "measurement output/reference or raw identity mismatch"))
+            measurement_failures.append(candidate_label(candidate) + ": " + (reason or "measurement output/reference or raw identity mismatch"))
             continue
         compact = {key: value for key, value in item.items() if key != "package"}
         compact.update({"latency_result": result, "latency_tiling_observation": observed, "latency_worker_wall_ms": wall})
@@ -674,6 +619,10 @@ def main() -> int:
         writer.append(failure)
         print("SOURCE_TILING_CAMPAIGN_PREFLIGHT_FAILED " + json.dumps(failure, ensure_ascii=False, sort_keys=True), flush=True)
         return 2
+    print("SOURCE_TILING_CAMPAIGN_PREFLIGHT_PASSED " + json.dumps({
+        "checks": len(preflight), "source_tiler_audits": sum(check["kind"] == "source_tiler_audit" for check in preflight),
+        "installed_reference_viability": sum(check["kind"] == "installed_reference_viability" for check in preflight),
+    }, sort_keys=True), flush=True)
     max_len = max(len(rows) for rows in planned.values())
     for index in range(max_len):
         for op in budgets:

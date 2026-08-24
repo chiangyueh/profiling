@@ -4,9 +4,8 @@
 This is deliberately generic: the manifest produced by an operator-specific
 preparer declares the real CMake operator name, audit entry, source family and
 the finite source-input axes.  The builder never reconstructs a tiling,
-changes an opaque raw buffer, or infers a candidate from a result.  It only
-packages the already-audited source overlay into an isolated custom OPP
-package.
+changes an opaque raw buffer, or infers a candidate from a result.  It builds
+only the already-audited original host tiler for an isolated custom OPP root.
 """
 
 from __future__ import annotations
@@ -111,7 +110,7 @@ def main() -> int:
     parser.add_argument("--overlay", required=True, type=Path)
     parser.add_argument("--build-dir", required=True, type=Path)
     parser.add_argument("--cann-root", required=True, type=Path)
-    parser.add_argument("--target", choices=("optiling", "package"), default="optiling")
+    parser.add_argument("--target", choices=("optiling",), default="optiling")
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--vendor", default=None)
     args = parser.parse_args()
@@ -138,9 +137,12 @@ def main() -> int:
     # output comparison remains the admission gate.
     cmake_args.append("-DCHECK_COMPATIBLE=OFF")
     run(cmake_args)
-    run(["cmake", "--build", str(args.build_dir), "--target", args.target, "--parallel", str(args.jobs)])
+    # `package` recursively compiles an operator's device-kernel matrix.  This
+    # campaign needs only the original host dispatcher/tiler; the installed
+    # dynamic device source is copied privately and compiles a key only when
+    # that key is actually launched.
+    run(["cmake", "--build", str(args.build_dir), "--target", "optiling", "--parallel", str(args.jobs)])
     artifact = args.build_dir / "libcust_opmaster_rt2.0.so"
-    packages = sorted(args.build_dir.glob("CANN-custom_ops-*.run"))
     # The unmodified public 8.1 root's ``optiling`` post-build action creates
     # this compatibility loader entry.  Do not invoke its separate
     # ``optiling_compat`` target: in a detached build that target constructs a
@@ -148,12 +150,10 @@ def main() -> int:
     # The post-build entry below is the source tree's actual host-tiler
     # delivery path and resolves to the same just-built library.
     compatibility_artifact = args.build_dir / "custom/op_impl/ai_core/tbe/op_tiling/liboptiling.so"
-    if args.target == "optiling" and not artifact.is_file():
+    if not artifact.is_file():
         raise RuntimeError("host tiling artifact is missing after build")
-    if args.target == "optiling" and not compatibility_artifact.is_file():
+    if not compatibility_artifact.is_file():
         raise RuntimeError("official host-tiler compatibility entry is missing after build")
-    if args.target == "package" and len(packages) != 1:
-        raise RuntimeError("expected one source package, found {}".format(len(packages)))
     output = {
         "schema": "source_candidate_build_v1", "operator": manifest["operator"],
         "cmake_op_name": manifest["cmake_op_name"], "source_family": manifest["source_family"],
@@ -165,8 +165,6 @@ def main() -> int:
         "host_tiling_artifact_sha256": digest(artifact) if artifact.is_file() else None,
         "host_tiling_compat_artifact": str(compatibility_artifact) if compatibility_artifact.is_file() else None,
         "host_tiling_compat_artifact_sha256": digest(compatibility_artifact) if compatibility_artifact.is_file() else None,
-        "source_package": str(packages[0]) if packages else None,
-        "source_package_sha256": digest(packages[0]) if packages else None,
         "instrumentation": manifest["instrumentation"], "build_harness": manifest.get("build_harness"),
         "strategy_algorithm_changes": False,
         "source_compile_info_core_budget_enumeration": True,

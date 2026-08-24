@@ -10,9 +10,9 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/scripts/trace_gather_source_dispatch.sh -d PHYSICAL_NPU_ID
 
-Runs exactly one real-NPU GatherElements call through the non-colliding
-private type ``GatherElementsSourceCandidate``. The private source records
-the actual Python module path when CANN imports it. It does not run the
+Runs exactly one real-NPU GatherElements call through the registered type
+``GatherElements`` selected by a private OPP vendor-priority overlay. The
+private source records the actual Python module path when CANN imports it. It does not run the
 5,000-record campaign, use timeout, kill a process, reset an NPU, or modify
 installed CANN files.
 
@@ -111,13 +111,13 @@ readarray -t OVERLAY_VALUES < <(python3 - "${PACKAGE_MANIFEST}" <<'PY'
 import json
 import sys
 item = json.load(open(sys.argv[1], encoding="utf-8"))
-for key in ("vendor_root", "source_file", "custom_opp_root", "source_operator_type"):
+for key in ("vendor_root", "source_file", "runtime_opp_root", "source_operator_type"):
     print(item[key])
 PY
 )
 VENDOR_ROOT="${OVERLAY_VALUES[0]}"
 PRIVATE_SOURCE="${OVERLAY_VALUES[1]}"
-CUSTOM_OPP_ROOT="${OVERLAY_VALUES[2]}"
+RUNTIME_OPP_ROOT="${OVERLAY_VALUES[2]}"
 SOURCE_OPERATOR_TYPE="${OVERLAY_VALUES[3]}"
 [[ -f "${PRIVATE_SOURCE}" ]] || { echo "fatal: private GatherElements source is absent: ${PRIVATE_SOURCE}" >&2; exit 1; }
 
@@ -136,7 +136,10 @@ RUNNER="${RUNNER_BUILD}/multi_op_npu_runner"
 [[ -x "${RUNNER}" ]] || { echo "fatal: runner was not built: ${RUNNER}" >&2; exit 1; }
 echo "GATHER_PROBE_BUILD status=passed"
 
-export ASCEND_CUSTOM_OPP_PATH="${VENDOR_ROOT}"
+unset ASCEND_CUSTOM_OPP_PATH
+export ASCEND_OPP_PATH="${RUNTIME_OPP_ROOT}"
+PRIVATE_TBE="$(cd "$(dirname "${PRIVATE_SOURCE}")/../.." && pwd)"
+export PYTHONPATH="${PRIVATE_TBE}${PYTHONPATH:+:${PYTHONPATH}}"
 export GATHER_ELEMENTS_TILING_AUDIT_PATH="${AUDIT_PATH}"
 export GATHER_ELEMENTS_SOURCE_DISPATCH="aclop_compile_and_execute"
 export GATHER_ELEMENTS_SOURCE_AIV_CAP=20
@@ -154,10 +157,8 @@ echo "GATHER_PROBE_NPU_BEGIN dispatch=aclopCompileAndExecute source_aiv_cap=20 u
 # writes a module_imported record with its actual __file__ before BuildCCE.
 # The runner return code is retained for diagnosis after a failed call.
 set +e
-"${COMMAND[@]}" 2>&1 | tee "${RUNNER_LOG}" | grep -E \
-    '^MULTIOP_NPU_RESULT |^MULTIOP_NPU_STAGE .*"stage":"(source_verification_compile_execute_begin|source_verification_sync_done|normal_cleanup_acl_finalize_done|failure|process_exit)"'
-PIPELINE_RC=("${PIPESTATUS[@]}")
-RUNNER_RC=${PIPELINE_RC[0]}
+"${COMMAND[@]}" >"${RUNNER_LOG}" 2>&1
+RUNNER_RC=$?
 set -e
 echo "GATHER_PROBE_NPU_END rc=${RUNNER_RC}"
 
@@ -206,7 +207,7 @@ audit_matches = any(
     for row in audit_rows
 )
 runner_success = isinstance(result, dict) and result.get("status") == "success"
-generic_route = isinstance(result, dict) and result.get("backend") == "acl_op_compiler_custom_source_op_real_npu"
+generic_route = isinstance(result, dict) and result.get("backend") == "acl_op_compiler_private_opp_source_real_npu"
 if int(runner_rc) == 0 and runner_success and generic_route and audit_matches:
     verdict = "source_selected_and_audited"
 elif source_import_expected_path:
@@ -215,16 +216,20 @@ elif int(runner_rc) == 0 and runner_success and generic_route:
     verdict = "generic_dispatch_completed_but_private_source_not_proven"
 else:
     verdict = "generic_dispatch_failed_before_source_selection_was_proven"
+error_text = None if not isinstance(result, dict) else result.get("error")
+if isinstance(error_text, str):
+    error_text = " ".join(error_text.split())[:500]
+runner_summary = None if not isinstance(result, dict) else {
+    "status": result.get("status"), "backend": result.get("backend"), "error": error_text,
+}
 print("GATHER_ELEMENTS_RUNTIME_DISPATCH_PROBE " + json.dumps({
     "verdict": verdict,
     "runner_return_code": int(runner_rc),
-    "runner_result": result,
+    "runner": runner_summary,
     "audit_row_count": len(audit_rows),
     "source_import_row_count": len(import_rows),
     "source_import_expected_private_path": source_import_expected_path,
     "audit_expected_context_present": audit_matches,
-    "private_source_expected_path": private_source,
-    "installed_source_path": installed_source,
     "source_operator_type": source_operator_type,
     "evidence_rule": "module_imported records the actual Python source path; only a matching tiling_generated row proves a completed source build",
 }, sort_keys=True))

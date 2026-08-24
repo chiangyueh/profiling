@@ -2,11 +2,11 @@
 """Create an isolated, native-CANN GatherElements dynamic-source overlay.
 
 This deliberately uses the GatherElements implementation shipped by the
-*same* CANN 8.1 installation as the reference. The overlay registers it as
-``GatherElementsSourceCandidate``: a non-colliding custom type required by
-the direct single-op compiler. The source's implementation and tiling body
-remain original; only its registration/module/kernel identities change. No
-installed file is edited.
+*same* CANN 8.1 installation as the reference. It creates a complete private
+OPP root whose ``built-in`` tree remains a read-only link to CANN, and whose
+``vendors/config.ini`` gives the source overlay priority for the already
+registered ``GatherElements`` type. The implementation and tiling body stay
+original. No installed file is edited.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ CORE_ENV = "GATHER_ELEMENTS_SOURCE_AIV_CAP"
 UB_ENV = "GATHER_ELEMENTS_SOURCE_UB_DIVISOR"
 DISPATCH_ENV = "GATHER_ELEMENTS_SOURCE_DISPATCH"
 VENDOR = "source_gather_elements"
-SOURCE_OPERATOR_TYPE = "GatherElementsSourceCandidate"
-SOURCE_MODULE = "gather_elements_source_candidate"
+SOURCE_OPERATOR_TYPE = "GatherElements"
+SOURCE_MODULE = "gather_elements"
 
 
 def digest(path: Path) -> str:
@@ -87,7 +87,7 @@ def _ge_emit_import_audit():
     row = {
         "schema": "gather_elements_native_dynamic_source_observation_v1",
         "event": "module_imported",
-        "operator_type": "GatherElementsSourceCandidate",
+        "operator_type": "GatherElements",
         "source_file": _ge_os.path.realpath(__file__),
         "pid": _ge_os.getpid(),
         "dispatch": _ge_os.environ.get("GATHER_ELEMENTS_SOURCE_DISPATCH"),
@@ -115,7 +115,7 @@ def _ge_emit_audit(obj, x_dict, indices_dict, dim):
     row = dict(identity)
     row.update({"schema": "gather_elements_native_dynamic_source_observation_v1",
                 "event": "tiling_generated",
-                "operator_type": "GatherElementsSourceCandidate",
+                "operator_type": "GatherElements",
                 "status": 0,
                 "source_variant_sha256": _ge_hashlib.sha256(encoded).hexdigest()})
     with open(target, "a", encoding="utf-8") as handle:
@@ -141,15 +141,6 @@ _ge_emit_import_audit()
     if source.count(resources) != 1:
         raise RuntimeError("cannot locate native GatherElements resource anchor")
     source = source.replace(resources, replacement)
-    registration = '@register_operator("GatherElements")'
-    if source.count(registration) != 1:
-        raise RuntimeError("cannot locate native GatherElements registration anchor")
-    source = source.replace(registration, '@register_operator("{}")'.format(SOURCE_OPERATOR_TYPE))
-    kernel_default = 'def gather_elements(x_dict, indices_dict, y_dict, dim=0, kernel_name="GatherElements"):'
-    if source.count(kernel_default) != 1:
-        raise RuntimeError("cannot locate native GatherElements kernel-name anchor")
-    source = source.replace(kernel_default,
-                            'def gather_elements(x_dict, indices_dict, y_dict, dim=0, kernel_name="{}"):'.format(SOURCE_OPERATOR_TYPE))
     final = '''    obj = GatherElements(x_dict, indices_dict, y_dict, dim, kernel_name)
     return obj.gather_elements_compute()'''
     final_replacement = '''    obj = GatherElements(x_dict, indices_dict, y_dict, dim, kernel_name)
@@ -162,22 +153,16 @@ _ge_emit_import_audit()
 
 
 def expected(output: Path, cann: Path, source: Path, config: Path) -> dict[str, Any]:
-    # CANN 8.1's documented custom-operator loader keeps the installed OPP
-    # root in ASCEND_OPP_PATH and receives one vendor directory through
-    # ASCEND_CUSTOM_OPP_PATH.  Do not replace ASCEND_OPP_PATH with a synthetic
-    # root: that can bypass normal ACLNN operator resolution before this
-    # source is considered.
-    root = output / "custom_opp"
+    # CANN's OPP loader discovers vendor priority from
+    # ``ASCEND_OPP_PATH/vendors/config.ini``.  A vendor path alone cannot
+    # introduce a new op type without an op-proto library.  This root keeps
+    # the registered built-in type and gives this source vendor priority.
+    root = output / "runtime_opp"
     vendor_root = root / "vendors" / VENDOR
-    # CANN's custom-package template installs Python implementations under
-    # ``<vendor>_impl`` (not the built-in ``impl`` directory).  The loader
-    # uses that name together with the vendor-specific config record.
     impl_dir = VENDOR + "_impl"
     source_target = vendor_root / "op_impl" / "ai_core" / "tbe" / impl_dir / "dynamic" / (SOURCE_MODULE + ".py")
     return {
-        # v5 follows the template's required <vendor>_impl layout and gives
-        # the source a non-colliding custom operator type for direct ACL use.
-        "schema": "gather_elements_native_dynamic_overlay_v5",
+        "schema": "gather_elements_native_dynamic_overlay_v6",
         "operator": "GatherElements",
         "source_operator_type": SOURCE_OPERATOR_TYPE,
         "source_module": SOURCE_MODULE,
@@ -190,7 +175,13 @@ def expected(output: Path, cann: Path, source: Path, config: Path) -> dict[str, 
         "installed_config": str(config),
         "installed_config_sha256": digest(config),
         "installed_opp_root": str(cann / "opp"),
-        "custom_opp_root": str(root),
+        "runtime_opp_root": str(root),
+        "runtime_opp_layout": {
+            "built_in_symlink": str(root / "built-in"),
+            "built_in_target": str(cann / "opp" / "built-in"),
+            "vendor_priority_file": str(root / "vendors" / "config.ini"),
+            "vendor_priority": VENDOR,
+        },
         "vendor": VENDOR,
         "vendor_impl_directory": impl_dir,
         "vendor_root": str(vendor_root),
@@ -208,7 +199,7 @@ def expected(output: Path, cann: Path, source: Path, config: Path) -> dict[str, 
         },
         "strategy_algorithm_changes": False,
         "kernel_algorithm_changes": False,
-        "formal_data_gate": "a non-colliding private GatherElements source operator type must be selected by aclopCompileAndExecute, launch, and exactly match an installed aclnnGather reference",
+        "formal_data_gate": "the registered GatherElements type must be selected from the private ASCEND_OPP_PATH vendor-priority overlay, launch through aclopCompileAndExecute, and exactly match an installed aclnnGather reference",
     }
 
 
@@ -220,7 +211,7 @@ def validate_existing(output: Path, planned: dict[str, Any], original: str) -> d
         raise RuntimeError("incomplete private native GatherElements overlay exists")
     item = json.loads(manifest_path.read_text(encoding="utf-8"))
     for key in ("schema", "operator", "source_operator_type", "source_module", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
-                "installed_source_sha256", "installed_config_sha256", "installed_opp_root", "custom_opp_root", "vendor", "vendor_impl_directory", "vendor_root",
+                "installed_source_sha256", "installed_config_sha256", "installed_opp_root", "runtime_opp_root", "runtime_opp_layout", "vendor", "vendor_impl_directory", "vendor_root",
                 "source_file", "instrumentation", "hardware_envelope_heuristic", "strategy_algorithm_changes",
                 "kernel_algorithm_changes", "formal_data_gate"):
         if item.get(key) != planned.get(key):
@@ -235,6 +226,16 @@ def validate_existing(output: Path, planned: dict[str, Any], original: str) -> d
             raise RuntimeError("native GatherElements overlay lost marker: {}".format(marker))
     if digest(actual) != str(item.get("source_file_sha256", "")):
         raise RuntimeError("native GatherElements overlay source hash changed")
+    runtime_root = Path(str(item["runtime_opp_root"]))
+    layout = item["runtime_opp_layout"]
+    builtin = runtime_root / "built-in"
+    priority = runtime_root / "vendors" / "config.ini"
+    installed_root = Path(str(item["installed_opp_root"]))
+    if (not runtime_root.is_dir() or not builtin.is_symlink() or
+            builtin.resolve() != (installed_root / "built-in").resolve() or
+            not priority.is_file() or priority.read_text(encoding="utf-8") != "load_priority={}\n".format(VENDOR) or
+            Path(str(layout.get("vendor_priority_file", ""))) != priority):
+        raise RuntimeError("native GatherElements private OPP layout is incomplete")
     return item
 
 
@@ -248,10 +249,14 @@ def prepare(cann: Path, output_parent: Path) -> dict[str, Any]:
         return prior
     if output.exists():
         raise RuntimeError("refuse to overwrite incomplete private native GatherElements overlay")
-    root = Path(planned["custom_opp_root"])
+    root = Path(planned["runtime_opp_root"])
     vendor_root = Path(planned["vendor_root"])
     root.mkdir(parents=True)
-    (root / "vendors").mkdir()
+    os.symlink(cann / "opp" / "built-in", root / "built-in", target_is_directory=True)
+    os.symlink(cann / "opp" / "version.info", root / "version.info")
+    priority = root / "vendors" / "config.ini"
+    priority.parent.mkdir(parents=True)
+    priority.write_text("load_priority={}\n".format(VENDOR), encoding="utf-8")
     target = Path(planned["source_file"])
     target.parent.mkdir(parents=True)
     text = instrumentation(original)
@@ -274,13 +279,14 @@ def prepare(cann: Path, output_parent: Path) -> dict[str, Any]:
     if "GatherElements" not in config_data:
         raise RuntimeError("installed CANN config has no GatherElements entry")
     custom_op_info = dict(config_data["GatherElements"])
-    custom_op_info["opFile"] = {"value": SOURCE_MODULE}
-    custom_op_info["opInterface"] = {"value": "gather_elements"}
     config_target = vendor_root / "op_impl" / "ai_core" / "tbe" / "config" / "ascend910b" / config.name
     config_target.parent.mkdir(parents=True)
     config_target.write_text(json.dumps({SOURCE_OPERATOR_TYPE: custom_op_info}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     planned["source_file_sha256"] = digest(target)
-    planned["private_links"] = {"vendor_impl_util": str(impl / "util")}
+    planned["private_links"] = {
+        "built_in": str(root / "built-in"),
+        "vendor_impl_util": str(impl / "util"),
+    }
     (output / "native_dynamic_overlay.json").write_text(json.dumps(planned, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return planned
 

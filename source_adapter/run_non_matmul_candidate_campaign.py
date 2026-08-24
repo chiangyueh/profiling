@@ -26,9 +26,9 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_native_dynamic_measurement_v5"
-SOURCE_BACKEND = "acl_op_compiler_custom_source_op_real_npu"
-SOURCE_OPERATOR_TYPE = "GatherElementsSourceCandidate"
+SCHEMA = "gather_elements_native_dynamic_measurement_v6"
+SOURCE_BACKEND = "acl_op_compiler_private_opp_source_real_npu"
+SOURCE_OPERATOR_TYPE = "GatherElements"
 # The campaign is intentionally append-only so an interrupted physical-NPU
 # run can resume without losing its completed groups.  A single log is kept
 # below this limit; the next numeric log is opened before an oversized write.
@@ -224,12 +224,12 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
         raise RuntimeError("missing native GatherElements overlay manifest: {}".format(path))
     item: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     required = ("schema", "operator", "source_operator_type", "source_module", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
-                "installed_source", "installed_source_sha256", "installed_opp_root", "custom_opp_root", "vendor", "vendor_impl_directory", "vendor_root",
+                "installed_source", "installed_source_sha256", "installed_opp_root", "runtime_opp_root", "runtime_opp_layout", "vendor", "vendor_impl_directory", "vendor_root",
                 "source_file", "source_file_sha256", "instrumentation", "hardware_envelope_heuristic",
                 "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
-    if (any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v5" or
+    if (any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v6" or
             item.get("source_operator_type") != SOURCE_OPERATOR_TYPE or
-            item.get("source_module") != "gather_elements_source_candidate"):
+            item.get("source_module") != "gather_elements"):
         raise RuntimeError("invalid native CANN GatherElements source-overlay manifest: {}".format(path))
     source_file = Path(str(item["source_file"]))
     if not source_file.is_file() or digest_file(source_file) != str(item["source_file_sha256"]):
@@ -250,14 +250,18 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
             int(envelope.get("max_anchors", 0)) < 1):
         raise RuntimeError("native overlay hardware-envelope provenance is invalid")
     vendor_root = Path(str(item["vendor_root"]))
-    custom_root = Path(str(item["custom_opp_root"]))
+    runtime_root = Path(str(item["runtime_opp_root"]))
     installed_root = Path(str(item["installed_opp_root"]))
     expected_impl = str(item["vendor"]) + "_impl"
     source_parent = vendor_root / "op_impl" / "ai_core" / "tbe" / str(item["vendor_impl_directory"]) / "dynamic"
-    if (not custom_root.is_dir() or not installed_root.is_dir() or not vendor_root.is_dir() or
-            vendor_root != custom_root / "vendors" / str(item["vendor"]) or
-            str(item["vendor_impl_directory"]) != expected_impl or not source_parent.is_dir()):
-        raise RuntimeError("native GatherElements private custom-OPP layout is incomplete")
+    priority = runtime_root / "vendors" / "config.ini"
+    builtin = runtime_root / "built-in"
+    if (not runtime_root.is_dir() or not installed_root.is_dir() or not vendor_root.is_dir() or
+            vendor_root != runtime_root / "vendors" / str(item["vendor"]) or
+            str(item["vendor_impl_directory"]) != expected_impl or not source_parent.is_dir() or
+            not builtin.is_symlink() or builtin.resolve() != (installed_root / "built-in").resolve() or
+            not priority.is_file() or priority.read_text(encoding="utf-8") != "load_priority={}\n".format(item["vendor"])):
+        raise RuntimeError("native GatherElements private OPP layout is incomplete")
     if item["strategy_algorithm_changes"] is not False or item["kernel_algorithm_changes"] is not False:
         raise RuntimeError("native GatherElements overlay is not source-preserving")
     item["runtime_op"] = runtime_op
@@ -338,12 +342,13 @@ def context_matches(observation: dict[str, Any] | None, candidate: dict[str, Any
 
 def source_environment(base: dict[str, str], package: dict[str, Any], candidate: dict[str, Any], audit: Path) -> dict[str, str]:
     environment = dict(base)
-    # This is CANN 8.1's normal custom-OPP loader contract: retain the real
-    # installed OPP root and add exactly one private vendor directory for the
-    # source candidate.  The worker process is isolated, so it cannot leak
-    # this selection to other users or later reference workers.
-    environment["ASCEND_OPP_PATH"] = str(package["installed_opp_root"])
-    environment["ASCEND_CUSTOM_OPP_PATH"] = str(package["vendor_root"])
+    # CANN discovers the private source from this complete OPP root's
+    # vendors/config.ini. The isolated worker restores no process-global
+    # state and cannot affect later installed-reference workers.
+    environment["ASCEND_OPP_PATH"] = str(package["runtime_opp_root"])
+    environment.pop("ASCEND_CUSTOM_OPP_PATH", None)
+    private_tbe = str(Path(str(package["source_file"])).parents[2])
+    environment["PYTHONPATH"] = private_tbe + ":" + environment.get("PYTHONPATH", "")
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
     environment[str(package["instrumentation"]["dispatch_environment"])] = str(package["instrumentation"]["dispatch_value"])
     environment[str(package["instrumentation"]["source_budget_environment"])] = str(candidate["aiv_core_cap"])

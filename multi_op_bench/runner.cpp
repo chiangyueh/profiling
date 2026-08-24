@@ -33,7 +33,7 @@ std::string JsonEscape(const std::string &value);
 void CheckAcl(aclError rc, const std::string &what);
 std::string gWorkloadId = "unknown";
 std::string gBackend = "aclnn_real_npu";
-constexpr const char *kGatherElementsSourceOperatorType = "GatherElementsSourceCandidate";
+constexpr const char *kGatherElementsSourceOperatorType = "GatherElements";
 
 void Stage(const std::string &stage, const std::string &detail = "")
 {
@@ -585,7 +585,7 @@ Measurement Measure(aclrtStream stream, int warmup, int samples, DeviceBuffer &o
     return result;
 }
 
-// The generic compiler submits the non-colliding dynamic custom-OPP kernel.
+// The generic compiler submits GatherElements from the private OPP overlay.
 // Host compilation is outside the returned device-event duration: events
 // bracket only submitted stream work, and each iteration is synchronized.
 template <class Launch>
@@ -783,7 +783,7 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         throw std::runtime_error("GatherElements source audit/dispatch environment mismatch");
     }
     if (useCustomSource) {
-        gBackend = "acl_op_compiler_custom_source_op_real_npu";
+        gBackend = "acl_op_compiler_private_opp_source_real_npu";
         OpTensorDesc inputDesc(dtype, shape), indexDesc(indexDtype, indexShape), outputDesc(dtype, indexShape);
         OpDataBuffer inputData(input), indexData(index), outputData(output);
         OpAttr attr;
@@ -793,11 +793,9 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         const aclTensorDesc *outputDescs[] = {outputDesc.Get()};
         aclDataBuffer *outputBuffers[] = {outputData.Get()};
         const auto launch = [&](aclrtStream launchStream) {
-            // ``GatherElements`` is already registered by CANN and therefore
-            // wins its own direct single-op lookup.  The private source uses
-            // this non-colliding type, while retaining the original source's
-            // implementation and tiling body.  This forces the generic
-            // compiler to resolve the vendor OPP instead of the builtin.
+            // The private OPP root keeps CANN's registered GatherElements
+            // type and uses vendors/config.ini to choose the private source
+            // before built-in. No synthetic type or missing op-proto is used.
             return aclopCompileAndExecute(kGatherElementsSourceOperatorType, 2, inputDescs, inputBuffers,
                                           1, outputDescs, outputBuffers, attr.Get(),
                                           ACL_ENGINE_AICORE, ACL_COMPILE_SYS, nullptr, launchStream);

@@ -54,8 +54,8 @@ def main() -> int:
     source_text = source.read_text(encoding="utf-8")
     runner_text = args.runner_source.read_text(encoding="utf-8")
     cmake_text = args.runner_cmake.read_text(encoding="utf-8")
-    source_operator_type = "GatherElementsSourceCandidate"
-    source_module = "gather_elements_source_candidate"
+    source_operator_type = "GatherElements"
+    source_module = "gather_elements"
     op_config = json.loads(config.read_text(encoding="utf-8")).get("GatherElements")
     require("aclopCompileAndExecute" in header_text,
             "CANN header does not publish aclopCompileAndExecute")
@@ -69,7 +69,7 @@ def main() -> int:
     require('@register_operator("GatherElements")' in source_text,
             "installed dynamic source does not register GatherElements")
     require("kGatherElementsSourceOperatorType" in runner_text and source_operator_type in runner_text,
-            "runner does not invoke the non-colliding GatherElements source operator type")
+            "runner does not invoke the registered GatherElements operator type")
     require("acl_op_compiler" in cmake_text,
             "runner is not linked against libacl_op_compiler")
     overlay = None
@@ -77,19 +77,21 @@ def main() -> int:
         require(args.overlay_manifest.is_file(),
                 "missing private GatherElements overlay manifest: {}".format(args.overlay_manifest))
         overlay = json.loads(args.overlay_manifest.read_text(encoding="utf-8"))
-        require(overlay.get("schema") == "gather_elements_native_dynamic_overlay_v5",
+        require(overlay.get("schema") == "gather_elements_native_dynamic_overlay_v6",
                 "private GatherElements overlay has an unexpected schema")
         require(overlay.get("source_operator_type") == source_operator_type and
                 overlay.get("source_module") == source_module,
-                "private overlay lacks the non-colliding source operator identity")
-        custom_root = Path(str(overlay.get("custom_opp_root", "")))
+                "private overlay lacks the registered GatherElements identity")
+        runtime_root = Path(str(overlay.get("runtime_opp_root", "")))
         vendor = str(overlay.get("vendor", ""))
         vendor_root = Path(str(overlay.get("vendor_root", "")))
         impl = str(overlay.get("vendor_impl_directory", ""))
         source_file = Path(str(overlay.get("source_file", "")))
         custom_config = vendor_root / "op_impl" / "ai_core" / "tbe" / "config" / "ascend910b" / config.name
-        require(vendor_root == custom_root / "vendors" / vendor,
-                "private vendor root is not exactly under custom_opp/vendors")
+        priority_file = runtime_root / "vendors" / "config.ini"
+        builtin = runtime_root / "built-in"
+        require(vendor_root == runtime_root / "vendors" / vendor,
+                "private vendor root is not exactly under runtime_opp/vendors")
         require(impl == vendor + "_impl",
                 "private source implementation directory is not <vendor>_impl")
         require(source_file == vendor_root / "op_impl" / "ai_core" / "tbe" / impl / "dynamic" / (source_module + ".py"),
@@ -97,11 +99,12 @@ def main() -> int:
         require(source_file.is_file(), "private instrumented GatherElements source is absent")
         require(custom_config.is_file(), "private GatherElements OPP config is absent")
         private_config = json.loads(custom_config.read_text(encoding="utf-8")).get(source_operator_type)
-        expected_custom_config = dict(op_config)
-        expected_custom_config["opFile"] = {"value": source_module}
-        expected_custom_config["opInterface"] = {"value": "gather_elements"}
-        require(private_config == expected_custom_config,
-                "private GatherElements config is not the required renamed source declaration")
+        require(private_config == op_config,
+                "private GatherElements config does not preserve the installed declaration")
+        require(runtime_root.is_dir() and builtin.is_symlink() and builtin.resolve() == (cann / "opp" / "built-in").resolve(),
+                "private OPP root does not link the installed built-in tree")
+        require(priority_file.is_file() and priority_file.read_text(encoding="utf-8") == "load_priority={}\n".format(vendor),
+                "private OPP root does not select the source vendor by CANN priority")
         private_source = source_file.read_text(encoding="utf-8")
         require("GATHER_ELEMENTS_NATIVE_DYNAMIC_SOURCE_AUDIT_V1" in private_source and
                 '"event": "module_imported"' in private_source and
@@ -131,6 +134,7 @@ def main() -> int:
         "source_operator_type": source_operator_type,
         "op_file": op_config["opFile"]["value"],
         "op_interface": op_config["opInterface"]["value"],
+        "source_selector": "private_ASCEND_OPP_PATH_vendor_priority",
         "overlay_manifest": None if args.overlay_manifest is None else str(args.overlay_manifest),
         "static_only": True,
     }, sort_keys=True))

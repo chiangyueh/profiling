@@ -82,10 +82,10 @@ SOURCE_ID="$({
     readlink -f "${CANN_ROOT}"
 } | sha256sum | cut -c1-20)"
 
-STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v5/${SOURCE_ID}"
+STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v6/${SOURCE_ID}"
 OVERLAY_PARENT="${STATE}/overlays"
 RUNNER_BUILD="${STATE}/runner_build"
-RESULTS="${ROOT}/results/gather_elements_native_dynamic_v5/${SOURCE_ID}"
+RESULTS="${ROOT}/results/gather_elements_native_dynamic_v6/${SOURCE_ID}"
 LOGS="${RESULTS}/logs"
 mkdir -p "${OVERLAY_PARENT}" "${RUNNER_BUILD}" "${LOGS}"
 
@@ -93,7 +93,7 @@ echo "GatherElements native CANN dynamic-source campaign"
 echo "  target:        physical NPU ${PHYSICAL_DEVICE} -> worker logical NPU 0"
 echo "  formal target: ${RECORD_TARGET} real-NPU latency records"
 echo "  source:        ${NATIVE_SOURCE}"
-echo "  source API:    aclopCompileAndExecute(GatherElementsSourceCandidate), a non-colliding private CANN custom-OPP type"
+echo "  source API:    aclopCompileAndExecute(GatherElements) through a private OPP vendor-priority overlay"
 echo "  reference API: installed aclnnGather under the unmodified installed OPP path"
 echo "  output:        ${LOGS}/1.log, 2.log, ... (JSONL, each <= 50 MiB)"
 
@@ -122,7 +122,7 @@ cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
 cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1
 
 # The controller's sole preflight performs one installed-reference launch and
-# one generic custom-source launch/audit, then stops immediately on failure.
+# one private-OPP source launch/audit, then stops immediately on failure.
 # Keeping that gate in one place avoids duplicate NPU smoke executions.
 PYTHONPATH="${ROOT}/multi_op_bench" python3 "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
     --runner "${RUNNER_BUILD}/multi_op_npu_runner" --log-dir "${LOGS}" --device 0 \

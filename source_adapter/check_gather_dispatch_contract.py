@@ -32,6 +32,8 @@ def main() -> int:
     parser.add_argument("--cann-root", required=True, type=Path)
     parser.add_argument("--runner-source", required=True, type=Path)
     parser.add_argument("--runner-cmake", required=True, type=Path)
+    parser.add_argument("--campaign-source", required=True, type=Path)
+    parser.add_argument("--launch-script", required=True, type=Path)
     parser.add_argument("--overlay-manifest", type=Path)
     args = parser.parse_args()
     cann = args.cann_root.resolve()
@@ -54,6 +56,8 @@ def main() -> int:
     source_text = source.read_text(encoding="utf-8")
     runner_text = args.runner_source.read_text(encoding="utf-8")
     cmake_text = args.runner_cmake.read_text(encoding="utf-8")
+    campaign_text = args.campaign_source.read_text(encoding="utf-8")
+    launch_text = args.launch_script.read_text(encoding="utf-8")
     source_operator_type = "GatherElements"
     source_module = "gather_elements"
     op_config = json.loads(config.read_text(encoding="utf-8")).get("GatherElements")
@@ -72,6 +76,10 @@ def main() -> int:
             "runner does not invoke the registered GatherElements operator type")
     require("acl_op_compiler" in cmake_text,
             "runner is not linked against libacl_op_compiler")
+    require('environment["PYTHONPATH"]' not in campaign_text,
+            "source worker must not rewrite PYTHONPATH before CANN imports TBE")
+    require("PYTHONPATH=" not in launch_text,
+            "GatherElements launch script must not rewrite PYTHONPATH before CANN imports TBE")
     overlay = None
     if args.overlay_manifest is not None:
         require(args.overlay_manifest.is_file(),

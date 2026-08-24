@@ -101,7 +101,9 @@ echo "  output:        ${LOGS}/1.log, 2.log, ... (JSONL, each <= 50 MiB)"
 # local prerequisite before creating a build directory or touching the NPU.
 python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
     --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
-    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt"
+    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" \
+    --campaign-source "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
+    --launch-script "${ROOT}/run_npu.sh"
 
 OVERLAY="${OVERLAY_PARENT}/gather_elements_native_dynamic"
 PACKAGE_MANIFEST="${OVERLAY}/native_dynamic_overlay.json"
@@ -115,6 +117,8 @@ fi
 python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
     --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
     --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" \
+    --campaign-source "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
+    --launch-script "${ROOT}/run_npu.sh" \
     --overlay-manifest "${PACKAGE_MANIFEST}"
 
 cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
@@ -124,7 +128,7 @@ cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1
 # The controller's sole preflight performs one installed-reference launch and
 # one private-OPP source launch/audit, then stops immediately on failure.
 # Keeping that gate in one place avoids duplicate NPU smoke executions.
-PYTHONPATH="${ROOT}/multi_op_bench" python3 "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
+python3 "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
     --runner "${RUNNER_BUILD}/multi_op_npu_runner" --log-dir "${LOGS}" --device 0 \
     --warmup "${WARMUP}" --samples "${SAMPLES}" --operator gather_elements \
     --record-target "${RECORD_TARGET}" --source-package-manifest "${PACKAGE_MANIFEST}"

@@ -85,7 +85,9 @@ echo "GATHER_PROBE_BEGIN physical_device=${PHYSICAL_DEVICE} logical_device=0 op=
 STATIC_PRE_LOG="${PROBE_DIR}/static_pre.log"
 if ! python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
     --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
-    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" >"${STATIC_PRE_LOG}" 2>&1; then
+    --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" \
+    --campaign-source "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
+    --launch-script "${ROOT}/scripts/trace_gather_source_dispatch.sh" >"${STATIC_PRE_LOG}" 2>&1; then
     show_failure "static_contract_pre" "${STATIC_PRE_LOG}"
 fi
 echo "GATHER_PROBE_STATIC status=passed"
@@ -103,6 +105,8 @@ STATIC_POST_LOG="${PROBE_DIR}/static_post.log"
 if ! python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
     --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
     --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" \
+    --campaign-source "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
+    --launch-script "${ROOT}/scripts/trace_gather_source_dispatch.sh" \
     --overlay-manifest "${PACKAGE_MANIFEST}" >"${STATIC_POST_LOG}" 2>&1; then
     show_failure "static_contract_post" "${STATIC_POST_LOG}"
 fi
@@ -138,8 +142,6 @@ echo "GATHER_PROBE_BUILD status=passed"
 
 unset ASCEND_CUSTOM_OPP_PATH
 export ASCEND_OPP_PATH="${RUNTIME_OPP_ROOT}"
-PRIVATE_TBE="$(cd "$(dirname "${PRIVATE_SOURCE}")/../.." && pwd)"
-export PYTHONPATH="${PRIVATE_TBE}${PYTHONPATH:+:${PYTHONPATH}}"
 export GATHER_ELEMENTS_TILING_AUDIT_PATH="${AUDIT_PATH}"
 export GATHER_ELEMENTS_SOURCE_DISPATCH="aclop_compile_and_execute"
 export GATHER_ELEMENTS_SOURCE_AIV_CAP=20

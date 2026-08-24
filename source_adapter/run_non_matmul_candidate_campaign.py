@@ -347,8 +347,6 @@ def source_environment(base: dict[str, str], package: dict[str, Any], candidate:
     # state and cannot affect later installed-reference workers.
     environment["ASCEND_OPP_PATH"] = str(package["runtime_opp_root"])
     environment.pop("ASCEND_CUSTOM_OPP_PATH", None)
-    private_tbe = str(Path(str(package["source_file"])).parents[2])
-    environment["PYTHONPATH"] = private_tbe + ":" + environment.get("PYTHONPATH", "")
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
     environment[str(package["instrumentation"]["dispatch_environment"])] = str(package["instrumentation"]["dispatch_value"])
     environment[str(package["instrumentation"]["source_budget_environment"])] = str(candidate["aiv_core_cap"])

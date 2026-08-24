@@ -15,7 +15,7 @@ import platform
 from pathlib import Path
 
 
-SCHEMA = "gather_elements_v2_private_cann_package_v1"
+SCHEMA = "gather_elements_v2_cann81_prebuilt_package_v2"
 OPERATOR = "GatherElementsV2"
 VENDOR = "gather_elements_source"
 AUDIT_SCHEMA = "gather_elements_v2_source_observation_v1"
@@ -57,6 +57,9 @@ def main() -> int:
     require(project.is_dir(), "private GatherElementsV2 project is absent: {}".format(project))
     require(package.is_dir(), "private GatherElementsV2 package is absent: {}".format(package))
     require((cann / "opp" / "version.info").is_file(), "CANN OPP version file is absent")
+    version_text = (cann / "opp" / "version.info").read_text(encoding="utf-8")
+    require("version_dir=8.1.RC1" in version_text,
+            "GatherElementsV2 must be fully built by CANN 8.1.RC1")
     project_manifest = project / "gather_elements_v2_project.json"
     require(project_manifest.is_file(), "private project provenance is absent: {}".format(project_manifest))
     provenance = json.loads(project_manifest.read_text(encoding="utf-8"))
@@ -66,20 +69,36 @@ def main() -> int:
             "private project does not attest a read-only CANN installation")
     compatibility = provenance.get("compatibility_port")
     require(isinstance(compatibility, dict) and compatibility.get("tiling_algorithm_changes") is False and
-            compatibility.get("kernel_algorithm_changes") is False,
+            compatibility.get("kernel_algorithm_changes") is False and
+            compatibility.get("runtime_python_compilation") is False and
+            compatibility.get("precompiled_device_kernels_required") is True and
+            compatibility.get("target_version") == "CANN-8.1.RC1 host ABI and Ascend C device compiler",
             "private project does not attest source-preserving tiling/kernel behavior")
 
     source_file = project / "src/index/gather_elements_v2/op_host/gather_elements_v2_tiling.cpp"
     audit_header = project / "src/index/gather_elements_v2/op_host/gather_elements_v2_source_audit.h"
     config = package / "op_impl/ai_core/tbe/config/ascend910b/aic-ascend910b-ops-info.json"
-    dynamic_root = package / "op_impl/ai_core/tbe/gather_elements_source_impl/dynamic"
-    adapter = dynamic_root / "gather_elements_v2.py"
-    kernel = dynamic_root / "gather_elements_v2.cpp"
+    kernel_root = package / "op_impl/ai_core/tbe/kernel/ascend910b/gather_elements_v2"
+    kernel_config_root = package / "op_impl/ai_core/tbe/kernel/config/ascend910b"
+    binary_info_config = kernel_config_root / "binary_info_config.json"
+    operator_binary_config = kernel_config_root / "gather_elements_v2.json"
     op_api = package / "op_api/lib/libcust_opapi.so"
     proto = architecture_library(package, "op_proto/lib/linux/{architecture}/libcust_opsproto_rt2.0.so")
     tiling = architecture_library(package, "op_impl/ai_core/tbe/op_tiling/lib/linux/{architecture}/libcust_opmaster_rt2.0.so")
-    for path in (source_file, audit_header, config, adapter, kernel, op_api):
+    for path in (source_file, audit_header, config, binary_info_config, operator_binary_config, op_api):
         require(path.is_file(), "private GatherElementsV2 package file is absent: {}".format(path))
+    kernel_objects = sorted(kernel_root.glob("*.o"))
+    require(len(kernel_objects) == 4,
+            "CANN 8.1 package must contain four precompiled GatherElementsV2 dtype kernels; found={}".format(
+                len(kernel_objects)))
+    kernel_metadata = [path.with_suffix(".json") for path in kernel_objects]
+    require(all(path.is_file() for path in kernel_metadata),
+            "a precompiled GatherElementsV2 kernel lacks matching CANN metadata")
+    dynamic_root = package / "op_impl/ai_core/tbe/gather_elements_source_impl/dynamic"
+    require(not dynamic_root.exists() or not any(dynamic_root.glob("*.py")),
+            "runtime package unexpectedly contains a Python/TBE operator adapter")
+    require(not dynamic_root.exists() or not any(dynamic_root.glob("*.cpp")),
+            "runtime package unexpectedly contains Ascend C source instead of precompiled kernels")
     config_data = json.loads(config.read_text(encoding="utf-8"))
     op_data = config_data.get(OPERATOR)
     require(isinstance(op_data, dict) and op_data.get("opFile", {}).get("value") == "gather_elements_v2" and
@@ -111,10 +130,18 @@ def main() -> int:
         "op_tiling_library_sha256": digest(tiling),
         "ops_config": str(config),
         "ops_config_sha256": digest(config),
-        "dynamic_adapter": str(adapter),
-        "dynamic_adapter_sha256": digest(adapter),
-        "dynamic_kernel": str(kernel),
-        "dynamic_kernel_sha256": digest(kernel),
+        "kernel_binary_root": str(kernel_root),
+        "kernel_binary_info_config": str(binary_info_config),
+        "kernel_binary_info_config_sha256": digest(binary_info_config),
+        "kernel_operator_config": str(operator_binary_config),
+        "kernel_operator_config_sha256": digest(operator_binary_config),
+        "precompiled_device_kernels": [
+            {"object": str(obj), "object_sha256": digest(obj),
+             "metadata": str(meta), "metadata_sha256": digest(meta)}
+            for obj, meta in zip(kernel_objects, kernel_metadata)
+        ],
+        "runtime_python_compilation": False,
+        "build_cann_version": "8.1.RC1",
         "instrumentation": {
             "enabled": True,
             "mutates_tiling_context": False,
@@ -122,7 +149,8 @@ def main() -> int:
             "audit_environment": "GATHER_ELEMENTS_TILING_AUDIT_PATH",
             "source_budget_environment": "GATHER_ELEMENTS_SOURCE_AIV_CAP",
             "dispatch_environment": "GATHER_ELEMENTS_SOURCE_DISPATCH",
-            "dispatch_value": "aclop_compile_and_execute",
+            "dispatch_value": "cann81_prebuilt_aclnn",
+            "opapi_library_environment": "GATHER_ELEMENTS_SOURCE_OPAPI_LIBRARY",
         },
         "hardware_envelope_heuristic": {
             "enabled": True,
@@ -137,7 +165,7 @@ def main() -> int:
         "kernel_algorithm_changes": False,
         "toolkit_install_modified": False,
         "matmul_included": False,
-        "formal_data_gate": "the private CANN package must be selected by aclopCompileAndExecute, emit one host-tiler raw identity, launch, and exactly match installed aclnnGather",
+        "formal_data_gate": "the generated CANN 8.1 C++ ACLNN entry point must load from the private package, emit one C++ host-tiler raw identity, launch a precompiled Ascend C kernel, and exactly match installed aclnnGather",
     }
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
     args.manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")

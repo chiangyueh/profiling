@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Prepare one private CANN-8.1 build project for GatherElementsV2.
 
-The installed CANN 8.1 package exposes ``GatherElements`` as a built-in
-dynamic Python operator.  Replacing a Python file under a private
-``ASCEND_OPP_PATH`` does *not* make the generic compiler select it.  CANN's
-supported custom-operator route instead requires an op-proto library and an
-op-tiling library in one vendor package.  This helper constructs exactly that
-private project from the repository-pinned sources.
+The resulting vendor package contains the C++ operator schema, C++ host
+tiler, generated C++ ACLNN entry point, and precompiled Ascend C kernels.
+Runtime execution therefore does not depend on Python/TBE source compilation.
+This helper constructs that private project from repository-pinned sources.
 
 Only the project under ``--output`` is written.  The CANN installation and
 the source bundle are read-only inputs.  The two small source edits are
@@ -139,17 +137,6 @@ target_include_directories(op_host_aclnnInner PRIVATE
         ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/msprof
 )
 
-# Keep the official dynamic kernel sources in the vendor package.  CANN can
-# build only a launched key from these sources; the harness never fabricates a
-# kernel or a tiling field.
-install(FILES
-        op_kernel/gather_elements_v2.cpp
-        op_kernel/gather_elements_v2_common.h
-        op_kernel/gather_elements_v2_last_dim.h
-        op_kernel/gather_elements_v2_scalar.h
-        op_kernel/gather_elements_v2_transpose.h
-        DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
-)
 '''
 
 
@@ -256,7 +243,7 @@ inline void Emit(gert::TilingContext *context, uint64_t block_dim, uint64_t tili
     out << "{\"schema\":\"" << kSchema
         << "\",\"event\":\"tiling_generated\",\"operator_type\":\"GatherElementsV2"
         << "\",\"status\":0"
-        << "\",\"source_compile_context_sha256\":\"" << kSourceSha256
+        << ",\"source_compile_context_sha256\":\"" << kSourceSha256
         << "\",\"aiv_core_cap\":" << RequestedCoreCap()
         << ",\"ub_cap_divisor\":" << RequestedUbDivisor()
         << ",\"compile_info_vars\":{\"block_dim\":" << block_dim
@@ -414,6 +401,93 @@ def make_build_helpers_executable(project: Path) -> list[str]:
     return restored
 
 
+def limit_private_build_parallelism(project: Path) -> str:
+    """Keep CANN's nested prepare build to one job.
+
+    CANN 8.1's stock helper otherwise chooses twice the host CPU count even
+    when the outer build uses ``--parallel 1``.  This changes only build
+    scheduling inside the checkout-local copy; no operator source or
+    installed toolkit file is modified.
+    """
+    helper = project / "cmake" / "scripts" / "prepare.sh"
+    body = helper.read_text(encoding="utf-8")
+    old = 'CPU_NUM=$(($(cat /proc/cpuinfo | grep "^processor" | wc -l)*2))\nJOB_NUM="-j${CPU_NUM}"'
+    new = 'CANN_OPS_BUILD_JOBS="${CANN_OPS_BUILD_JOBS:-1}"\nJOB_NUM="-j${CANN_OPS_BUILD_JOBS}"'
+    body = replace_once(body, old, new, "CANN 8.1 nested prepare-build parallelism")
+    body = replace_once(
+        body,
+        '    --ascend-compute_unit)\n        ASCEND_COMPUTE_UNIT="$2"\n        shift 2\n        ;;',
+        '    --ascend-compute_unit)\n        ASCEND_COMPUTE_UNIT="$2"\n        shift 2\n        ;;\n'
+        '    --ascend-op-name)\n        ASCEND_OP_NAME="$2"\n        shift 2\n        ;;',
+        "CANN 8.1 selected-op argument",
+    )
+    body = replace_once(
+        body,
+        '        -DASCEND_COMPUTE_UNIT=${CONVERT_ASCEND_COMPUTE_UNIT} \\\n        -DOP_DEBUG_CONFIG=${OP_DEBUG_CONFIG}',
+        '        -DASCEND_COMPUTE_UNIT=${CONVERT_ASCEND_COMPUTE_UNIT} \\\n'
+        '        -DASCEND_OP_NAME="${ASCEND_OP_NAME}" \\\n        -DOP_DEBUG_CONFIG=${OP_DEBUG_CONFIG}',
+        "CANN 8.1 nested selected-op configure",
+    )
+    helper.write_text(body, encoding="utf-8")
+    config = project / "cmake" / "config.cmake"
+    config_body = config.read_text(encoding="utf-8")
+    config_body = replace_once(
+        config_body,
+        '                --ascend-compute_unit ${EP_ASCEND_COMPUTE_UNIT}\n                --op_debug_config ${OP_DEBUG_CONFIG}',
+        '                --ascend-compute_unit ${EP_ASCEND_COMPUTE_UNIT}\n'
+        '                --ascend-op-name ${ASCEND_OP_NAME}\n                --op_debug_config ${OP_DEBUG_CONFIG}',
+        "CANN 8.1 outer selected-op forwarding",
+    )
+    config.write_text(config_body, encoding="utf-8")
+    return digest(helper) + ":" + digest(config)
+
+
+def omit_runtime_source_payload(project: Path) -> str:
+    """Do not ship Python or Ascend C source in the runtime vendor package.
+
+    CANN still generates and uses its adapter inside the private *build* to
+    invoke the 8.1 offline compiler.  The installed package contains only
+    host libraries, metadata, and precompiled device objects, so the NPU
+    process cannot fall back to Python/TBE source compilation.
+    """
+    cmake = project / "CMakeLists.txt"
+    body = cmake.read_text(encoding="utf-8")
+    blocks = [
+        '''foreach (_op_name ${OP_LIST})
+    install(FILES ${ASCEND_IMPL_OUT_DIR}/dynamic/${_op_name}.py
+            DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
+            OPTIONAL
+    )
+endforeach ()
+
+foreach (_op_name ${OP_LIST})
+    install(FILES ${ASCEND_IMPL_OUT_DIR}/dynamic/${_op_name}.cpp
+            DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
+            OPTIONAL
+    )
+endforeach ()
+''',
+        '''foreach (op_dir ${OP_DIR_LIST})
+    get_filename_component(_op_name "${op_dir}" NAME)
+
+    file(GLOB KERNEL_FILES
+            ${op_dir}/op_kernel/*.cpp
+            ${op_dir}/op_kernel/*.h
+    )
+
+    install(FILES ${KERNEL_FILES}
+            DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
+            OPTIONAL
+    )
+endforeach ()
+''',
+    ]
+    for index, block in enumerate(blocks, start=1):
+        body = replace_once(body, block, "", "runtime source install block {}".format(index))
+    cmake.write_text(body, encoding="utf-8")
+    return digest(cmake)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cann-ops-source", required=True, type=Path)
@@ -436,6 +510,8 @@ def main() -> int:
     pruned_platform_configs = retain_ascend910b_config(operator)
     provenance["instrumented_op_proto_sha256"] = retain_ascend910b_op_proto(operator)
     build_helper_modes = make_build_helpers_executable(args.output)
+    provenance["single_job_prepare_helper_sha256"] = limit_private_build_parallelism(args.output)
+    provenance["precompiled_only_install_cmake_sha256"] = omit_runtime_source_payload(args.output)
     pinned = LOCK["operators"]["gather_elements_v2"]["pinned_files"]
     for relative, expected in pinned.items():
         actual = operator / relative
@@ -449,7 +525,7 @@ def main() -> int:
         "operator": SOURCE_OPERATOR,
         "runtime_op": "gather_elements",
         "vendor": VENDOR,
-        "source_kind": "pinned_extracted_gather_elements_v2_source_with_cann81_cmake_compatibility",
+        "source_kind": "pinned_gather_elements_v2_algorithm_fully_compiled_by_cann81",
         "source_bundle": str(SOURCE_BUNDLE),
         "source_bundle_sha256": digest(SOURCE_BUNDLE),
         "cann_root": str(args.cann_root.resolve()),
@@ -465,7 +541,7 @@ def main() -> int:
             "audit_environment": "GATHER_ELEMENTS_TILING_AUDIT_PATH",
             "source_budget_environment": "GATHER_ELEMENTS_SOURCE_AIV_CAP",
             "dispatch_environment": "GATHER_ELEMENTS_SOURCE_DISPATCH",
-            "dispatch_value": "aclop_compile_and_execute",
+            "dispatch_value": "cann81_prebuilt_aclnn",
         },
         "hardware_envelope_heuristic": {
             "enabled": True,
@@ -477,8 +553,10 @@ def main() -> int:
         },
         "compatibility_port": {
             "source_version": "extracted CANN-8.3 GatherElementsV2 source",
-            "target_version": "CANN-8.1.RC1 build framework",
-            "allowed_changes": ["CMake target binding", "pre-source bounded hardware budget", "post-generation raw-tiling audit"],
+            "target_version": "CANN-8.1.RC1 host ABI and Ascend C device compiler",
+            "allowed_changes": ["CANN 8.1 CMake target binding", "CANN 8.1 API spelling bridge", "single-job private build scheduling", "precompiled-only runtime packaging", "pre-source bounded hardware budget", "post-generation raw-tiling audit"],
+            "runtime_python_compilation": False,
+            "precompiled_device_kernels_required": True,
             "tiling_algorithm_changes": False,
             "kernel_algorithm_changes": False,
             "pruned_unrelated_platform_configs": pruned_platform_configs,

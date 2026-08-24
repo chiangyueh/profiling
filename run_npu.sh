@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# This campaign has one scope: a checkout-local, real CANN custom package for
-# GatherElementsV2.  The installed CANN files remain inputs; every explicit
-# build, package, temporary campaign artifact, and rotating JSONL log stays
-# below this checkout.
+# This campaign has one scope: a checkout-local CANN-8.1 custom package for
+# GatherElementsV2 with a C++ host tiler and precompiled Ascend C kernels.
+# The installed CANN files remain read-only inputs; every build, package,
+# temporary artifact, and rotating JSONL log stays below this checkout.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE=""
@@ -52,6 +52,10 @@ done
 
 CANN_ROOT="${CANN_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
 [[ -d "${CANN_ROOT}" && -f "${CANN_ROOT}/opp/version.info" ]] || { echo "fatal: CANN root or OPP package is missing: ${CANN_ROOT}" >&2; exit 1; }
+grep -q '^version_dir=8\.1\.RC1$' "${CANN_ROOT}/opp/version.info" || {
+    echo "fatal: this package must be built and run with CANN 8.1.RC1: ${CANN_ROOT}/opp/version.info" >&2
+    exit 1
+}
 ENV_FILE=""
 for candidate in "${CANN_ROOT}/set_env.sh" "$(dirname "${CANN_ROOT}")/set_env.sh"; do
     [[ -f "${candidate}" ]] && { ENV_FILE="${candidate}"; break; }
@@ -69,6 +73,7 @@ export ASCEND_OPP_PATH="${CANN_ROOT}/opp"
 export ASCEND_RT_VISIBLE_DEVICES="${PHYSICAL_DEVICE}"
 export TILINGKEY_PAR_COMPILE=1
 export OMP_NUM_THREADS=1
+export CANN_OPS_BUILD_JOBS=1
 unset ASCEND_CUSTOM_OPP_PATH GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE \
     GATHER_ELEMENTS_TILING_AUDIT_PATH GATHER_ELEMENTS_SOURCE_DISPATCH \
     GATHER_ELEMENTS_SOURCE_AIV_CAP GATHER_ELEMENTS_SOURCE_UB_DIVISOR ASCENDC_CPU_DEBUG
@@ -102,13 +107,13 @@ SOURCE_ID="$({
 
 SOURCE_CACHE_PARENT="${ROOT}/.source_cache"
 CANN_OPS_SOURCE="${SOURCE_CACHE_PARENT}/cann_ops_8_1rc1"
-STATE="${ROOT}/.benchmark_state/gather_elements_v2_private_package_v8/${SOURCE_ID}"
+STATE="${ROOT}/.benchmark_state/gather_elements_v2_cann81_prebuilt_v9/${SOURCE_ID}"
 PROJECT="${STATE}/project"
 PACKAGE_BUILD="${STATE}/package_build"
 PACKAGE_ROOT="${STATE}/output/packages/vendors/gather_elements_source"
 PACKAGE_MANIFEST="${STATE}/gather_elements_v2_private_package.json"
 RUNNER_BUILD="${STATE}/runner_build"
-RESULTS="${ROOT}/results/gather_elements_v2_private_package_v8/${SOURCE_ID}"
+RESULTS="${ROOT}/results/gather_elements_v2_cann81_prebuilt_v9/${SOURCE_ID}"
 LOGS="${RESULTS}/logs"
 mkdir -p "${SOURCE_CACHE_PARENT}" "${STATE}" "${LOGS}"
 # Keep temporary files made by tools that honor the standard variables under
@@ -134,6 +139,20 @@ run_logged() {
     return 1
 }
 
+# Apply low priority and one allowed CPU to the compiler and every child it
+# creates. This is process-local resource control; it does not change system
+# settings or another user's processes.
+CPU_ALLOWED_LIST="$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
+BUILD_CPU="${CPU_ALLOWED_LIST%%[-,]*}"
+resource_limited() {
+    local command=("$@")
+    if command -v taskset >/dev/null 2>&1 && [[ "${BUILD_CPU}" =~ ^[0-9]+$ ]]; then
+        nice -n 15 taskset -c "${BUILD_CPU}" "${command[@]}"
+    else
+        nice -n 15 "${command[@]}"
+    fi
+}
+
 echo "GATHER_ELEMENTS_CAMPAIGN begin device=${PHYSICAL_DEVICE} records=${RECORD_TARGET} logs=${LOGS}"
 echo "GATHER_ELEMENTS_CAMPAIGN scope=private_checkout_package installed_cann_read_only no_reset_no_kill"
 
@@ -155,15 +174,15 @@ fi
 
 if [[ ! -f "${PACKAGE_BUILD}/CMakeCache.txt" ]]; then
     run_logged "GATHER_PACKAGE_CONFIGURE" "${STATE}/package_configure.log" \
-        cmake -S "${PROJECT}" -B "${PACKAGE_BUILD}" -G "Unix Makefiles" \
+        resource_limited cmake -S "${PROJECT}" -B "${PACKAGE_BUILD}" -G "Unix Makefiles" \
         -DBUILD_OPEN_PROJECT=ON -DASCEND_COMPUTE_UNIT=ascend910b \
         -DASCEND_OP_NAME=gather_elements_v2 -DVENDOR_NAME=gather_elements_source \
         -DCUSTOM_ASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" -DCHECK_COMPATIBLE=OFF \
-        -DENABLE_OPS_KERNEL=OFF -DPREPARE_BUILD=ON -DENABLE_CCACHE=OFF \
+        -DENABLE_OPS_KERNEL=ON -DENABLE_OPS_HOST=ON -DPREPARE_BUILD=OFF -DENABLE_CCACHE=OFF \
         -DCMAKE_BUILD_TYPE=Release
 fi
 run_logged "GATHER_PACKAGE_BUILD" "${STATE}/package_build.log" \
-    cmake --build "${PACKAGE_BUILD}" --parallel 1
+    resource_limited cmake --build "${PACKAGE_BUILD}" --parallel 1
 run_logged "GATHER_PACKAGE_INSTALL" "${STATE}/package_install.log" \
     cmake --install "${PACKAGE_BUILD}"
 run_logged "GATHER_PACKAGE_VALIDATE" "${STATE}/package_validate.log" \
@@ -177,7 +196,7 @@ if [[ ! -f "${RUNNER_BUILD}/CMakeCache.txt" ]]; then
         -DCMAKE_BUILD_TYPE=Release -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}"
 fi
 run_logged "GATHER_RUNNER_BUILD" "${STATE}/runner_build.log" \
-    cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1
+    resource_limited cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1
 
 python3 "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
     --runner "${RUNNER_BUILD}/multi_op_npu_runner" --log-dir "${LOGS}" --device 0 \

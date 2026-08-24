@@ -24,11 +24,10 @@ set(CANN_DEVLIB "${CANN_PLATFORM}/devlib")
 add_executable(multi_op_npu_runner runner.cpp)
 target_include_directories(multi_op_npu_runner PRIVATE "${CANN_INCLUDE}")
 target_link_directories(multi_op_npu_runner PRIVATE "${CANN_LIB}")
-# ``aclopCompileAndExecute`` is the CANN generic compiler entry point.  Unlike
-# an already-bound ACLNN OpAPI call, it resolves ``GatherElements`` through the
-# current OPP registry and can therefore load the checkout-local custom OPP
-# source package used by the source-tiling campaign.
-target_link_libraries(multi_op_npu_runner PRIVATE ascendcl acl_op_compiler nnopbase opapi pthread)
+# The installed reference is linked normally. The checkout-local CANN 8.1
+# package's generated C++ ACLNN entry point is loaded by absolute path with
+# dlopen, so no Python/TBE runtime compiler is part of the custom path.
+target_link_libraries(multi_op_npu_runner PRIVATE ascendcl nnopbase opapi pthread dl)
 target_link_options(
     multi_op_npu_runner PRIVATE
     "-Wl,-rpath-link,${CANN_LIB}"

@@ -26,16 +26,16 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_v2_private_cann_package_measurement_v8"
-SOURCE_BACKEND = "acl_op_compiler_private_cann_package_source_real_npu"
+SCHEMA = "gather_elements_v2_cann81_prebuilt_measurement_v9"
+SOURCE_BACKEND = "private_cann81_prebuilt_ascendc_aclnn_real_npu"
 SOURCE_OPERATOR_TYPE = "GatherElementsV2"
 # The campaign is intentionally append-only so an interrupted physical-NPU
 # run can resume without losing its completed groups.  A single log is kept
 # below this limit; the next numeric log is opened before an oversized write.
 MAX_LOG_BYTES = 50 * 1024 * 1024
 # This executable campaign has one deliberate scope.  The generic compiler
-# must select the separately registered private CANN operator, not the
-# installed Python GatherElements implementation that previously shadowed it.
+# must call the generated CANN 8.1 C++ ACLNN entry point and its precompiled
+# device kernel, not the installed Python GatherElements implementation.
 OPERATOR_RUNTIME_NAMES = {"GatherElementsV2": "gather_elements"}
 RUNTIME_OPERATOR_NAMES = {value: key for key, value in OPERATOR_RUNTIME_NAMES.items()}
 
@@ -226,11 +226,13 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
     required = ("schema", "operator", "source_operator_type", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
                 "project_root", "package_root", "source_file", "source_file_sha256", "op_api_library", "op_api_library_sha256",
                 "op_proto_library", "op_proto_library_sha256",
-                "op_tiling_library", "op_tiling_library_sha256", "ops_config", "ops_config_sha256", "dynamic_adapter",
-                "dynamic_adapter_sha256", "dynamic_kernel", "dynamic_kernel_sha256", "instrumentation",
+                "op_tiling_library", "op_tiling_library_sha256", "ops_config", "ops_config_sha256",
+                "kernel_binary_root", "kernel_binary_info_config", "kernel_binary_info_config_sha256",
+                "kernel_operator_config", "kernel_operator_config_sha256", "precompiled_device_kernels",
+                "runtime_python_compilation", "build_cann_version", "instrumentation",
                 "hardware_envelope_heuristic", "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
     if (any(key not in item for key in required) or
-            item["schema"] != "gather_elements_v2_private_cann_package_v1" or
+            item["schema"] != "gather_elements_v2_cann81_prebuilt_package_v2" or
             item.get("source_operator_type") != SOURCE_OPERATOR_TYPE or
             item.get("operator") != SOURCE_OPERATOR_TYPE or
             item.get("runtime_op") != "gather_elements"):
@@ -246,11 +248,25 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
                                 ("op_proto_library", "op_proto_library_sha256"),
                                 ("op_tiling_library", "op_tiling_library_sha256"),
                                 ("ops_config", "ops_config_sha256"),
-                                ("dynamic_adapter", "dynamic_adapter_sha256"),
-                                ("dynamic_kernel", "dynamic_kernel_sha256")):
+                                ("kernel_binary_info_config", "kernel_binary_info_config_sha256"),
+                                ("kernel_operator_config", "kernel_operator_config_sha256")):
         artifact = Path(str(item[value_key]))
         if not artifact.is_file() or digest_file(artifact) != str(item[hash_key]) or package_root not in artifact.parents:
             raise RuntimeError("private GatherElementsV2 package artifact is missing or mismatched: {}".format(artifact))
+    kernel_root = Path(str(item["kernel_binary_root"]))
+    kernels = item["precompiled_device_kernels"]
+    if (not kernel_root.is_dir() or package_root not in kernel_root.parents or not isinstance(kernels, list) or
+            len(kernels) != 4 or item["runtime_python_compilation"] is not False or
+            item["build_cann_version"] != "8.1.RC1"):
+        raise RuntimeError("private package is not a complete CANN 8.1 precompiled kernel package")
+    for kernel in kernels:
+        if not isinstance(kernel, dict):
+            raise RuntimeError("invalid precompiled GatherElementsV2 kernel manifest entry")
+        for value_key, hash_key in (("object", "object_sha256"), ("metadata", "metadata_sha256")):
+            artifact = Path(str(kernel.get(value_key, "")))
+            if (not artifact.is_file() or digest_file(artifact) != str(kernel.get(hash_key)) or
+                    kernel_root not in artifact.parents):
+                raise RuntimeError("precompiled GatherElementsV2 kernel is missing or mismatched: {}".format(artifact))
     runtime_op = OPERATOR_RUNTIME_NAMES.get(str(item["operator"]))
     if runtime_op is None:
         raise RuntimeError("private package is not an allowed GatherElements source: {}".format(item["operator"]))
@@ -258,7 +274,8 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
     if (not isinstance(inst, dict) or inst.get("enabled") is not True or inst.get("mutates_tiling_context") is not False or
             not inst.get("audit_schema") or not inst.get("audit_environment") or not inst.get("source_budget_environment") or
             inst.get("dispatch_environment") != "GATHER_ELEMENTS_SOURCE_DISPATCH" or
-            inst.get("dispatch_value") != "aclop_compile_and_execute"):
+            inst.get("dispatch_value") != "cann81_prebuilt_aclnn" or
+            inst.get("opapi_library_environment") != "GATHER_ELEMENTS_SOURCE_OPAPI_LIBRARY"):
         raise RuntimeError("private package does not attest its original-source candidate axes")
     envelope = item["hardware_envelope_heuristic"]
     if (not isinstance(envelope, dict) or envelope.get("enabled") is not True or
@@ -368,6 +385,7 @@ def source_environment(base: dict[str, str], package: dict[str, Any], candidate:
     environment["ASCEND_CUSTOM_OPP_PATH"] = str(package_root)
     previous_loader_path = environment.get("LD_LIBRARY_PATH", "")
     environment["LD_LIBRARY_PATH"] = str(op_api.parent) + (":" + previous_loader_path if previous_loader_path else "")
+    environment[str(package["instrumentation"]["opapi_library_environment"])] = str(op_api)
     environment["GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE"] = SOURCE_OPERATOR_TYPE
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
     environment[str(package["instrumentation"]["dispatch_environment"])] = str(package["instrumentation"]["dispatch_value"])
@@ -681,6 +699,7 @@ def main() -> int:
     base_env = dict(os.environ)
     base_env.pop("ASCEND_CUSTOM_OPP_PATH", None)
     base_env.pop("GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE", None)
+    base_env.pop("GATHER_ELEMENTS_SOURCE_OPAPI_LIBRARY", None)
     for package_set in packages.values():
         for package in package_set:
             base_env.pop(str(package["instrumentation"]["audit_environment"]), None)
@@ -704,7 +723,7 @@ def main() -> int:
         "historical_latency_or_tiling_records_read": 0, "cce_data_or_cost_model_read": 0,
         "timing": {"warmup": args.warmup, "samples": args.samples, "kind": "device_event_only"},
         "no_host_timeout_or_forced_worker_kill": True, "temporary_reference_storage": str(temporary_root),
-        "preflight": "one installed viability launch per operator plus one source-audit call per host-tiler package; any failure stops before semantic-shape discovery",
+        "preflight": "one installed viability launch plus one private CANN 8.1 C++ ACLNN/precompiled-kernel source audit; any failure stops before semantic-shape discovery",
         "log_directory": str(args.log_dir), "log_rotation_max_bytes": MAX_LOG_BYTES,
     }
     writer.append({**begin, "record_type": "campaign_begin"})

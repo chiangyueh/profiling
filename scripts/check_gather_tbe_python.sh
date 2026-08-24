@@ -22,6 +22,7 @@ done
 set +u
 source "${ENV_FILE}"
 set -u
+export PYTHONDONTWRITEBYTECODE=1
 
 python3 - <<'PY'
 import importlib

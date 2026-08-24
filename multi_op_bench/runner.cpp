@@ -793,9 +793,10 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         const aclTensorDesc *outputDescs[] = {outputDesc.Get()};
         aclDataBuffer *outputBuffers[] = {outputData.Get()};
         const auto launch = [&](aclrtStream launchStream) {
-            // The private OPP root keeps CANN's registered GatherElements
-            // type and uses vendors/config.ini to choose the private source
-            // before built-in. No synthetic type or missing op-proto is used.
+            // The private complete OPP view keeps CANN's registered
+            // GatherElements type and resolves its canonical dynamic Python
+            // module from the isolated worker environment. No synthetic type
+            // or missing op-proto is used.
             return aclopCompileAndExecute(kGatherElementsSourceOperatorType, 2, inputDescs, inputBuffers,
                                           1, outputDescs, outputBuffers, attr.Get(),
                                           ACL_ENGINE_AICORE, ACL_COMPILE_SYS, nullptr, launchStream);

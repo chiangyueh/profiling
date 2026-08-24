@@ -11,8 +11,8 @@ usage() {
 Usage: profiling/scripts/trace_gather_source_dispatch.sh -d PHYSICAL_NPU_ID
 
 Runs exactly one real-NPU GatherElements call through the registered type
-``GatherElements`` selected by a private OPP vendor-priority overlay. The
-private source records the actual Python module path when CANN imports it. It does not run the
+``GatherElements`` selected from a complete private OPP view. The private
+source records the actual Python module path when CANN imports it. It does not run the
 5,000-record campaign, use timeout, kill a process, reset an NPU, or modify
 installed CANN files.
 
@@ -115,14 +115,17 @@ readarray -t OVERLAY_VALUES < <(python3 - "${PACKAGE_MANIFEST}" <<'PY'
 import json
 import sys
 item = json.load(open(sys.argv[1], encoding="utf-8"))
-for key in ("vendor_root", "source_file", "runtime_opp_root", "source_operator_type"):
-    print(item[key])
+for key in ("source_file", "runtime_opp_root", "source_operator_type", "runtime_opp_layout"):
+    value = item[key]
+    if key == "runtime_opp_layout":
+        value = value["private_tbe_import_root"]
+    print(value)
 PY
 )
-VENDOR_ROOT="${OVERLAY_VALUES[0]}"
-PRIVATE_SOURCE="${OVERLAY_VALUES[1]}"
-RUNTIME_OPP_ROOT="${OVERLAY_VALUES[2]}"
-SOURCE_OPERATOR_TYPE="${OVERLAY_VALUES[3]}"
+PRIVATE_SOURCE="${OVERLAY_VALUES[0]}"
+RUNTIME_OPP_ROOT="${OVERLAY_VALUES[1]}"
+SOURCE_OPERATOR_TYPE="${OVERLAY_VALUES[2]}"
+PRIVATE_TBE_IMPORT_ROOT="${OVERLAY_VALUES[3]}"
 [[ -f "${PRIVATE_SOURCE}" ]] || { echo "fatal: private GatherElements source is absent: ${PRIVATE_SOURCE}" >&2; exit 1; }
 
 echo "GATHER_PROBE_OVERLAY status=passed source_operator_type=${SOURCE_OPERATOR_TYPE}"
@@ -142,6 +145,7 @@ echo "GATHER_PROBE_BUILD status=passed"
 
 unset ASCEND_CUSTOM_OPP_PATH
 export ASCEND_OPP_PATH="${RUNTIME_OPP_ROOT}"
+export PYTHONPATH="${PRIVATE_TBE_IMPORT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export GATHER_ELEMENTS_TILING_AUDIT_PATH="${AUDIT_PATH}"
 export GATHER_ELEMENTS_SOURCE_DISPATCH="aclop_compile_and_execute"
 export GATHER_ELEMENTS_SOURCE_AIV_CAP=20

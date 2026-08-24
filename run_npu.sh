@@ -82,10 +82,10 @@ SOURCE_ID="$({
     readlink -f "${CANN_ROOT}"
 } | sha256sum | cut -c1-20)"
 
-STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v6/${SOURCE_ID}"
+STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v7/${SOURCE_ID}"
 OVERLAY_PARENT="${STATE}/overlays"
 RUNNER_BUILD="${STATE}/runner_build"
-RESULTS="${ROOT}/results/gather_elements_native_dynamic_v6/${SOURCE_ID}"
+RESULTS="${ROOT}/results/gather_elements_native_dynamic_v7/${SOURCE_ID}"
 LOGS="${RESULTS}/logs"
 mkdir -p "${OVERLAY_PARENT}" "${RUNNER_BUILD}" "${LOGS}"
 
@@ -93,13 +93,27 @@ echo "GatherElements native CANN dynamic-source campaign"
 echo "  target:        physical NPU ${PHYSICAL_DEVICE} -> worker logical NPU 0"
 echo "  formal target: ${RECORD_TARGET} real-NPU latency records"
 echo "  source:        ${NATIVE_SOURCE}"
-echo "  source API:    aclopCompileAndExecute(GatherElements) through a private OPP vendor-priority overlay"
+echo "  source API:    aclopCompileAndExecute(GatherElements) through a complete private OPP view"
 echo "  reference API: installed aclnnGather under the unmodified installed OPP path"
 echo "  output:        ${LOGS}/1.log, 2.log, ... (JSONL, each <= 50 MiB)"
 
+run_logged() {
+    local label="$1"
+    local log="$2"
+    shift 2
+    if "$@" >"${log}" 2>&1; then
+        echo "${label} status=passed"
+        return 0
+    fi
+    echo "${label} status=failed log=${log}" >&2
+    tail -n 30 "${log}" >&2 || true
+    return 1
+}
+
 # A wrong API path was the cause of the prior no-audit failures.  Check every
 # local prerequisite before creating a build directory or touching the NPU.
-python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
+run_logged "GATHER_STATIC_PRE" "${STATE}/contract_pre.log" \
+    python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
     --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
     --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" \
     --campaign-source "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
@@ -114,16 +128,19 @@ if [[ ! -f "${PACKAGE_MANIFEST}" ]]; then
         --cann-root "${CANN_ROOT}" --output-parent "${OVERLAY_PARENT}" >"${STATE}/overlay_prepare.log" 2>&1
     echo "NATIVE_DYNAMIC_OVERLAY_PREPARE_END operator=gather_elements"
 fi
-python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
+run_logged "GATHER_STATIC_POST" "${STATE}/contract_post.log" \
+    python3 "${ROOT}/source_adapter/check_gather_dispatch_contract.py" \
     --cann-root "${CANN_ROOT}" --runner-source "${ROOT}/multi_op_bench/runner.cpp" \
     --runner-cmake "${ROOT}/multi_op_bench/CMakeLists.txt" \
     --campaign-source "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
     --launch-script "${ROOT}/run_npu.sh" \
     --overlay-manifest "${PACKAGE_MANIFEST}"
 
-cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
+run_logged "GATHER_RUNNER_CONFIGURE" "${STATE}/runner_configure.log" \
+    cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
     -DCMAKE_BUILD_TYPE=Release -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}"
-cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1
+run_logged "GATHER_RUNNER_BUILD" "${STATE}/runner_build.log" \
+    cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1
 
 # The controller's sole preflight performs one installed-reference launch and
 # one private-OPP source launch/audit, then stops immediately on failure.

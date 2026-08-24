@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Collect output-validated native GatherElements source-tiling contexts.
+"""Collect output-validated native GatherElements source compile contexts.
 
 Every formal group evaluates the finite set of bounded inputs to CANN's
 original dynamic GatherElements source.  The source then produces the runtime
 flow-table normally; this controller never enumerates, edits, or replays its
-fields. A group is admitted only when twenty distinct source contexts launch,
-exactly match the installed reference, and complete device-event measurement.
+opaque fields. A group is admitted only when twenty distinct source compile
+contexts launch, exactly match the installed reference, and complete
+device-event measurement.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_native_dynamic_measurement_v6"
+SCHEMA = "gather_elements_native_dynamic_measurement_v7"
 SOURCE_BACKEND = "acl_op_compiler_private_opp_source_real_npu"
 SOURCE_OPERATOR_TYPE = "GatherElements"
 # The campaign is intentionally append-only so an interrupted physical-NPU
@@ -177,7 +178,7 @@ def emit(writer: RotatingJsonl, row: dict[str, Any]) -> None:
         "schema": row.get("schema"), "status": row.get("status"),
         "op": workload.get("op"), "workload_id": workload.get("workload_id"),
         "valid_latency_count": row.get("valid_latency_count", 0),
-        "distinct_raw_tilings": discovery.get("distinct_raw_tilings"),
+        "distinct_source_compile_contexts": discovery.get("distinct_source_compile_contexts"),
         "attempted_source_contexts": discovery.get("attempted_source_contexts"),
         "rejection_reason": row.get("rejection_reason"),
     }
@@ -224,10 +225,10 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
         raise RuntimeError("missing native GatherElements overlay manifest: {}".format(path))
     item: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     required = ("schema", "operator", "source_operator_type", "source_module", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
-                "installed_source", "installed_source_sha256", "installed_opp_root", "runtime_opp_root", "runtime_opp_layout", "vendor", "vendor_impl_directory", "vendor_root",
+                "installed_source", "installed_source_sha256", "installed_opp_root", "runtime_opp_root", "runtime_opp_layout",
                 "source_file", "source_file_sha256", "instrumentation", "hardware_envelope_heuristic",
                 "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
-    if (any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v6" or
+    if (any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v7" or
             item.get("source_operator_type") != SOURCE_OPERATOR_TYPE or
             item.get("source_module") != "gather_elements"):
         raise RuntimeError("invalid native CANN GatherElements source-overlay manifest: {}".format(path))
@@ -249,19 +250,25 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
             not envelope.get("audit_field") or tuple(envelope.get("divisors", ())) != (2, 4, 8) or
             int(envelope.get("max_anchors", 0)) < 1):
         raise RuntimeError("native overlay hardware-envelope provenance is invalid")
-    vendor_root = Path(str(item["vendor_root"]))
     runtime_root = Path(str(item["runtime_opp_root"]))
     installed_root = Path(str(item["installed_opp_root"]))
-    expected_impl = str(item["vendor"]) + "_impl"
-    source_parent = vendor_root / "op_impl" / "ai_core" / "tbe" / str(item["vendor_impl_directory"]) / "dynamic"
-    priority = runtime_root / "vendors" / "config.ini"
+    layout = item["runtime_opp_layout"]
+    if not isinstance(layout, dict):
+        raise RuntimeError("native GatherElements private OPP layout is not an object")
+    private_tbe_root = Path(str(layout.get("private_tbe_import_root", "")))
     builtin = runtime_root / "built-in"
-    if (not runtime_root.is_dir() or not installed_root.is_dir() or not vendor_root.is_dir() or
-            vendor_root != runtime_root / "vendors" / str(item["vendor"]) or
-            str(item["vendor_impl_directory"]) != expected_impl or not source_parent.is_dir() or
-            not builtin.is_symlink() or builtin.resolve() != (installed_root / "built-in").resolve() or
-            not priority.is_file() or priority.read_text(encoding="utf-8") != "load_priority={}\n".format(item["vendor"])):
+    linked_entries = layout.get("linked_root_entries")
+    if (not runtime_root.is_dir() or not installed_root.is_dir() or not builtin.is_dir() or builtin.is_symlink() or
+            layout.get("mode") != "complete_private_opp_view_with_canonical_dynamic_module_override" or
+            private_tbe_root != builtin / "op_impl" / "ai_core" / "tbe" or
+            source_file != private_tbe_root / "impl" / "dynamic" / "gather_elements.py" or
+            not isinstance(linked_entries, list) or
+            sorted(linked_entries) != sorted(path.name for path in installed_root.iterdir() if path.name != "built-in")):
         raise RuntimeError("native GatherElements private OPP layout is incomplete")
+    for name in linked_entries:
+        private_entry, installed_entry = runtime_root / str(name), installed_root / str(name)
+        if not private_entry.is_symlink() or private_entry.resolve() != installed_entry.resolve():
+            raise RuntimeError("native GatherElements private OPP root link is invalid: {}".format(name))
     if item["strategy_algorithm_changes"] is not False or item["kernel_algorithm_changes"] is not False:
         raise RuntimeError("native GatherElements overlay is not source-preserving")
     item["runtime_op"] = runtime_op
@@ -283,11 +290,11 @@ def read_observations(path: Path, schema: str) -> list[dict[str, Any]]:
     return rows
 
 
-def source_tiling_identity(observation: dict[str, Any]) -> str:
-    fields = ("source_variant_sha256", "aiv_core_cap", "ub_cap_divisor")
+def source_compile_context_identity(observation: dict[str, Any]) -> str:
+    fields = ("source_compile_context_sha256", "aiv_core_cap", "ub_cap_divisor", "compile_info_vars")
     if any(field not in observation for field in fields):
-        raise RuntimeError("source audit omitted its native tiling-context identity")
-    return ":".join(str(observation[field]) for field in fields)
+        raise RuntimeError("source audit omitted its native compile-context identity")
+    return stable_hash({field: observation[field] for field in fields})
 
 
 def successful_observation(path: Path, package: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -297,13 +304,13 @@ def successful_observation(path: Path, package: dict[str, Any]) -> tuple[dict[st
         if any(row.get("event") == "module_imported" for row in all_rows):
             return None, "private source was imported but did not emit a completed tiling audit"
         return None, "original-source overlay emitted no audit observation"
-    identities = {source_tiling_identity(row) for row in rows}
+    identities = {source_compile_context_identity(row) for row in rows}
     if len(identities) != 1:
-        return None, "one source execution emitted multiple tiling-context identities"
+        return None, "one source execution emitted multiple compile-context identities"
     if any(int(row.get("status", -1)) != 0 for row in rows):
         return None, "original source tiler returned a non-success status"
     result = dict(rows[-1])
-    result["source_tiling_identity"] = next(iter(identities))
+    result["source_compile_context_identity"] = next(iter(identities))
     result["observation_count"] = len(rows)
     return result, None
 
@@ -342,11 +349,15 @@ def context_matches(observation: dict[str, Any] | None, candidate: dict[str, Any
 
 def source_environment(base: dict[str, str], package: dict[str, Any], candidate: dict[str, Any], audit: Path) -> dict[str, str]:
     environment = dict(base)
-    # CANN discovers the private source from this complete OPP root's
-    # vendors/config.ini. The isolated worker restores no process-global
-    # state and cannot affect later installed-reference workers.
+    # This environment belongs only to the child worker passed to
+    # subprocess.run.  It makes CANN resolve the original registered module
+    # from the private full OPP view; it never changes the login shell, CANN,
+    # or another user's process.
     environment["ASCEND_OPP_PATH"] = str(package["runtime_opp_root"])
     environment.pop("ASCEND_CUSTOM_OPP_PATH", None)
+    import_root = str(package["runtime_opp_layout"]["private_tbe_import_root"])
+    previous_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = import_root + (os.pathsep + previous_pythonpath if previous_pythonpath else "")
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
     environment[str(package["instrumentation"]["dispatch_environment"])] = str(package["instrumentation"]["dispatch_value"])
     environment[str(package["instrumentation"]["source_budget_environment"])] = str(candidate["aiv_core_cap"])
@@ -371,7 +382,7 @@ def source_audit_emitted(path: Path, package: dict[str, Any], candidate: dict[st
         return False, "original-source overlay emitted no audit observation"
     for row in rows:
         try:
-            source_tiling_identity(row)
+            source_compile_context_identity(row)
         except RuntimeError:
             continue
         if context_matches(row, candidate, package):
@@ -483,7 +494,7 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
         return {"attempted_source_contexts": original_contexts + heuristic_contexts,
                 "attempted_original_source_contexts": original_contexts,
                 "attempted_hardware_rule_heuristic_contexts": heuristic_contexts,
-                "successful_source_contexts": successful_contexts, "distinct_raw_tilings": len(discovered),
+                "successful_source_contexts": successful_contexts, "distinct_source_compile_contexts": len(discovered),
                 "heuristic_anchor_count": len(anchors), "source_audit_missing": source_audit_missing}
 
     def attempt(package: dict[str, Any], candidate: dict[str, Any], kind: str) -> bool:
@@ -507,7 +518,7 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
             failures.append(candidate_label(candidate) + ": " + (reason or compact_failure(output)))
             return False
         successful_contexts += 1
-        identity = str(observed["source_tiling_identity"])
+        identity = str(observed["source_compile_context_identity"])
         entry = discovered.setdefault(identity, {"candidate": candidate, "package": package, "source_origins": [],
                                                  "source_tiling_observation": observed, "discovery_wall_ms": wall})
         entry["source_origins"].append(candidate)
@@ -540,10 +551,10 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
         return "rejected", {"rejection_reason": "installed reference execution failed", "failure": compact_failure(output), "worker_wall_ms": wall}
     discovered, discovery, failures = discover_group(args, workload, packages, caps, minimum, base_env, group_key, temp)
     if discovery.get("source_audit_missing"):
-        return "rejected", {"rejection_reason": "source tiling audit was absent; this is a deployment failure, not a tiling rejection",
+        return "rejected", {"rejection_reason": "source compile-context audit was absent; this is a deployment failure, not a candidate rejection",
                               "source_discovery": discovery, "discovery_failures": failures}
     if len(discovered) < minimum:
-        return "rejected", {"rejection_reason": "fewer than 20 distinct native source-tiling contexts from the complete source search", "source_discovery": discovery, "discovery_failures": failures}
+        return "rejected", {"rejection_reason": "fewer than 20 distinct native source compile contexts from the complete source search", "source_discovery": discovery, "discovery_failures": failures}
     verified: list[dict[str, Any]] = []
     verification_failures: list[str] = []
     for identity, item in discovered.items():
@@ -554,14 +565,14 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
         observed, reason = successful_observation(audit, package)
         equal = bool(result.get("output_reference_checked")) and bool(result.get("output_reference_equal"))
         if (rc != 0 or result.get("status") != "success" or result.get("backend") != SOURCE_BACKEND or not equal or
-                not context_matches(observed, candidate, package) or observed.get("source_tiling_identity") != identity):
+                not context_matches(observed, candidate, package) or observed.get("source_compile_context_identity") != identity):
             verification_failures.append(candidate_label(candidate) + ": " + (
                 reason or ("unexpected backend {}".format(result.get("backend"))
                            if result.get("backend") != SOURCE_BACKEND else "output/reference or source identity mismatch")))
             continue
         verified.append({**item, "verification_result": result, "verification_wall_ms": wall, "verification_tiling_observation": observed})
     if len(verified) < minimum:
-        return "rejected", {"rejection_reason": "fewer than 20 distinct source tilings passed exact output validation", "source_discovery": discovery,
+        return "rejected", {"rejection_reason": "fewer than 20 distinct source compile contexts passed exact output validation", "source_discovery": discovery,
                               "successful_verified_distinct_tilings": len(verified), "discovery_failures": failures,
                               "verification_failures": verification_failures}
     measured: list[dict[str, Any]] = []
@@ -571,7 +582,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
     # per admitted shape keeps the 5,000-record contract exact while retaining
     # a non-random ranking set. If a timed candidate fails, the next validated
     # identity replaces it; failures never count.
-    verified.sort(key=lambda item: str(item["source_tiling_observation"]["source_tiling_identity"]))
+    verified.sort(key=lambda item: str(item["source_tiling_observation"]["source_compile_context_identity"]))
     for item in verified:
         if len(measured) == minimum:
             break
@@ -583,7 +594,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
         equal = bool(result.get("output_reference_checked")) and bool(result.get("output_reference_equal"))
         if (rc != 0 or result.get("status") != "success" or result.get("backend") != SOURCE_BACKEND or not equal or
                 not context_matches(observed, candidate, package) or
-                observed.get("source_tiling_identity") != item["source_tiling_observation"]["source_tiling_identity"]):
+                observed.get("source_compile_context_identity") != item["source_tiling_observation"]["source_compile_context_identity"]):
             measurement_failures.append(candidate_label(candidate) + ": " + (
                 reason or ("unexpected backend {}".format(result.get("backend"))
                            if result.get("backend") != SOURCE_BACKEND else
@@ -596,7 +607,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
     # it does not erase other legal candidates.  The shape is useful only
     # when it still has the requested twenty successful, measured tilings.
     if len(measured) < minimum:
-        return "rejected", {"rejection_reason": "fewer than 20 source tilings completed real measurement", "source_discovery": discovery,
+        return "rejected", {"rejection_reason": "fewer than 20 source compile contexts completed real measurement", "source_discovery": discovery,
                               "successful_verified_distinct_tilings": len(verified), "successful_measured_distinct_tilings": len(measured),
                               "discovery_failures": failures, "verification_failures": verification_failures,
                               "measurement_failures": measurement_failures}
@@ -667,7 +678,13 @@ def main() -> int:
         "log_directory": str(args.log_dir), "log_rotation_max_bytes": MAX_LOG_BYTES,
     }
     writer.append({**begin, "record_type": "campaign_begin"})
-    print("SOURCE_TILING_CAMPAIGN_BEGIN " + json.dumps(begin, ensure_ascii=False, sort_keys=True), flush=True)
+    print("SOURCE_TILING_CAMPAIGN_BEGIN " + json.dumps({
+        "operator": args.operator,
+        "target_records": args.record_target,
+        "minimum_contexts_per_shape": minimum,
+        "reviewed_shapes": len(planned[args.operator]),
+        "logs": str(args.log_dir),
+    }, ensure_ascii=False, sort_keys=True), flush=True)
     preflight = source_audit_preflight(args, planned, packages, caps, base_env)
     for check in preflight:
         writer.append({"schema": SCHEMA, "record_type": "campaign_preflight", **check})
@@ -677,7 +694,9 @@ def main() -> int:
                    "failure_count": len(preflight_failures), "checks": preflight_failures,
                    "reason": "no semantic workload discovery was started because installed viability or source-audit loading failed"}
         writer.append(failure)
-        print("SOURCE_TILING_CAMPAIGN_PREFLIGHT_FAILED " + json.dumps(failure, ensure_ascii=False, sort_keys=True), flush=True)
+        print("SOURCE_TILING_CAMPAIGN_PREFLIGHT_FAILED " + json.dumps({
+            "failure_count": len(preflight_failures), "logs": str(args.log_dir)
+        }, ensure_ascii=False, sort_keys=True), flush=True)
         return 2
     print("SOURCE_TILING_CAMPAIGN_PREFLIGHT_PASSED " + json.dumps({
         "checks": len(preflight), "source_tiler_audits": sum(check["kind"] == "source_tiler_audit" for check in preflight),
@@ -711,7 +730,11 @@ def main() -> int:
           "summary": summarize(args.log_dir), "prior_rejected_groups": prior_rejected,
           "log_directory": str(args.log_dir), "log_rotation_max_bytes": MAX_LOG_BYTES}
     writer.append({**end, "record_type": "campaign_end"})
-    print("SOURCE_TILING_CAMPAIGN_END " + json.dumps(end, ensure_ascii=False, sort_keys=True), flush=True)
+    print("SOURCE_TILING_CAMPAIGN_END " + json.dumps({
+        "operator": args.operator, "status": end["status"],
+        "formal_valid_latency_records": end["summary"]["formal_valid_latency_records"],
+        "rejected_groups": end["summary"]["rejected_groups"], "logs": str(args.log_dir)
+    }, ensure_ascii=False, sort_keys=True), flush=True)
     return 0
 
 

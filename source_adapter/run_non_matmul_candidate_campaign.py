@@ -224,7 +224,8 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
         raise RuntimeError("missing private GatherElementsV2 package manifest: {}".format(path))
     item: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     required = ("schema", "operator", "source_operator_type", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
-                "project_root", "package_root", "custom_opp_root", "source_file", "source_file_sha256", "op_proto_library", "op_proto_library_sha256",
+                "project_root", "package_root", "source_file", "source_file_sha256", "op_api_library", "op_api_library_sha256",
+                "op_proto_library", "op_proto_library_sha256",
                 "op_tiling_library", "op_tiling_library_sha256", "ops_config", "ops_config_sha256", "dynamic_adapter",
                 "dynamic_adapter_sha256", "dynamic_kernel", "dynamic_kernel_sha256", "instrumentation",
                 "hardware_envelope_heuristic", "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
@@ -239,11 +240,10 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
         raise RuntimeError("private GatherElementsV2 host tiler is missing or mismatched: {}".format(source_file))
     package_root = Path(str(item["package_root"]))
     project_root = Path(str(item["project_root"]))
-    custom_opp_root = Path(str(item["custom_opp_root"]))
-    if (not package_root.is_dir() or not project_root.is_dir() or not custom_opp_root.is_dir() or
-            custom_opp_root / "vendors" / str(item.get("vendor", "")) != package_root):
+    if not package_root.is_dir() or not project_root.is_dir():
         raise RuntimeError("private GatherElementsV2 package/project root is absent")
-    for value_key, hash_key in (("op_proto_library", "op_proto_library_sha256"),
+    for value_key, hash_key in (("op_api_library", "op_api_library_sha256"),
+                                ("op_proto_library", "op_proto_library_sha256"),
                                 ("op_tiling_library", "op_tiling_library_sha256"),
                                 ("ops_config", "ops_config_sha256"),
                                 ("dynamic_adapter", "dynamic_adapter_sha256"),
@@ -356,8 +356,18 @@ def source_environment(base: dict[str, str], package: dict[str, Any], candidate:
     # OPP root and adds one checkout-local vendor package through CANN's
     # supported custom-OPP variable; it does not alter the login shell, CANN,
     # or another user's process/environment.
+    package_root = Path(str(package["package_root"]))
+    op_api = Path(str(package["op_api_library"]))
+    if op_api.parent != package_root / "op_api/lib":
+        raise RuntimeError("private GatherElementsV2 op-api library is outside its vendor package")
     environment["ASCEND_OPP_PATH"] = str(Path(str(package["cann_root"])) / "opp")
-    environment["ASCEND_CUSTOM_OPP_PATH"] = str(package["custom_opp_root"])
+    # CANN's generated set_env.bash sets this to the individual vendor
+    # package (not its packages/ parent) and prepends this exact op_api/lib
+    # directory to the dynamic loader path.  Reproduce that contract only for
+    # this worker process; never source or install anything into global CANN.
+    environment["ASCEND_CUSTOM_OPP_PATH"] = str(package_root)
+    previous_loader_path = environment.get("LD_LIBRARY_PATH", "")
+    environment["LD_LIBRARY_PATH"] = str(op_api.parent) + (":" + previous_loader_path if previous_loader_path else "")
     environment["GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE"] = SOURCE_OPERATOR_TYPE
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
     environment[str(package["instrumentation"]["dispatch_environment"])] = str(package["instrumentation"]["dispatch_value"])
@@ -714,8 +724,11 @@ def main() -> int:
                    "failure_count": len(preflight_failures), "checks": preflight_failures,
                    "reason": "no semantic workload discovery was started because installed viability or source-audit loading failed"}
         writer.append(failure)
+        first = preflight_failures[0]
         print("SOURCE_TILING_CAMPAIGN_PREFLIGHT_FAILED " + json.dumps({
-            "failure_count": len(preflight_failures), "logs": str(args.log_dir)
+            "kind": first.get("kind"), "worker_return_code": first.get("worker_return_code"),
+            "runner_backend": first.get("runner_backend"), "failure": first.get("failure"),
+            "logs": str(args.log_dir)
         }, ensure_ascii=False, sort_keys=True), flush=True)
         return 2
     print("SOURCE_TILING_CAMPAIGN_PREFLIGHT_PASSED " + json.dumps({

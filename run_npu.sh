@@ -114,10 +114,12 @@ mkdir -p "${SOURCE_CACHE_PARENT}" "${STATE}" "${LOGS}"
 # Keep temporary files made by tools that honor the standard variables under
 # the checkout as well. These exports are limited to this script and its
 # children and disappear when it exits.
-mkdir -p "${STATE}/tmp"
+mkdir -p "${STATE}/tmp" "${STATE}/cache" "${STATE}/work"
 export TMPDIR="${STATE}/tmp"
 export TMP="${TMPDIR}"
 export TEMP="${TMPDIR}"
+export ASCEND_CACHE_PATH="${STATE}/cache"
+export ASCEND_WORK_PATH="${STATE}/work"
 
 run_logged() {
     local label="$1"

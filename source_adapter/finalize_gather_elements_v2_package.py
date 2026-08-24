@@ -56,12 +56,6 @@ def main() -> int:
     cann = args.cann_root.resolve()
     require(project.is_dir(), "private GatherElementsV2 project is absent: {}".format(project))
     require(package.is_dir(), "private GatherElementsV2 package is absent: {}".format(package))
-    # CANN's generated install.sh copies packages/vendors/<vendor> below the
-    # directory named by ASCEND_CUSTOM_OPP_PATH.  The runtime variable must
-    # therefore name this private packages root, not the vendor directory.
-    custom_opp_root = package.parent.parent
-    require(custom_opp_root / "vendors" / VENDOR == package,
-            "private GatherElementsV2 package is not below packages/vendors/<vendor>")
     require((cann / "opp" / "version.info").is_file(), "CANN OPP version file is absent")
     project_manifest = project / "gather_elements_v2_project.json"
     require(project_manifest.is_file(), "private project provenance is absent: {}".format(project_manifest))
@@ -81,9 +75,10 @@ def main() -> int:
     dynamic_root = package / "op_impl/ai_core/tbe/gather_elements_source_impl/dynamic"
     adapter = dynamic_root / "gather_elements_v2.py"
     kernel = dynamic_root / "gather_elements_v2.cpp"
+    op_api = package / "op_api/lib/libcust_opapi.so"
     proto = architecture_library(package, "op_proto/lib/linux/{architecture}/libcust_opsproto_rt2.0.so")
     tiling = architecture_library(package, "op_impl/ai_core/tbe/op_tiling/lib/linux/{architecture}/libcust_opmaster_rt2.0.so")
-    for path in (source_file, audit_header, config, adapter, kernel):
+    for path in (source_file, audit_header, config, adapter, kernel, op_api):
         require(path.is_file(), "private GatherElementsV2 package file is absent: {}".format(path))
     config_data = json.loads(config.read_text(encoding="utf-8"))
     op_data = config_data.get(OPERATOR)
@@ -106,9 +101,10 @@ def main() -> int:
         "cann_version_file_sha256": digest(cann / "opp" / "version.info"),
         "project_root": str(project),
         "package_root": str(package),
-        "custom_opp_root": str(custom_opp_root),
         "source_file": str(source_file),
         "source_file_sha256": digest(source_file),
+        "op_api_library": str(op_api),
+        "op_api_library_sha256": digest(op_api),
         "op_proto_library": str(proto),
         "op_proto_library_sha256": digest(proto),
         "op_tiling_library": str(tiling),

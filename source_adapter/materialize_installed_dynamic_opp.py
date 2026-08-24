@@ -7,12 +7,14 @@ tiling key needed by an actual workload.  FlashAttentionScoreGrad alone has
 884 device-key branches, so eagerly rebuilding all of them merely to replace
 the host tiler is not a viable collection precondition.
 
-This helper creates a minimal, isolated vendor root.  It copies the exact
-installed dynamic device implementation/configuration for the operator and
-installs only the two host-tiling libraries built from the pinned source
-overlay.  No kernel source, raw tiling field, or device binary is modified.
-The controller subsequently requires a source audit, a real execution, and
-exact output equality before recording any latency.
+This helper creates a minimal private OPP root: its ``built-in`` entry is a
+read-only symlink to the installed OPP tree and ``vendors/config.ini`` selects
+the source-built tiler. It copies the exact installed dynamic device
+implementation/configuration for the operator and installs only the two host
+tiling libraries built from the pinned source overlay. No kernel source, raw
+tiling field, or installed device binary is modified. The controller requires
+a source audit, a real execution, and exact output equality before recording
+any latency.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import shutil
 import sys
@@ -103,6 +106,18 @@ def main() -> int:
     if host_arch not in ("aarch64", "x86_64"):
         raise RuntimeError("unsupported CANN host architecture: {}".format(host_arch))
     vendor = "source_" + str(build["cmake_op_name"]).lower().replace("-", "_")
+    # ``libopapi`` resolves custom tilers from a complete OPP root selected
+    # through ASCEND_OPP_PATH.  A vendor directory by itself (or the newer
+    # ASCEND_CUSTOM_OPP_PATH convenience variable) is not a CANN-8.1 loader
+    # contract.  Keep the installed built-in tree read-only and expose it via
+    # a private symlink; only this checkout's vendor payload is written.
+    root = args.destination
+    installed_opp_root = args.installed_op_impl.parent
+    builtin_link = root / "built-in"
+    os.symlink(installed_opp_root, builtin_link, target_is_directory=True)
+    priority_file = root / "vendors" / "config.ini"
+    priority_file.parent.mkdir(parents=True, exist_ok=True)
+    priority_file.write_text("load_priority={}\n".format(vendor), encoding="utf-8")
     vendor_root = args.destination / "vendors" / vendor
     destination = vendor_root / "op_impl" / "ai_core" / "tbe"
 
@@ -142,7 +157,6 @@ def main() -> int:
         for relative, value in copied_tree_hashes(target_dir).items():
             copied.append({"source": str(source_dir / relative), "destination": str(target_dir / relative), "sha256": value})
 
-    root = args.destination
     delivery = root / "installed_dynamic_device_assets.json"
     delivery.write_text(json.dumps({
         "schema": "installed_dynamic_device_assets_v1", "operator": operator,
@@ -155,9 +169,16 @@ def main() -> int:
         "cmake_op_name": build["cmake_op_name"], "source_family": build["source_family"],
         "strategy_class": build.get("strategy_class"), "strategy_priority": build.get("strategy_priority"),
         "official_commit": build["official_commit"], "vendor": vendor, "custom_opp_root": str(root),
-        # CANN resolves a package from this vendor directory, not from the
-        # parent installation root.  Keep it explicit so the runtime cannot
-        # silently fall through to the installed host tiler.
+        # This is a full private OPP view: built-in is a read-only symlink to
+        # the installed package and vendors/config.ini selects this one host
+        # tiler.  No installed CANN path is changed.
+        "runtime_opp_root": str(root),
+        "runtime_opp_layout": {
+            "built_in_symlink": str(builtin_link),
+            "built_in_target": str(installed_opp_root),
+            "vendor_priority_file": str(priority_file),
+            "vendor_priority": vendor,
+        },
         "custom_opp_vendor_root": str(vendor_root),
         "host_tiling_arch": host_arch,
         "source_package": str(delivery), "source_package_sha256": digest(delivery),

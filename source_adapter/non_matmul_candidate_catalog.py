@@ -386,7 +386,12 @@ def index_multi_tiling_reserve(op: str, start_index: int) -> list[dict[str, Any]
     axis_extents = (17, 31, 63, 65, 127, 129, 257, 513)
     index_extents = (1, 3, 15, 17, 31, 63, 65, 127)
     modes = (("fp16", "int32"), ("bf16", "int64"), ("fp32", "int32"), ("int32", "int64"))
-    base_count = 48
+    # GatherElements-only collection needs 250 admitted 20-tiling groups for
+    # its 5,000 formal latency records.  Keep a deterministic reserve beyond
+    # that target so source-rule or output-validation rejections do not leave
+    # the campaign without legal replacement geometries.  The 96-point
+    # reviewed lattice is not exhausted or randomized.
+    base_count = 80
     output: list[dict[str, Any]] = []
     # A fixed coprime walk over documented rank/axis/dtype boundaries.  All
     # non-axis index extents equal their input extent; the final index extent

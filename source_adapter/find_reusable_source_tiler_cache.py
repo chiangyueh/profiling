@@ -34,14 +34,30 @@ def object_from(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def matching_build(path: Path, overlay_digest: str) -> dict[str, Any] | None:
+def overlay_semantic_digest(path: Path) -> str | None:
+    """Digest source semantics, excluding the private overlay location.
+
+    Each campaign state has a different checkout-local overlay path.  That
+    path is provenance for a particular build directory, but it is not part
+    of the original source, audit, or resource-input semantics.  Normalizing
+    it permits reuse of an attested existing host tiler without recompilation.
+    """
+    value = object_from(path)
+    if value is None:
+        return None
+    value.pop("overlay", None)
+    value.pop("resumed_existing_overlay", None)
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def matching_build(path: Path, desired_overlay_semantics: str) -> dict[str, Any] | None:
     build = object_from(path)
     if build is None:
         return None
     if (build.get("schema") != "source_candidate_build_v1" or
             build.get("target") != "optiling" or
-            build.get("strategy_algorithm_changes") is not False or
-            build.get("overlay_manifest_sha256") != overlay_digest):
+            build.get("strategy_algorithm_changes") is not False):
         return None
     for artifact_key, digest_key in (
         ("host_tiling_artifact", "host_tiling_artifact_sha256"),
@@ -50,7 +66,15 @@ def matching_build(path: Path, overlay_digest: str) -> dict[str, Any] | None:
         artifact = Path(str(build.get(artifact_key, "")))
         if not artifact.is_file() or digest(artifact) != build.get(digest_key):
             return None
-    return build
+    try:
+        state = path.parents[2]
+    except IndexError:
+        return None
+    raw_digest = str(build.get("overlay_manifest_sha256", ""))
+    for prior_overlay in state.rglob("source_candidate_overlay.json"):
+        if digest(prior_overlay) == raw_digest and overlay_semantic_digest(prior_overlay) == desired_overlay_semantics:
+            return build
+    return None
 
 
 def matching_package(path: Path, build: dict[str, Any], overlay_digest: str,
@@ -69,8 +93,23 @@ def matching_package(path: Path, build: dict[str, Any], overlay_digest: str,
             package.get("host_tiling_arch") != platform.machine()):
         return False
     vendor_root = Path(str(package.get("custom_opp_vendor_root", "")))
+    runtime_opp_root = Path(str(package.get("runtime_opp_root", "")))
     source_package = Path(str(package.get("source_package", "")))
-    if not vendor_root.is_dir() or not source_package.is_file():
+    layout = package.get("runtime_opp_layout")
+    if (not vendor_root.is_dir() or not source_package.is_file() or not runtime_opp_root.is_dir() or
+            not isinstance(layout, dict)):
+        return False
+    builtin = runtime_opp_root / "built-in"
+    priority = runtime_opp_root / "vendors" / "config.ini"
+    try:
+        builtin_target = builtin.resolve(strict=True)
+        expected_builtin = installed_op_impl.parent.resolve(strict=True)
+    except OSError:
+        return False
+    if (builtin_target != expected_builtin or not priority.is_file() or
+            priority.read_text(encoding="utf-8").strip() != "load_priority={}".format(package.get("vendor")) or
+            Path(str(layout.get("built_in_symlink", ""))) != builtin or
+            Path(str(layout.get("vendor_priority_file", ""))) != priority):
         return False
     if digest(source_package) != package.get("source_package_sha256"):
         return False
@@ -116,7 +155,9 @@ def main() -> int:
         raise RuntimeError("overlay manifest is missing: {}".format(args.overlay_manifest))
     if not args.installed_op_impl.is_dir():
         raise RuntimeError("installed OPP root is missing: {}".format(args.installed_op_impl))
-    overlay_digest = digest(args.overlay_manifest)
+    desired_overlay_semantics = overlay_semantic_digest(args.overlay_manifest)
+    if desired_overlay_semantics is None:
+        raise RuntimeError("overlay manifest is not valid JSON: {}".format(args.overlay_manifest))
     # The prior clean route used ``_host``.  Keep the second name to make the
     # check forward-compatible, while its manifest validation remains exact.
     patterns = (
@@ -125,19 +166,24 @@ def main() -> int:
     )
     candidates = sorted({path for pattern in patterns for path in args.state_parent.glob(pattern)},
                         key=lambda item: str(item))
+    reusable_build: Path | None = None
     for build_manifest in candidates:
-        build = matching_build(build_manifest, overlay_digest)
+        build = matching_build(build_manifest, desired_overlay_semantics)
         if build is None:
             continue
+        reusable_build = build_manifest
         try:
             prior_state = build_manifest.parents[2]
         except IndexError:
             continue
         package_manifest = prior_state / "custom_opp" / args.label / "source_candidate_package.json"
-        if matching_package(package_manifest, build, overlay_digest, args.installed_op_impl):
+        if matching_package(package_manifest, build, str(build.get("overlay_manifest_sha256")), args.installed_op_impl):
             print(json.dumps({"status": "reused", "build_manifest": str(build_manifest),
                               "custom_opp_manifest": str(package_manifest)}, sort_keys=True))
             return 0
+    if reusable_build is not None:
+        print(json.dumps({"status": "repackage", "build_manifest": str(reusable_build)}, sort_keys=True))
+        return 0
     print(json.dumps({"status": "absent"}, sort_keys=True))
     return 0
 

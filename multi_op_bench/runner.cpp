@@ -332,7 +332,11 @@ public:
     explicit GatherElementsV2CustomApi(const std::string &path)
     {
         Stage("source_custom_api_load_begin");
-        handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        // The official custom-op invocation links cust_opapi as a process
+        // dependency.  Match that lifetime/visibility when this runner loads
+        // it dynamically: CANN may retain package callbacks beyond the API
+        // call which constructed the executor.
+        handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
         if (handle_ == nullptr) {
             const char *message = dlerror();
             throw std::runtime_error("dlopen GatherElementsV2 custom API failed: " +
@@ -346,10 +350,7 @@ public:
     GatherElementsV2CustomApi(const GatherElementsV2CustomApi &) = delete;
     GatherElementsV2CustomApi &operator=(const GatherElementsV2CustomApi &) = delete;
 
-    ~GatherElementsV2CustomApi()
-    {
-        if (handle_ != nullptr) dlclose(handle_);
-    }
+    ~GatherElementsV2CustomApi() = default;
 
     aclnnStatus Get(const aclTensor *x, const aclTensor *index, int64_t dim, const aclTensor *out,
                     uint64_t *workspace, aclOpExecutor **executor) const
@@ -701,16 +702,11 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
     Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape), outputTensor(output, dtype, indexShape);
     const auto execute = [&](const auto &getWorkspace, const auto &launch) {
         if (args.Has("source-tiling-only")) {
-            Measurement result;
-            Executor executor;
-            Stage("source_tiling_get_workspace_begin");
-            CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr),
-                       "GatherElements source tiling GetWorkspaceSize");
-            if (executor.ptr == nullptr) {
-                throw std::runtime_error("GatherElements source tiling returned null executor");
-            }
-            Stage("source_tiling_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
-            return result;
+            // A source audit counts only when the exact source package also
+            // performs one real device launch.  This is the normal ACLNN
+            // executor lifecycle: the launch consumes its executor; no
+            // standalone destroy is attempted on a custom-op executor.
+            return Measure(stream, 0, 0, output, getWorkspace, launch);
         }
         Measurement result = Measure(stream, warmup, samples, output, getWorkspace, launch);
         const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});

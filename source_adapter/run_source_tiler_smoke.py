@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise one source host tiler before the campaign builds the rest.
+"""Launch one source GatherElementsV2 kernel before the campaign.
 
-The smoke path creates an ACLNN executor only: it does not allocate a
-workspace or launch a device kernel.  It proves that the isolated custom OPP
-was selected and that its observational source-tiler audit was emitted.  This
-prevents a loader/argument error from consuming the time needed to build all
-eleven host tilers.
+The smoke uses the normal ACLNN executor lifecycle (GetWorkspaceSize, launch,
+stream synchronization).  It therefore proves that the isolated source
+OpProto, host tiler and source kernel were all selected before collection.
 """
 
 from __future__ import annotations
@@ -29,6 +27,12 @@ def campaign_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def last_runner_stage(output: str) -> str | None:
+    """Return the final runner stage without hiding a native-process crash."""
+    stages = [line for line in output.splitlines() if line.startswith("MULTIOP_NPU_STAGE ")]
+    return stages[-1] if stages else None
 
 
 def main() -> int:
@@ -62,6 +66,10 @@ def main() -> int:
         "workload_id": workload["workload_id"], "worker_return_code": rc,
         "worker_status": result.get("status"), "worker_wall_ms": wall,
         "failure": None if passed else (reason if not observed else module.compact_failure(output)),
+        # ``reason`` can be a secondary consequence of a native crash.  Keep
+        # the last real runner transition on the same terminal/log record so
+        # an operator does not need to recover a discarded subprocess trace.
+        "last_runner_stage": None if passed else last_runner_stage(output),
     }
     print("SOURCE_TILER_EARLY_SMOKE " + json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
     return 0 if passed else 2

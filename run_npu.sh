@@ -81,10 +81,10 @@ SOURCE_ID="$({
     readlink -f "${CANN_ROOT}"
 } | sha256sum | cut -c1-20)"
 
-STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v2/${SOURCE_ID}"
+STATE="${ROOT}/.benchmark_state/gather_elements_native_dynamic_v3/${SOURCE_ID}"
 OVERLAY_PARENT="${STATE}/overlays"
 RUNNER_BUILD="${STATE}/runner_build"
-RESULTS="${ROOT}/results/gather_elements_native_dynamic_v2/${SOURCE_ID}"
+RESULTS="${ROOT}/results/gather_elements_native_dynamic_v3/${SOURCE_ID}"
 LOGS="${RESULTS}/logs"
 mkdir -p "${OVERLAY_PARENT}" "${RUNNER_BUILD}" "${LOGS}"
 

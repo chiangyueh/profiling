@@ -26,7 +26,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_native_dynamic_measurement_v2"
+SCHEMA = "gather_elements_native_dynamic_measurement_v3"
 # The campaign is intentionally append-only so an interrupted physical-NPU
 # run can resume without losing its completed groups.  A single log is kept
 # below this limit; the next numeric log is opened before an oversized write.
@@ -215,10 +215,10 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
         raise RuntimeError("missing native GatherElements overlay manifest: {}".format(path))
     item: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     required = ("schema", "operator", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
-                "installed_source", "installed_source_sha256", "installed_opp_root", "custom_opp_root", "vendor", "vendor_root",
+                "installed_source", "installed_source_sha256", "installed_opp_root", "custom_opp_root", "vendor", "vendor_impl_directory", "vendor_root",
                 "source_file", "source_file_sha256", "instrumentation", "hardware_envelope_heuristic",
                 "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
-    if any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v2":
+    if any(key not in item for key in required) or item["schema"] != "gather_elements_native_dynamic_overlay_v3":
         raise RuntimeError("invalid native CANN GatherElements source-overlay manifest: {}".format(path))
     source_file = Path(str(item["source_file"]))
     if not source_file.is_file() or digest_file(source_file) != str(item["source_file_sha256"]):
@@ -238,9 +238,11 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
     vendor_root = Path(str(item["vendor_root"]))
     custom_root = Path(str(item["custom_opp_root"]))
     installed_root = Path(str(item["installed_opp_root"]))
-    source_parent = vendor_root / "op_impl" / "ai_core" / "tbe" / "impl" / "dynamic"
+    expected_impl = str(item["vendor"]) + "_impl"
+    source_parent = vendor_root / "op_impl" / "ai_core" / "tbe" / str(item["vendor_impl_directory"]) / "dynamic"
     if (not custom_root.is_dir() or not installed_root.is_dir() or not vendor_root.is_dir() or
-            vendor_root != custom_root / "vendors" / str(item["vendor"]) or not source_parent.is_dir()):
+            vendor_root != custom_root / "vendors" / str(item["vendor"]) or
+            str(item["vendor_impl_directory"]) != expected_impl or not source_parent.is_dir()):
         raise RuntimeError("native GatherElements private custom-OPP layout is incomplete")
     if item["strategy_algorithm_changes"] is not False or item["kernel_algorithm_changes"] is not False:
         raise RuntimeError("native GatherElements overlay is not source-preserving")

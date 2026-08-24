@@ -16,8 +16,10 @@ The collector uses the CANN 8.1 `GatherElements` dynamic Python source from
 the same installation that provides `aclnnGather`. Before execution it makes
 a private vendor overlay under `.benchmark_state/`:
 
-- only a patched copy of `impl/dynamic/gather_elements.py` and its one config
-  record live in the private vendor directory;
+- only a patched copy of `<vendor>_impl/dynamic/gather_elements.py` and its
+  one config record live in the private vendor directory;
+- that source is placed in CANN's required `<vendor>_impl` directory, exactly
+  as the installed CANN 8.1 custom-package template does;
 - each source worker keeps `ASCEND_OPP_PATH` pointed at the installed CANN
   OPP tree and sets `ASCEND_CUSTOM_OPP_PATH` to that one private vendor
   directory, which is CANN 8.1's documented custom-operator loader layout;
@@ -42,7 +44,7 @@ One admitted shape contributes exactly 20 output-validated device-event
 latency records. The 5,000-record target therefore needs 250 admitted
 shapes. The catalog contains 404 source-supported deterministic legal
 GatherElements shapes. Logs are append-only JSONL below
-`results/gather_elements_native_dynamic_v2/<contract>/logs/`; each numbered
+`results/gather_elements_native_dynamic_v3/<contract>/logs/`; each numbered
 data log is capped at 50 MiB. The collector reads no CCE data, historic
 latency/tiling records, RuntimeKb, callbacks, or cost model.
 

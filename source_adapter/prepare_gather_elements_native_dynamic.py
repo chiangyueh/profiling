@@ -134,11 +134,14 @@ def expected(output: Path, cann: Path, source: Path, config: Path) -> dict[str, 
     # source is considered.
     root = output / "custom_opp"
     vendor_root = root / "vendors" / VENDOR
-    source_target = vendor_root / "op_impl" / "ai_core" / "tbe" / "impl" / "dynamic" / "gather_elements.py"
+    # CANN's custom-package template installs Python implementations under
+    # ``<vendor>_impl`` (not the built-in ``impl`` directory).  The loader
+    # uses that name together with the vendor-specific config record.
+    impl_dir = VENDOR + "_impl"
+    source_target = vendor_root / "op_impl" / "ai_core" / "tbe" / impl_dir / "dynamic" / "gather_elements.py"
     return {
-        # v2 distinguishes the documented ASCEND_CUSTOM_OPP_PATH vendor
-        # layout from the older, invalid synthetic ASCEND_OPP_PATH overlay.
-        "schema": "gather_elements_native_dynamic_overlay_v2",
+        # v3 also follows the template's required <vendor>_impl layout.
+        "schema": "gather_elements_native_dynamic_overlay_v3",
         "operator": "GatherElements",
         "runtime_op": "gather_elements",
         "source_kind": "installed_cann81_native_dynamic_source",
@@ -151,6 +154,7 @@ def expected(output: Path, cann: Path, source: Path, config: Path) -> dict[str, 
         "installed_opp_root": str(cann / "opp"),
         "custom_opp_root": str(root),
         "vendor": VENDOR,
+        "vendor_impl_directory": impl_dir,
         "vendor_root": str(vendor_root),
         "source_file": str(source_target),
         "instrumentation": {
@@ -176,7 +180,7 @@ def validate_existing(output: Path, planned: dict[str, Any], original: str) -> d
         raise RuntimeError("incomplete private native GatherElements overlay exists")
     item = json.loads(manifest_path.read_text(encoding="utf-8"))
     for key in ("schema", "operator", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
-                "installed_source_sha256", "installed_config_sha256", "installed_opp_root", "custom_opp_root", "vendor", "vendor_root",
+                "installed_source_sha256", "installed_config_sha256", "installed_opp_root", "custom_opp_root", "vendor", "vendor_impl_directory", "vendor_root",
                 "source_file", "instrumentation", "hardware_envelope_heuristic", "strategy_algorithm_changes",
                 "kernel_algorithm_changes", "formal_data_gate"):
         if item.get(key) != planned.get(key):
@@ -216,7 +220,7 @@ def prepare(cann: Path, output_parent: Path) -> dict[str, Any]:
     # The dynamic compiler imports CANN's normal ``impl.util`` helpers.  This
     # private link is read-only and leaves only the selected dynamic source in
     # the overlay itself.
-    impl = vendor_root / "op_impl" / "ai_core" / "tbe" / "impl"
+    impl = vendor_root / "op_impl" / "ai_core" / "tbe" / str(planned["vendor_impl_directory"])
     os.symlink(tbe / "impl" / "util", impl / "util", target_is_directory=True)
     shutil.copy2(tbe / "impl" / "__init__.py", impl / "__init__.py")
     dynamic = impl / "dynamic"
@@ -232,7 +236,7 @@ def prepare(cann: Path, output_parent: Path) -> dict[str, Any]:
     config_target.parent.mkdir(parents=True)
     config_target.write_text(json.dumps({"GatherElements": config_data["GatherElements"]}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     planned["source_file_sha256"] = digest(target)
-    planned["private_links"] = {"impl_util": str(impl / "util")}
+    planned["private_links"] = {"vendor_impl_util": str(impl / "util")}
     (output / "native_dynamic_overlay.json").write_text(json.dumps(planned, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return planned
 

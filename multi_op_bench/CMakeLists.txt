@@ -24,7 +24,7 @@ set(CANN_DEVLIB "${CANN_PLATFORM}/devlib")
 add_executable(multi_op_npu_runner runner.cpp)
 target_include_directories(multi_op_npu_runner PRIVATE "${CANN_INCLUDE}")
 target_link_directories(multi_op_npu_runner PRIVATE "${CANN_LIB}")
-target_link_libraries(multi_op_npu_runner PRIVATE ascendcl nnopbase opapi dl pthread)
+target_link_libraries(multi_op_npu_runner PRIVATE ascendcl nnopbase opapi pthread)
 target_link_options(
     multi_op_npu_runner PRIVATE
     "-Wl,-rpath-link,${CANN_LIB}"

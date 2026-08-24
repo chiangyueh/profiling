@@ -1,96 +1,50 @@
-# Non-MatMul source-tiling collector
+# GatherElements native dynamic-source collector
 
-This is a data-collection path for ranking legal tilings of four non-MatMul
-operators on Ascend910B3:
-
-- FlashAttentionScoreGrad — all eight original CANN 8.1 registered strategies.
-- FusedInferAttentionScore — its original decode/prefill dispatcher.
-- GatherElementsV2 — extracted CANN 8.3 source in a clearly labelled CANN 8.1
-  build compatibility layer.
-- ScatterElementsV2 — its original CANN 8.1 last-axis tiler.
-
-MatMul is deliberately excluded. Transpose and GatherV2 remain excluded because
-there is no matching 910B source route; they are not relabelled as supported.
-
-## Collection contract
-
-For every semantic shape, the controller first invokes the complete finite set
-of original source contexts: every retained source strategy/dispatcher and AIV
-core budget 1..20. A candidate is the raw tiling emitted by that source, not a
-manually constructed set of tile fields.
-
-If and only if the complete original set yields fewer than 20 distinct raw
-identities, the controller revisits selected original contexts using only the
-operator-declared source-visible capacity envelope:
-
-- FASG: L2 scheduling capacity;
-- FIAS, GatherElements, ScatterElements: UB capacity.
-
-The only heuristic values are divisors 2, 4, and 8. They lower the resource
-visible to the original tiler before it calculates its own fields, so a plan
-cannot demand more capacity than hardware provides. No output tiling field,
-tiling key, block dimension, or workspace is edited after source generation.
-
-A shape is admitted only when at least 20 distinct candidates execute, exactly
-match an installed-operator output reference, and complete device-event
-measurement. A failed candidate is recorded as rejected and does not count;
-it does not erase the other legal candidates. The global formal-record ceiling
-is 20,000, partitioned 6,000 / 6,000 / 4,000 / 4,000 across FASG, FIAS,
-GatherElements and ScatterElements.
-
-The collector reads neither CCE data, historic latency/tiling records,
-RuntimeKb, callbacks, nor a cost model. Full reference tensors live only in a
-temporary directory; the durable output is compact JSONL.
-
-## Sources and compatibility limits
-
-The source pins are in `non_matmul_source_lock.json`.
-
-- FASG/FIAS use public `cann-ops-adv` 8.1 RC1 source and the pinned public
-  `cann-ops` 8.1 build harness.
-- ScatterElements uses pinned public `cann-ops` 8.1 source.
-- Public 8.1 source does not provide the needed GatherElements route. Its
-  extracted source reports CANN 8.3 RC2. The compatibility preparer copies it
-  into a pinned 8.1 build parent and changes only the Ascend910B registration
-  scope, CMake target wiring, two missing 8.1-compatible logging/arithmetic
-  headers, and observational audit/resource inputs. It is not claimed to be
-  native 8.1; package build and exact real-NPU output equality are both hard
-  gates.
-
-The advanced source tree has original op-host sources but no top-level CMake
-project. Its detached overlay uses the pinned public 8.1 build harness,
-selects only the requested op-host directories, and copies one unchanged,
-hash-attested public packaging helper (`gen_ops_filter.sh`). This is build
-plumbing only; it does not alter a tiler or a kernel.
-
-No build or package is installed into the toolkit. Each source overlay builds
-only its host tiler into an isolated custom OPP root under ignored state. The
-root copies the exact installed dynamic device source/configuration for that
-operator, so CANN compiles only the actually launched tiling key; it does not
-eagerly precompile the release matrix of keys.
-
-For FASG, the eight isolated overlays have different host tiling registrations.
-Each root carries its own source-built host tiler and the same exact installed
-dynamic device source. It neither shares a tiler nor modifies device code.
-
-## Run
-
-The normal entry point is one command. It uses physical device 1 by default
-and maps it to worker logical device 0.
+The active NPU entry point collects **GatherElements only** on Ascend910B3:
 
 ```bash
-./run_npu.sh --mode full -d 1
+profiling/run_npu.sh --mode full -d 2
 ```
 
-The pinned, uncompiled source snapshots are shipped under
-`source_adapter/vendor_source/`. `full` expands them only into this checkout's
-ignored `.source_cache/`, then builds serially on the NPU host. It makes no
-network request and never reads `/home/CCE_EXTRACT`. The command does not
-impose a host-side timeout or kill a
-worker. Results are written below
-`results/non_matmul_source_candidate_v5/<contract>/logs/` as append-only
-numbered JSONL logs (`1.log`, `2.log`, ...). Each log is capped at 50 MiB.
-Every formal latency point is one `formal_latency_candidate` record; every
-candidate rejection has its own `candidate_rejected` record; and each
-semantic shape ends with one resumable `workload` summary record. Generated
-sources/builds remain below ignored `.benchmark_state/`.
+It does not build, load, or otherwise use a CANN 8.3 `GatherElementsV2`
+custom operator. That compatibility route was removed because a CANN 8.3
+host-tiler ABI cannot safely run inside the installed CANN 8.1 runtime.
+
+## Execution route
+
+The collector uses the CANN 8.1 `GatherElements` dynamic Python source from
+the same installation that provides `aclnnGather`. Before execution it makes
+a private OPP overlay under `.benchmark_state/`:
+
+- `built-in` is a read-only symlink to the installed OPP tree;
+- only a patched copy of `impl/dynamic/gather_elements.py` and its one config
+  record live in the private vendor directory;
+- `ASCEND_OPP_PATH` is set only in each isolated worker process;
+- the installed CANN tree, global environment, device state, and processes
+  are never modified.
+
+The source copy emits an audit only after its original `BuildCCE` returns. A
+candidate therefore counts only when the source was selected, the normal
+`aclnnGather` call launched on the NPU, and the output exactly matched the
+same call under the unmodified installed OPP path.
+
+## Candidate and data contract
+
+Each semantic shape starts with the finite native-source core budgets 1..20.
+If fewer than twenty source contexts complete, selected successful contexts
+are additionally evaluated with native-source visible-UB divisors 2, 4, and
+8. These are bounded inputs to the original source's branch selection and
+compile-info publication; no generated flow-table field, tiling key, block
+dimension, workspace, or output is edited or replayed.
+
+One admitted shape contributes exactly 20 output-validated device-event
+latency records. The 5,000-record target therefore needs 250 admitted
+shapes. The catalog contains 404 source-supported deterministic legal
+GatherElements shapes. Logs are append-only JSONL below
+`results/gather_elements_native_dynamic_v1/<contract>/logs/`; each numbered
+data log is capped at 50 MiB. The collector reads no CCE data, historic
+latency/tiling records, RuntimeKb, callbacks, or cost model.
+
+The automatic preflight is one real normal-core source launch and stream
+synchronization. It is not a host timeout and it does not kill or reset an
+NPU.

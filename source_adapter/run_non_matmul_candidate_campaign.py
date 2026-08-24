@@ -245,7 +245,7 @@ def validate_custom_manifest(path: Path) -> dict[str, Any]:
     vendor_root = Path(str(item["custom_opp_vendor_root"]))
     custom_root = Path(str(item["custom_opp_root"]))
     if (not vendor_root.is_dir() or vendor_root.name != str(item["vendor"]) or
-            custom_root != vendor_root.parent.parent or not (custom_root / "vendors").is_dir()):
+            custom_root != vendor_root or not (custom_root / "op_impl").is_dir()):
         raise RuntimeError("complete GatherElementsV2 custom OPP vendor root is missing: {}".format(vendor_root))
     if not Path(str(item["kernel_payload_root"])).is_dir():
         raise RuntimeError("complete GatherElementsV2 source kernel payload is absent")
@@ -329,11 +329,11 @@ def context_matches(observation: dict[str, Any] | None, candidate: dict[str, Any
 
 def source_environment(base: dict[str, str], package: dict[str, Any], candidate: dict[str, Any], audit: Path) -> dict[str, str]:
     environment = dict(base)
-    # CANN's documented custom-op root contains ``vendors/<vendor>``. Keep
-    # ASCEND_OPP_PATH on the installed, read-only OPP tree for normal runtime
-    # assets; the generated GatherElementsV2 API is explicitly dlopen'd by
-    # the runner and its source tiler/kernel are selected through this private
-    # path.  No installed OPP file is copied, shadowed or modified.
+    # CANN 8.1's generated custom-op ``set_env.bash`` exports the vendor
+    # directory itself: ``.../packages/vendors/<vendor>``.  Keep
+    # ASCEND_OPP_PATH on the installed, read-only tree for normal runtime
+    # assets; this exact private vendor root selects the source custom
+    # OpProto/tiler/kernel for the generated GatherElementsV2 API.
     environment["ASCEND_CUSTOM_OPP_PATH"] = str(package["custom_opp_root"])
     api_library_directory = str(Path(str(package["custom_opapi"])).parent)
     previous_library = environment.get("LD_LIBRARY_PATH", "")

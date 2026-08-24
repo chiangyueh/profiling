@@ -64,7 +64,11 @@ def expected(overlay: Path, build: Path, cann: Path, vendor: str) -> dict[str, A
         "cann_root": str(cann.resolve()),
         "cann_version_file_sha256": digest(cann / "opp" / "version.info"),
         "vendor": vendor,
-        "custom_opp_root": str(vendor_root.parent.parent),
+        # CANN 8.1's generated ``set_env.bash`` exports this exact vendor
+        # directory, not the parent ``packages`` directory.  The runtime
+        # loader searches this colon-separated vendor-root path for the
+        # custom OpProto/tiler/kernel which belongs to the generated API.
+        "custom_opp_root": str(vendor_root),
         "custom_opp_vendor_root": str(vendor_root),
         "custom_opapi": str(opapi),
         "custom_tiling_library": str(tiler),

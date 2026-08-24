@@ -95,8 +95,10 @@ def main() -> int:
         require(private_config == op_config,
                 "private GatherElements config is not an exact installed-source declaration copy")
         private_source = source_file.read_text(encoding="utf-8")
-        require("GATHER_ELEMENTS_NATIVE_DYNAMIC_SOURCE_AUDIT_V1" in private_source,
-                "private GatherElements source lacks its dispatch audit marker")
+        require("GATHER_ELEMENTS_NATIVE_DYNAMIC_SOURCE_AUDIT_V1" in private_source and
+                '"event": "module_imported"' in private_source and
+                "_ge_emit_import_audit()" in private_source,
+                "private GatherElements source lacks its import-path audit marker")
         instrumentation = overlay.get("instrumentation")
         require(isinstance(instrumentation, dict) and
                 instrumentation.get("dispatch_environment") == "GATHER_ELEMENTS_SOURCE_DISPATCH" and

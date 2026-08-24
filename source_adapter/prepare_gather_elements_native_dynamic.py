@@ -76,6 +76,24 @@ def _ge_visible_ub_size():
     divisor = _ge_read_cap("GATHER_ELEMENTS_SOURCE_UB_DIVISOR", (1, 2, 4, 8), 1)
     return current // divisor
 
+def _ge_emit_import_audit():
+    # This executes before the source entrypoint. It distinguishes a private
+    # source never selected from one selected but failing in native BuildCCE.
+    target = _ge_os.environ.get("GATHER_ELEMENTS_TILING_AUDIT_PATH")
+    if not target:
+        return
+    row = {
+        "schema": "gather_elements_native_dynamic_source_observation_v1",
+        "event": "module_imported",
+        "source_file": _ge_os.path.realpath(__file__),
+        "pid": _ge_os.getpid(),
+        "dispatch": _ge_os.environ.get("GATHER_ELEMENTS_SOURCE_DISPATCH"),
+        "ascend_opp_path": _ge_os.environ.get("ASCEND_OPP_PATH"),
+        "ascend_custom_opp_path": _ge_os.environ.get("ASCEND_CUSTOM_OPP_PATH"),
+    }
+    with open(target, "a", encoding="utf-8") as handle:
+        handle.write(_ge_json.dumps(row, sort_keys=True, separators=(",", ":")) + "\\n")
+
 def _ge_emit_audit(obj, x_dict, indices_dict, dim):
     target = _ge_os.environ.get("GATHER_ELEMENTS_TILING_AUDIT_PATH")
     if not target:
@@ -93,10 +111,12 @@ def _ge_emit_audit(obj, x_dict, indices_dict, dim):
     encoded = _ge_json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     row = dict(identity)
     row.update({"schema": "gather_elements_native_dynamic_source_observation_v1",
+                "event": "tiling_generated",
                 "status": 0,
                 "source_variant_sha256": _ge_hashlib.sha256(encoded).hexdigest()})
     with open(target, "a", encoding="utf-8") as handle:
         handle.write(_ge_json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+_ge_emit_import_audit()
 '''
     if source.count(imports) != 1:
         raise RuntimeError("cannot locate native GatherElements import anchor")

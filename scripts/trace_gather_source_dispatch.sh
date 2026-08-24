@@ -11,9 +11,10 @@ usage() {
 Usage: profiling/scripts/trace_gather_source_dispatch.sh -d PHYSICAL_NPU_ID
 
 Runs exactly one real-NPU GatherElements call through
-aclopCompileAndExecute("GatherElements") and traces the files that process
-opens. It does not run the 5,000-record campaign, use timeout, kill a
-process, reset an NPU, or modify installed CANN files.
+aclopCompileAndExecute("GatherElements"). The private source itself records
+the actual Python module path when CANN imports it. It does not run the
+5,000-record campaign, use timeout, kill a process, reset an NPU, or modify
+installed CANN files.
 
 It creates one private probe directory under profiling/.benchmark_state and
 prints the decisive paths and source-audit result to the terminal. Paste the
@@ -32,10 +33,6 @@ done
 [[ -n "${PHYSICAL_DEVICE}" ]] || { echo "fatal: pass the physical NPU explicitly, for example: -d 2" >&2; exit 2; }
 [[ "${PHYSICAL_DEVICE}" =~ ^[0-9]+$ ]] || { echo "fatal: device must be a non-negative integer" >&2; exit 2; }
 [[ -e "/dev/davinci${PHYSICAL_DEVICE}" ]] || { echo "fatal: physical NPU device node is absent: /dev/davinci${PHYSICAL_DEVICE}" >&2; exit 1; }
-command -v strace >/dev/null 2>&1 || {
-    echo "fatal: strace is required for this path-evidence probe and is not installed; no NPU call was made." >&2
-    exit 1
-}
 
 CANN_ROOT="${CANN_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
 [[ -d "${CANN_ROOT}" && -f "${CANN_ROOT}/opp/version.info" ]] || {
@@ -73,7 +70,6 @@ PROBE_DIR="${ROOT}/.benchmark_state/gather_elements_runtime_dispatch_probe/${PRO
 OVERLAY_PARENT="${PROBE_DIR}/overlays"
 RUNNER_BUILD="${PROBE_DIR}/runner_build"
 AUDIT_PATH="${PROBE_DIR}/source_audit.jsonl"
-TRACE_PATH="${PROBE_DIR}/open_exec.trace"
 RUNNER_LOG="${PROBE_DIR}/runner.log"
 mkdir -p "${OVERLAY_PARENT}" "${RUNNER_BUILD}"
 
@@ -153,10 +149,11 @@ printf 'command='
 printf ' %q' "${COMMAND[@]}"
 printf '\n'
 
-# This is tracing only. There is deliberately no timeout wrapper or forced
-# kill. The runner return code is retained for diagnosis after a failed call.
+# There is deliberately no timeout wrapper or forced kill. The private source
+# writes a module_imported record with its actual __file__ before BuildCCE.
+# The runner return code is retained for diagnosis after a failed call.
 set +e
-strace -f -qq -s 512 -yy -e trace=open,openat,execve -o "${TRACE_PATH}" "${COMMAND[@]}" 2>&1 | tee "${RUNNER_LOG}"
+"${COMMAND[@]}" 2>&1 | tee "${RUNNER_LOG}"
 RUNNER_RC=${PIPESTATUS[0]}
 set -e
 echo "===== one generic-dispatch execution ended rc=${RUNNER_RC} ====="
@@ -168,16 +165,12 @@ else
     echo "MISSING: ${AUDIT_PATH}"
 fi
 
-echo "===== traced paths relevant to generic OPP dispatch (up to 160 lines) ====="
-rg -n -F -e "${PRIVATE_SOURCE}" -e "${NATIVE_SOURCE}" -e "${VENDOR_ROOT}" \
-    -e "aic-ascend910b-ops-info.json" -e "libacl_op_compiler.so" "${TRACE_PATH}" | tail -160 || true
-
-python3 - "${RUNNER_LOG}" "${AUDIT_PATH}" "${TRACE_PATH}" "${PRIVATE_SOURCE}" "${NATIVE_SOURCE}" "${RUNNER_RC}" <<'PY'
+python3 - "${RUNNER_LOG}" "${AUDIT_PATH}" "${PRIVATE_SOURCE}" "${NATIVE_SOURCE}" "${RUNNER_RC}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-runner_log, audit_path, trace_path, private_source, installed_source, runner_rc = sys.argv[1:]
+runner_log, audit_path, private_source, installed_source, runner_rc = sys.argv[1:]
 result = None
 for line in Path(runner_log).read_text(encoding="utf-8", errors="replace").splitlines():
     if line.startswith("MULTIOP_NPU_RESULT "):
@@ -195,10 +188,13 @@ if path.is_file():
             continue
         if row.get("schema") == "gather_elements_native_dynamic_source_observation_v1":
             audit_rows.append(row)
-trace = Path(trace_path).read_text(encoding="utf-8", errors="replace")
-private_open_count = trace.count(private_source)
-installed_open_count = trace.count(installed_source)
+import_rows = [row for row in audit_rows if row.get("event") == "module_imported"]
+source_import_expected_path = any(
+    Path(str(row.get("source_file", ""))).resolve() == Path(private_source).resolve()
+    for row in import_rows
+)
 audit_matches = any(
+    row.get("event") == "tiling_generated" and
     row.get("aiv_core_cap") == 20 and row.get("ub_cap_divisor") == 1 and
     row.get("shape") == [64] and row.get("index_shape") == [17] and
     row.get("axis") == 0 and row.get("dtype") == "float16" and
@@ -209,6 +205,8 @@ runner_success = isinstance(result, dict) and result.get("status") == "success"
 generic_route = isinstance(result, dict) and result.get("backend") == "acl_op_compiler_custom_opp_real_npu"
 if int(runner_rc) == 0 and runner_success and generic_route and audit_matches:
     verdict = "source_selected_and_audited"
+elif source_import_expected_path:
+    verdict = "private_source_imported_but_dispatch_did_not_complete"
 elif int(runner_rc) == 0 and runner_success and generic_route:
     verdict = "generic_dispatch_completed_but_private_source_not_proven"
 else:
@@ -218,10 +216,12 @@ print("GATHER_ELEMENTS_RUNTIME_DISPATCH_PROBE " + json.dumps({
     "runner_return_code": int(runner_rc),
     "runner_result": result,
     "audit_row_count": len(audit_rows),
+    "source_import_row_count": len(import_rows),
+    "source_import_expected_private_path": source_import_expected_path,
     "audit_expected_context_present": audit_matches,
-    "trace_private_source_path_occurrences": private_open_count,
-    "trace_installed_source_path_occurrences": installed_open_count,
-    "evidence_rule": "only an expected private-source audit row proves selection; the generic backend alone proves only the requested API route",
+    "private_source_expected_path": private_source,
+    "installed_source_path": installed_source,
+    "evidence_rule": "module_imported records the actual Python source path; only a matching tiling_generated row proves a completed source build",
 }, sort_keys=True))
 PY
 

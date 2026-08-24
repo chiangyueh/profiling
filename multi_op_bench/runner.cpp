@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <dlfcn.h>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -314,6 +315,70 @@ public:
     }
     void MarkConsumedByOneShotLaunch() { ptr = nullptr; }
     aclOpExecutor *ptr = nullptr;
+};
+
+// The extracted GatherElementsV2 source is built as a complete private CANN
+// custom operator.  Its generated CANN-8.1 API must be loaded explicitly:
+// calling the installed aclnnGather API would select the installed
+// GatherElements operator and would never invoke the extracted source tiler.
+// This loader is intentionally GatherElementsV2-specific, so ordinary
+// installed ACLNN calls remain untouched.
+class GatherElementsV2CustomApi {
+public:
+    using GetWorkspaceSize = aclnnStatus (*)(
+        const aclTensor *, const aclTensor *, int64_t, const aclTensor *, uint64_t *, aclOpExecutor **);
+    using Launch = aclnnStatus (*)(void *, uint64_t, aclOpExecutor *, aclrtStream);
+
+    explicit GatherElementsV2CustomApi(const std::string &path)
+    {
+        Stage("source_custom_api_load_begin");
+        handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (handle_ == nullptr) {
+            const char *message = dlerror();
+            throw std::runtime_error("dlopen GatherElementsV2 custom API failed: " +
+                                     std::string(message == nullptr ? "unknown" : message));
+        }
+        getWorkspace_ = Load<GetWorkspaceSize>("aclnnGatherElementsV2GetWorkspaceSize");
+        launch_ = Load<Launch>("aclnnGatherElementsV2");
+        Stage("source_custom_api_load_done", path);
+    }
+
+    GatherElementsV2CustomApi(const GatherElementsV2CustomApi &) = delete;
+    GatherElementsV2CustomApi &operator=(const GatherElementsV2CustomApi &) = delete;
+
+    ~GatherElementsV2CustomApi()
+    {
+        if (handle_ != nullptr) dlclose(handle_);
+    }
+
+    aclnnStatus Get(const aclTensor *x, const aclTensor *index, int64_t dim, const aclTensor *out,
+                    uint64_t *workspace, aclOpExecutor **executor) const
+    {
+        return getWorkspace_(x, index, dim, out, workspace, executor);
+    }
+
+    aclnnStatus Run(void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream stream) const
+    {
+        return launch_(workspace, bytes, executor, stream);
+    }
+
+private:
+    template <class Function>
+    Function Load(const char *symbol)
+    {
+        dlerror();
+        void *value = dlsym(handle_, symbol);
+        const char *message = dlerror();
+        if (message != nullptr || value == nullptr) {
+            throw std::runtime_error("GatherElementsV2 custom API symbol missing: " + std::string(symbol) +
+                                     (message == nullptr ? "" : ", " + std::string(message)));
+        }
+        return reinterpret_cast<Function>(value);
+    }
+
+    void *handle_ = nullptr;
+    GetWorkspaceSize getWorkspace_ = nullptr;
+    Launch launch_ = nullptr;
 };
 
 struct Measurement {
@@ -634,31 +699,54 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
     FillGeneralPattern(input, dtype, Elements(shape), 0);
     FillIndices(index, indexDtype, Elements(indexShape), shape[axis]);
     Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape), outputTensor(output, dtype, indexShape);
-    const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
-        return aclnnGatherGetWorkspaceSize(inputTensor.Get(), axis, indexTensor.Get(), outputTensor.Get(), workspace, executor);
-    };
-    const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
-        return aclnnGather(workspace, bytes, executor, launchStream);
-    };
-    if (args.Has("source-tiling-only")) {
-        Measurement result;
-        Executor executor;
-        Stage("source_tiling_get_workspace_begin");
-        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "GatherElements source tiling GetWorkspaceSize");
-        if (executor.ptr == nullptr) throw std::runtime_error("GatherElements source tiling returned null executor");
-        Stage("source_tiling_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
+    const auto execute = [&](const auto &getWorkspace, const auto &launch) {
+        if (args.Has("source-tiling-only")) {
+            Measurement result;
+            Executor executor;
+            Stage("source_tiling_get_workspace_begin");
+            CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr),
+                       "GatherElements source tiling GetWorkspaceSize");
+            if (executor.ptr == nullptr) {
+                throw std::runtime_error("GatherElements source tiling returned null executor");
+            }
+            Stage("source_tiling_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
+            return result;
+        }
+        Measurement result = Measure(stream, warmup, samples, output, getWorkspace, launch);
+        const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
+        result.outputBytes = snapshot.size();
+        result.outputDigest = Fnv1a64(snapshot);
+        if (args.Has("write-reference")) WriteReference(args.Get("write-reference"), snapshot);
+        if (args.Has("compare-reference")) {
+            result.outputReferenceChecked = true;
+            result.outputReferenceEqual = snapshot == ReadReference(args.Get("compare-reference"));
+        }
         return result;
+    };
+
+    if (args.Has("gather-source-opapi")) {
+        // Generated from the source's GatherElementsV2 OpDef.  Its input order
+        // is x, index, dim, out; it is deliberately different from the
+        // installed aclnnGather signature (x, dim, index, out).
+        GatherElementsV2CustomApi sourceApi(args.Get("gather-source-opapi"));
+        return execute(
+            [&](uint64_t *workspace, aclOpExecutor **executor) {
+                return sourceApi.Get(inputTensor.Get(), indexTensor.Get(), axis, outputTensor.Get(), workspace, executor);
+            },
+            [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+                return sourceApi.Run(workspace, bytes, executor, launchStream);
+            });
     }
-    Measurement result = Measure(stream, warmup, samples, output, getWorkspace, launch);
-    const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
-    result.outputBytes = snapshot.size();
-    result.outputDigest = Fnv1a64(snapshot);
-    if (args.Has("write-reference")) WriteReference(args.Get("write-reference"), snapshot);
-    if (args.Has("compare-reference")) {
-        result.outputReferenceChecked = true;
-        result.outputReferenceEqual = snapshot == ReadReference(args.Get("compare-reference"));
-    }
-    return result;
+
+    // This branch is exclusively the installed operator reference. It is
+    // never used for a source candidate.
+    return execute(
+        [&](uint64_t *workspace, aclOpExecutor **executor) {
+            return aclnnGatherGetWorkspaceSize(inputTensor.Get(), axis, indexTensor.Get(), outputTensor.Get(), workspace, executor);
+        },
+        [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
+            return aclnnGather(workspace, bytes, executor, launchStream);
+        });
 }
 
 Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int warmup, int samples)

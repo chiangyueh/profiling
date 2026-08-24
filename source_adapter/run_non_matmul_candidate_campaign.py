@@ -29,7 +29,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_source_candidate_measurement_v1"
+SCHEMA = "gather_elements_source_candidate_measurement_v2"
 # The campaign is intentionally append-only so an interrupted physical-NPU
 # run can resume without losing its completed groups.  A single log is kept
 # below this limit; the next numeric log is opened before an oversized write.
@@ -81,7 +81,8 @@ def parse_worker_result(output: str) -> dict[str, Any] | None:
     return None
 
 
-def worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int, samples: int) -> list[str]:
+def worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int, samples: int,
+                source_package: dict[str, Any] | None = None) -> list[str]:
     values = [str(runner), "--workload-id", workload["workload_id"], "--op", workload["op"],
               "--device", str(device), "--warmup", str(warmup), "--samples", str(samples),
               "--expected-soc", "Ascend910B3"]
@@ -97,6 +98,10 @@ def worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int
         item = workload[field]
         rendered = ",".join(map(str, item)) if isinstance(item, list) else str(item)
         values += ["--" + field.replace("_", "-"), rendered]
+    if source_package is not None:
+        if workload["op"] != "gather_elements" or source_package.get("runtime_op") != "gather_elements":
+            raise RuntimeError("a source package may be passed only to its GatherElementsV2 worker")
+        values += ["--gather-source-opapi", str(source_package["custom_opapi"])]
     return values
 
 
@@ -213,58 +218,45 @@ def validate_custom_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError("missing custom OPP manifest: {}".format(path))
     item: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-    required = ("schema", "operator", "cmake_op_name", "source_family", "official_commit", "vendor",
-                "custom_opp_root", "runtime_opp_root", "runtime_opp_layout", "custom_opp_vendor_root",
-                "source_package_sha256", "source_tiling_observation_enabled",
-                "source_compile_info_core_budget_enumeration", "source_hardware_envelope_heuristic_enumeration",
-                "hardware_envelope_heuristic", "instrumentation", "overlay_manifest_sha256")
-    if any(key not in item for key in required) or item["schema"] != "source_candidate_custom_opp_v1":
-        raise RuntimeError("invalid source-host-tiler manifest: {}".format(path))
-    source_package = Path(str(item.get("source_package", "")))
-    if not source_package.is_file() or digest_file(source_package) != str(item["source_package_sha256"]):
-        raise RuntimeError("custom OPP dynamic-device asset attestation is missing or mismatched")
+    required = ("schema", "operator", "runtime_op", "source_overlay_sha256", "source_version", "source_revision",
+                "vendor", "custom_opp_root", "custom_opp_vendor_root", "custom_opapi", "custom_opapi_sha256",
+                "custom_tiling_library", "custom_tiling_library_sha256", "custom_proto_library",
+                "custom_proto_library_sha256", "custom_api", "kernel_payload_root", "instrumentation",
+                "hardware_envelope_heuristic", "strategy_algorithm_changes", "kernel_algorithm_changes",
+                "generated_api_required", "formal_data_gate")
+    if any(key not in item for key in required) or item["schema"] != "gather_elements_complete_custom_package_v1":
+        raise RuntimeError("invalid complete GatherElementsV2 custom-package manifest: {}".format(path))
+    for name in ("custom_opapi", "custom_tiling_library", "custom_proto_library"):
+        asset = Path(str(item[name]))
+        if not asset.is_file() or digest_file(asset) != str(item[name + "_sha256"]):
+            raise RuntimeError("complete GatherElementsV2 package asset is missing or mismatched: {}".format(asset))
     runtime_op = OPERATOR_RUNTIME_NAMES.get(str(item["operator"]))
     if runtime_op is None:
         raise RuntimeError("custom package is not an allowed non-MatMul operator: {}".format(item["operator"]))
-    source_name = str(item["source_family"])
-    if source_name not in LOCK["sources"] or item["official_commit"] != LOCK["sources"][source_name].get("commit"):
-        raise RuntimeError("custom package official source provenance is mismatched")
     inst = item["instrumentation"]
     if (not isinstance(inst, dict) or inst.get("enabled") is not True or inst.get("mutates_tiling_context") is not False or
-            not inst.get("audit_schema") or not inst.get("audit_environment") or not inst.get("source_budget_environment") or
-            item["source_tiling_observation_enabled"] is not True or item["source_compile_info_core_budget_enumeration"] is not True):
+            not inst.get("audit_schema") or not inst.get("audit_environment") or not inst.get("source_budget_environment")):
         raise RuntimeError("custom package does not attest an observational original-source candidate axis")
     envelope = item["hardware_envelope_heuristic"]
-    if (not isinstance(envelope, dict) or envelope.get("enabled") != bool(item["source_hardware_envelope_heuristic_enumeration"]) or
-            (envelope.get("enabled") and (not envelope.get("environment") or not envelope.get("audit_field") or
-                                           tuple(envelope.get("divisors", ())) != (2, 4, 8) or int(envelope.get("max_anchors", 0)) < 1))):
+    if (not isinstance(envelope, dict) or envelope.get("enabled") is not True or not envelope.get("environment") or
+            not envelope.get("audit_field") or tuple(envelope.get("divisors", ())) != (2, 4, 8) or
+            int(envelope.get("max_anchors", 0)) < 1):
         raise RuntimeError("custom package hardware-envelope provenance is invalid")
-    custom_root = Path(str(item["custom_opp_root"]))
-    runtime_opp_root = Path(str(item["runtime_opp_root"]))
     vendor_root = Path(str(item["custom_opp_vendor_root"]))
-    if vendor_root != custom_root / "vendors" / str(item["vendor"]) or not vendor_root.is_dir():
-        raise RuntimeError("isolated custom OPP vendor root is missing: {}".format(custom_root))
-    layout = item["runtime_opp_layout"]
-    if not isinstance(layout, dict) or runtime_opp_root != custom_root:
-        raise RuntimeError("custom OPP runtime root layout is invalid")
-    builtin = runtime_opp_root / "built-in"
-    priority = runtime_opp_root / "vendors" / "config.ini"
-    if (not builtin.is_dir() or not priority.is_file() or
-            priority.read_text(encoding="utf-8").strip() != "load_priority={}".format(item["vendor"]) or
-            Path(str(layout.get("built_in_symlink", ""))) != builtin or
-            Path(str(layout.get("vendor_priority_file", ""))) != priority):
-        raise RuntimeError("custom OPP does not provide a CANN-8.1 ASCEND_OPP_PATH layout")
-    delivery = item.get("device_kernel_delivery")
-    if (not isinstance(delivery, dict) or delivery.get("mode") != "installed_dynamic_source_passthrough" or
-            delivery.get("precompiled_all_tiling_keys") is not False or not delivery.get("formal_data_gate")):
-        raise RuntimeError("custom OPP must use installed dynamic device source without bulk key precompilation")
+    custom_root = Path(str(item["custom_opp_root"]))
+    if (not vendor_root.is_dir() or vendor_root.name != str(item["vendor"]) or
+            custom_root != vendor_root.parent.parent or not (custom_root / "vendors").is_dir()):
+        raise RuntimeError("complete GatherElementsV2 custom OPP vendor root is missing: {}".format(vendor_root))
+    if not Path(str(item["kernel_payload_root"])).is_dir():
+        raise RuntimeError("complete GatherElementsV2 source kernel payload is absent")
+    api = item["custom_api"]
+    if (not isinstance(api, dict) or api.get("get_workspace_symbol") != "aclnnGatherElementsV2GetWorkspaceSize" or
+            api.get("launch_symbol") != "aclnnGatherElementsV2" or api.get("input_order") != ["x", "index", "dim", "out"]):
+        raise RuntimeError("generated GatherElementsV2 custom API contract is invalid")
+    if (item["strategy_algorithm_changes"] is not False or item["kernel_algorithm_changes"] is not False or
+            item["generated_api_required"] is not True):
+        raise RuntimeError("complete GatherElementsV2 package is not source-preserving")
     item["runtime_op"] = runtime_op
-    compatibility = item.get("compatibility_port")
-    if compatibility is not None and (not isinstance(compatibility, dict) or
-                                      compatibility.get("tiling_algorithm_changes") is not False or
-                                      compatibility.get("kernel_algorithm_changes") is not False or
-                                      not compatibility.get("formal_data_gate")):
-        raise RuntimeError("custom package compatibility port exceeds source-preserving limits")
     item["manifest_path"] = str(path)
     return item
 
@@ -316,7 +308,8 @@ def candidate_descriptor(package: dict[str, Any], cap: int, l2_divisor: int = 1)
         "id": package.get("strategy_class") or "original_semantic_dispatch",
         "priority": package.get("strategy_priority"), "aiv_core_cap": int(cap),
         "hardware_envelope_resource": envelope.get("resource"), "hardware_envelope_divisor": int(l2_divisor),
-        "source_package_sha256": package["source_package_sha256"], "official_commit": package["official_commit"],
+        "source_custom_opapi_sha256": package["custom_opapi_sha256"],
+        "source_revision": package["source_revision"],
     }
 
 
@@ -336,12 +329,15 @@ def context_matches(observation: dict[str, Any] | None, candidate: dict[str, Any
 
 def source_environment(base: dict[str, str], package: dict[str, Any], candidate: dict[str, Any], audit: Path) -> dict[str, str]:
     environment = dict(base)
-    # CANN 8.1 discovers custom host tilers through ASCEND_OPP_PATH plus
-    # vendors/config.ini.  The private root retains the installed built-in
-    # tree as a read-only symlink and selects exactly this vendor payload.
-    # ASCEND_CUSTOM_OPP_PATH is not used by the CANN 8.1 loader here.
-    environment.pop("ASCEND_CUSTOM_OPP_PATH", None)
-    environment["ASCEND_OPP_PATH"] = str(package["runtime_opp_root"])
+    # CANN's documented custom-op root contains ``vendors/<vendor>``. Keep
+    # ASCEND_OPP_PATH on the installed, read-only OPP tree for normal runtime
+    # assets; the generated GatherElementsV2 API is explicitly dlopen'd by
+    # the runner and its source tiler/kernel are selected through this private
+    # path.  No installed OPP file is copied, shadowed or modified.
+    environment["ASCEND_CUSTOM_OPP_PATH"] = str(package["custom_opp_root"])
+    api_library_directory = str(Path(str(package["custom_opapi"])).parent)
+    previous_library = environment.get("LD_LIBRARY_PATH", "")
+    environment["LD_LIBRARY_PATH"] = api_library_directory + (":" + previous_library if previous_library else "")
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
     environment[str(package["instrumentation"]["source_budget_environment"])] = str(candidate["aiv_core_cap"])
     envelope = package["hardware_envelope_heuristic"]
@@ -393,9 +389,9 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                 continue
             for package in packages[op]:
                 candidate = candidate_descriptor(package, caps[0])
-                audit = root / (op + "_" + stable_hash({"package": package["overlay_manifest_sha256"], "candidate": candidate}) + ".jsonl")
+                audit = root / (op + "_" + stable_hash({"package": package["source_overlay_sha256"], "candidate": candidate}) + ".jsonl")
                 result, output, wall, rc = run_worker(
-                    worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
+                    worker_args(args.runner, workload, args.device, 0, 0, package) + ["--source-tiling-only", "1"],
                     source_environment(base_env, package, candidate, audit))
                 observed, reason = source_audit_emitted(audit, package, candidate)
                 source_ok = observed and rc == 0 and result.get("status") == "success"
@@ -418,6 +414,19 @@ def plan_packages(manifests: list[dict[str, Any]], selected_operator: str) -> di
             grouped[selected_operator][0]["hardware_envelope_heuristic"]["enabled"] is not True):
         raise RuntimeError("GatherElements requires one original semantic dispatcher plus its declared conditional UB envelope")
     return grouped
+
+
+def source_supported_workload(workload: dict[str, Any]) -> bool:
+    """Filter before NPU work using the pinned GatherElementsV2 OpDef.
+
+    Its source declaration accepts x in fp16/bf16/fp32/int32 and index in
+    int32.  Sending CANN-8.1's installed-only int64 index variants through
+    the source package would manufacture predictable rejects and cannot
+    contribute to the 5,000 real source-kernel measurements.
+    """
+    return (workload.get("op") == "gather_elements" and
+            workload.get("dtype") in ("fp16", "bf16", "fp32", "int32") and
+            workload.get("index_dtype") == "int32")
 
 
 def select_heuristic_anchors(discovered: dict[str, dict[str, Any]], maximum: int) -> list[dict[str, Any]]:
@@ -458,7 +467,7 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
         if kind == "original": original_contexts += 1
         else: heuristic_contexts += 1
         audit = temp / ("discover_" + stable_hash({"g": group_key, "c": candidate}) + ".jsonl")
-        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
+        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0, package) + ["--source-tiling-only", "1"],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
         if reason == "original-source overlay emitted no audit observation":
@@ -510,7 +519,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
     for identity, item in discovered.items():
         candidate, package = item["candidate"], item["package"]
         audit = temp / ("verify_" + stable_hash({"g": group_key, "c": candidate}) + ".jsonl")
-        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0) + ["--compare-reference", str(reference_path)],
+        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, 0, 0, package) + ["--compare-reference", str(reference_path)],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
         equal = bool(result.get("output_reference_checked")) and bool(result.get("output_reference_equal"))
@@ -536,7 +545,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
             break
         candidate, package = item["candidate"], item["package"]
         audit = temp / ("measure_" + stable_hash({"g": group_key, "c": candidate}) + ".jsonl")
-        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, args.warmup, args.samples) + ["--compare-reference", str(reference_path)],
+        result, output, wall, rc = run_worker(worker_args(args.runner, workload, args.device, args.warmup, args.samples, package) + ["--compare-reference", str(reference_path)],
                                               source_environment(base_env, package, candidate, audit))
         observed, reason = successful_observation(audit, package)
         equal = bool(result.get("output_reference_checked")) and bool(result.get("output_reference_equal"))
@@ -605,7 +614,7 @@ def main() -> int:
             if envelope["enabled"]:
                 base_env.pop(str(envelope["environment"]), None)
     runner_hash = digest_file(args.runner)
-    planned = {args.operator: [row for row in workloads if row["op"] == args.operator]}
+    planned = {args.operator: [row for row in workloads if source_supported_workload(row)]}
     if len(planned[args.operator]) < args.record_target // minimum:
         raise RuntimeError("GatherElements catalog does not contain enough reviewed shapes for the requested record target")
     begin = {
@@ -642,7 +651,7 @@ def main() -> int:
         if admitted_by_op.get(op, 0) >= budgets[op]:
             break
         group_key = stable_hash({"workload": workload, "runner_sha256": runner_hash,
-                                 "package_manifests": [p["overlay_manifest_sha256"] for p in packages[op]],
+                                 "package_manifests": [p["source_overlay_sha256"] for p in packages[op]],
                                  "source_aiv_caps": caps, "minimum": minimum, "schema": SCHEMA})
         if group_key in completed:
             continue

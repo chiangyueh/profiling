@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# This entry point intentionally runs one operator only: GatherElementsV2.
+# It builds an isolated CANN-8.1 custom package below this checkout, then
+# calls its generated API. The installed aclnnGather route is used only as
+# the output reference. No installed CANN/OPP file is copied or modified.
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE=""
 PHYSICAL_DEVICE="${PHYSICAL_NPU_ID:-1}"
@@ -11,21 +16,18 @@ RECORD_TARGET=5000
 
 usage() {
     cat <<'USAGE'
-Usage: ./run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
+Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-Runs only the GatherElements original-source tiling collection.
+Runs only the complete GatherElementsV2 source package campaign.
 
-Formal output target: 5,000 real-NPU latency records. Every admitted shape
-has at least 20 distinct source-rule tilings which each complete an installed
-reference equality check and a device-event measurement. The source search
-uses the original GatherElements dispatcher across bounded AIV caps 1..20;
-only if that yields fewer than 20 raw identities does its declared UB-capacity
-envelope (2/4/8) run. No MatMul, attention, ScatterElements, CCE table,
-historical tiling, or historical latency is used.
-
-All generated source, build, OPP-view, and logs stay below this profiling
-checkout. The installed CANN built-in OPP is linked read-only; it is never
-copied into or modified by this command.
+- 5,000 formal real-NPU device-event latency records (250 groups x 20).
+- A group counts only if 20 distinct source-generated raw tilings each launch
+  the source kernel and exactly match an installed aclnnGather reference.
+- The source dispatcher is tried at AIV caps 1..20; only then may its declared
+  UB-capacity envelope 2/4/8 be tried. No raw tiling field is edited or
+  replayed.
+- All source cache, build state and JSONL logs remain under this checkout.
+  Each numeric log is capped at 50 MiB. The installed CANN tree is read-only.
 USAGE
 }
 
@@ -82,27 +84,24 @@ export ASCEND_OPP_PATH="${CANN_ROOT}/opp"
 export ASCEND_RT_VISIBLE_DEVICES="${PHYSICAL_DEVICE}"
 export TILINGKEY_PAR_COMPILE=1
 export OMP_NUM_THREADS=1
+# Do not inherit a different user's custom operator tree into either the
+# installed reference path or this private package.  Source workers add this
+# run's exact private root explicitly.
 unset ASCEND_CUSTOM_OPP_PATH ASCENDC_CPU_DEBUG
 
-PRIVATE_SOURCE_CACHE="${ROOT}/.source_cache/repo_bundles_v1"
+PRIVATE_SOURCE_CACHE="${ROOT}/.source_cache/gather_elements_complete_v2"
 mkdir -p "${PRIVATE_SOURCE_CACHE}"
-
-prepare_repo_source() {
-    local kind="$1"
-    local destination="$2"
-    if [[ -f "${destination}/.source_bundle_attestation.json" ]]; then return; fi
-    if [[ -e "${destination}" ]]; then
-        echo "fatal: private repository-source cache is incomplete: ${destination}" >&2
+GATHER_SOURCE="${PRIVATE_SOURCE_CACHE}/gather_elements_v2"
+if [[ ! -f "${GATHER_SOURCE}/.source_bundle_attestation.json" ]]; then
+    if [[ -e "${GATHER_SOURCE}" ]]; then
+        echo "fatal: incomplete private GatherElements source cache exists: ${GATHER_SOURCE}" >&2
         exit 2
     fi
-    echo "SOURCE_PREPARE {\"source\":\"${kind}\",\"destination\":\"${destination}\",\"scope\":\"this_profiling_checkout_only\",\"network_calls\":0}"
-    python3 "${ROOT}/source_adapter/materialize_repo_source_bundle.py" --kind "${kind}" --destination "${destination}"
-}
-
-OPS_SOURCE="${PRIVATE_SOURCE_CACHE}/cann_ops"
-GATHER_EXTRACT_SOURCE="${PRIVATE_SOURCE_CACHE}/gather_elements_v2"
-prepare_repo_source cann_ops "${OPS_SOURCE}"
-prepare_repo_source gather_elements_v2 "${GATHER_EXTRACT_SOURCE}"
+    echo "SOURCE_PREPARE_BEGIN source=gather_elements_v2 scope=profiling_checkout_only network_calls=0"
+    python3 "${ROOT}/source_adapter/materialize_repo_source_bundle.py" \
+        --kind gather_elements_v2 --destination "${GATHER_SOURCE}"
+    echo "SOURCE_PREPARE_END source=gather_elements_v2"
+fi
 
 SOURCE_ID="$({
     sha256sum \
@@ -111,133 +110,83 @@ SOURCE_ID="$({
         "${ROOT}/multi_op_bench/runner.cpp" \
         "${ROOT}/source_adapter/non_matmul_source_lock.json" \
         "${ROOT}/source_adapter/non_matmul_candidate_catalog.py" \
-        "${ROOT}/source_adapter/prepare_gather_elements_compat_overlay.py" \
-        "${ROOT}/source_adapter/build_source_candidate_overlay.py" \
+        "${ROOT}/source_adapter/prepare_gather_elements_custom_package.py" \
+        "${ROOT}/source_adapter/build_gather_elements_complete_custom_package.py" \
         "${ROOT}/source_adapter/materialize_repo_source_bundle.py" \
-        "${ROOT}/source_adapter/materialize_installed_dynamic_opp.py" \
-        "${ROOT}/source_adapter/find_reusable_source_tiler_cache.py" \
-        "${ROOT}/source_adapter/run_source_tiler_smoke.py" \
         "${ROOT}/source_adapter/reset_incomplete_private_state.py" \
+        "${ROOT}/source_adapter/run_source_tiler_smoke.py" \
         "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py"
-    sha256sum "${ROOT}/source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz" \
-        "${ROOT}/source_adapter/vendor_source/gather_elements_v2_source.zip"
+    sha256sum "${ROOT}/source_adapter/vendor_source/gather_elements_v2_source.zip"
+    sha256sum "${GATHER_SOURCE}/op_host/gather_elements_v2_tiling.cpp"
     readlink -f "${CANN_ROOT}"
-    sha256sum "${GATHER_EXTRACT_SOURCE}/op_host/gather_elements_v2_tiling.cpp"
+    sha256sum "${CANN_ROOT}/opp/version.info"
 } | sha256sum | cut -c1-20)"
-STATE="${ROOT}/.benchmark_state/gather_elements_source_candidate_v1/${SOURCE_ID}"
+
+STATE="${ROOT}/.benchmark_state/gather_elements_complete_custom_v2/${SOURCE_ID}"
 OVERLAY_PARENT="${STATE}/overlays"
-PACKAGE_BUILD_PARENT="${STATE}/package_builds"
-CUSTOM_OPP_PARENT="${STATE}/custom_opp"
+PACKAGE_PARENT="${STATE}/package_builds"
 RUNNER_BUILD="${STATE}/runner_build"
-RESULTS="${ROOT}/results/gather_elements_source_candidate_v1/${SOURCE_ID}"
+RESULTS="${ROOT}/results/gather_elements_complete_custom_v2/${SOURCE_ID}"
 LOGS="${RESULTS}/logs"
-mkdir -p "${OVERLAY_PARENT}" "${PACKAGE_BUILD_PARENT}" "${CUSTOM_OPP_PARENT}" "${RUNNER_BUILD}" "${LOGS}"
+mkdir -p "${OVERLAY_PARENT}" "${PACKAGE_PARENT}" "${RUNNER_BUILD}" "${LOGS}"
 
-echo "GatherElements original-source tiling campaign"
+echo "GatherElementsV2 complete original-source tiling campaign"
 echo "  target:             physical NPU ${PHYSICAL_DEVICE} -> worker logical NPU 0"
-echo "  operator:           GatherElements only"
 echo "  formal target:      ${RECORD_TARGET} output-validated device-event latency records"
-echo "  group gate:         at least 20 distinct successful source-rule tilings per shape"
-echo "  source search:      original GatherElements dispatcher × AIV caps 1..20; declared UB 2/4/8 only below 20 identities"
-echo "  build:              one GatherElements host tiler only; no FASG/FIAS/Scatter build or dynamic OPP materialization"
-echo "  installed CANN:     private read-only built-in OPP link; no CANN files are written"
-echo "  output:             ${LOGS}/1.log, 2.log, ... (JSONL records; each file <= 50 MiB)"
+echo "  group gate:         at least 20 distinct successful source tilings per shape"
+echo "  source execution:   generated aclnnGatherElementsV2 API + source host tiler + source kernel"
+echo "  reference only:     installed aclnnGather"
+echo "  search:             original dispatcher × AIV 1..20; declared UB 2/4/8 only below 20 identities"
+echo "  installed CANN:     read-only; all new files are below ${ROOT}"
+echo "  output:             ${LOGS}/1.log, 2.log, ... (JSONL, each <= 50 MiB)"
 
-GATHER_OVERLAY="${OVERLAY_PARENT}/gather/gather_elements_v2_compat_source/source_candidate_overlay.json"
-if [[ ! -f "${GATHER_OVERLAY}" ]]; then
-    mkdir -p "${OVERLAY_PARENT}/gather"
-    echo "SOURCE_OVERLAY_PREPARE_BEGIN operator=gather_elements"
-    if ! python3 "${ROOT}/source_adapter/prepare_gather_elements_compat_overlay.py" \
-        --parent-source-root "${OPS_SOURCE}" --extracted-source-root "${GATHER_EXTRACT_SOURCE}" \
-        --output-parent "${OVERLAY_PARENT}/gather" >"${STATE}/gather_overlay_prepare.log" 2>&1; then
-        tail -100 "${STATE}/gather_overlay_prepare.log" >&2 || true
-        exit 1
+OVERLAY="${OVERLAY_PARENT}/gather_elements_v2_complete_custom"
+OVERLAY_MANIFEST="${OVERLAY}/source_candidate_overlay.json"
+if [[ ! -f "${OVERLAY_MANIFEST}" ]]; then
+    if [[ -e "${OVERLAY}" ]]; then
+        echo "fatal: incomplete private GatherElements custom overlay exists: ${OVERLAY}" >&2
+        exit 2
     fi
-    echo "SOURCE_OVERLAY_PREPARE_END operator=gather_elements"
+    echo "SOURCE_COMPLETE_OVERLAY_PREPARE_BEGIN operator=gather_elements_v2"
+    python3 "${ROOT}/source_adapter/prepare_gather_elements_custom_package.py" \
+        --extracted-source-root "${GATHER_SOURCE}" \
+        --template-root "${CANN_ROOT}/tools/op_project_templates/ascendc/customize" \
+        --output-parent "${OVERLAY_PARENT}" >"${STATE}/overlay_prepare.log" 2>&1
+    echo "SOURCE_COMPLETE_OVERLAY_PREPARE_END operator=gather_elements_v2"
 fi
 
-LABEL="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1], encoding="utf-8")); print((m["cmake_op_name"] + "__" + (m.get("strategy_class") or "dispatch")).lower())' "${GATHER_OVERLAY}")"
-BUILD_DIR="${PACKAGE_BUILD_PARENT}/${LABEL}_host_tiler"
-BUILD_MANIFEST="${BUILD_DIR}/source_candidate_build.json"
-BUILD_LOG="${STATE}/${LABEL}_source_host_tiler_build.log"
-CUSTOM_ROOT="${CUSTOM_OPP_PARENT}/${LABEL}"
-CUSTOM_MANIFEST="${CUSTOM_ROOT}/source_candidate_package.json"
+PACKAGE_BUILD="${PACKAGE_PARENT}/gather_elements_v2_complete_custom"
+PACKAGE_MANIFEST="${PACKAGE_BUILD}/complete_custom_package.json"
+if [[ ! -f "${PACKAGE_MANIFEST}" && -e "${PACKAGE_BUILD}" ]]; then
+    python3 "${ROOT}/source_adapter/reset_incomplete_private_state.py" \
+        --parent "${PACKAGE_PARENT}" --target "${PACKAGE_BUILD}" \
+        --required-absent "${PACKAGE_MANIFEST}" --kind complete_custom_package
+fi
+if [[ ! -f "${PACKAGE_MANIFEST}" ]]; then
+    echo "SOURCE_COMPLETE_PACKAGE_BUILD_BEGIN operator=gather_elements_v2"
+    if ! python3 "${ROOT}/source_adapter/build_gather_elements_complete_custom_package.py" \
+        --overlay "${OVERLAY}" --build-dir "${PACKAGE_BUILD}" --cann-root "${CANN_ROOT}" \
+        --vendor gather_elements_v2_source --jobs "${BUILD_JOBS}" >"${STATE}/complete_package_build.log" 2>&1; then
+        tail -120 "${STATE}/complete_package_build.log" >&2 || true
+        exit 1
+    fi
+    echo "SOURCE_COMPLETE_PACKAGE_BUILD_END operator=gather_elements_v2"
+else
+    echo "SOURCE_COMPLETE_PACKAGE_CACHE_REUSE operator=gather_elements_v2"
+fi
 
 cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
     -DCMAKE_BUILD_TYPE=Release -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}"
 cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel "${BUILD_JOBS}"
 
-# A matching host-tiler artifact from the old private state remains usable.
-# Its former OPP package is deliberately not reused: this release creates the
-# correct private ASCEND_OPP_PATH view around the artifact without rebuilding.
-if [[ -f "${CUSTOM_MANIFEST}" ]]; then
-    REUSE_STATUS="local"
-else
-    REUSE_JSON="$(python3 "${ROOT}/source_adapter/find_reusable_source_tiler_cache.py" \
-        --state-parent "${ROOT}/.benchmark_state/non_matmul_source_candidate_v5" \
-        --overlay-manifest "${GATHER_OVERLAY}" --label "${LABEL}" \
-        --installed-op-impl "${CANN_ROOT}/opp/built-in/op_impl")"
-    REUSE_STATUS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<<"${REUSE_JSON}")"
-fi
-if [[ "${REUSE_STATUS}" == "reused" || "${REUSE_STATUS}" == "repackage" ]]; then
-    BUILD_MANIFEST="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["build_manifest"])' <<<"${REUSE_JSON}")"
-fi
-
-if [[ "${REUSE_STATUS}" == "local" ]]; then
-    echo "SOURCE_HOST_TILER_CACHE_REUSE source=${LABEL} package=current_private_state"
-elif [[ "${REUSE_STATUS}" == "reused" ]]; then
-    CUSTOM_MANIFEST="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["custom_opp_manifest"])' <<<"${REUSE_JSON}")"
-    echo "SOURCE_HOST_TILER_CACHE_REUSE source=${LABEL} package=complete"
-elif [[ "${REUSE_STATUS}" == "repackage" ]]; then
-    echo "SOURCE_HOST_TILER_CACHE_REUSE source=${LABEL} package=rematerialize_only"
-elif [[ "${REUSE_STATUS}" == "absent" ]]; then
-    if [[ ! -f "${BUILD_MANIFEST}" ]]; then
-        if [[ -e "${BUILD_DIR}" ]]; then
-            python3 "${ROOT}/source_adapter/reset_incomplete_private_state.py" \
-                --parent "${PACKAGE_BUILD_PARENT}" --target "${BUILD_DIR}" \
-                --required-absent "${BUILD_MANIFEST}" --kind host_tiler_build
-        fi
-        echo "SOURCE_HOST_TILER_BUILD_BEGIN source=${LABEL}"
-        if ! python3 "${ROOT}/source_adapter/build_source_candidate_overlay.py" \
-            --overlay "$(dirname "${GATHER_OVERLAY}")" --build-dir "${BUILD_DIR}" \
-            --cann-root "${CANN_ROOT}" --target optiling --jobs "${BUILD_JOBS}" >"${BUILD_LOG}" 2>&1; then
-            tail -100 "${BUILD_LOG}" >&2 || true
-            exit 1
-        fi
-        echo "SOURCE_HOST_TILER_BUILD_END source=${LABEL}"
-    else
-        echo "SOURCE_HOST_TILER_CACHE_REUSE source=${LABEL} package=local_build"
-    fi
-else
-    echo "fatal: invalid GatherElements host-tiler cache status: ${REUSE_STATUS}" >&2
-    exit 1
-fi
-
-if [[ "${REUSE_STATUS}" != "reused" && "${REUSE_STATUS}" != "local" ]]; then
-    if [[ -e "${CUSTOM_ROOT}" ]]; then
-        python3 "${ROOT}/source_adapter/reset_incomplete_private_state.py" \
-            --parent "${CUSTOM_OPP_PARENT}" --target "${CUSTOM_ROOT}" \
-            --required-absent "${CUSTOM_MANIFEST}" --kind dynamic_opp_root
-    fi
-    mkdir -p "${CUSTOM_ROOT}"
-    echo "SOURCE_DYNAMIC_OPP_MATERIALIZE_BEGIN source=${LABEL}"
-    if ! python3 "${ROOT}/source_adapter/materialize_installed_dynamic_opp.py" \
-        --build-manifest "${BUILD_MANIFEST}" --installed-op-impl "${CANN_ROOT}/opp/built-in/op_impl" \
-        --destination "${CUSTOM_ROOT}" >"${STATE}/${LABEL}_dynamic_opp_materialize.log" 2>&1; then
-        tail -100 "${STATE}/${LABEL}_dynamic_opp_materialize.log" >&2 || true
-        exit 1
-    fi
-    echo "SOURCE_DYNAMIC_OPP_MATERIALIZE_END source=${LABEL}"
-fi
-
-# This executor-only smoke must emit the source audit before any semantic
-# shape or timed device launch begins. A failure exits here with zero formal
-# measurements instead of producing a large rejection log.
+# The only NPU smoke is the source custom API itself. It first creates a
+# source executor (which must emit the source audit), then the campaign makes
+# one source-kernel viability launch before any semantic shape discovery.
 SMOKE_LOG="${LOGS}/preflight_gather_elements.log"
 if ! python3 "${ROOT}/source_adapter/run_source_tiler_smoke.py" \
     --runner "${RUNNER_BUILD}/multi_op_npu_runner" --device 0 \
-    --custom-opp-manifest "${CUSTOM_MANIFEST}" --work-dir "${STATE}/smoke" >"${SMOKE_LOG}" 2>&1; then
-    tail -100 "${SMOKE_LOG}" >&2 || true
+    --custom-opp-manifest "${PACKAGE_MANIFEST}" --work-dir "${STATE}/smoke" >"${SMOKE_LOG}" 2>&1; then
+    tail -120 "${SMOKE_LOG}" >&2 || true
     exit 1
 fi
 grep '^SOURCE_TILER_EARLY_SMOKE ' "${SMOKE_LOG}"
@@ -245,4 +194,4 @@ grep '^SOURCE_TILER_EARLY_SMOKE ' "${SMOKE_LOG}"
 PYTHONPATH="${ROOT}/multi_op_bench" python3 "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
     --runner "${RUNNER_BUILD}/multi_op_npu_runner" --log-dir "${LOGS}" --device 0 \
     --warmup "${WARMUP}" --samples "${SAMPLES}" --operator gather_elements \
-    --record-target "${RECORD_TARGET}" --custom-opp-manifest "${CUSTOM_MANIFEST}"
+    --record-target "${RECORD_TARGET}" --custom-opp-manifest "${PACKAGE_MANIFEST}"

@@ -27,7 +27,8 @@ def main() -> int:
     parser.add_argument("--parent", required=True, type=Path)
     parser.add_argument("--target", required=True, type=Path)
     parser.add_argument("--required-absent", required=True, type=Path)
-    parser.add_argument("--kind", required=True, choices=("host_tiler_build", "dynamic_opp_root"))
+    parser.add_argument("--kind", required=True,
+                        choices=("host_tiler_build", "dynamic_opp_root", "complete_custom_package"))
     args = parser.parse_args()
 
     parent = existing_parent(args.parent)

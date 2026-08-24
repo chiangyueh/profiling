@@ -52,7 +52,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="source_tiler_smoke_", dir=args.work_dir) as temporary:
         audit = Path(temporary) / "audit.jsonl"
         result, output, wall, rc = module.run_worker(
-            module.worker_args(args.runner, workload, args.device, 0, 0) + ["--source-tiling-only", "1"],
+            module.worker_args(args.runner, workload, args.device, 0, 0, package) + ["--source-tiling-only", "1"],
             module.source_environment(dict(os.environ), package, candidate, audit),
         )
         observed, reason = module.source_audit_emitted(audit, package, candidate)

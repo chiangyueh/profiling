@@ -383,15 +383,22 @@ def index_multi_tiling_reserve(op: str, start_index: int) -> list[dict[str, Any]
         (5, (1, 8, 32, 128)),
         (5, (3, 15, 63, 129)),
     )
-    axis_extents = (17, 31, 63, 65, 127, 129, 257, 513)
+    # The V2 source OpDef has a documented int32-index route.  GatherElements
+    # needs 250 non-duplicated, source-supported shape groups to make its
+    # 5,000-record (20 per group) target attainable, so its reviewed axis
+    # lattice is expanded before execution rather than padding it with repeat
+    # measurements of the same shape.  Scatter keeps its original smaller
+    # lattice because it is not part of this single-operator campaign.
+    axis_extents = ((16, 17, 31, 32, 47, 63, 64, 65, 95, 96, 127, 128, 129, 191, 257, 513)
+                    if op == "gather_elements" else
+                    (17, 31, 63, 65, 127, 129, 257, 513))
     index_extents = (1, 3, 15, 17, 31, 63, 65, 127)
     modes = (("fp16", "int32"), ("bf16", "int64"), ("fp32", "int32"), ("int32", "int64"))
-    # GatherElements-only collection needs 250 admitted 20-tiling groups for
-    # its 5,000 formal latency records.  Keep a deterministic reserve beyond
-    # that target so source-rule or output-validation rejections do not leave
-    # the campaign without legal replacement geometries.  The 96-point
-    # reviewed lattice is not exhausted or randomized.
-    base_count = 80
+    # One full GatherElements walk visits all 12 x 16 semantic shapes exactly
+    # once; with its two source-supported int32-index dtype routes that yields
+    # 384 distinct eligible invocations before the explicit boundary cases.
+    # This is a finite reviewed shape lattice, not a tiling-field enumeration.
+    base_count = len(ranks) * len(axis_extents) if op == "gather_elements" else 80
     output: list[dict[str, Any]] = []
     # A fixed coprime walk over documented rank/axis/dtype boundaries.  All
     # non-axis index extents equal their input extent; the final index extent

@@ -45,6 +45,18 @@ struct GatherElementsPrivateApi {
     std::string path;
 };
 
+using ScatterElementsGetWorkspace = aclnnStatus (*)(const aclTensor *, int64_t, const aclTensor *,
+                                                     const aclTensor *, int64_t, aclTensor *,
+                                                     uint64_t *, aclOpExecutor **);
+using ScatterElementsLaunch = aclnnStatus (*)(void *, uint64_t, aclOpExecutor *, aclrtStream);
+
+struct ScatterElementsPrivateApi {
+    void *library = nullptr;
+    ScatterElementsGetWorkspace getWorkspace = nullptr;
+    ScatterElementsLaunch launch = nullptr;
+    std::string path;
+};
+
 void Stage(const std::string &stage, const std::string &detail = "")
 {
     std::cout << "MULTIOP_NPU_STAGE {\"workload_id\":\"" << JsonEscape(gWorkloadId)
@@ -97,6 +109,47 @@ const GatherElementsPrivateApi &LoadGatherElementsPrivateApi(const char *library
         throw std::runtime_error("private GatherElementsV2 launch symbol is absent");
     }
     Stage("private_opapi_launch_symbol_done");
+    api = loaded;
+    return *api;
+}
+
+const ScatterElementsPrivateApi &LoadScatterElementsPrivateApi(const char *libraryPath)
+{
+    // CANN's generated OpAPI keeps process-local executor state.  Match the
+    // official loader lifetime and let the isolated worker own the handle
+    // until process exit; unloading it after GetWorkspaceSize is unsafe.
+    static ScatterElementsPrivateApi *api = nullptr;
+    if (api != nullptr) {
+        if (api->path != libraryPath) {
+            throw std::runtime_error("private ScatterElementsV2 OpAPI path changed within one worker");
+        }
+        return *api;
+    }
+    Stage("private_scatter_opapi_load_begin", libraryPath);
+    auto *loaded = new ScatterElementsPrivateApi();
+    loaded->path = libraryPath;
+    loaded->library = dlopen(libraryPath, RTLD_LAZY | RTLD_LOCAL);
+    if (loaded->library == nullptr) {
+        const char *error = dlerror();
+        const std::string message = error == nullptr ? "unknown dlopen error" : error;
+        delete loaded;
+        throw std::runtime_error("cannot load private ScatterElementsV2 C++ OpAPI: " + message);
+    }
+    dlerror();
+    loaded->getWorkspace = reinterpret_cast<ScatterElementsGetWorkspace>(
+        dlsym(loaded->library, "aclnnScatterEleGetWorkspaceSize"));
+    const char *workspaceError = dlerror();
+    if (loaded->getWorkspace == nullptr || workspaceError != nullptr) {
+        throw std::runtime_error("private ScatterElementsV2 GetWorkspaceSize symbol is absent");
+    }
+    dlerror();
+    loaded->launch = reinterpret_cast<ScatterElementsLaunch>(
+        dlsym(loaded->library, "aclnnScatterEle"));
+    const char *launchError = dlerror();
+    if (loaded->launch == nullptr || launchError != nullptr) {
+        throw std::runtime_error("private ScatterElementsV2 launch symbol is absent");
+    }
+    Stage("private_scatter_opapi_load_done");
     api = loaded;
     return *api;
 }
@@ -812,23 +865,61 @@ Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int wa
     FillIndices(index, indexDtype, Elements(indexShape), shape[axis]);
     Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape);
     Tensor sourceTensor(source, dtype, indexShape), outputTensor(output, dtype, shape);
+    const char *dispatch = std::getenv("SCATTER_ELEMENTS_SOURCE_DISPATCH");
+    const bool auditRequested = std::getenv("SCATTER_ELEMENTS_TILING_AUDIT_PATH") != nullptr;
+    const bool usePrivateSource = dispatch != nullptr;
+    if (usePrivateSource && std::string(dispatch) != "cann81_native_aclnn") {
+        throw std::runtime_error("invalid SCATTER_ELEMENTS_SOURCE_DISPATCH");
+    }
+    if (auditRequested != usePrivateSource) {
+        throw std::runtime_error("ScatterElements source audit/dispatch environment mismatch");
+    }
+
+    ScatterElementsGetWorkspace privateGetWorkspace = nullptr;
+    ScatterElementsLaunch privateLaunch = nullptr;
+    if (usePrivateSource) {
+        const char *libraryPath = std::getenv("SCATTER_ELEMENTS_SOURCE_OPAPI_LIBRARY");
+        if (libraryPath == nullptr || *libraryPath == '\0') {
+            throw std::runtime_error("private ScatterElementsV2 C++ OpAPI path is absent");
+        }
+        const ScatterElementsPrivateApi &api = LoadScatterElementsPrivateApi(libraryPath);
+        privateGetWorkspace = api.getWorkspace;
+        privateLaunch = api.launch;
+        gBackend = "private_cann81_native_scatter_aclnn_real_npu";
+        if (args.Has("source-load-only")) {
+            Stage("private_scatter_opapi_load_probe_done");
+            return Measurement{};
+        }
+    }
+
     const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
+        if (usePrivateSource) {
+            return privateGetWorkspace(inputTensor.Get(), axis, indexTensor.Get(), sourceTensor.Get(), reduce,
+                                       outputTensor.Get(), workspace, executor);
+        }
         return aclnnScatterGetWorkspaceSize(inputTensor.Get(), axis, indexTensor.Get(), sourceTensor.Get(), reduce,
                                             outputTensor.Get(), workspace, executor);
     };
     const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
-        return aclnnScatter(workspace, bytes, executor, launchStream);
+        return usePrivateSource ? privateLaunch(workspace, bytes, executor, launchStream)
+                                : aclnnScatter(workspace, bytes, executor, launchStream);
     };
-    if (args.Has("source-tiling-only")) {
+    if (args.Has("source-executor-planning-only")) {
         Measurement result;
         Executor executor;
-        Stage("source_tiling_get_workspace_begin");
-        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "ScatterElements source tiling GetWorkspaceSize");
-        if (executor.ptr == nullptr) throw std::runtime_error("ScatterElements source tiling returned null executor");
-        Stage("source_tiling_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
+        Stage("private_scatter_executor_planning_begin");
+        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr),
+                   "private ScatterElementsV2 GetWorkspaceSize probe");
+        if (executor.ptr == nullptr) {
+            throw std::runtime_error("private ScatterElementsV2 GetWorkspaceSize returned null executor");
+        }
+        executor.ReleaseToIsolatedProcessExit();
+        Stage("private_scatter_executor_planning_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
         return result;
     }
-    Measurement result = Measure(stream, warmup, samples, output, getWorkspace, launch);
+    Measurement result = Measure(stream, args.Has("source-tiling-only") ? 0 : warmup,
+                                 args.Has("source-tiling-only") ? 0 : samples,
+                                 output, getWorkspace, launch);
     const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
     result.outputBytes = snapshot.size();
     result.outputDigest = Fnv1a64(snapshot);

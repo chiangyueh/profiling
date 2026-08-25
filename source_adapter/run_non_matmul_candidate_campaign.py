@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Collect output-validated private GatherElementsV2 source compile contexts.
+"""Collect output-validated official CANN-8.1 ScatterElementsV2 tilings.
 
 Every formal group evaluates the finite set of bounded inputs to the private
-CANN package's original GatherElementsV2 host tiler. The controller never
+CANN package's original ScatterElementsV2 host tiler. The controller never
 enumerates, edits, or replays opaque raw-tiling fields. A group is admitted
 only when twenty distinct source contexts launch, exactly match the installed
 reference, and complete device-event measurement.
@@ -27,17 +27,17 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
 LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SCHEMA = "gather_elements_v2_cann81_prebuilt_measurement_v10"
-SOURCE_BACKEND = "private_cann81_prebuilt_ascendc_aclnn_real_npu"
-SOURCE_OPERATOR_TYPE = "GatherElementsV2"
+SCHEMA = "scatter_elements_v2_cann81_native_measurement_v1"
+SOURCE_BACKEND = "private_cann81_native_scatter_aclnn_real_npu"
+SOURCE_OPERATOR_TYPE = "ScatterElementsV2"
 # The campaign is intentionally append-only so an interrupted physical-NPU
 # run can resume without losing its completed groups.  A single log is kept
 # below this limit; the next numeric log is opened before an oversized write.
 MAX_LOG_BYTES = 50 * 1024 * 1024
 # This executable campaign has one deliberate scope.  The generic compiler
 # must call the generated CANN 8.1 C++ ACLNN entry point and its precompiled
-# device kernel, not the installed Python GatherElements implementation.
-OPERATOR_RUNTIME_NAMES = {"GatherElementsV2": "gather_elements"}
+# device kernel, not an installed fallback implementation.
+OPERATOR_RUNTIME_NAMES = {"ScatterElementsV2": "scatter_elements"}
 RUNTIME_OPERATOR_NAMES = {value: key for key, value in OPERATOR_RUNTIME_NAMES.items()}
 
 
@@ -255,78 +255,76 @@ def read_progress(directory: Path) -> tuple[set[str], dict[str, int], int]:
 
 def validate_source_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        raise RuntimeError("missing private GatherElementsV2 package manifest: {}".format(path))
+        raise RuntimeError("missing private ScatterElementsV2 package manifest: {}".format(path))
     item: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-    required = ("schema", "operator", "source_operator_type", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
-                "project_root", "package_root", "source_file", "source_file_sha256", "op_api_library", "op_api_library_sha256",
+    required = ("schema", "operator", "runtime_op", "source_kind", "cann_root", "cann_version_file_sha256",
+                "project_root", "package_root", "source_file", "source_file_sha256", "official_tiling_source_sha256",
+                "op_api_library", "op_api_library_sha256",
                 "op_proto_library", "op_proto_library_sha256",
                 "op_tiling_library", "op_tiling_library_sha256", "ops_config", "ops_config_sha256",
-                "kernel_binary_root", "kernel_binary_info_config", "kernel_binary_info_config_sha256",
-                "kernel_operator_config", "kernel_operator_config_sha256", "precompiled_device_kernels",
+                "precompiled_device_kernels",
                 "runtime_python_compilation", "build_cann_version", "instrumentation",
                 "hardware_envelope_heuristic", "strategy_algorithm_changes", "kernel_algorithm_changes", "formal_data_gate")
     if (any(key not in item for key in required) or
-            item["schema"] != "gather_elements_v2_cann81_prebuilt_package_v2" or
-            item.get("source_operator_type") != SOURCE_OPERATOR_TYPE or
+            item["schema"] != "scatter_elements_v2_cann81_package_v1" or
             item.get("operator") != SOURCE_OPERATOR_TYPE or
-            item.get("runtime_op") != "gather_elements"):
-        raise RuntimeError("invalid private GatherElementsV2 CANN package manifest: {}".format(path))
+            item.get("runtime_op") != "scatter_elements"):
+        raise RuntimeError("invalid private ScatterElementsV2 CANN package manifest: {}".format(path))
     source_file = Path(str(item["source_file"]))
     if not source_file.is_file() or digest_file(source_file) != str(item["source_file_sha256"]):
-        raise RuntimeError("private GatherElementsV2 host tiler is missing or mismatched: {}".format(source_file))
+        raise RuntimeError("private ScatterElementsV2 host tiler is missing or mismatched: {}".format(source_file))
+    expected_official = LOCK["operators"]["scatter_elements_v2"]["pinned_files"]["op_host/scatter_elements_v2_tiling.cc"]
+    if item["official_tiling_source_sha256"] != expected_official:
+        raise RuntimeError("private ScatterElementsV2 package has the wrong official host-tiler origin")
     package_root = Path(str(item["package_root"]))
     project_root = Path(str(item["project_root"]))
     if not package_root.is_dir() or not project_root.is_dir():
-        raise RuntimeError("private GatherElementsV2 package/project root is absent")
+        raise RuntimeError("private ScatterElementsV2 package/project root is absent")
     for value_key, hash_key in (("op_api_library", "op_api_library_sha256"),
                                 ("op_proto_library", "op_proto_library_sha256"),
                                 ("op_tiling_library", "op_tiling_library_sha256"),
-                                ("ops_config", "ops_config_sha256"),
-                                ("kernel_binary_info_config", "kernel_binary_info_config_sha256"),
-                                ("kernel_operator_config", "kernel_operator_config_sha256")):
+                                ("ops_config", "ops_config_sha256")):
         artifact = Path(str(item[value_key]))
         if not artifact.is_file() or digest_file(artifact) != str(item[hash_key]) or package_root not in artifact.parents:
-            raise RuntimeError("private GatherElementsV2 package artifact is missing or mismatched: {}".format(artifact))
-    kernel_root = Path(str(item["kernel_binary_root"]))
+            raise RuntimeError("private ScatterElementsV2 package artifact is missing or mismatched: {}".format(artifact))
     kernels = item["precompiled_device_kernels"]
-    if (not kernel_root.is_dir() or package_root not in kernel_root.parents or not isinstance(kernels, list) or
-            len(kernels) != 4 or item["runtime_python_compilation"] is not False or
+    if (not isinstance(kernels, list) or len(kernels) < 1 or item["runtime_python_compilation"] is not False or
             item["build_cann_version"] != "8.1.RC1"):
         raise RuntimeError("private package is not a complete CANN 8.1 precompiled kernel package")
     for kernel in kernels:
         if not isinstance(kernel, dict):
-            raise RuntimeError("invalid precompiled GatherElementsV2 kernel manifest entry")
+            raise RuntimeError("invalid precompiled ScatterElementsV2 kernel manifest entry")
         for value_key, hash_key in (("object", "object_sha256"), ("metadata", "metadata_sha256")):
             artifact = Path(str(kernel.get(value_key, "")))
             if (not artifact.is_file() or digest_file(artifact) != str(kernel.get(hash_key)) or
-                    kernel_root not in artifact.parents):
-                raise RuntimeError("precompiled GatherElementsV2 kernel is missing or mismatched: {}".format(artifact))
+                    package_root not in artifact.parents):
+                raise RuntimeError("precompiled ScatterElementsV2 kernel is missing or mismatched: {}".format(artifact))
     runtime_op = OPERATOR_RUNTIME_NAMES.get(str(item["operator"]))
     if runtime_op is None:
-        raise RuntimeError("private package is not an allowed GatherElements source: {}".format(item["operator"]))
+        raise RuntimeError("private package is not an allowed ScatterElements source: {}".format(item["operator"]))
     inst = item["instrumentation"]
     if (not isinstance(inst, dict) or inst.get("enabled") is not True or inst.get("mutates_tiling_context") is not False or
             not inst.get("audit_schema") or not inst.get("audit_environment") or not inst.get("source_budget_environment") or
-            inst.get("dispatch_environment") != "GATHER_ELEMENTS_SOURCE_DISPATCH" or
-            inst.get("dispatch_value") != "cann81_prebuilt_aclnn" or
-            inst.get("opapi_library_environment") != "GATHER_ELEMENTS_SOURCE_OPAPI_LIBRARY"):
+            inst.get("dispatch_environment") != "SCATTER_ELEMENTS_SOURCE_DISPATCH" or
+            inst.get("dispatch_value") != "cann81_native_aclnn" or
+            inst.get("opapi_library_environment") != "SCATTER_ELEMENTS_SOURCE_OPAPI_LIBRARY"):
         raise RuntimeError("private package does not attest its original-source candidate axes")
     envelope = item["hardware_envelope_heuristic"]
     if (not isinstance(envelope, dict) or envelope.get("enabled") is not True or
-            envelope.get("environment") != "GATHER_ELEMENTS_SOURCE_UB_DIVISOR" or
+            envelope.get("environment") != "SCATTER_ELEMENTS_SOURCE_UB_DIVISOR" or
             not envelope.get("audit_field") or tuple(envelope.get("divisors", ())) != (2, 4, 8) or
             int(envelope.get("max_anchors", 0)) < 1):
         raise RuntimeError("private package hardware-envelope provenance is invalid")
     config = json.loads(Path(str(item["ops_config"])).read_text(encoding="utf-8"))
     entry = config.get(SOURCE_OPERATOR_TYPE)
-    if not isinstance(entry, dict) or entry.get("opFile", {}).get("value") != "gather_elements_v2" or \
-            entry.get("opInterface", {}).get("value") != "gather_elements_v2":
-        raise RuntimeError("private package lacks GatherElementsV2 generic-dispatch config")
+    if not isinstance(entry, dict) or entry.get("opFile", {}).get("value") != "scatter_elements_v2" or \
+            entry.get("opInterface", {}).get("value") != "scatter_elements_v2":
+        raise RuntimeError("private package lacks ScatterElementsV2 config")
     version_file = Path(str(item["cann_root"])) / "opp" / "version.info"
     if not version_file.is_file() or digest_file(version_file) != str(item["cann_version_file_sha256"]):
         raise RuntimeError("private package was built against a different or missing CANN OPP installation")
     if item["strategy_algorithm_changes"] is not False or item["kernel_algorithm_changes"] is not False:
-        raise RuntimeError("private GatherElementsV2 package is not source-preserving")
+        raise RuntimeError("private ScatterElementsV2 package is not source-preserving")
     item["runtime_op"] = runtime_op
     item["manifest_path"] = str(path)
     return item
@@ -347,7 +345,10 @@ def read_observations(path: Path, schema: str) -> list[dict[str, Any]]:
 
 
 def source_compile_context_identity(observation: dict[str, Any]) -> str:
-    fields = ("source_compile_context_sha256", "aiv_core_cap", "ub_cap_divisor", "compile_info_vars")
+    # Candidate inputs (core cap / UB divisor) are provenance, not identity.
+    # Two inputs that produce the same key, block dimension and raw tiling
+    # bytes are one tiling and must be deduplicated before the 20-way gate.
+    fields = ("source_compile_context_sha256", "compile_info_vars", "tiling")
     if any(field not in observation for field in fields):
         raise RuntimeError("source audit omitted its native compile-context identity")
     return stable_hash({field: observation[field] for field in fields})
@@ -357,7 +358,7 @@ def successful_observation(path: Path, package: dict[str, Any]) -> tuple[dict[st
     all_rows = read_observations(path, str(package["instrumentation"]["audit_schema"]))
     rows = [row for row in all_rows if row.get("event") == "tiling_generated"]
     if not rows:
-        return None, "private GatherElementsV2 host tiler emitted no raw-tiling audit"
+        return None, "private ScatterElementsV2 host tiler emitted no raw-tiling audit"
     identities = {source_compile_context_identity(row) for row in rows}
     if len(identities) != 1:
         return None, "one source execution emitted multiple compile-context identities"
@@ -393,6 +394,7 @@ def candidate_label(candidate: dict[str, Any]) -> str:
 def context_matches(observation: dict[str, Any] | None, candidate: dict[str, Any], package: dict[str, Any]) -> bool:
     if (observation is None or observation.get("event") != "tiling_generated" or
             observation.get("operator_type") != SOURCE_OPERATOR_TYPE or
+            observation.get("source_compile_context_sha256") != package["official_tiling_source_sha256"] or
             str(observation.get("aiv_core_cap")) != str(candidate["aiv_core_cap"])):
         return False
     envelope = package["hardware_envelope_heuristic"]
@@ -410,7 +412,7 @@ def source_environment(base: dict[str, str], package: dict[str, Any], candidate:
     package_root = Path(str(package["package_root"]))
     op_api = Path(str(package["op_api_library"]))
     if op_api.parent != package_root / "op_api/lib":
-        raise RuntimeError("private GatherElementsV2 op-api library is outside its vendor package")
+        raise RuntimeError("private ScatterElementsV2 op-api library is outside its vendor package")
     environment["ASCEND_OPP_PATH"] = str(Path(str(package["cann_root"])) / "opp")
     # CANN's generated set_env.bash sets this to the individual vendor
     # package (not its packages/ parent) and prepends this exact op_api/lib
@@ -420,7 +422,6 @@ def source_environment(base: dict[str, str], package: dict[str, Any], candidate:
     previous_loader_path = environment.get("LD_LIBRARY_PATH", "")
     environment["LD_LIBRARY_PATH"] = str(op_api.parent) + (":" + previous_loader_path if previous_loader_path else "")
     environment[str(package["instrumentation"]["opapi_library_environment"])] = str(op_api)
-    environment["GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE"] = SOURCE_OPERATOR_TYPE
     environment[str(package["instrumentation"]["audit_environment"])] = str(audit)
     environment[str(package["instrumentation"]["dispatch_environment"])] = str(package["instrumentation"]["dispatch_value"])
     environment[str(package["instrumentation"]["source_budget_environment"])] = str(candidate["aiv_core_cap"])
@@ -440,7 +441,7 @@ def source_audit_emitted(path: Path, package: dict[str, Any], candidate: dict[st
     all_rows = read_observations(path, str(package["instrumentation"]["audit_schema"]))
     rows = [row for row in all_rows if row.get("event") == "tiling_generated"]
     if not rows:
-        return False, "private GatherElementsV2 host tiler emitted no raw-tiling audit"
+        return False, "private ScatterElementsV2 host tiler emitted no raw-tiling audit"
     for row in rows:
         try:
             source_compile_context_identity(row)
@@ -459,8 +460,8 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
     Each boundary runs in its own process, so a host-library or device crash
     cannot erase the last known-good boundary.  The gates are deliberately
     ordered: installed reference launch, private OpAPI load/symbol lookup,
-    private C++ GetWorkspace/host tiler, then precompiled kernel launch plus
-    exact output comparison.
+    private C++ GetWorkspace/executor construction, then the launch-time host
+    tiler audit plus precompiled kernel launch and exact output comparison.
     """
     checks: list[dict[str, Any]] = []
     temporary_root = args.log_dir.parent / "tmp"
@@ -500,22 +501,24 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                 if not load_ok:
                     continue
 
-                tiling_audit = root / (op + "_host_tiling_" + stable_hash(candidate) + ".jsonl")
+                planning_audit = root / (op + "_executor_planning_unused_" + stable_hash(candidate) + ".jsonl")
                 result, output, wall, rc = run_worker(
-                    source_worker_args(args.runner, workload, args.device, 0, 0) + ["--source-host-tiling-only", "1"],
-                    source_environment(base_env, package, candidate, tiling_audit))
-                observed, reason = source_audit_emitted(tiling_audit, package, candidate)
-                tiling_ok = (observed and rc == 0 and result.get("status") == "success" and
-                             result.get("backend") == SOURCE_BACKEND)
-                checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "private_host_tiling",
+                    source_worker_args(args.runner, workload, args.device, 0, 0) + ["--source-executor-planning-only", "1"],
+                    source_environment(base_env, package, candidate, planning_audit))
+                # ACLNN phase one constructs the executor but does not execute
+                # this custom op's host tiler. The tiler is therefore proved by
+                # the following real launch audit, not by demanding an audit
+                # file at this boundary.
+                planning_ok = (rc == 0 and result.get("status") == "success" and
+                               result.get("backend") == SOURCE_BACKEND)
+                checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "private_executor_planning",
                                "strategy": candidate["id"], "aiv_core_cap": candidate["aiv_core_cap"],
-                               "status": "passed" if tiling_ok else "failed", "worker_return_code": rc,
+                               "status": "passed" if planning_ok else "failed", "worker_return_code": rc,
                                "worker_status": result.get("status"), "worker_wall_ms": wall,
                                "runner_backend": result.get("backend"), "last_stage": parse_worker_stage(output),
-                               "runner_error": None if tiling_ok else result.get("error"),
-                               "failure": None if tiling_ok else (
-                                   runner_failure(result, output) if (rc != 0 or result.get("status") != "success") else reason)})
-                if not tiling_ok:
+                               "runner_error": None if planning_ok else result.get("error"),
+                               "failure": None if planning_ok else runner_failure(result, output)})
+                if not planning_ok:
                     continue
 
                 launch_audit = root / (op + "_kernel_launch_" + stable_hash(candidate) + ".jsonl")
@@ -534,7 +537,7 @@ def source_audit_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                     elif result.get("backend") != SOURCE_BACKEND:
                         launch_failure = "runner used unexpected backend: {}".format(result.get("backend"))
                     else:
-                        launch_failure = "private precompiled kernel output did not exactly match installed aclnnGather"
+                        launch_failure = "private precompiled kernel output did not exactly match installed aclnnScatter"
                 else:
                     launch_failure = None if launch_ok else runner_failure(result, output)
                 checks.append({"operator": op, "workload_id": workload["workload_id"],
@@ -559,37 +562,42 @@ def plan_packages(manifests: list[dict[str, Any]], selected_operator: str) -> di
             selected_operator, sorted(grouped)))
     if (len(grouped[selected_operator]) != 1 or
             grouped[selected_operator][0]["hardware_envelope_heuristic"]["enabled"] is not True):
-        raise RuntimeError("GatherElements requires one original semantic dispatcher plus its declared conditional UB envelope")
+        raise RuntimeError("ScatterElementsV2 requires one original semantic dispatcher plus its declared conditional UB envelope")
     return grouped
 
 
 def source_supported_workload(workload: dict[str, Any]) -> bool:
-    """Filter before NPU work using the private GatherElementsV2 declaration.
-
-    Its source declaration accepts x in fp16/bf16/fp32/int32 and index in
-    int32.  Sending CANN-8.1's installed-only int64 index variants through
-    the private 910B package would manufacture predictable rejects and cannot
-    contribute to the 5,000 real source-kernel measurements.  At least twenty
-    output-parallel positions are also required: otherwise all caps above the
-    available parallelism collapse to the same raw tiling and cannot satisfy
-    the requested 20-way ranking set.
-    """
-    if not (workload.get("op") == "gather_elements" and
+    """Keep documented last-axis shapes with at least twenty work groups."""
+    if not (workload.get("op") == "scatter_elements" and
             workload.get("dtype") in ("fp16", "bf16", "fp32", "int32") and
-            workload.get("index_dtype") == "int32"):
+            workload.get("index_dtype") in ("int32", "int64") and
+            workload.get("reduce") in (0, 1)):
         return False
     shape = workload.get("index_shape")
     axis = workload.get("axis")
     if not isinstance(shape, list) or not shape or not isinstance(axis, int):
         return False
     normalized_axis = axis % len(shape)
+    if normalized_axis != len(shape) - 1:
+        return False
     output_parallelism = 1
     for index, value in enumerate(shape):
         if not isinstance(value, int) or value <= 0:
             return False
         if index != normalized_axis:
             output_parallelism *= value
-    return output_parallelism >= 20
+    return output_parallelism >= 1024
+
+
+def workload_storage_elements(workload: dict[str, Any]) -> int:
+    """Stable small-first order for inexpensive preflight and early groups."""
+    total = 0
+    for field in ("shape", "index_shape"):
+        count = 1
+        for extent in workload[field]:
+            count *= int(extent)
+        total += count
+    return total
 
 
 def select_heuristic_anchors(discovered: dict[str, dict[str, Any]], maximum: int) -> list[dict[str, Any]]:
@@ -636,7 +644,7 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
         if result.get("backend") != SOURCE_BACKEND:
             failures.append(candidate_label(candidate) + ": runner used unexpected backend {}".format(result.get("backend")))
             return True
-        if reason == "private GatherElementsV2 host tiler emitted no raw-tiling audit":
+        if reason == "private ScatterElementsV2 host tiler emitted no raw-tiling audit":
             failures.append(candidate_label(candidate) + ": " + reason)
             # This is a deployment/instrumentation failure, not an invalid
             # tiling. Retrying its remaining caps would only create duplicate
@@ -744,7 +752,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
                          "discovery_failures": failures, "verification_failures": verification_failures,
                          "measurement_failures": measurement_failures,
                          "rejected_candidate_count": len(failures) + len(verification_failures) + len(measurement_failures),
-                         "source_rule": "complete private GatherElementsV2 source discovery and validation, then deterministic timing of 20 validated source contexts; the declared UB envelope is used only when core-budget contexts are below 20; failed candidates do not count; no flow-table field generation"}
+                         "source_rule": "complete official CANN 8.1 ScatterElementsV2 source discovery and validation, then deterministic timing of 20 validated source contexts; the declared UB envelope is used only when core-budget contexts are below 20; failed candidates do not count; no raw tiling field generation"}
 
 
 def summarize(directory: Path) -> dict[str, Any]:
@@ -760,7 +768,7 @@ def main() -> int:
     parser.add_argument("--device", required=True, type=int)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--samples", type=int, default=5)
-    parser.add_argument("--operator", choices=("gather_elements",), required=True)
+    parser.add_argument("--operator", choices=("scatter_elements",), required=True)
     parser.add_argument("--record-target", type=int, required=True)
     parser.add_argument("--source-package-manifest", action="append", default=[], type=Path)
     args = parser.parse_args()
@@ -771,7 +779,7 @@ def main() -> int:
     caps = tuple(int(value) for value in catalog.SOURCE_AIV_CAPS)
     budgets = {args.operator: args.record_target}
     if minimum != 20 or not caps or args.record_target < minimum or args.record_target % minimum:
-        raise RuntimeError("GatherElements requires an exact target of whole 20-tiling groups")
+        raise RuntimeError("ScatterElementsV2 requires an exact target of whole 20-tiling groups")
     packages = plan_packages([validate_source_manifest(path) for path in args.source_package_manifest], args.operator)
     writer = RotatingJsonl(args.log_dir)
     temporary_root = args.log_dir.parent / "tmp"
@@ -781,8 +789,7 @@ def main() -> int:
         raise RuntimeError("existing progress exceeds a per-operator formal record ceiling")
     base_env = dict(os.environ)
     base_env.pop("ASCEND_CUSTOM_OPP_PATH", None)
-    base_env.pop("GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE", None)
-    base_env.pop("GATHER_ELEMENTS_SOURCE_OPAPI_LIBRARY", None)
+    base_env.pop("SCATTER_ELEMENTS_SOURCE_OPAPI_LIBRARY", None)
     for package_set in packages.values():
         for package in package_set:
             base_env.pop(str(package["instrumentation"]["audit_environment"]), None)
@@ -794,9 +801,12 @@ def main() -> int:
             if envelope["enabled"]:
                 base_env.pop(str(envelope["environment"]), None)
     runner_hash = digest_file(args.runner)
-    planned = {args.operator: [row for row in workloads if source_supported_workload(row)]}
+    planned = {args.operator: sorted(
+        (row for row in workloads if source_supported_workload(row)),
+        key=lambda row: (workload_storage_elements(row), row["workload_id"]),
+    )}
     if len(planned[args.operator]) < args.record_target // minimum:
-        raise RuntimeError("GatherElements catalog does not contain enough reviewed shapes for the requested record target")
+        raise RuntimeError("ScatterElementsV2 catalog does not contain enough reviewed shapes for the requested record target")
     begin = {
         "schema": SCHEMA, "matmul_included": False, "operator": args.operator,
         "formal_latency_ceiling": args.record_target, "formal_record_budget_per_op": budgets,
@@ -806,7 +816,7 @@ def main() -> int:
         "historical_latency_or_tiling_records_read": 0, "cce_data_or_cost_model_read": 0,
         "timing": {"warmup": args.warmup, "samples": args.samples, "kind": "device_event_only"},
         "no_host_timeout_or_forced_worker_kill": True, "temporary_reference_storage": str(temporary_root),
-        "preflight": "ordered isolated gates: installed ACLNN reference, private C++ OpAPI load, private GetWorkspace/host tiler, precompiled kernel launch, exact output equality",
+        "preflight": "ordered isolated gates: installed ACLNN reference, private C++ OpAPI load, private GetWorkspace/executor planning, launch-time host-tiler audit, precompiled kernel launch, exact output equality",
         "log_directory": str(args.log_dir), "log_rotation_max_bytes": MAX_LOG_BYTES,
     }
     writer.append({**begin, "record_type": "campaign_begin"})
@@ -838,7 +848,7 @@ def main() -> int:
         "checks": [check["kind"] for check in preflight],
         "installed_reference_viability": sum(check["kind"] == "installed_reference_viability" for check in preflight),
         "private_opapi_load": sum(check["kind"] == "private_opapi_load" for check in preflight),
-        "private_host_tiling": sum(check["kind"] == "private_host_tiling" for check in preflight),
+        "private_executor_planning": sum(check["kind"] == "private_executor_planning" for check in preflight),
         "private_precompiled_kernel_launch": sum(
             check["kind"] == "private_precompiled_kernel_launch" for check in preflight),
     }, sort_keys=True), flush=True)

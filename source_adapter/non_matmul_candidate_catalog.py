@@ -369,26 +369,40 @@ def index_multi_tiling_reserve(op: str, start_index: int) -> list[dict[str, Any]
     complete legal operator invocation (including dtype/index dtype/reduce),
     never a hand-written tiling candidate.
     """
-    ranks = (
-        (1, ()),
-        (2, (17,)),
-        (2, (64,)),
-        (3, (4, 17)),
-        (3, (8, 64)),
-        (3, (31, 65)),
-        (4, (2, 17, 33)),
-        (4, (4, 16, 64)),
-        (4, (2, 64, 128)),
-        (5, (2, 4, 16, 64)),
-        (5, (1, 8, 32, 128)),
-        (5, (3, 15, 63, 129)),
-    )
-    # The V2 source OpDef has a documented int32-index route.  GatherElements
-    # needs 250 non-duplicated, source-supported shape groups to make its
-    # 5,000-record (20 per group) target attainable, so its reviewed axis
-    # lattice is expanded before execution rather than padding it with repeat
-    # measurements of the same shape.  Scatter keeps its original smaller
-    # lattice because it is not part of this single-operator campaign.
+    if op == "scatter_elements":
+        # ScatterElementsV2's small-mode split rounds `times` over the source
+        # core budget. Prefix products >=1024 preserve all twenty distinct
+        # core-cap identities while keeping the largest tensor near one
+        # million elements. Smaller prefixes collapse several caps to the
+        # same raw tiling and therefore cannot serve a 20-way ranking group.
+        ranks = (
+            (2, (1024,)),
+            (2, (1536,)),
+            (3, (32, 32)),
+            (3, (16, 64)),
+            (3, (32, 64)),
+            (4, (4, 16, 16)),
+            (4, (8, 16, 16)),
+            (5, (2, 4, 16, 16)),
+        )
+    else:
+        ranks = (
+            (1, ()),
+            (2, (17,)),
+            (2, (64,)),
+            (3, (4, 17)),
+            (3, (8, 64)),
+            (3, (31, 65)),
+            (4, (2, 17, 33)),
+            (4, (4, 16, 64)),
+            (4, (2, 64, 128)),
+            (5, (2, 4, 16, 64)),
+            (5, (1, 8, 32, 128)),
+            (5, (3, 15, 63, 129)),
+        )
+    # Both finite lattices contain non-duplicated semantic shapes. The current
+    # ScatterElementsV2 campaign uses its 8 x 8 x 4 = 256 reviewed combinations
+    # so 250 admitted groups can produce exactly 5,000 latency records.
     axis_extents = ((16, 17, 31, 32, 47, 63, 64, 65, 95, 96, 127, 128, 129, 191, 257, 513)
                     if op == "gather_elements" else
                     (17, 31, 63, 65, 127, 129, 257, 513))
@@ -398,7 +412,7 @@ def index_multi_tiling_reserve(op: str, start_index: int) -> list[dict[str, Any]
     # once; with its two source-supported int32-index dtype routes that yields
     # 384 distinct eligible invocations before the explicit boundary cases.
     # This is a finite reviewed shape lattice, not a tiling-field enumeration.
-    base_count = len(ranks) * len(axis_extents) if op == "gather_elements" else 80
+    base_count = len(ranks) * len(axis_extents)
     output: list[dict[str, Any]] = []
     # A fixed coprime walk over documented rank/axis/dtype boundaries.  All
     # non-axis index extents equal their input extent; the final index extent

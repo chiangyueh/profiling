@@ -114,6 +114,12 @@ def instrument(source: str) -> str:
     if source.count(ub_assignment) != 1:
         raise RuntimeError("cannot locate ScatterElements original UB capacity assignment")
     source = source.replace(ub_assignment, ub_replacement)
+    class_method = '''        void TilingDataPrint() const;'''
+    class_method_replacement = '''        void TilingDataPrint() const;
+        void SourceAudit(ge::graphStatus status) const;'''
+    if source.count(class_method) != 1:
+        raise RuntimeError("cannot locate ScatterElements tiling class audit anchor")
+    source = source.replace(class_method, class_method_replacement)
     entry = '''  ge::graphStatus TilingScatterElementsV2(gert::TilingContext* context) {
     ScatterElementsV2Tiling tilingObject(context);
     if (tilingObject.Init() != ge::GRAPH_SUCCESS) {
@@ -127,30 +133,46 @@ def instrument(source: str) -> str:
     for (size_t index = 0; index < size; ++index) { value ^= data[index]; value *= 1099511628211ULL; }
     return value;
   }
-  static ge::graphStatus ScatterElementsSourceAudit(gert::TilingContext *context, ge::graphStatus status) {
+  void ScatterElementsV2Tiling::SourceAudit(ge::graphStatus status) const {
     const char *path = std::getenv("SCATTER_ELEMENTS_TILING_AUDIT_PATH");
-    if (path == nullptr || context == nullptr) { return status; }
-    auto *raw = context->GetRawTilingData();
+    if (path == nullptr || tilingContext == nullptr) { return; }
+    auto *raw = tilingContext->GetRawTilingData();
     const size_t rawSize = raw == nullptr ? 0U : raw->GetDataSize();
     const auto *rawBytes = raw == nullptr ? nullptr : static_cast<const uint8_t *>(raw->GetData());
     const char *coreCap = std::getenv("SCATTER_ELEMENTS_SOURCE_AIV_CAP");
     std::FILE *output = std::fopen(path, "a");
     if (output != nullptr) {
       const char *ubDivisor = std::getenv("SCATTER_ELEMENTS_SOURCE_UB_DIVISOR");
-      std::fprintf(output, "{\"schema\":\"scatter_elements_raw_tiling_observation_v1\",\"status\":%d,\"aiv_core_cap\":\"%s\",\"ub_cap_divisor\":\"%s\",\"tiling_key\":%llu,\"block_dim\":%u,\"raw_bytes\":%llu,\"raw_fnv1a64\":%llu}\n",
+      std::fprintf(output, "{\"schema\":\"scatter_elements_raw_tiling_observation_v1\",\"event\":\"tiling_generated\",\"operator_type\":\"ScatterElementsV2\",\"status\":%d,\"source_compile_context_sha256\":\"af4fa87f4760e73b93a31a301827e9e2c286c58f3ff32a0be7344adf2c5543f7\",\"aiv_core_cap\":\"%s\",\"ub_cap_divisor\":\"%s\",\"compile_info_vars\":{\"tiling_key\":%llu,\"block_dim\":%u,\"raw_tiling_bytes\":%llu,\"raw_tiling_fnv1a64\":\"%llu\"},\"tiling\":{\"used_core_num\":%llu,\"each_num\":%llu,\"extra_task_core\":%llu,\"each_piece\":%llu,\"input_one_piece\":%llu,\"input_count\":%llu,\"indices_count\":%llu,\"updates_count\":%llu,\"input_one_time\":%llu,\"indices_one_time\":%llu,\"updates_one_time\":%llu,\"input_each\":%llu,\"indices_each\":%llu,\"input_last\":%llu,\"indices_last\":%llu,\"input_loop\":%llu,\"indices_loop\":%llu,\"input_align\":%llu,\"indices_align\":%llu,\"updates_align\":%llu,\"last_indices_loop\":%llu,\"last_indices_each\":%llu,\"last_indices_last\":%llu,\"one_time\":%llu,\"last_one_time\":%llu,\"mode_flag\":%llu,\"source_visible_max_ub\":%llu,\"workspace_bytes\":%llu}}\n",
           static_cast<int>(status), coreCap == nullptr ? "runtime" : coreCap, ubDivisor == nullptr ? "1" : ubDivisor,
-          static_cast<unsigned long long>(context->GetTilingKey()), context->GetBlockDim(),
-          static_cast<unsigned long long>(rawSize), static_cast<unsigned long long>(ScatterElementsSourceAuditHash(rawBytes, rawSize)));
+          static_cast<unsigned long long>(tilingContext->GetTilingKey()), tilingContext->GetBlockDim(),
+          static_cast<unsigned long long>(rawSize), static_cast<unsigned long long>(ScatterElementsSourceAuditHash(rawBytes, rawSize)),
+          static_cast<unsigned long long>(usedCoreNum), static_cast<unsigned long long>(eachNum),
+          static_cast<unsigned long long>(extraTaskCore), static_cast<unsigned long long>(eachPiece),
+          static_cast<unsigned long long>(inputOnePiece), static_cast<unsigned long long>(inputCount),
+          static_cast<unsigned long long>(indicesCount), static_cast<unsigned long long>(updatesCount),
+          static_cast<unsigned long long>(inputOneTime), static_cast<unsigned long long>(indicesOneTime),
+          static_cast<unsigned long long>(updatesOneTime), static_cast<unsigned long long>(inputEach),
+          static_cast<unsigned long long>(indicesEach), static_cast<unsigned long long>(inputLast),
+          static_cast<unsigned long long>(indicesLast), static_cast<unsigned long long>(inputLoop),
+          static_cast<unsigned long long>(indicesLoop), static_cast<unsigned long long>(inputAlign),
+          static_cast<unsigned long long>(indicesAlign), static_cast<unsigned long long>(updatesAlign),
+          static_cast<unsigned long long>(lastIndicesLoop), static_cast<unsigned long long>(lastIndicesEach),
+          static_cast<unsigned long long>(lastIndicesLast), static_cast<unsigned long long>(oneTime),
+          static_cast<unsigned long long>(lastOneTime), static_cast<unsigned long long>(modeFlag),
+          static_cast<unsigned long long>(max_ub), static_cast<unsigned long long>(workspaceSize));
       std::fclose(output);
     }
-    return status;
   }
   ge::graphStatus TilingScatterElementsV2(gert::TilingContext* context) {
     ScatterElementsV2Tiling tilingObject(context);
     if (tilingObject.Init() != ge::GRAPH_SUCCESS) {
-        return ScatterElementsSourceAudit(context, ge::GRAPH_FAILED);
+        tilingObject.SourceAudit(ge::GRAPH_FAILED);
+        return ge::GRAPH_FAILED;
     }
-    return ScatterElementsSourceAudit(context, tilingObject.RunKernelTiling());
+    const ge::graphStatus status = tilingObject.RunKernelTiling();
+    tilingObject.SourceAudit(status);
+    return status;
   }'''
     if source.count(entry) != 1:
         raise RuntimeError("cannot locate ScatterElements source entry")
@@ -170,7 +192,46 @@ def scoped_root_cmake(source: str) -> str:
 set(ASCEND_OP_NAME "scatter_elements_v2" CACHE STRING "operators that need to be compiled" FORCE)'''
     if source.count(original) != 1:
         raise RuntimeError("cannot locate public ASCEND_OP_NAME build-selection anchor")
-    return source.replace(original, replacement)
+    source = source.replace(original, replacement)
+    source_install = '''foreach (_op_name ${OP_LIST})
+    install(FILES ${ASCEND_IMPL_OUT_DIR}/dynamic/${_op_name}.py
+            DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
+            OPTIONAL
+    )
+endforeach ()
+
+foreach (_op_name ${OP_LIST})
+    install(FILES ${ASCEND_IMPL_OUT_DIR}/dynamic/${_op_name}.cpp
+            DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
+            OPTIONAL
+    )
+endforeach ()
+
+install(DIRECTORY ${OPS_ADV_UTILS_KERNEL_INC}/
+        DESTINATION ${IMPL_INSTALL_DIR}/ascendc/common
+)
+
+foreach (op_dir ${OP_DIR_LIST})
+    get_filename_component(_op_name "${op_dir}" NAME)
+
+    file(GLOB KERNEL_FILES
+            ${op_dir}/op_kernel/*.cpp
+            ${op_dir}/op_kernel/*.h
+    )
+
+    install(FILES ${KERNEL_FILES}
+            DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
+            OPTIONAL
+    )
+endforeach ()'''
+    binary_only = '''# SCATTER_ELEMENTS_CANN81_PRECOMPILED_PACKAGE_V1: the official
+# sources remain build inputs, but the private runtime package installs only
+# CANN-8.1 host libraries, metadata and precompiled 910B device objects.  A
+# missing binary key therefore fails instead of invoking Python/TBE runtime
+# compilation. No source algorithm or generated binary is changed.'''
+    if source.count(source_install) != 1:
+        raise RuntimeError("cannot locate official dynamic-source install block")
+    return source.replace(source_install, binary_only)
 
 
 def existing_overlay(source_root: Path, output: Path) -> dict[str, Any] | None:
@@ -190,7 +251,7 @@ def existing_overlay(source_root: Path, output: Path) -> dict[str, Any] | None:
                                          "divisors": [2, 4, 8], "max_anchors": 16},
         "build_scope": {"sentinel": BUILD_SCOPE, "operator": "scatter_elements_v2",
                         "reason": "official nested prepare helper otherwise drops ASCEND_OP_NAME and compiles unrelated operators",
-                        "structural_only": True},
+                        "structural_only": True, "runtime_package": "precompiled_910b_binaries_only"},
     }
     if any(manifest.get(key) != value for key, value in required.items()):
         raise RuntimeError("existing ScatterElements overlay provenance differs")
@@ -199,6 +260,10 @@ def existing_overlay(source_root: Path, output: Path) -> dict[str, Any] | None:
     if (output / "CMakeLists.txt").read_text(encoding="utf-8") != scoped_root_cmake(
             (source_root / "CMakeLists.txt").read_text(encoding="utf-8")):
         raise RuntimeError("existing ScatterElements root build scope differs")
+    helper = output / "cmake/util/gen_ops_filter.sh"
+    if not helper.is_file():
+        raise RuntimeError("existing ScatterElements overlay lacks the official package helper")
+    helper.chmod(helper.stat().st_mode | 0o111)
     manifest["resumed_existing_overlay"] = True
     return manifest
 
@@ -209,6 +274,14 @@ def write_overlay(source_root: Path, output_parent: Path) -> dict[str, Any]:
     if existing is not None:
         return existing
     run(["git", "-C", str(source_root), "worktree", "add", "--detach", str(output), "HEAD"])
+    # The repository bundle intentionally contains source bytes only, so its
+    # archive does not preserve executable mode bits.  CANN's package target
+    # invokes this official helper directly; restore that one build metadata
+    # bit inside the private worktree.
+    helper = output / "cmake/util/gen_ops_filter.sh"
+    if not helper.is_file():
+        raise RuntimeError("official CANN package helper is absent")
+    helper.chmod(helper.stat().st_mode | 0o111)
     root_cmake = output / "CMakeLists.txt"
     root_cmake.write_text(scoped_root_cmake(root_cmake.read_text(encoding="utf-8")), encoding="utf-8")
     target = output / RELATIVE
@@ -228,7 +301,7 @@ def write_overlay(source_root: Path, output_parent: Path) -> dict[str, Any]:
         "source_hardware_envelope_heuristic_enumeration": True,
         "build_scope": {"sentinel": BUILD_SCOPE, "operator": "scatter_elements_v2",
                         "reason": "official nested prepare helper otherwise drops ASCEND_OP_NAME and compiles unrelated operators",
-                        "structural_only": True},
+                        "structural_only": True, "runtime_package": "precompiled_910b_binaries_only"},
         "hardware_envelope_heuristic": {"enabled": True, "environment": "SCATTER_ELEMENTS_SOURCE_UB_DIVISOR",
                                          "audit_field": "ub_cap_divisor", "resource": "source_visible_ub_capacity",
                                          "divisors": [2, 4, 8], "max_anchors": 16},
@@ -244,6 +317,8 @@ def main() -> int:
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--output-parent", required=True, type=Path)
     args = parser.parse_args()
+    args.source_root = args.source_root.resolve()
+    args.output_parent = args.output_parent.resolve()
     if not args.output_parent.is_dir():
         raise RuntimeError("output parent does not exist: {}".format(args.output_parent))
     require_pinned_source(args.source_root)

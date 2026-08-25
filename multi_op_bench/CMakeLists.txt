@@ -22,6 +22,10 @@ set(CANN_LIB "${CANN_PLATFORM}/lib64")
 set(CANN_DEVLIB "${CANN_PLATFORM}/devlib")
 
 add_executable(multi_op_npu_runner runner.cpp)
+option(SCATTER_ELEMENTS_ONLY "Compile only the ScatterElementsV2 measurement path" OFF)
+if(SCATTER_ELEMENTS_ONLY)
+    target_compile_definitions(multi_op_npu_runner PRIVATE SCATTER_ELEMENTS_ONLY=1)
+endif()
 target_include_directories(multi_op_npu_runner PRIVATE "${CANN_INCLUDE}")
 target_link_directories(multi_op_npu_runner PRIVATE "${CANN_LIB}")
 # The installed reference is linked normally. The checkout-local CANN 8.1

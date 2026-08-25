@@ -44,8 +44,14 @@ done
 
 CANN_ROOT="${CANN_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
 VERSION_FILE="${CANN_ROOT}/opp/version.info"
-[[ -f "${VERSION_FILE}" ]] || { echo "fatal: missing CANN OPP version file" >&2; exit 1; }
-grep -q '^version_dir=8\.1\.RC1$' "${VERSION_FILE}" || { echo "fatal: this campaign requires CANN 8.1.RC1" >&2; exit 1; }
+for component in compiler toolkit runtime acllib opp; do
+    component_version="${CANN_ROOT}/${component}/version.info"
+    [[ -f "${component_version}" ]] || { echo "fatal: missing CANN ${component} version file" >&2; exit 1; }
+    grep -q '^version_dir=8\.1\.RC1$' "${component_version}" || {
+        echo "fatal: CANN ${component} is not 8.1.RC1" >&2
+        exit 1
+    }
+done
 ENV_FILE=""
 for candidate in "${CANN_ROOT}/set_env.sh" "$(dirname "${CANN_ROOT}")/set_env.sh"; do
     [[ -f "${candidate}" ]] && { ENV_FILE="${candidate}"; break; }
@@ -68,12 +74,12 @@ unset ASCEND_CUSTOM_OPP_PATH SCATTER_ELEMENTS_SOURCE_DISPATCH \
 
 REQUIRED=(
     source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz
-    source_adapter/materialize_repo_source_bundle.py
+    source_adapter/materialize_scatter_elements_v2_cann81_source.py
     source_adapter/prepare_scatter_source_overlay.py
     source_adapter/finalize_scatter_elements_v2_package.py
     source_adapter/run_non_matmul_candidate_campaign.py
-    source_adapter/non_matmul_candidate_catalog.py
-    source_adapter/non_matmul_source_lock.json
+    source_adapter/scatter_elements_v2_candidate_catalog.py
+    source_adapter/scatter_elements_v2_cann81_lock.json
     multi_op_bench/CMakeLists.txt
     multi_op_bench/runner.cpp
 )
@@ -83,28 +89,29 @@ done
 
 PACKAGE_ID="$({
     sha256sum "${ROOT}/source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz" \
+        "${ROOT}/source_adapter/materialize_scatter_elements_v2_cann81_source.py" \
         "${ROOT}/source_adapter/prepare_scatter_source_overlay.py" \
         "${ROOT}/source_adapter/finalize_scatter_elements_v2_package.py" \
-        "${ROOT}/source_adapter/non_matmul_source_lock.json" "${VERSION_FILE}"
+        "${ROOT}/source_adapter/scatter_elements_v2_cann81_lock.json" "${VERSION_FILE}"
     readlink -f "${CANN_ROOT}"
 } | sha256sum | cut -c1-20)"
 RUN_ID="$({
     printf '%s\n' "${PACKAGE_ID}"
     sha256sum "${ROOT}/run_npu.sh" "${ROOT}/source_adapter/run_non_matmul_candidate_campaign.py" \
-        "${ROOT}/source_adapter/non_matmul_candidate_catalog.py" \
+        "${ROOT}/source_adapter/scatter_elements_v2_candidate_catalog.py" \
         "${ROOT}/multi_op_bench/CMakeLists.txt" "${ROOT}/multi_op_bench/runner.cpp"
 } | sha256sum | cut -c1-20)"
 
-SOURCE_ROOT="${ROOT}/.source_cache/cann_ops_8_1rc1"
-PACKAGE_STATE="${ROOT}/.benchmark_state/scatter_elements_v2_cann81_native_v1/${PACKAGE_ID}"
+SOURCE_ROOT="${ROOT}/.source_cache/scatter_elements_v2_cann_ops_8_1rc1"
+PACKAGE_STATE="${ROOT}/.benchmark_state/scatter_elements_v2_cann81_native_v2/${PACKAGE_ID}"
 PROJECT_PARENT="${PACKAGE_STATE}/project"
 PROJECT="${PROJECT_PARENT}/scatter_elements_v2_source"
 BUILD="${PACKAGE_STATE}/build"
 OUTPUT="${PACKAGE_STATE}/output"
 PACKAGE_ROOT="${OUTPUT}/packages/vendors/scatter_elements_source"
 MANIFEST="${PACKAGE_STATE}/scatter_elements_v2_package.json"
-RUNNER_BUILD="${ROOT}/.benchmark_state/scatter_elements_v2_cann81_native_runner_v1/${RUN_ID}"
-RESULTS="${ROOT}/results/scatter_elements_v2_cann81_native_v1/${RUN_ID}"
+RUNNER_BUILD="${ROOT}/.benchmark_state/scatter_elements_v2_cann81_native_runner_v2/${RUN_ID}"
+RESULTS="${ROOT}/results/scatter_elements_v2_cann81_native_v2/${RUN_ID}"
 LOGS="${RESULTS}/logs"
 mkdir -p "${ROOT}/.source_cache" "${PACKAGE_STATE}" "${PROJECT_PARENT}" "${RUNNER_BUILD}" "${LOGS}"
 mkdir -p "${PACKAGE_STATE}/tmp" "${PACKAGE_STATE}/cache" "${PACKAGE_STATE}/work"
@@ -138,9 +145,10 @@ echo "source=official_cann_ops_cann81_native installed_cann=read_only no_reset_n
 
 if [[ ! -d "${SOURCE_ROOT}" ]]; then
     run_logged "SOURCE_CACHE" "${PACKAGE_STATE}/source_cache.log" \
-        python3 "${ROOT}/source_adapter/materialize_repo_source_bundle.py" --kind cann_ops --destination "${SOURCE_ROOT}"
+        python3 "${ROOT}/source_adapter/materialize_scatter_elements_v2_cann81_source.py" \
+        --destination "${SOURCE_ROOT}"
 fi
-[[ -f "${SOURCE_ROOT}/.source_bundle_attestation.json" ]] || { echo "fatal: incomplete source cache" >&2; exit 2; }
+[[ -f "${SOURCE_ROOT}/.scatter_elements_v2_cann81_attestation.json" ]] || { echo "fatal: incomplete dedicated CANN-8.1 source cache" >&2; exit 2; }
 
 if [[ ! -f "${PROJECT}/source_candidate_overlay.json" ]]; then
     [[ ! -e "${PROJECT}" ]] || { echo "fatal: incomplete private ScatterElementsV2 project: ${PROJECT}" >&2; exit 2; }
@@ -170,7 +178,8 @@ run_logged "SCATTER_PACKAGE_VALIDATE" "${PACKAGE_STATE}/validate.log" \
 if [[ ! -f "${RUNNER_BUILD}/CMakeCache.txt" ]]; then
     run_logged "SCATTER_RUNNER_CONFIGURE" "${RUNNER_BUILD}/configure.log" \
         cmake -S "${ROOT}/multi_op_bench" -B "${RUNNER_BUILD}" \
-        -DCMAKE_BUILD_TYPE=Release -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}"
+        -DCMAKE_BUILD_TYPE=Release -DASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" \
+        -DSCATTER_ELEMENTS_ONLY=ON
 fi
 run_logged "SCATTER_RUNNER_BUILD" "${RUNNER_BUILD}/build.log" \
     resource_limited cmake --build "${RUNNER_BUILD}" --target multi_op_npu_runner --parallel 1

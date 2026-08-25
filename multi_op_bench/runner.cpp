@@ -1,11 +1,13 @@
 #include <acl/acl.h>
 #include <aclnn/acl_meta.h>
+#ifndef SCATTER_ELEMENTS_ONLY
 #include <aclnnop/aclnn_flash_attention_score_grad.h>
 #include <aclnnop/aclnn_fused_infer_attention_score.h>
 #include <aclnnop/aclnn_gather.h>
 #include <aclnnop/aclnn_gather_v2.h>
 #include <aclnnop/aclnn_matmul.h>
 #include <aclnnop/aclnn_permute.h>
+#endif
 #include <aclnnop/aclnn_scatter.h>
 
 #include <algorithm>
@@ -32,6 +34,7 @@ std::string JsonEscape(const std::string &value);
 void CheckAcl(aclError rc, const std::string &what);
 std::string gWorkloadId = "unknown";
 std::string gBackend = "aclnn_real_npu";
+#ifndef SCATTER_ELEMENTS_ONLY
 constexpr const char *kGatherElementsSourceOperatorType = "GatherElementsV2";
 
 using GatherElementsGetWorkspace = aclnnStatus (*)(const aclTensor *, const aclTensor *, int64_t,
@@ -44,6 +47,7 @@ struct GatherElementsPrivateApi {
     GatherElementsLaunch launch = nullptr;
     std::string path;
 };
+#endif
 
 using ScatterElementsGetWorkspace = aclnnStatus (*)(const aclTensor *, int64_t, const aclTensor *,
                                                      const aclTensor *, int64_t, aclTensor *,
@@ -65,6 +69,7 @@ void Stage(const std::string &stage, const std::string &detail = "")
     std::cout << "}" << std::endl;
 }
 
+#ifndef SCATTER_ELEMENTS_ONLY
 const GatherElementsPrivateApi &LoadGatherElementsPrivateApi(const char *libraryPath)
 {
     // Match CANN 8.1's official custom-OpAPI loader: the library handle and
@@ -112,6 +117,7 @@ const GatherElementsPrivateApi &LoadGatherElementsPrivateApi(const char *library
     api = loaded;
     return *api;
 }
+#endif
 
 const ScatterElementsPrivateApi &LoadScatterElementsPrivateApi(const char *libraryPath)
 {
@@ -656,6 +662,7 @@ void FillIndices(DeviceBuffer &buffer, aclDataType dtype, uint64_t count, int64_
     }
 }
 
+#ifndef SCATTER_ELEMENTS_ONLY
 Measurement RunMatmul(const Arguments &args, aclrtStream stream, int warmup, int samples)
 {
     const int64_t m = args.Int("m"), n = args.Int("n"), k = args.Int("k");
@@ -850,6 +857,7 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
             return aclnnGather(workspace, bytes, executor, launchStream);
         });
 }
+#endif
 
 Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int warmup, int samples)
 {
@@ -931,6 +939,7 @@ Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int wa
     return result;
 }
 
+#ifndef SCATTER_ELEMENTS_ONLY
 std::vector<int64_t> AttentionShape(const std::string &layout, int64_t batch, int64_t heads,
                                     int64_t sequence, int64_t headDim)
 {
@@ -1064,10 +1073,14 @@ Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream strea
     }
     return result;
 }
+#endif
 
 Measurement RunOperation(const Arguments &args, aclrtStream stream, int warmup, int samples)
 {
     const std::string op = args.Get("op");
+#ifdef SCATTER_ELEMENTS_ONLY
+    if (op == "scatter_elements") return RunScatterElements(args, stream, warmup, samples);
+#else
     if (op == "matmul") return RunMatmul(args, stream, warmup, samples);
     if (op == "transpose") return RunTranspose(args, stream, warmup, samples);
     if (op == "gather_v2") return RunGatherV2(args, stream, warmup, samples);
@@ -1075,6 +1088,7 @@ Measurement RunOperation(const Arguments &args, aclrtStream stream, int warmup, 
     if (op == "scatter_elements") return RunScatterElements(args, stream, warmup, samples);
     if (op == "flash_attention_score_grad") return RunFlashAttentionScoreGrad(args, stream, warmup, samples);
     if (op == "fused_infer_attention_score") return RunFusedInferAttentionScore(args, stream, warmup, samples);
+#endif
     throw std::runtime_error("unknown op: " + op);
 }
 

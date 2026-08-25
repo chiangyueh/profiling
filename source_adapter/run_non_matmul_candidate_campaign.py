@@ -25,8 +25,8 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
-CATALOG_PATH = ROOT / "non_matmul_candidate_catalog.py"
-LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
+CATALOG_PATH = ROOT / "scatter_elements_v2_candidate_catalog.py"
+LOCK = json.loads((ROOT / "scatter_elements_v2_cann81_lock.json").read_text(encoding="utf-8"))
 SCHEMA = "scatter_elements_v2_cann81_native_measurement_v1"
 SOURCE_BACKEND = "private_cann81_native_scatter_aclnn_real_npu"
 SOURCE_OPERATOR_TYPE = "ScatterElementsV2"
@@ -55,9 +55,9 @@ def stable_hash(value: Any) -> str:
 
 
 def load_catalog() -> tuple[list[dict[str, Any]], dict[str, Any], Any]:
-    spec = importlib.util.spec_from_file_location("non_matmul_candidate_catalog", CATALOG_PATH)
+    spec = importlib.util.spec_from_file_location("scatter_elements_v2_candidate_catalog", CATALOG_PATH)
     if spec is None or spec.loader is None:
-        raise RuntimeError("cannot load non-MatMul candidate catalog")
+        raise RuntimeError("cannot load ScatterElementsV2 candidate catalog")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -112,14 +112,9 @@ def worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int
     values = [str(runner), "--workload-id", workload["workload_id"], "--op", workload["op"],
               "--device", str(device), "--warmup", str(warmup), "--samples", str(samples),
               "--expected-soc", "Ascend910B3"]
-    if workload["op"] in ("flash_attention_score_grad", "fused_infer_attention_score"):
-        fields = ("batch", "q_heads", "kv_heads", "q_seq", "kv_seq", "head_dim", "layout", "dtype")
-    elif workload["op"] == "gather_elements":
-        fields = ("shape", "index_shape", "axis", "dtype", "index_dtype")
-    elif workload["op"] == "scatter_elements":
-        fields = ("shape", "index_shape", "axis", "dtype", "index_dtype", "reduce")
-    else:
+    if workload["op"] != "scatter_elements":
         raise RuntimeError("unsupported runtime op: {}".format(workload["op"]))
+    fields = ("shape", "index_shape", "axis", "dtype", "index_dtype", "reduce")
     for field in fields:
         item = workload[field]
         rendered = ",".join(map(str, item)) if isinstance(item, list) else str(item)
@@ -273,7 +268,7 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
     source_file = Path(str(item["source_file"]))
     if not source_file.is_file() or digest_file(source_file) != str(item["source_file_sha256"]):
         raise RuntimeError("private ScatterElementsV2 host tiler is missing or mismatched: {}".format(source_file))
-    expected_official = LOCK["operators"]["scatter_elements_v2"]["pinned_files"]["op_host/scatter_elements_v2_tiling.cc"]
+    expected_official = LOCK["operator"]["tiler_sha256"]
     if item["official_tiling_source_sha256"] != expected_official:
         raise RuntimeError("private ScatterElementsV2 package has the wrong official host-tiler origin")
     package_root = Path(str(item["package_root"]))

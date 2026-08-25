@@ -19,14 +19,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from prepare_fasg_strategy_overlays import require_repo_source_bundle
-
-
 ROOT = Path(__file__).resolve().parent
-LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
-SOURCE = LOCK["sources"]["cann_ops"]
-OP = LOCK["operators"]["scatter_elements_v2"]
-RELATIVE = Path(OP["relative_root"]) / "op_host/scatter_elements_v2_tiling.cc"
+LOCK = json.loads((ROOT / "scatter_elements_v2_cann81_lock.json").read_text(encoding="utf-8"))
+SOURCE = LOCK["source"]
+OP = LOCK["operator"]
+RELATIVE = Path(OP["relative_root"]) / OP["tiler"]
 AUDIT_SENTINEL = "SCATTER_ELEMENTS_SOURCE_TILING_AUDIT_V1"
 CORE_SENTINEL = "SCATTER_ELEMENTS_SOURCE_AIV_CAP_V1"
 BUILD_SCOPE = "SOURCE_CANDIDATE_BUILD_SCOPE_V1"
@@ -49,13 +46,24 @@ def run(argv: list[str]) -> str:
 
 
 def require_pinned_source(source_root: Path) -> None:
-    require_repo_source_bundle(source_root, "cann_ops", SOURCE["commit"])
-    for relative, expected in OP["pinned_files"].items():
-        path = source_root / OP["relative_root"] / relative
-        if not path.is_file() or digest(path) != expected:
-            raise RuntimeError("pinned source hash mismatch: {}".format(relative))
-    if not (source_root / "CMakeLists.txt").is_file():
-        raise RuntimeError("pinned public cann-ops source lacks its root build file")
+    attestation = source_root / ".scatter_elements_v2_cann81_attestation.json"
+    if not attestation.is_file():
+        raise RuntimeError("private source lacks its dedicated CANN-8.1 attestation")
+    value = json.loads(attestation.read_text(encoding="utf-8"))
+    if (value.get("schema") != "scatter_elements_v2_cann81_source_bundle_v1" or
+            value.get("archive_sha256") != SOURCE["archive_sha256"] or
+            value.get("official_commit") != SOURCE["official_commit"] or
+            value.get("network_calls") != 0 or value.get("installed_cann_writes") != 0):
+        raise RuntimeError("private source attestation does not match the dedicated CANN-8.1 lock")
+    path = source_root / RELATIVE
+    if not path.is_file() or digest(path) != OP["tiler_sha256"]:
+        raise RuntimeError("pinned ScatterElementsV2 tiler hash mismatch")
+    cmake = source_root / "CMakeLists.txt"
+    if not cmake.is_file() or digest(cmake) != SOURCE["root_cmake_sha256"]:
+        raise RuntimeError("pinned CANN-8.1 root build file hash mismatch")
+    status = run(["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=no"])
+    if status:
+        raise RuntimeError("private official source snapshot is modified")
 
 
 def instrument(source: str) -> str:
@@ -244,7 +252,7 @@ def existing_overlay(source_root: Path, output: Path) -> dict[str, Any] | None:
     required = {
         "operator": "ScatterElementsV2", "source_family": "cann_ops", "cmake_op_name": "scatter_elements_v2",
         "audit_entry_relative": str(RELATIVE), "audit_sentinel": AUDIT_SENTINEL,
-        "official_commit": SOURCE["commit"], "strategy_algorithm_changes": False,
+        "official_commit": SOURCE["official_commit"], "strategy_algorithm_changes": False,
         "source_compile_info_core_budget_enumeration": True, "source_hardware_envelope_heuristic_enumeration": True,
         "hardware_envelope_heuristic": {"enabled": True, "environment": "SCATTER_ELEMENTS_SOURCE_UB_DIVISOR",
                                          "audit_field": "ub_cap_divisor", "resource": "source_visible_ub_capacity",
@@ -292,7 +300,7 @@ def write_overlay(source_root: Path, output_parent: Path) -> dict[str, Any]:
         "schema": "scatter_elements_original_tiler_overlay_v1", "operator": "ScatterElementsV2",
         "source_family": "cann_ops", "cmake_op_name": "scatter_elements_v2",
         "audit_entry_relative": str(RELATIVE), "audit_sentinel": AUDIT_SENTINEL,
-        "official_url": SOURCE["url"], "official_commit": SOURCE["commit"], "overlay": str(output),
+        "official_url": SOURCE["official_url"], "official_commit": SOURCE["official_commit"], "overlay": str(output),
         "modified_source_files": [{"path": str(RELATIVE), "sha256_before": hashlib.sha256(before.encode()).hexdigest(), "sha256_after": digest(target)}],
         "instrumentation": {"enabled": True, "audit_schema": "scatter_elements_raw_tiling_observation_v1",
                             "audit_environment": "SCATTER_ELEMENTS_TILING_AUDIT_PATH",
@@ -306,7 +314,7 @@ def write_overlay(source_root: Path, output_parent: Path) -> dict[str, Any]:
                                          "audit_field": "ub_cap_divisor", "resource": "source_visible_ub_capacity",
                                          "divisors": [2, 4, 8], "max_anchors": 16},
         "candidate_rule": "run the original documented last-axis tiler for every finite runtime-bounded AIV core budget; if that complete original set is below 20, rerun selected contexts with smaller source-visible UB capacities; accept only raw identities that later pass exact output validation",
-        "forbidden": LOCK["collection_contract"]["forbidden"],
+        "forbidden": LOCK["forbidden"],
     }
     (output / "source_candidate_overlay.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest

@@ -80,6 +80,12 @@ def validate_manifest(path: Path, selected: str) -> dict[str, Any]:
             raise RuntimeError("GatherElementsV2 is not the attested source-preserving CANN-8.1 port")
         item["official_tiling_source_sha256"] = source_provenance["original_tiling_cpp_sha256"]
         item["strategy_class"] = None
+        instrumentation = item.get("instrumentation")
+        if (item.get("source_operator_type") != OPERATOR_TYPES[selected] or
+                not isinstance(instrumentation, dict) or
+                instrumentation.get("operator_type_environment") !=
+                "GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE"):
+            raise RuntimeError("GatherElementsV2 package lacks its runner operator-type contract")
     elif (item.get("schema") != "remaining_operator_cann81_host_tiler_v1" or
           item.get("device_kernel_origin") != "installed_cann81_same_official_source_release"):
         raise RuntimeError("invalid CANN-8.1 host-tiler manifest: {}".format(path))
@@ -184,6 +190,7 @@ def source_environment(base: dict[str, str], package: dict[str, Any], candidate:
             raise RuntimeError("private OpAPI is outside its package")
         environment["ASCEND_CUSTOM_OPP_PATH"] = str(package_root)
         library_environment = inst["opapi_library_environment"]
+        environment[inst["operator_type_environment"]] = package["source_operator_type"]
     else:
         environment.pop("ASCEND_CUSTOM_OPP_PATH", None)
         library = Path(package["op_tiling_library"])
@@ -396,8 +403,12 @@ def main() -> int:
         library_environment = inst.get("opapi_library_environment", inst.get("tiling_library_environment"))
         if not isinstance(library_environment, str):
             raise RuntimeError("source library environment is absent")
-        for key in (library_environment, inst["audit_environment"],
-                    inst["source_budget_environment"], inst["dispatch_environment"], envelope["environment"]):
+        environment_keys = [library_environment, inst["audit_environment"],
+                            inst["source_budget_environment"], inst["dispatch_environment"],
+                            envelope["environment"]]
+        if args.operator == "gather_elements":
+            environment_keys.append(inst["operator_type_environment"])
+        for key in environment_keys:
             base_env.pop(key, None)
     planned = {args.operator: sorted((row for row in workloads if supported(row)),
                                      key=lambda row: (storage(row), row["workload_id"]))}

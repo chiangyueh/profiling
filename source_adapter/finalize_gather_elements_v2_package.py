@@ -150,6 +150,7 @@ def main() -> int:
             "source_budget_environment": "GATHER_ELEMENTS_SOURCE_AIV_CAP",
             "dispatch_environment": "GATHER_ELEMENTS_SOURCE_DISPATCH",
             "dispatch_value": "cann81_prebuilt_aclnn",
+            "operator_type_environment": "GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE",
             "opapi_library_environment": "GATHER_ELEMENTS_SOURCE_OPAPI_LIBRARY",
         },
         "hardware_envelope_heuristic": {

@@ -44,6 +44,7 @@ g++ -std=c++17 -O2 -Wall -Wextra \
 "$WORK_DIR/proxy_model_test"
 python3 "$ROOT/tests/refine_model_test.py"
 python3 "$ROOT/tests/rank_results_test.py"
+python3 "$ROOT/tests/remaining_operator_environment_test.py"
 
 GENERAL_CSV="$WORK_DIR/candidates.csv"
 GENERAL_LOG="$WORK_DIR/search.log"

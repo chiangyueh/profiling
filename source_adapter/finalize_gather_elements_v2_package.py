@@ -165,7 +165,7 @@ def main() -> int:
         "kernel_algorithm_changes": False,
         "toolkit_install_modified": False,
         "matmul_included": False,
-        "formal_data_gate": "the generated CANN 8.1 C++ ACLNN entry point must load from the private package, emit one C++ host-tiler raw identity, launch a precompiled Ascend C kernel, and exactly match installed aclnnGather",
+        "formal_data_gate": "the generated CANN 8.1 C++ ACLNN entry point must load from the private package, emit one C++ host-tiler raw identity, launch a precompiled Ascend C kernel, and exactly match the deterministic GatherElements coordinate reference; rank-one preflight also matches installed aclnnGather",
     }
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
     args.manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")

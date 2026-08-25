@@ -1,0 +1,88 @@
+{
+  "schema": "remaining_operators_cann81_lock_v1",
+  "sources": {
+    "cann_ops": {
+      "url": "https://gitee.com/ascend/cann-ops.git",
+      "archive": "vendor_source/cann_ops_8_1rc1.tar.gz",
+      "archive_sha256": "c4a2f6bf4ea6784dbfb2ef554858221a4e8f603bad9e4f5597a5083efb73c18e",
+      "official_commit": "c214b710edbe24017dc7dc92170a50bd8ff38171",
+      "root_cmake_sha256": "732deb1a5c93f4725587d4e6e8bb2d5a3046310aa31353c363b1df699a21b961"
+    },
+    "cann_ops_adv": {
+      "url": "https://gitee.com/ascend/cann-ops-adv.git",
+      "tag": "v1.0-8.1.RC1.alpha001",
+      "archive": "vendor_source/cann_ops_adv_8_1rc1.tar.gz",
+      "archive_sha256": "753d7f581955c088f28f478f6aa7c26abf0c66187d5f82f653658c0ce45b45d0",
+      "official_commit": "d9b54c8395cfa31ab5c35cfa4225e0fb35ee5553"
+    },
+    "gather_elements_v2_port": {
+      "archive": "vendor_source/gather_elements_v2_source.zip",
+      "archive_sha256": "9f1d9753d47ec8e0f0fb3dde1de5b047e048900ff2e9a014c1ed614d7ed57470",
+      "source_version": "CANN 8.3 extracted GatherElementsV2 source",
+      "target_build": "CANN 8.1.RC1 host ABI and Ascend C device compiler",
+      "runtime_python_compilation": false,
+      "tiling_algorithm_changes": false,
+      "kernel_algorithm_changes": false
+    }
+  },
+  "operators": {
+    "gather_elements": {
+      "source": "gather_elements_v2_port",
+      "operator_type": "GatherElementsV2",
+      "runtime_op": "gather_elements",
+      "relative_root": "src/index/gather_elements_v2",
+      "tiler": "op_host/gather_elements_v2_tiling.cpp",
+      "tiler_sha256": "c7bb8d76d1741b5c3212a8de9f28bf6f9de5fe2f7d012bfa90780b25e6f12793",
+      "cmake_op_name": "gather_elements_v2",
+      "acl_api": "aclnnInnerGatherElementsV2"
+    },
+    "flash_attention_score_grad": {
+      "source": "cann_ops_adv",
+      "operator_type": "FlashAttentionScoreGrad",
+      "runtime_op": "flash_attention_score_grad",
+      "relative_root": "src/transformer/flash_attention_score_grad",
+      "cmake_op_name": "flash_attention_score_grad",
+      "entry_sha256": "ecd77bd3de27e48d5184d97eb635ede20183d5841af3d69342f06e2578115e4a",
+      "registration_macro": "REGISTER_TILING_TEMPLATE",
+      "registration_operator": "FlashAttentionScoreGrad",
+      "expected_strategy_count": 8,
+      "strategy_files": {
+        "ophost/flash_attention_score_grad_tiling_bngs1s2_b.cpp": "b4b927d8eede05cb7570ed14c669cb0bbc55d8241313813bea1e8af457baa05c",
+        "ophost/flash_attention_score_grad_tiling_ngs1s2_bn.cpp": "f23e5607920676caa882a0916df67986ea3c855b0d8b1bd2b18a2d53878ce389",
+        "ophost/flash_attention_score_grad_tiling_s1s2_bn2.cpp": "c7a00c521cb978fadbb575284c4e3d09eb9ac654da5348f2408d8854e48ae07b",
+        "ophost/flash_attention_score_grad_tiling_s1s2_bn2gs1s2.cpp": "a71ed86aee024855f155659ae30c412656efc9b3b8c95374800c205d4f751769",
+        "ophost/flash_attention_score_grad_tiling_s1s2_bn2gs1s2_sab.cpp": "e2f2039154724a09e36599cbc799fa304354eb7f9eb0c4709209717121167ef0",
+        "ophost/flash_attention_score_grad_tiling_unpadded_attension.cpp": "998aa5b42fe6ecb651bcdd02a20373314e2edbb2cbc04c765def4561be3e9548"
+      }
+    },
+    "fused_infer_attention_score": {
+      "source": "cann_ops_adv",
+      "operator_type": "FusedInferAttentionScore",
+      "runtime_op": "fused_infer_attention_score",
+      "relative_root": "src/transformer/fused_infer_attention_score",
+      "cmake_op_name": "fused_infer_attention_score",
+      "tiler": "ophost/fused_infer_attention_score_tiling.cpp",
+      "tiler_sha256": "0d1e75dca04281714ce066a0a7632e9d1fc58b15fb9a443edae275708b4a67ce",
+      "decode_tiler": "src/transformer/incre_flash_attention/ophost/incre_flash_attention_tiling.cc",
+      "decode_tiler_sha256": "6b58bd6d5f8ffb581444c984d842e37e77058b5e7dc247a281d4223061b3e2db"
+    }
+  },
+  "contract": {
+    "cann_version": "8.1.RC1",
+    "minimum_successful_tilings_per_shape": 20,
+    "target_records_per_operator": 5000,
+    "runtime_python_compilation": false,
+    "installed_cann_writes": 0,
+    "matmul_included": false,
+    "scatter_elements_included": false
+  },
+  "collection_contract": {
+    "forbidden": [
+      "read historical latency or tiling records during execution",
+      "read CCE calibration or cost-model data during execution",
+      "edit a generated raw tiling field",
+      "runtime Python or TBE compilation",
+      "write the installed CANN tree"
+    ]
+  }
+}

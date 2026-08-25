@@ -8,7 +8,9 @@
 #include <aclnnop/aclnn_matmul.h>
 #include <aclnnop/aclnn_permute.h>
 #endif
+#ifndef REMAINING_OPERATOR_ONLY
 #include <aclnnop/aclnn_scatter.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -49,6 +51,7 @@ struct GatherElementsPrivateApi {
 };
 #endif
 
+#ifndef REMAINING_OPERATOR_ONLY
 using ScatterElementsGetWorkspace = aclnnStatus (*)(const aclTensor *, int64_t, const aclTensor *,
                                                      const aclTensor *, int64_t, aclTensor *,
                                                      uint64_t *, aclOpExecutor **);
@@ -60,6 +63,7 @@ struct ScatterElementsPrivateApi {
     ScatterElementsLaunch launch = nullptr;
     std::string path;
 };
+#endif
 
 void Stage(const std::string &stage, const std::string &detail = "")
 {
@@ -68,6 +72,25 @@ void Stage(const std::string &stage, const std::string &detail = "")
     if (!detail.empty()) std::cout << ",\"detail\":\"" << JsonEscape(detail) << "\"";
     std::cout << "}" << std::endl;
 }
+
+#ifndef SCATTER_ELEMENTS_ONLY
+void *LoadRemainingPrivateLibrary(const char *path, const std::string &label)
+{
+    if (path == nullptr || *path == '\0') throw std::runtime_error(label + " path is absent");
+    Stage("private_host_tiler_load_begin", label);
+    // Host-tiler registration is performed by library constructors and must
+    // be globally visible to the installed CANN 8.1 OpAPI invoked below.
+    void *handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    if (handle == nullptr) {
+        const char *error = dlerror();
+        throw std::runtime_error("cannot load " + label + ": " +
+                                 (error == nullptr ? "unknown dlopen error" : std::string(error)));
+    }
+    Stage("private_host_tiler_load_done", label);
+    return handle;  // Isolated worker owns this host tiler until process exit.
+}
+
+#endif
 
 #ifndef SCATTER_ELEMENTS_ONLY
 const GatherElementsPrivateApi &LoadGatherElementsPrivateApi(const char *libraryPath)
@@ -119,6 +142,7 @@ const GatherElementsPrivateApi &LoadGatherElementsPrivateApi(const char *library
 }
 #endif
 
+#ifndef REMAINING_OPERATOR_ONLY
 const ScatterElementsPrivateApi &LoadScatterElementsPrivateApi(const char *libraryPath)
 {
     // CANN's generated OpAPI keeps process-local executor state.  Match the
@@ -159,6 +183,7 @@ const ScatterElementsPrivateApi &LoadScatterElementsPrivateApi(const char *libra
     api = loaded;
     return *api;
 }
+#endif
 
 void DeviceException(aclrtExceptionInfo *info)
 {
@@ -662,6 +687,52 @@ void FillIndices(DeviceBuffer &buffer, aclDataType dtype, uint64_t count, int64_
     }
 }
 
+std::vector<uint8_t> GatherElementsHostReference(DeviceBuffer &input, DeviceBuffer &index,
+                                                 aclDataType dtype, aclDataType indexDtype,
+                                                 const std::vector<int64_t> &shape,
+                                                 const std::vector<int64_t> &indexShape,
+                                                 int64_t axis)
+{
+    const std::vector<uint8_t> inputBytes = input.CopyTo<uint8_t>();
+    const uint64_t outputElements = Elements(indexShape);
+    std::vector<int64_t> indices(outputElements);
+    if (indexDtype == ACL_INT32) {
+        const std::vector<int32_t> values = index.CopyTo<int32_t>();
+        std::copy(values.begin(), values.end(), indices.begin());
+    } else if (indexDtype == ACL_INT64) {
+        indices = index.CopyTo<int64_t>();
+    } else {
+        throw std::runtime_error("GatherElements reference index dtype must be int32 or int64");
+    }
+    const std::vector<int64_t> inputStrides = Strides(shape);
+    const std::vector<int64_t> outputStrides = Strides(indexShape);
+    const size_t elementBytes = ElementBytes(dtype);
+    std::vector<uint8_t> outputBytes(static_cast<size_t>(outputElements) * elementBytes);
+    for (uint64_t linear = 0; linear < outputElements; ++linear) {
+        uint64_t inputOffset = 0;
+        for (size_t dimension = 0; dimension < shape.size(); ++dimension) {
+            int64_t coordinate = static_cast<int64_t>(
+                (linear / static_cast<uint64_t>(outputStrides[dimension])) %
+                static_cast<uint64_t>(indexShape[dimension]));
+            if (static_cast<int64_t>(dimension) == axis) coordinate = indices[linear];
+            if (coordinate < 0 || coordinate >= shape[dimension]) {
+                throw std::runtime_error("GatherElements deterministic reference index is out of range");
+            }
+            inputOffset += static_cast<uint64_t>(coordinate * inputStrides[dimension]);
+        }
+        std::memcpy(outputBytes.data() + linear * elementBytes,
+                    inputBytes.data() + inputOffset * elementBytes, elementBytes);
+    }
+    std::vector<uint8_t> snapshot;
+    const uint64_t byteCount = static_cast<uint64_t>(outputBytes.size());
+    snapshot.reserve(8 + outputBytes.size());
+    for (int byte = 0; byte < 8; ++byte) {
+        snapshot.push_back(static_cast<uint8_t>((byteCount >> (byte * 8)) & 0xFFU));
+    }
+    snapshot.insert(snapshot.end(), outputBytes.begin(), outputBytes.end());
+    return snapshot;
+}
+
 #ifndef SCATTER_ELEMENTS_ONLY
 Measurement RunMatmul(const Arguments &args, aclrtStream stream, int warmup, int samples)
 {
@@ -756,6 +827,10 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
     DeviceBuffer input(Elements(shape), dtype), index(Elements(indexShape), indexDtype), output(Elements(indexShape), dtype);
     FillGeneralPattern(input, dtype, Elements(shape), 0);
     FillIndices(index, indexDtype, Elements(indexShape), shape[axis]);
+    const bool needsReference = args.Has("write-reference") || args.Has("compare-reference");
+    const std::vector<uint8_t> exactReference = needsReference
+        ? GatherElementsHostReference(input, index, dtype, indexDtype, shape, indexShape, axis)
+        : std::vector<uint8_t>{};
     // A private source candidate explicitly opts into generic OPP dispatch.
     // The reference has neither variable and therefore cannot accidentally
     // take this path. An audit path without the dispatch contract is an error,
@@ -791,7 +866,7 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
             return api.launch(workspace, bytes, executor, launchStream);
         };
-        if (args.Has("source-host-tiling-only")) {
+        if (args.Has("source-host-tiling-only") || args.Has("source-executor-planning-only")) {
             Measurement result;
             Executor executor;
             Stage("private_host_tiling_get_workspace_begin");
@@ -827,6 +902,21 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         return result;
     }
 
+    // CANN 8.1 exposes aclnnGather but not a public aclnnGatherElements API.
+    // Rank-one Gather and GatherElements are equivalent, so preflight still
+    // proves the installed NPU route on the first workload.  Higher-rank
+    // reference files are generated from the exact deterministic tensor
+    // coordinates; this host work is never inside a device-event interval.
+    if (args.Has("write-reference") && shape.size() != 1) {
+        WriteReference(args.Get("write-reference"), exactReference);
+        Measurement result;
+        result.outputBytes = exactReference.size();
+        result.outputDigest = Fnv1a64(exactReference);
+        gBackend = "host_exact_gather_elements_reference";
+        Stage("gather_elements_host_reference_done");
+        return result;
+    }
+
     Tensor inputTensor(input, dtype, shape), indexTensor(index, indexDtype, indexShape), outputTensor(output, dtype, indexShape);
     const auto execute = [&](const auto &getWorkspace, const auto &launch) {
         if (args.Has("source-tiling-only")) {
@@ -839,7 +929,10 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
         const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
         result.outputBytes = snapshot.size();
         result.outputDigest = Fnv1a64(snapshot);
-        if (args.Has("write-reference")) WriteReference(args.Get("write-reference"), snapshot);
+        if (args.Has("write-reference")) {
+            if (snapshot != exactReference) throw std::runtime_error("installed rank-one Gather reference mismatch");
+            WriteReference(args.Get("write-reference"), exactReference);
+        }
         if (args.Has("compare-reference")) {
             result.outputReferenceChecked = true;
             result.outputReferenceEqual = snapshot == ReadReference(args.Get("compare-reference"));
@@ -859,6 +952,7 @@ Measurement RunGatherElements(const Arguments &args, aclrtStream stream, int war
 }
 #endif
 
+#ifndef REMAINING_OPERATOR_ONLY
 Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int warmup, int samples)
 {
     const auto shape = args.Shape("shape"), indexShape = args.Shape("index-shape");
@@ -938,6 +1032,7 @@ Measurement RunScatterElements(const Arguments &args, aclrtStream stream, int wa
     }
     return result;
 }
+#endif
 
 #ifndef SCATTER_ELEMENTS_ONLY
 std::vector<int64_t> AttentionShape(const std::string &layout, int64_t batch, int64_t heads,
@@ -985,6 +1080,17 @@ Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream
     std::vector<char> layoutText(layout.begin(), layout.end());
     layoutText.push_back('\0');
     const double scale = 1.0 / std::sqrt(static_cast<double>(headDim));
+    const char *dispatch = std::getenv("FASG_SOURCE_DISPATCH");
+    const bool privateSource = dispatch != nullptr;
+    const bool auditRequested = std::getenv("FASG_TILING_AUDIT_PATH") != nullptr;
+    if (privateSource && std::string(dispatch) != "cann81_native_aclnn") throw std::runtime_error("invalid FASG_SOURCE_DISPATCH");
+    if (privateSource != auditRequested) throw std::runtime_error("FASG source audit/dispatch mismatch");
+    if (privateSource) {
+        LoadRemainingPrivateLibrary(std::getenv("FASG_SOURCE_TILING_LIBRARY"),
+                                    "FlashAttentionScoreGrad CANN-8.1 host tiler");
+        gBackend = "private_cann81_fasg_host_tiler_installed_kernel_real_npu";
+        if (args.Has("source-load-only")) return Measurement{};
+    }
     const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
         return aclnnFlashAttentionScoreGradGetWorkspaceSize(
             qTensor.Get(), kTensor.Get(), vTensor.Get(), dyTensor.Get(),
@@ -996,20 +1102,18 @@ Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream
     const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
         return aclnnFlashAttentionScoreGrad(workspace, bytes, executor, launchStream);
     };
-    if (args.Has("source-tiling-only")) {
-        // This invokes the original host-side tiling path once and exits before
-        // allocating workspace or launching a kernel. The isolated overlay's
-        // audit-only passthrough writes the raw tiling identity to its temporary
-        // path; this is the finite-candidate discovery phase, not a latency.
+    if (args.Has("source-executor-planning-only")) {
         Measurement result;
         Executor executor;
-        Stage("source_tiling_get_workspace_begin");
-        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "FASG source tiling GetWorkspaceSize");
-        if (executor.ptr == nullptr) throw std::runtime_error("FASG source tiling returned null executor");
-        Stage("source_tiling_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
+        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "private FASG GetWorkspaceSize probe");
+        if (executor.ptr == nullptr) throw std::runtime_error("private FASG returned null executor");
+        executor.ReleaseToIsolatedProcessExit();
         return result;
     }
-    Measurement result = Measure(stream, warmup, samples, dq, getWorkspace, launch);
+    // Source discovery performs one real installed-kernel launch/sync after
+    // registering the selected instrumented CANN 8.1 host tiler.
+    Measurement result = Measure(stream, args.Has("source-tiling-only") ? 0 : warmup,
+                                 args.Has("source-tiling-only") ? 0 : samples, dq, getWorkspace, launch);
     const std::vector<uint8_t> snapshot = SnapshotOutputs({&dq, &dk, &dv});
     result.outputBytes = snapshot.size();
     result.outputDigest = Fnv1a64(snapshot);
@@ -1043,6 +1147,17 @@ Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream strea
     std::vector<char> layoutText(layout.begin(), layout.end());
     layoutText.push_back('\0');
     const double scale = 1.0 / std::sqrt(static_cast<double>(headDim));
+    const char *dispatch = std::getenv("FIAS_SOURCE_DISPATCH");
+    const bool privateSource = dispatch != nullptr;
+    const bool auditRequested = std::getenv("FIAS_TILING_AUDIT_PATH") != nullptr;
+    if (privateSource && std::string(dispatch) != "cann81_native_aclnn") throw std::runtime_error("invalid FIAS_SOURCE_DISPATCH");
+    if (privateSource != auditRequested) throw std::runtime_error("FIAS source audit/dispatch mismatch");
+    if (privateSource) {
+        LoadRemainingPrivateLibrary(std::getenv("FIAS_SOURCE_TILING_LIBRARY"),
+                                    "FusedInferAttentionScore CANN-8.1 host tiler");
+        gBackend = "private_cann81_fias_host_tiler_installed_kernel_real_npu";
+        if (args.Has("source-load-only")) return Measurement{};
+    }
     const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
         return aclnnFusedInferAttentionScoreGetWorkspaceSize(
             qTensor.Get(), keyList.Get(), valueList.Get(), nullptr, nullptr, nullptr, nullptr,
@@ -1053,16 +1168,16 @@ Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream strea
     const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
         return aclnnFusedInferAttentionScore(workspace, bytes, executor, launchStream);
     };
-    if (args.Has("source-tiling-only")) {
+    if (args.Has("source-executor-planning-only")) {
         Measurement result;
         Executor executor;
-        Stage("source_tiling_get_workspace_begin");
-        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "FIAS source tiling GetWorkspaceSize");
-        if (executor.ptr == nullptr) throw std::runtime_error("FIAS source tiling returned null executor");
-        Stage("source_tiling_get_workspace_done", "workspace_bytes=" + std::to_string(result.workspaceBytes));
+        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "private FIAS GetWorkspaceSize probe");
+        if (executor.ptr == nullptr) throw std::runtime_error("private FIAS returned null executor");
+        executor.ReleaseToIsolatedProcessExit();
         return result;
     }
-    Measurement result = Measure(stream, warmup, samples, output, getWorkspace, launch);
+    Measurement result = Measure(stream, args.Has("source-tiling-only") ? 0 : warmup,
+                                 args.Has("source-tiling-only") ? 0 : samples, output, getWorkspace, launch);
     const std::vector<uint8_t> snapshot = SnapshotOutputs({&output});
     result.outputBytes = snapshot.size();
     result.outputDigest = Fnv1a64(snapshot);
@@ -1080,6 +1195,12 @@ Measurement RunOperation(const Arguments &args, aclrtStream stream, int warmup, 
     const std::string op = args.Get("op");
 #ifdef SCATTER_ELEMENTS_ONLY
     if (op == "scatter_elements") return RunScatterElements(args, stream, warmup, samples);
+#elif defined(GATHER_ELEMENTS_ONLY)
+    if (op == "gather_elements") return RunGatherElements(args, stream, warmup, samples);
+#elif defined(FASG_ONLY)
+    if (op == "flash_attention_score_grad") return RunFlashAttentionScoreGrad(args, stream, warmup, samples);
+#elif defined(FIAS_ONLY)
+    if (op == "fused_infer_attention_score") return RunFusedInferAttentionScore(args, stream, warmup, samples);
 #else
     if (op == "matmul") return RunMatmul(args, stream, warmup, samples);
     if (op == "transpose") return RunTranspose(args, stream, warmup, samples);

@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -44,7 +45,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
+LOCK_PATH = Path(os.environ.get("CANN81_SOURCE_LOCK", str(ROOT / "non_matmul_source_lock.json")))
+LOCK = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
 OP = LOCK["operators"]["flash_attention_score_grad"]
 SOURCE = LOCK["sources"]["cann_ops_adv"]
 HARNESS_SOURCE = LOCK["sources"]["cann_ops"]
@@ -185,6 +187,44 @@ endforeach ()'''.format(name=cmake_op_name, ops=scoped_ops, dirs=scoped_dirs, ho
     if original_scope not in transformed:
         raise RuntimeError("cannot locate public op-directory selection block")
     transformed = transformed.replace(original_scope, scoped_replacement)
+    source_install = '''foreach (_op_name ${OP_LIST})
+    install(FILES ${ASCEND_IMPL_OUT_DIR}/dynamic/${_op_name}.py
+            DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
+            OPTIONAL
+    )
+endforeach ()
+
+foreach (_op_name ${OP_LIST})
+    install(FILES ${ASCEND_IMPL_OUT_DIR}/dynamic/${_op_name}.cpp
+            DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
+            OPTIONAL
+    )
+endforeach ()
+
+install(DIRECTORY ${OPS_ADV_UTILS_KERNEL_INC}/
+        DESTINATION ${IMPL_INSTALL_DIR}/ascendc/common
+)
+
+foreach (op_dir ${OP_DIR_LIST})
+    get_filename_component(_op_name "${op_dir}" NAME)
+
+    file(GLOB KERNEL_FILES
+            ${op_dir}/op_kernel/*.cpp
+            ${op_dir}/op_kernel/*.h
+    )
+
+    install(FILES ${KERNEL_FILES}
+            DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
+            OPTIONAL
+    )
+endforeach ()'''
+    binary_only = '''# REMAINING_ATTENTION_CANN81_PRECOMPILED_PACKAGE_V1: source bytes
+# remain private build inputs, but the runtime package receives only host
+# libraries, metadata and precompiled 910B objects.  Missing keys fail closed
+# instead of entering Python/TBE runtime compilation.'''
+    if transformed.count(source_install) != 1:
+        raise RuntimeError("cannot locate public dynamic-source install block")
+    transformed = transformed.replace(source_install, binary_only)
     if transformed == original or "src/common" in transformed or BUILD_SCOPE_SENTINEL not in transformed:
         raise RuntimeError("unexpected public build-harness layout")
     return transformed, {
@@ -512,6 +552,7 @@ def existing_overlay(source_root: Path, output: Path, selected: Registration,
         "strategy_class": selected.source_class,
         "strategy_priority": selected.priority,
         "strategy_algorithm_changes": False,
+        "kernel_algorithm_changes": False,
         "source_compile_info_core_budget_enumeration": True,
         "source_hardware_envelope_heuristic_enumeration": True,
         "hardware_envelope_heuristic": {
@@ -594,6 +635,7 @@ def write_overlay(source_root: Path, output_parent: Path, selected: Registration
             "mutates_tiling_context": False,
         },
         "strategy_algorithm_changes": False,
+        "kernel_algorithm_changes": False,
         "source_compile_info_core_budget_enumeration": True,
         "source_hardware_envelope_heuristic_enumeration": True,
         "hardware_envelope_heuristic": {

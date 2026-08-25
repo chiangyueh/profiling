@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,7 +31,8 @@ from prepare_fasg_strategy_overlays import (digest, materialize_build_support_fi
 
 
 ROOT = Path(__file__).resolve().parent
-LOCK = json.loads((ROOT / "non_matmul_source_lock.json").read_text(encoding="utf-8"))
+LOCK_PATH = Path(os.environ.get("CANN81_SOURCE_LOCK", str(ROOT / "non_matmul_source_lock.json")))
+LOCK = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
 SOURCE = LOCK["sources"]["cann_ops_adv"]
 OP = LOCK["operators"]["fused_infer_attention_score"]
 OP_ROOT = Path(OP["relative_root"])
@@ -91,6 +93,11 @@ static ge::graphStatus FIASSourceAuditResult(gert::TilingContext *context, ge::g
     if source.count(include_anchor) != 1:
         raise RuntimeError("cannot locate FIAS include anchor")
     source = source.replace(include_anchor, audit)
+    host_entry = "ge::graphStatus DoOpTilingFusedInferAttentionScore(gert::TilingContext *context)"
+    original_host_entry = "static ge::graphStatus FIASOriginalDoOpTilingFusedInferAttentionScore(gert::TilingContext *context)"
+    if source.count(host_entry) != 1:
+        raise RuntimeError("cannot locate registered FIAS host-tiling entry")
+    source = source.replace(host_entry, original_host_entry)
     assignment = '''        tempCompileInfoPtr.aivNum = ascendcPlatform.GetCoreNumAiv();
         tempCompileInfoPtr.aicNum = ascendcPlatform.GetCoreNumAic();'''
     replacement = r'''        tempCompileInfoPtr.aivNum = ascendcPlatform.GetCoreNumAiv();
@@ -139,29 +146,39 @@ static ge::graphStatus FIASSourceAuditResult(gert::TilingContext *context, ge::g
     if source.count(pfa_ub_anchor) != 1:
         raise RuntimeError("cannot locate FIAS PFA UB capacity assignment")
     source = source.replace(pfa_ub_anchor, pfa_ub_replacement)
-    original_wrapper = '''__attribute__((visibility("default"))) ge::graphStatus
+    original_wrapper = '''extern "C" {
+__attribute__((visibility("default"))) ge::graphStatus DeviceDoOpTilingIncreFlashAttention(gert::TilingContext *context)
+{
+    return TilingIncreFlashAttention(context);
+}
+__attribute__((visibility("default"))) ge::graphStatus
 DeviceDoOpTilingFusedInferAttentionScore(gert::TilingContext *context)
 {
     return DoOpTilingFusedInferAttentionScore(context);
+}
 }'''
-    replacement_wrapper = '''__attribute__((visibility("default"))) ge::graphStatus
+    replacement_wrapper = '''// The registration in fused_infer_attention_score_tiling_register.cpp
+// calls this host entry directly. Audit here, not only in the device-tiling
+// export, so an actual CANN package launch proves the selected host tiler.
+ge::graphStatus DoOpTilingFusedInferAttentionScore(gert::TilingContext *context)
+{
+    return FIASSourceAuditResult(context, FIASOriginalDoOpTilingFusedInferAttentionScore(context));
+}
+
+extern "C" {
+__attribute__((visibility("default"))) ge::graphStatus DeviceDoOpTilingIncreFlashAttention(gert::TilingContext *context)
+{
+    return TilingIncreFlashAttention(context);
+}
+__attribute__((visibility("default"))) ge::graphStatus
 DeviceDoOpTilingFusedInferAttentionScore(gert::TilingContext *context)
 {
-    return FIASSourceAuditResult(context, DoOpTilingFusedInferAttentionScore(context));
+    return DoOpTilingFusedInferAttentionScore(context);
+}
 }'''
     if source.count(original_wrapper) != 1:
         raise RuntimeError("cannot locate FIAS source tiling entry for audit")
-    original_incre_wrapper = '''__attribute__((visibility("default"))) ge::graphStatus DeviceDoOpTilingIncreFlashAttention(gert::TilingContext *context)
-{
-    return TilingIncreFlashAttention(context);
-}'''
-    replacement_incre_wrapper = '''__attribute__((visibility("default"))) ge::graphStatus DeviceDoOpTilingIncreFlashAttention(gert::TilingContext *context)
-{
-    return FIASSourceAuditResult(context, TilingIncreFlashAttention(context));
-}'''
-    if source.count(original_incre_wrapper) != 1:
-        raise RuntimeError("cannot locate FIAS decode source tiling entry for audit")
-    return source.replace(original_wrapper, replacement_wrapper).replace(original_incre_wrapper, replacement_incre_wrapper)
+    return source.replace(original_wrapper, replacement_wrapper)
 
 
 def instrument_ifa_tiler(source: str) -> str:
@@ -226,7 +243,8 @@ def existing_overlay(source_root: Path, output: Path, harness_text: str,
         "operator": "FusedInferAttentionScore", "official_commit": SOURCE["commit"],
         "source_family": "cann_ops_adv", "cmake_op_name": "fused_infer_attention_score",
         "audit_entry_relative": str(FIAS_RELATIVE), "audit_sentinel": AUDIT_SENTINEL,
-        "strategy_algorithm_changes": False, "source_compile_info_core_budget_enumeration": True,
+        "strategy_algorithm_changes": False, "kernel_algorithm_changes": False,
+        "source_compile_info_core_budget_enumeration": True,
         "source_hardware_envelope_heuristic_enumeration": True,
         "hardware_envelope_heuristic": {"enabled": True, "environment": "FIAS_SOURCE_UB_DIVISOR",
                                          "audit_field": "ub_cap_divisor", "resource": "source_visible_ub_capacity",
@@ -293,6 +311,7 @@ def write_overlay(source_root: Path, output_parent: Path, harness_root: Path, ha
             "mutates_tiling_context": False,
         },
         "strategy_algorithm_changes": False,
+        "kernel_algorithm_changes": False,
         "source_compile_info_core_budget_enumeration": True,
         "source_hardware_envelope_heuristic_enumeration": True,
         "hardware_envelope_heuristic": {"enabled": True, "environment": "FIAS_SOURCE_UB_DIVISOR",

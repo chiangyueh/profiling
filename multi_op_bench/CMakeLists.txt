@@ -23,14 +23,28 @@ set(CANN_DEVLIB "${CANN_PLATFORM}/devlib")
 
 add_executable(multi_op_npu_runner runner.cpp)
 option(SCATTER_ELEMENTS_ONLY "Compile only the ScatterElementsV2 measurement path" OFF)
+set(REMAINING_OPERATOR "" CACHE STRING "Compile one remaining CANN-8.1 operator: gather_elements, flash_attention_score_grad, or fused_infer_attention_score")
 if(SCATTER_ELEMENTS_ONLY)
     target_compile_definitions(multi_op_npu_runner PRIVATE SCATTER_ELEMENTS_ONLY=1)
 endif()
+if(REMAINING_OPERATOR)
+    if(NOT REMAINING_OPERATOR MATCHES "^(gather_elements|flash_attention_score_grad|fused_infer_attention_score)$")
+        message(FATAL_ERROR "unsupported REMAINING_OPERATOR=${REMAINING_OPERATOR}")
+    endif()
+    target_compile_definitions(multi_op_npu_runner PRIVATE REMAINING_OPERATOR_ONLY=1)
+    if(REMAINING_OPERATOR STREQUAL "gather_elements")
+        target_compile_definitions(multi_op_npu_runner PRIVATE GATHER_ELEMENTS_ONLY=1)
+    elseif(REMAINING_OPERATOR STREQUAL "flash_attention_score_grad")
+        target_compile_definitions(multi_op_npu_runner PRIVATE FASG_ONLY=1)
+    else()
+        target_compile_definitions(multi_op_npu_runner PRIVATE FIAS_ONLY=1)
+    endif()
+endif()
 target_include_directories(multi_op_npu_runner PRIVATE "${CANN_INCLUDE}")
 target_link_directories(multi_op_npu_runner PRIVATE "${CANN_LIB}")
-# The installed reference is linked normally. The checkout-local CANN 8.1
-# package's generated C++ ACLNN entry point is loaded by absolute path with
-# dlopen, so no Python/TBE runtime compiler is part of the custom path.
+# The installed CANN 8.1 OpAPI and kernel are linked normally. For the two
+# attention campaigns, only the checkout-local instrumented CANN 8.1 host
+# tiler is loaded by absolute path; no Python/TBE runtime compiler is involved.
 target_link_libraries(multi_op_npu_runner PRIVATE ascendcl nnopbase opapi pthread dl)
 target_link_options(
     multi_op_npu_runner PRIVATE

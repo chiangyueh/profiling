@@ -26,10 +26,12 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 CATALOG_PATH = ROOT / "scatter_elements_v2_candidate_catalog.py"
-LOCK = json.loads((ROOT / "scatter_elements_v2_cann81_lock.json").read_text(encoding="utf-8"))
 SCHEMA = "scatter_elements_v2_cann81_native_measurement_v1"
 SOURCE_BACKEND = "private_cann81_native_scatter_aclnn_real_npu"
 SOURCE_OPERATOR_TYPE = "ScatterElementsV2"
+SOURCE_RULE = ("complete official CANN 8.1 ScatterElementsV2 source discovery and validation, then "
+               "deterministic timing of 20 validated source contexts; the declared UB envelope is used only "
+               "when core-budget contexts are below 20; failed candidates do not count; no raw tiling field generation")
 # The campaign is intentionally append-only so an interrupted physical-NPU
 # run can resume without losing its completed groups.  A single log is kept
 # below this limit; the next numeric log is opened before an oversized write.
@@ -268,7 +270,8 @@ def validate_source_manifest(path: Path) -> dict[str, Any]:
     source_file = Path(str(item["source_file"]))
     if not source_file.is_file() or digest_file(source_file) != str(item["source_file_sha256"]):
         raise RuntimeError("private ScatterElementsV2 host tiler is missing or mismatched: {}".format(source_file))
-    expected_official = LOCK["operator"]["tiler_sha256"]
+    scatter_lock = json.loads((ROOT / "scatter_elements_v2_cann81_lock.json").read_text(encoding="utf-8"))
+    expected_official = scatter_lock["operator"]["tiler_sha256"]
     if item["official_tiling_source_sha256"] != expected_official:
         raise RuntimeError("private ScatterElementsV2 package has the wrong official host-tiler origin")
     package_root = Path(str(item["package_root"]))
@@ -639,7 +642,7 @@ def discover_group(args: Any, workload: dict[str, Any], packages: list[dict[str,
         if result.get("backend") != SOURCE_BACKEND:
             failures.append(candidate_label(candidate) + ": runner used unexpected backend {}".format(result.get("backend")))
             return True
-        if reason == "private ScatterElementsV2 host tiler emitted no raw-tiling audit":
+        if reason is not None and reason.endswith("host tiler emitted no raw-tiling audit"):
             failures.append(candidate_label(candidate) + ": " + reason)
             # This is a deployment/instrumentation failure, not an invalid
             # tiling. Retrying its remaining caps would only create duplicate
@@ -747,7 +750,7 @@ def execute_group(args: Any, workload: dict[str, Any], packages: list[dict[str, 
                          "discovery_failures": failures, "verification_failures": verification_failures,
                          "measurement_failures": measurement_failures,
                          "rejected_candidate_count": len(failures) + len(verification_failures) + len(measurement_failures),
-                         "source_rule": "complete official CANN 8.1 ScatterElementsV2 source discovery and validation, then deterministic timing of 20 validated source contexts; the declared UB envelope is used only when core-budget contexts are below 20; failed candidates do not count; no raw tiling field generation"}
+                         "source_rule": SOURCE_RULE}
 
 
 def summarize(directory: Path) -> dict[str, Any]:

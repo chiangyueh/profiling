@@ -44,8 +44,8 @@ int32_t BaseKAlignment(const Workload &w)
 }  // namespace
 
 BeamLnsSearcher::BeamLnsSearcher(
-    const OfficialTilingEngine &engine, SearchOptions options, ProxyWeights weights)
-    : engine_(engine), options_(options), proxy_(engine.Caps(), weights)
+    const OfficialTilingEngine &engine, SearchOptions options, MatmulPathParameters parameters)
+    : engine_(engine), options_(options), proxy_(engine.Caps(), parameters)
 {
 }
 

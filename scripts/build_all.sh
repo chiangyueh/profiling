@@ -59,6 +59,9 @@ COMMON_HOST=(
 HOST_SOURCES=(
     "$ROOT/host/src/search_types.cpp"
     "$ROOT/host/src/official_tiling.cpp"
+    "$ROOT/host/src/hardware_cost_model.cpp"
+    "$ROOT/host/src/hardware_profiles.cpp"
+    "$ROOT/host/src/indexed_update_path.cpp"
     "$ROOT/host/src/proxy_model.cpp"
     "$ROOT/host/src/beam_lns_search.cpp"
     "$ROOT/host/src/csv_io.cpp"
@@ -83,6 +86,15 @@ if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
         -ltiling_api -lplatform -lregister -lgraph -lgraph_base \
         -lascendcl -lascendalog -lc_sec -ldl -lpthread \
         -o "$BUILD/matmul_tiling_search"
+    run_logged "$BUILD/host_build.log" "compile indexed_update_cost" \
+        g++ "${COMMON_HOST[@]}" -c "$ROOT/tools/indexed_update_cost.cpp" \
+        -o "$HOST_OBJ_DIR/indexed_update_cost.o"
+    run_logged "$BUILD/host_build.log" "link indexed_update_cost" \
+        g++ "$HOST_OBJ_DIR/indexed_update_cost.o" \
+        "$HOST_OBJ_DIR/hardware_cost_model.o" \
+        "$HOST_OBJ_DIR/hardware_profiles.o" \
+        "$HOST_OBJ_DIR/indexed_update_path.o" \
+        -o "$BUILD/indexed_update_cost"
 else
     echo "[1/2] Skipping tiling search host (runner-only build)"
 fi

@@ -19,9 +19,25 @@ fi
 
 ARCH="$(uname -m)"
 CANN_INCLUDE="$CANN_ROOT/${ARCH}-linux/include"
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic \
+    -I"$ROOT/host/include" \
+    "$ROOT/tests/hardware_cost_model_test.cpp" \
+    "$ROOT/host/src/hardware_cost_model.cpp" \
+    -o "$WORK_DIR/hardware_cost_model_test"
+"$WORK_DIR/hardware_cost_model_test"
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic \
+    -I"$ROOT/host/include" \
+    "$ROOT/tests/indexed_update_path_test.cpp" \
+    "$ROOT/host/src/hardware_cost_model.cpp" \
+    "$ROOT/host/src/hardware_profiles.cpp" \
+    "$ROOT/host/src/indexed_update_path.cpp" \
+    -o "$WORK_DIR/indexed_update_path_test"
+"$WORK_DIR/indexed_update_path_test"
 g++ -std=c++17 -O2 -Wall -Wextra \
     -I"$ROOT/host/include" -I"$ROOT/compat" -I"$CANN_INCLUDE" \
     "$ROOT/tests/proxy_model_test.cpp" \
+    "$ROOT/host/src/hardware_cost_model.cpp" \
+    "$ROOT/host/src/hardware_profiles.cpp" \
     "$ROOT/host/src/proxy_model.cpp" \
     "$ROOT/host/src/search_types.cpp" \
     -o "$WORK_DIR/proxy_model_test"

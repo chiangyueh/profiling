@@ -1,5 +1,8 @@
 #include "proxy_model.h"
 
+#include "hardware_cost_model.h"
+#include "hardware_profiles.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -66,28 +69,8 @@ double BlendReuse(double fullCacheRepeat, double noCacheRepeat, double cacheFrac
     return fullCacheRepeat + (noCacheRepeat - fullCacheRepeat) * (1.0 - cacheFraction);
 }
 
-double OverlapStages(double first, double second, double workItems, double &fillDrain)
-{
-    if (first <= 0.0) return second;
-    if (second <= 0.0) return first;
-    if (workItems <= 1.0) return first + second;
-
-    // For a double-buffered two-stage pipeline, the bottleneck total is the
-    // steady state. One average non-bottleneck item accounts for fill/drain.
-    const double fill = std::min(first, second) / workItems;
-    fillDrain += fill;
-    return std::max(first, second) + fill;
-}
-
-struct TileCost {
-    double cycles = 0.0;
-    double pipelineCycles = 0.0;
-    double cubeCycles = 0.0;
-    double mte2Cycles = 0.0;
-    double mte1Cycles = 0.0;
-    double fixpipeCycles = 0.0;
-    double scalarCycles = 0.0;
-    double fillDrainCycles = 0.0;
+struct TilePlan {
+    hardware_cost::PathNode path;
     double aGmBytes = 0.0;
     double bGmBytes = 0.0;
     double cGmBytes = 0.0;
@@ -99,17 +82,21 @@ struct TileCost {
     double outputTiles = 0.0;
 };
 
-struct CoreCost : TileCost {
-    void Add(const TileCost &tile)
+struct CorePlan {
+    std::vector<hardware_cost::PathNode> paths;
+    double aGmBytes = 0.0;
+    double bGmBytes = 0.0;
+    double cGmBytes = 0.0;
+    double logicalInputBytes = 0.0;
+    double mte1Bytes = 0.0;
+    double actualMac = 0.0;
+    double paddedMac = 0.0;
+    double mmads = 0.0;
+    double outputTiles = 0.0;
+
+    void Add(TilePlan tile)
     {
-        cycles += tile.cycles;
-        pipelineCycles += tile.pipelineCycles;
-        cubeCycles += tile.cubeCycles;
-        mte2Cycles += tile.mte2Cycles;
-        mte1Cycles += tile.mte1Cycles;
-        fixpipeCycles += tile.fixpipeCycles;
-        scalarCycles += tile.scalarCycles;
-        fillDrainCycles += tile.fillDrainCycles;
+        paths.push_back(std::move(tile.path));
         aGmBytes += tile.aGmBytes;
         bGmBytes += tile.bGmBytes;
         cGmBytes += tile.cGmBytes;
@@ -122,10 +109,33 @@ struct CoreCost : TileCost {
     }
 };
 
-TileCost PredictTile(const Workload &w, const TCubeTiling &t, const ProxyWeights &weights,
-                     int64_t m, int64_t n, int64_t k, bool atomicOutput)
+hardware_cost::ResourceWork Transfer(
+    hardware_cost::Resource resource, hardware_cost::MemorySpace source,
+    hardware_cost::MemorySpace destination, double bytes, double issues)
 {
-    TileCost out;
+    hardware_cost::ResourceWork work;
+    work.resource = resource;
+    work.source = source;
+    work.destination = destination;
+    if (source == hardware_cost::MemorySpace::GM ||
+        destination == hardware_cost::MemorySpace::GM) {
+        work.intermediate = hardware_cost::MemorySpace::L2;
+    }
+    work.bytes = bytes;
+    work.issues = issues;
+    return work;
+}
+
+TilePlan LowerTileToHardwarePath(const Workload &w, const TCubeTiling &t,
+                                 const MatmulPathParameters &parameters, int64_t m,
+                                 int64_t n, int64_t k, bool atomicOutput)
+{
+    using hardware_cost::MemorySpace;
+    using hardware_cost::PathNode;
+    using hardware_cost::Resource;
+    using hardware_cost::ResourceWork;
+
+    TilePlan out;
     const int64_t inputBytes = DTypeBytes(w.dtype);
     const int64_t outputBytes = OutputBytes(w.dtype);
     const int64_t accumulatorBytes = AccumulatorBytes(w.dtype);
@@ -189,66 +199,120 @@ TileCost PredictTile(const Workload &w, const TCubeTiling &t, const ProxyWeights
     out.mmads = static_cast<double>(mTiles) * nTiles * kTiles;
     out.outputTiles = static_cast<double>(mTiles) * nTiles;
 
-    out.cubeCycles = out.paddedMac / cubeMacPerCycle + out.mmads * weights.cubeIssueCycles;
-
     const double aMte1Bytes = static_cast<double>(alignedM) * alignedK * inputBytes * nTiles;
     const double bMte1Bytes = static_cast<double>(alignedN) * alignedK * inputBytes * mTiles;
     out.mte1Bytes = aMte1Bytes + bMte1Bytes;
-    out.mte1Cycles = out.mte1Bytes / std::max(1.0, weights.mte1BytesPerCyclePerCore) +
-        2.0 * out.mmads * weights.mte1IssueCycles;
 
     const double aLoadBlocks = static_cast<double>(mTiles) * kTiles * aRepeat;
     const double bLoadBlocks = static_cast<double>(nTiles) * kTiles * bRepeat;
-    const double mte2A = out.aGmBytes / std::max(1.0, weights.mte2BytesPerCyclePerCore) +
-        aLoadBlocks * weights.mte2IssueCycles;
-    const double mte2B = out.bGmBytes / std::max(1.0, weights.mte2BytesPerCyclePerCore) +
-        bLoadBlocks * weights.mte2IssueCycles;
-    out.mte2Cycles = mte2A + mte2B;
-
     const double fixpipeBytes = static_cast<double>(alignedM) * alignedN *
         (accumulatorBytes + outputBytes);
-    out.fixpipeCycles = fixpipeBytes / std::max(1.0, weights.fixpipeBytesPerCyclePerCore) +
-        out.outputTiles * weights.fixpipeIssueCycles;
 
-    out.scalarCycles = weights.scalarCoreSetupCycles +
-        out.mmads * weights.scalarPerMmadCycles +
-        out.outputTiles * weights.scalarPerOutputTileCycles;
+    ResourceWork mte2AWork = Transfer(
+        Resource::MTE2, MemorySpace::GM, MemorySpace::L1, out.aGmBytes, aLoadBlocks);
+    ResourceWork mte2BWork = Transfer(
+        Resource::MTE2, MemorySpace::GM, MemorySpace::L1, out.bGmBytes, bLoadBlocks);
+    const PathNode mte2A = PathNode::Work(mte2AWork);
+    const PathNode mte2B = PathNode::Work(mte2BWork);
+    ResourceWork mte1AWork = Transfer(
+        Resource::MTE1, MemorySpace::L1, MemorySpace::L0A, aMte1Bytes, out.mmads);
+    ResourceWork mte1BWork = Transfer(
+        Resource::MTE1, MemorySpace::L1, MemorySpace::L0B, bMte1Bytes, out.mmads);
+    // V220 has asymmetric L1->L0A/L0B service. This is an intrinsic route
+    // property, not a MatMul- or shape-specific correction.
+    mte1AWork.bytesPerCycle = 256.0;
+    mte1BWork.bytesPerCycle = 128.0;
+    const PathNode mte1A = PathNode::Work(mte1AWork);
+    const PathNode mte1B = PathNode::Work(mte1BWork);
+
+    ResourceWork cube;
+    cube.resource = Resource::CUBE;
+    cube.operations = out.paddedMac;
+    cube.operationsPerCycle = cubeMacPerCycle;
+    cube.issues = out.mmads;
+    const PathNode cubePath = PathNode::Work(cube);
+
+    ResourceWork fixpipe = Transfer(Resource::FIXPIPE, MemorySpace::L0C,
+                                    MemorySpace::GM, fixpipeBytes, out.outputTiles);
+    // The internal L0C/FixPipe traffic includes accumulator conversion; only
+    // the final output bytes reach GM.
+    fixpipe.destinationBytes = out.cGmBytes;
+    const PathNode fixpipePath = PathNode::Work(fixpipe);
+
+    ResourceWork scalar;
+    scalar.resource = Resource::SCALAR;
+    scalar.fixedCycles = parameters.scalarCoreSetupCycles;
+    scalar.operations = out.mmads * parameters.scalarPerMmadCycles +
+        out.outputTiles * parameters.scalarPerOutputTileCycles;
+    scalar.operationsPerCycle = 1.0;
+    const PathNode scalarPath = PathNode::Work(scalar);
 
     const bool l0InputDb = t.dbL0A == 2 && t.dbL0B == 2;
-    double downstream = l0InputDb ?
-        OverlapStages(out.mte1Cycles, out.cubeCycles, out.mmads, out.fillDrainCycles) :
-        out.mte1Cycles + out.cubeCycles;
+    PathNode downstream = l0InputDb ?
+        PathNode::Pipeline(out.mmads,
+            {PathNode::Sequence({mte1A, mte1B}), cubePath}) :
+        PathNode::Sequence({mte1A, mte1B, cubePath});
 
     if (t.dbL0C == 2) {
-        downstream = OverlapStages(downstream, out.fixpipeCycles,
-                                   out.outputTiles, out.fillDrainCycles);
+        downstream = PathNode::Pipeline(out.outputTiles,
+                                        {std::move(downstream), fixpipePath});
     } else {
-        downstream += out.fixpipeCycles;
+        downstream = PathNode::Sequence({std::move(downstream), fixpipePath});
     }
 
     const bool aL1Db = HasL1DoubleBuffer(t.depthA1, t.stepM, t.stepKa);
     const bool bL1Db = HasL1DoubleBuffer(t.depthB1, t.stepN, t.stepKb);
     if (aL1Db && bL1Db) {
-        downstream = OverlapStages(out.mte2Cycles, downstream,
-                                   std::max(1.0, aLoadBlocks + bLoadBlocks), out.fillDrainCycles);
+        downstream = PathNode::Pipeline(std::max(1.0, aLoadBlocks + bLoadBlocks),
+            {PathNode::Sequence({mte2A, mte2B}), std::move(downstream)});
     } else if (aL1Db || bL1Db) {
-        const double overlappedMte2 = aL1Db ? mte2A : mte2B;
-        const double serializedMte2 = aL1Db ? mte2B : mte2A;
-        downstream = serializedMte2 + OverlapStages(overlappedMte2, downstream,
-            std::max(1.0, aL1Db ? aLoadBlocks : bLoadBlocks), out.fillDrainCycles);
+        const PathNode &overlappedMte2 = aL1Db ? mte2A : mte2B;
+        const PathNode &serializedMte2 = aL1Db ? mte2B : mte2A;
+        downstream = PathNode::Sequence({serializedMte2,
+            PathNode::Pipeline(std::max(1.0, aL1Db ? aLoadBlocks : bLoadBlocks),
+                               {overlappedMte2, std::move(downstream)})});
     } else {
-        downstream += out.mte2Cycles;
+        downstream = PathNode::Sequence({mte2A, mte2B, std::move(downstream)});
     }
 
-    out.pipelineCycles = downstream;
-    out.cycles = std::max(out.pipelineCycles, out.scalarCycles);
+    out.path = PathNode::Parallel({std::move(downstream), scalarPath});
     return out;
+}
+
+hardware_cost::HardwareProfile MakeHardwareProfile(const PlatformCaps &caps,
+                                                    const MatmulPathParameters &parameters,
+                                                    int32_t usedCores)
+{
+    using hardware_cost::MemorySpace;
+    using hardware_cost::Resource;
+    hardware_cost::HardwareProfile profile = hardware_cost::Ascend910B3VectorProfile();
+    const auto resource = [](Resource value) { return static_cast<std::size_t>(value); };
+    const auto memory = [](MemorySpace value) { return static_cast<std::size_t>(value); };
+    profile.rates[resource(Resource::CUBE)].issueCycles = parameters.cubeIssueCycles;
+    profile.rates[resource(Resource::SCALAR)].operationsPerCycle = 1.0;
+
+    profile.capacityBytes[memory(MemorySpace::L0A)] = caps.l0aBytes;
+    profile.capacityBytes[memory(MemorySpace::L0B)] = caps.l0bBytes;
+    profile.capacityBytes[memory(MemorySpace::L0C)] = caps.l0cBytes;
+    profile.capacityBytes[memory(MemorySpace::L1)] = caps.l1Bytes;
+    profile.capacityBytes[memory(MemorySpace::UB)] = caps.ubBytes;
+    profile.capacityBytes[memory(MemorySpace::L2)] = caps.l2Bytes;
+    if (caps.hbmBytesPerCycle > 0) {
+        profile.aggregateHbmBytesPerCycle =
+            static_cast<double>(caps.hbmBytesPerCycle) * std::max(1, usedCores);
+    }
+    if (caps.l2BytesPerCycle > 0) {
+        profile.aggregateL2BytesPerCycle =
+            static_cast<double>(caps.l2BytesPerCycle) * std::max(1, usedCores);
+    }
+    profile.kernelLaunchCycles = parameters.kernelFixedCycles;
+    return profile;
 }
 
 }  // namespace
 
-ProxyModel::ProxyModel(PlatformCaps caps, ProxyWeights weights)
-    : caps_(caps), weights_(weights)
+ProxyModel::ProxyModel(PlatformCaps caps, MatmulPathParameters parameters)
+    : caps_(caps), parameters_(parameters)
 {
 }
 
@@ -269,12 +333,7 @@ ProxyBreakdown ProxyModel::Score(
     const bool splitK = kParts > 1;
     const int64_t totalTiles = mParts * nParts * kParts;
     const int32_t usedCores = std::max(1, t.usedCoreNum);
-    std::vector<CoreCost> cores(static_cast<size_t>(usedCores));
-    ProxyWeights effectiveWeights = weights_;
-    const double hbmBytesPerCyclePerCore = caps_.hbmBytesPerCycle > 0 ?
-        static_cast<double>(caps_.hbmBytesPerCycle) : weights_.fallbackHbmBytesPerCycle;
-    effectiveWeights.mte2BytesPerCyclePerCore = std::min(
-        effectiveWeights.mte2BytesPerCyclePerCore, hbmBytesPerCyclePerCore);
+    std::vector<CorePlan> cores(static_cast<size_t>(usedCores));
 
     if (splitK) {
         for (int32_t core = 0; core < usedCores && core < totalTiles; ++core) {
@@ -284,7 +343,7 @@ ProxyBreakdown ProxyModel::Score(
             const int64_t mUse = std::min<int64_t>(t.singleCoreM, w.m - mIndex * t.singleCoreM);
             const int64_t nUse = std::min<int64_t>(t.singleCoreN, w.n - nIndex * t.singleCoreN);
             const int64_t kUse = std::min<int64_t>(t.singleCoreK, w.k - kIndex * t.singleCoreK);
-            cores[core].Add(PredictTile(w, t, effectiveWeights, mUse, nUse, kUse, true));
+            cores[core].Add(LowerTileToHardwarePath(w, t, parameters_, mUse, nUse, kUse, true));
         }
     } else {
         const int64_t mnTiles = mParts * nParts;
@@ -301,18 +360,25 @@ ProxyBreakdown ProxyModel::Score(
                 const int64_t nIndex = tile % nParts;
                 const int64_t mUse = std::min<int64_t>(t.singleCoreM, w.m - mIndex * t.singleCoreM);
                 const int64_t nUse = std::min<int64_t>(t.singleCoreN, w.n - nIndex * t.singleCoreN);
-                cores[core].Add(PredictTile(w, t, effectiveWeights, mUse, nUse, w.k, false));
+                cores[core].Add(LowerTileToHardwarePath(w, t, parameters_, mUse, nUse, w.k, false));
             }
         }
     }
 
-    double coreCycleSum = 0.0;
     double actualMac = 0.0;
     double paddedMac = 0.0;
     double logicalInputBytes = 0.0;
+    hardware_cost::KernelProgram program;
+    program.availableCores = std::max(1, std::min(w.maxCores, caps_.coreNum));
+    program.launchCycles = parameters_.kernelFixedCycles;
+    if (splitK) {
+        program.synchronizationCycles = parameters_.splitKBaseCycles +
+            parameters_.splitKPerCoreCycles * usedCores;
+    }
+    program.corePaths.reserve(cores.size());
     for (int32_t core = 0; core < usedCores; ++core) {
-        const CoreCost &cost = cores[core];
-        coreCycleSum += cost.cycles;
+        const CorePlan &cost = cores[core];
+        program.corePaths.push_back(hardware_cost::PathNode::Sequence(cost.paths));
         actualMac += cost.actualMac;
         paddedMac += cost.paddedMac;
         logicalInputBytes += cost.logicalInputBytes;
@@ -322,18 +388,35 @@ ProxyBreakdown ProxyModel::Score(
         out.estimatedMte1Bytes += cost.mte1Bytes;
         out.estimatedMmadCount += cost.mmads;
         out.estimatedOutputTileCount += cost.outputTiles;
-        if (out.criticalCoreId < 0 || cost.cycles > out.criticalCoreCycles) {
-            out.criticalCoreId = core;
-            out.criticalCoreCycles = cost.cycles;
-            out.pipelineCycles = cost.pipelineCycles;
-            out.cubeCycles = cost.cubeCycles;
-            out.mte2Cycles = cost.mte2Cycles;
-            out.mte1Cycles = cost.mte1Cycles;
-            out.fixpipeCycles = cost.fixpipeCycles;
-            out.scalarCycles = cost.scalarCycles;
-            out.fillDrainCycles = cost.fillDrainCycles;
-        }
     }
+
+    const hardware_cost::HardwareCostModel hardwareModel(
+        MakeHardwareProfile(caps_, parameters_, usedCores));
+    const hardware_cost::KernelCost hardware = hardwareModel.Evaluate(program);
+    if (!hardware.valid) {
+        out.total = std::numeric_limits<double>::infinity();
+        return out;
+    }
+
+    const auto resource = [](hardware_cost::Resource value) {
+        return static_cast<std::size_t>(value);
+    };
+    out.total = hardware.totalCycles;
+    out.criticalCoreId = hardware.criticalCore;
+    out.criticalCoreCycles = hardware.criticalCoreCycles;
+    out.averageCoreCycles = hardware.averageCoreCycles;
+    out.pipelineCycles = hardware.criticalCoreCycles;
+    out.cubeCycles = hardware.criticalResourceCycles[resource(hardware_cost::Resource::CUBE)];
+    out.mte2Cycles = hardware.criticalResourceCycles[resource(hardware_cost::Resource::MTE2)];
+    out.mte1Cycles = hardware.criticalResourceCycles[resource(hardware_cost::Resource::MTE1)];
+    out.fixpipeCycles = hardware.criticalResourceCycles[resource(hardware_cost::Resource::FIXPIPE)];
+    out.scalarCycles = hardware.criticalResourceCycles[resource(hardware_cost::Resource::SCALAR)];
+    out.fillDrainCycles = hardware.fillDrainCycles;
+    out.balancePenalty = hardware.balanceCycles;
+    out.launchCycles = hardware.launchCycles;
+    out.splitKPenalty = hardware.synchronizationCycles;
+    out.gmCycles = hardware.hbmCycles;
+    out.coreUtilization = hardware.coreUtilization;
 
     if (splitK) {
         const int64_t c0 = 32 / OutputBytes(w.dtype);
@@ -341,15 +424,9 @@ ProxyBreakdown ProxyModel::Score(
             OutputBytes(w.dtype);
     }
 
-    out.averageCoreCycles = coreCycleSum / usedCores;
-    out.balancePenalty = std::max(0.0, out.criticalCoreCycles - out.averageCoreCycles);
     out.l1Cycles = out.mte1Cycles;
     out.estimatedGmBytes = out.estimatedAGmBytes + out.estimatedBGmBytes + out.estimatedCGmBytes;
-    out.gmCycles = out.estimatedGmBytes /
-        std::max(1.0, hbmBytesPerCyclePerCore * usedCores);
 
-    const int32_t availableCores = std::max(1, std::min(w.maxCores, caps_.coreNum));
-    out.coreUtilization = std::min(1.0, SafeRatio(usedCores, availableCores));
     out.tailEfficiency = std::min(1.0, SafeRatio(actualMac, paddedMac));
     const double cubeMacPerCycle = static_cast<double>((256 / DTypeBits(w.dtype)) * 256);
     out.tailPenalty = std::max(0.0, paddedMac - actualMac) /
@@ -358,13 +435,6 @@ ProxyBreakdown ProxyModel::Score(
         out.estimatedAGmBytes + out.estimatedBGmBytes, logicalInputBytes), 0.0, 1.0);
     out.arithmeticIntensity = SafeRatio(2.0 * actualMac, out.estimatedGmBytes);
 
-    out.launchCycles = weights_.kernelFixedCycles;
-    if (splitK) {
-        out.splitKPenalty = weights_.splitKBaseCycles +
-            weights_.splitKPerCoreCycles * usedCores;
-    }
-    out.total = std::max(out.criticalCoreCycles, out.gmCycles) +
-        out.launchCycles + out.splitKPenalty;
     return out;
 }
 

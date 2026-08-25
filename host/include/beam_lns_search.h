@@ -14,7 +14,8 @@ struct SearchResult {
 
 class BeamLnsSearcher {
 public:
-    BeamLnsSearcher(const OfficialTilingEngine &engine, SearchOptions options = {}, ProxyWeights weights = {});
+    BeamLnsSearcher(const OfficialTilingEngine &engine, SearchOptions options = {},
+                    MatmulPathParameters parameters = {});
     SearchResult Search(const Workload &workload);
 
 private:

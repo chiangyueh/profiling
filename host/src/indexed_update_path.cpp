@@ -1,5 +1,7 @@
 #include "indexed_update_path.h"
 
+#include "hardware_path_builders.h"
+
 #include <algorithm>
 #include <utility>
 #include <vector>
@@ -22,50 +24,11 @@ uint64_t AlignUp(uint64_t value, uint64_t alignment)
     return alignment == 0 ? value : CeilDiv(value, alignment) * alignment;
 }
 
-PathNode Transfer(Resource resource, MemorySpace source, MemorySpace destination,
-                  double bytes, double instructions = 1.0)
-{
-    ResourceWork work;
-    work.resource = resource;
-    work.source = source;
-    work.destination = destination;
-    if (source == MemorySpace::GM || destination == MemorySpace::GM) {
-        work.intermediate = MemorySpace::L2;
-    }
-    work.bytes = bytes;
-    work.issues = instructions;
-    return PathNode::Work(work);
-}
-
-PathNode Operations(Resource resource, double operations, double instructions = 0.0)
-{
-    ResourceWork work;
-    work.resource = resource;
-    work.operations = operations;
-    work.issues = instructions;
-    return PathNode::Work(work);
-}
-
-PathNode EventHandshake(double instructions = 2.0)
-{
-    // set_flag/wait_flag occupy the scalar issue path but do not execute a
-    // pipe-wide drain.  Dependency ordering is represented by SEQUENCE.
-    return Operations(Resource::SYNC, 0.0, instructions);
-}
-
-PathNode PipeBarrier()
-{
-    // A PIPE_ALL barrier is a different intrinsic from an event handshake.
-    // Resource::SYNC operations use the measured architectural barrier rate;
-    // issues use the one-cycle scalar issue rate.
-    return Operations(Resource::SYNC, 1.0, 0.0);
-}
-
 PathNode ConcurrentTransfers(std::vector<PathNode> transfers)
 {
     // Consecutive DataCopyPad requests overlap their completion latency, but
     // still share MTE issue and byte service.
-    return PathNode::Parallel(std::move(transfers));
+    return Concurrent(std::move(transfers));
 }
 
 double CastLaneWork(uint64_t elements, uint32_t sourceBytes, uint32_t destinationBytes)

@@ -61,6 +61,16 @@ int main()
     assert(Near(queued.elapsedCycles, 116.0));
     assert(Near(queued.resourceCycles[static_cast<std::size_t>(Resource::MTE2)], 16.0));
 
+    ResourceWork dependentLoads = Bytes(Resource::MTE2, MemorySpace::GM,
+                                        MemorySpace::UB, 256.0);
+    dependentLoads.latencyWaves = 3.0;
+    const PathCost dependent = HardwareCostModel(queuedProfile).EvaluatePath(
+        PathNode::Work(dependentLoads));
+    assert(Near(dependent.elapsedCycles, 316.0));
+    // Completion latency is not shared-pipe occupancy.
+    assert(Near(dependent.resourceCycles[
+        static_cast<std::size_t>(Resource::MTE2)], 16.0));
+
     const PathCost pipelined = model.EvaluatePath(PathNode::Pipeline(8.0, {load, compute, store}));
     assert(Near(pipelined.elapsedCycles, 20.0));
     assert(pipelined.fillDrainCycles > 0.0);

@@ -97,6 +97,11 @@ struct ResourceWork {
     double issueCycles = 0.0;
     // Negative means use ResourceRate::latencyCycles.
     double latencyCycles = -1.0;
+    // Number of serialized dependency waves that pay completion latency.
+    // Multiple requests inside one wave may remain outstanding together;
+    // separate producer/consumer iterations cannot.  This is a hardware
+    // property of the lowered path, not an operator-specific coefficient.
+    double latencyWaves = 1.0;
 };
 
 struct PathNode {

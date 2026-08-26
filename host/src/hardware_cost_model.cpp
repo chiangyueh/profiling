@@ -96,7 +96,7 @@ PathCost HardwareCostModel::EvaluatePath(const PathNode &path) const
             work.latencyCycles : fallback.latencyCycles;
         const double occupancy = work.fixedCycles + Divide(work.bytes, byteRate) +
             Divide(work.operations, operationRate) + work.issues * issueCost;
-        const double cycles = latency + occupancy;
+        const double cycles = latency * std::max(0.0, work.latencyWaves) + occupancy;
         result.valid = std::isfinite(cycles) && cycles >= 0.0;
         result.elapsedCycles = result.valid ? cycles : std::numeric_limits<double>::infinity();
         // Latency can overlap with other outstanding requests and therefore

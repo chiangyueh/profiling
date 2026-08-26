@@ -2,7 +2,7 @@
 """Prepare one private CANN-8.1 build project for GatherElementsV2.
 
 The resulting vendor package contains the C++ operator schema, C++ host
-tiler, generated C++ ACLNN entry point, and precompiled Ascend C kernels.
+tiler, a CANN-8.1 level-2 OpAPI entry point, and precompiled Ascend C kernels.
 Runtime execution therefore does not depend on Python/TBE source compilation.
 This helper constructs that private project from repository-pinned sources.
 
@@ -137,6 +137,82 @@ target_include_directories(op_host_aclnnInner PRIVATE
         ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/msprof
 )
 
+# Match the CANN-8.1 ScatterElements package architecture: expose a small
+# level-2 OpAPI which creates a normal opdev executor and calls the source's
+# level-0 GatherElementsV2 launcher.  The generated aclnnInner entry point is
+# retained in the package metadata, but the benchmark never calls it because
+# that generated route is not ABI-safe for this source port on CANN 8.1.
+target_sources(opapi PRIVATE
+        op_host/op_api/aclnn_gather_elements_v2_private.cpp
+        op_host/op_api/gather_elements_v2.cpp
+)
+target_include_directories(opapi PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/op_host
+        ${CMAKE_CURRENT_SOURCE_DIR}/op_host/op_api
+        ${CMAKE_SOURCE_DIR}/src/common/inc
+        ${ASCEND_CANN_PACKAGE_PATH}/include
+        ${ASCEND_CANN_PACKAGE_PATH}/include/external
+        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment
+        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/platform
+        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/metadef
+        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/runtime
+        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/msprof
+)
+
+'''
+
+
+def cann81_private_opapi() -> str:
+    """CANN-8.1 level-2 wrapper around the source's unchanged level-0 op."""
+    return r'''// Private CANN-8.1 GatherElementsV2 OpAPI adapter.
+//
+// This follows the same CREATE_EXECUTOR -> L0 op -> ViewCopy ->
+// CommonOpExecutorRun contract used by the native CANN-8.1 ScatterElements
+// package.  It does not select a tiling or implement a device algorithm.
+#include "aclnn_kernels/common/op_error_check.h"
+#include "aclnn_kernels/contiguous.h"
+#include "opdev/make_op_executor.h"
+#include "opdev/op_dfx.h"
+#include "opdev/op_executor.h"
+#include "gather_elements_v2.h"
+
+using namespace op;
+
+extern "C" __attribute__((visibility("default")))
+aclnnStatus aclnnPrivateGatherElementsV2GetWorkspaceSize(
+    const aclTensor *x,
+    const aclTensor *index,
+    int64_t dim,
+    aclTensor *out,
+    uint64_t *workspaceSize,
+    aclOpExecutor **executor)
+{
+    OP_CHECK_COMM_INPUT(workspaceSize, executor);
+    L2_DFX_PHASE_1(aclnnPrivateGatherElementsV2, DFX_IN(x, index, dim), DFX_OUT(out));
+    auto uniqueExecutor = CREATE_EXECUTOR();
+    CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
+    CHECK_RET(x != nullptr && index != nullptr && out != nullptr, ACLNN_ERR_PARAM_NULLPTR);
+
+    const aclTensor *result = l0op::GatherElementsV2(x, index, dim, uniqueExecutor.get());
+    CHECK_RET(result != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    const aclTensor *viewCopy = l0op::ViewCopy(result, out, uniqueExecutor.get());
+    CHECK_RET(viewCopy != nullptr, ACLNN_ERR_INNER_NULLPTR);
+
+    *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+    uniqueExecutor.ReleaseTo(executor);
+    return ACLNN_SUCCESS;
+}
+
+extern "C" __attribute__((visibility("default")))
+aclnnStatus aclnnPrivateGatherElementsV2(
+    void *workspace,
+    uint64_t workspaceSize,
+    aclOpExecutor *executor,
+    aclrtStream stream)
+{
+    L2_DFX_PHASE_2(aclnnPrivateGatherElementsV2);
+    return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
 '''
 
 
@@ -298,6 +374,8 @@ def instrument(operator: Path) -> dict[str, str]:
     math_compat = operator / "op_host" / "util" / "math_util.h"
     math_compat.parent.mkdir(parents=True, exist_ok=True)
     math_compat.write_text(math_util_compat_header(), encoding="utf-8")
+    private_opapi = operator / "op_host" / "op_api" / "aclnn_gather_elements_v2_private.cpp"
+    private_opapi.write_text(cann81_private_opapi(), encoding="utf-8")
 
     body = tiling.read_text(encoding="utf-8")
     body = replace_once(body, '#include "platform/platform_infos_def.h"\n',
@@ -341,6 +419,7 @@ def instrument(operator: Path) -> dict[str, str]:
         "instrumented_last_dim_header_sha256": digest(last),
         "audit_header_sha256": digest(header),
         "math_util_compat_header_sha256": digest(math_compat),
+        "cann81_private_opapi_sha256": digest(private_opapi),
     }
 
 
@@ -554,7 +633,7 @@ def main() -> int:
         "compatibility_port": {
             "source_version": "extracted CANN-8.3 GatherElementsV2 source",
             "target_version": "CANN-8.1.RC1 host ABI and Ascend C device compiler",
-            "allowed_changes": ["CANN 8.1 CMake target binding", "CANN 8.1 API spelling bridge", "single-job private build scheduling", "precompiled-only runtime packaging", "pre-source bounded hardware budget", "post-generation raw-tiling audit"],
+            "allowed_changes": ["CANN 8.1 CMake target binding", "CANN 8.1 API spelling bridge", "CANN 8.1 level-2 OpAPI adapter", "single-job private build scheduling", "precompiled-only runtime packaging", "pre-source bounded hardware budget", "post-generation raw-tiling audit"],
             "runtime_python_compilation": False,
             "precompiled_device_kernels_required": True,
             "tiling_algorithm_changes": False,

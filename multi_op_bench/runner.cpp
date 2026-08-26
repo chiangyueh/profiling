@@ -40,7 +40,7 @@ std::string gBackend = "aclnn_real_npu";
 constexpr const char *kGatherElementsSourceOperatorType = "GatherElementsV2";
 
 using GatherElementsGetWorkspace = aclnnStatus (*)(const aclTensor *, const aclTensor *, int64_t,
-                                                    const aclTensor *, uint64_t *, aclOpExecutor **);
+                                                    aclTensor *, uint64_t *, aclOpExecutor **);
 using GatherElementsLaunch = aclnnStatus (*)(void *, uint64_t, aclOpExecutor *, aclrtStream);
 
 struct GatherElementsPrivateApi {
@@ -122,19 +122,19 @@ const GatherElementsPrivateApi &LoadGatherElementsPrivateApi(const char *library
 
     dlerror();
     loaded->getWorkspace = reinterpret_cast<GatherElementsGetWorkspace>(
-        dlsym(loaded->library, "aclnnInnerGatherElementsV2GetWorkspaceSize"));
+        dlsym(loaded->library, "aclnnPrivateGatherElementsV2GetWorkspaceSize"));
     const char *workspaceSymbolError = dlerror();
     if (loaded->getWorkspace == nullptr || workspaceSymbolError != nullptr) {
-        throw std::runtime_error("private GatherElementsV2 GetWorkspaceSize symbol is absent");
+        throw std::runtime_error("private GatherElementsV2 CANN-8.1 OpAPI GetWorkspaceSize symbol is absent");
     }
     Stage("private_opapi_get_workspace_symbol_done");
 
     dlerror();
     loaded->launch = reinterpret_cast<GatherElementsLaunch>(
-        dlsym(loaded->library, "aclnnInnerGatherElementsV2"));
+        dlsym(loaded->library, "aclnnPrivateGatherElementsV2"));
     const char *launchSymbolError = dlerror();
     if (loaded->launch == nullptr || launchSymbolError != nullptr) {
-        throw std::runtime_error("private GatherElementsV2 launch symbol is absent");
+        throw std::runtime_error("private GatherElementsV2 CANN-8.1 OpAPI launch symbol is absent");
     }
     Stage("private_opapi_launch_symbol_done");
     api = loaded;

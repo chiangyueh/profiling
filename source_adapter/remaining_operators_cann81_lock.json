@@ -34,7 +34,7 @@
       "tiler": "op_host/gather_elements_v2_tiling.cpp",
       "tiler_sha256": "c7bb8d76d1741b5c3212a8de9f28bf6f9de5fe2f7d012bfa90780b25e6f12793",
       "cmake_op_name": "gather_elements_v2",
-      "acl_api": "aclnnInnerGatherElementsV2"
+      "acl_api": "aclnnPrivateGatherElementsV2"
     },
     "flash_attention_score_grad": {
       "source": "cann_ops_adv",

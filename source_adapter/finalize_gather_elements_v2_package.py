@@ -77,6 +77,7 @@ def main() -> int:
 
     source_file = project / "src/index/gather_elements_v2/op_host/gather_elements_v2_tiling.cpp"
     audit_header = project / "src/index/gather_elements_v2/op_host/gather_elements_v2_source_audit.h"
+    private_opapi_source = project / "src/index/gather_elements_v2/op_host/op_api/aclnn_gather_elements_v2_private.cpp"
     config = package / "op_impl/ai_core/tbe/config/ascend910b/aic-ascend910b-ops-info.json"
     kernel_root = package / "op_impl/ai_core/tbe/kernel/ascend910b/gather_elements_v2"
     kernel_config_root = package / "op_impl/ai_core/tbe/kernel/config/ascend910b"
@@ -85,8 +86,16 @@ def main() -> int:
     op_api = package / "op_api/lib/libcust_opapi.so"
     proto = architecture_library(package, "op_proto/lib/linux/{architecture}/libcust_opsproto_rt2.0.so")
     tiling = architecture_library(package, "op_impl/ai_core/tbe/op_tiling/lib/linux/{architecture}/libcust_opmaster_rt2.0.so")
-    for path in (source_file, audit_header, config, binary_info_config, operator_binary_config, op_api):
+    for path in (source_file, audit_header, private_opapi_source, config, binary_info_config,
+                 operator_binary_config, op_api):
         require(path.is_file(), "private GatherElementsV2 package file is absent: {}".format(path))
+    op_api_bytes = op_api.read_bytes()
+    require(b"aclnnPrivateGatherElementsV2GetWorkspaceSize" in op_api_bytes and
+            b"aclnnPrivateGatherElementsV2" in op_api_bytes,
+            "private GatherElementsV2 package lacks its CANN-8.1 level-2 OpAPI exports")
+    source_provenance = provenance.get("provenance", {})
+    require(source_provenance.get("cann81_private_opapi_sha256") == digest(private_opapi_source),
+            "private GatherElementsV2 CANN-8.1 OpAPI source attestation mismatches")
     kernel_objects = sorted(kernel_root.glob("*.o"))
     require(len(kernel_objects) == 4,
             "CANN 8.1 package must contain four precompiled GatherElementsV2 dtype kernels; found={}".format(
@@ -166,7 +175,7 @@ def main() -> int:
         "kernel_algorithm_changes": False,
         "toolkit_install_modified": False,
         "matmul_included": False,
-        "formal_data_gate": "the generated CANN 8.1 C++ ACLNN entry point must load from the private package, emit one C++ host-tiler raw identity, launch a precompiled Ascend C kernel, and exactly match the deterministic GatherElements coordinate reference; rank-one preflight also matches installed aclnnGather",
+        "formal_data_gate": "the CANN 8.1 level-2 OpAPI and L0 launcher must load from the private package, emit one C++ host-tiler raw identity, launch a precompiled Ascend C kernel, and exactly match the deterministic GatherElements coordinate reference; rank-one preflight also matches installed aclnnGather",
     }
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
     args.manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")

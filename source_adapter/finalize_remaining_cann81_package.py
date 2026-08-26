@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Attest one source-instrumented CANN-8.1 attention host tiler."""
+"""Attest one complete source-instrumented CANN-8.1 attention package."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import platform
 import sys
 from pathlib import Path
 
@@ -22,8 +21,9 @@ SPECS = {
         "budget_env": "FASG_SOURCE_AIV_CAP",
         "envelope_env": "FASG_SOURCE_L2_DIVISOR",
         "dispatch_env": "FASG_SOURCE_DISPATCH",
-        "dispatch_value": "cann81_native_aclnn",
-        "tiling_env": "FASG_SOURCE_TILING_LIBRARY",
+        "dispatch_value": "cann81_prebuilt_aclnn",
+        "opapi_env": "FASG_SOURCE_OPAPI_LIBRARY",
+        "cmake_op": "flash_attention_score_grad",
     },
     "fused_infer_attention_score": {
         "operator": "FusedInferAttentionScore",
@@ -33,8 +33,9 @@ SPECS = {
         "budget_env": "FIAS_SOURCE_AIV_CAP",
         "envelope_env": "FIAS_SOURCE_UB_DIVISOR",
         "dispatch_env": "FIAS_SOURCE_DISPATCH",
-        "dispatch_value": "cann81_native_aclnn",
-        "tiling_env": "FIAS_SOURCE_TILING_LIBRARY",
+        "dispatch_value": "cann81_prebuilt_aclnn",
+        "opapi_env": "FIAS_SOURCE_OPAPI_LIBRARY",
+        "cmake_op": "fused_infer_attention_score",
     },
 }
 
@@ -52,17 +53,10 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
-def installed_library(cann: Path, name: str) -> Path:
-    candidates = [
-        cann / "lib64" / name,
-        cann / platform.machine() / "lib64" / name,
-        cann / "aarch64-linux" / "lib64" / name,
-        cann / "x86_64-linux" / "lib64" / name,
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
-    raise RuntimeError("installed CANN library is absent: {}".format(name))
+def unique_file(root: Path, pattern: str, label: str) -> Path:
+    matches = sorted(path.resolve() for path in root.glob(pattern) if path.is_file())
+    require(len(matches) == 1, "expected one {} under {}, found {}".format(label, root, len(matches)))
+    return matches[0]
 
 
 def main() -> int:
@@ -70,6 +64,8 @@ def main() -> int:
     parser.add_argument("--operator", required=True, choices=tuple(SPECS))
     parser.add_argument("--project", required=True, type=Path)
     parser.add_argument("--build-root", required=True, type=Path)
+    parser.add_argument("--package-root", required=True, type=Path)
+    parser.add_argument("--kernel-copy-manifest", required=True, type=Path)
     parser.add_argument("--cann-root", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path)
     args = parser.parse_args()
@@ -77,12 +73,23 @@ def main() -> int:
     locked = LOCK["operators"][args.operator]
     project = args.project.resolve()
     build = args.build_root.resolve()
+    package = args.package_root.resolve()
     cann = args.cann_root.resolve()
     version = cann / "opp/version.info"
 
-    require(project.is_dir() and build.is_dir(), "private project or host-tiler build is absent")
+    require(project.is_dir() and build.is_dir() and package.is_dir(),
+            "private project, build, or package root is absent")
     require(version.is_file() and "version_dir=8.1.RC1" in version.read_text(encoding="utf-8"),
             "remaining operators require CANN 8.1.RC1")
+    require(args.kernel_copy_manifest.is_file(), "installed-kernel copy manifest is absent")
+    kernel_copy = json.loads(args.kernel_copy_manifest.read_text(encoding="utf-8"))
+    require(kernel_copy.get("schema") == "installed_cann81_attention_kernel_copy_v1" and
+            kernel_copy.get("operator") == args.operator and
+            Path(kernel_copy.get("cann_root", "")).resolve() == cann and
+            kernel_copy.get("opp_version_sha256") == digest(version) and
+            kernel_copy.get("source_read_only") is True and
+            kernel_copy.get("toolkit_install_modified") is False,
+            "installed CANN-8.1 kernel provenance is invalid")
     overlay_path = project / "source_candidate_overlay.json"
     require(overlay_path.is_file(), "source overlay manifest is absent")
     overlay = json.loads(overlay_path.read_text(encoding="utf-8"))
@@ -116,36 +123,76 @@ def main() -> int:
         official_hash = locked["entry_sha256"]
     require(source_file.is_file(), "instrumented host tiler is absent")
 
-    tiling = build / "libcust_opmaster_rt2.0.so"
-    require(tiling.is_file(), "CANN-8.1 host-tiler library was not built")
-    installed_opapi = installed_library(cann, "libopapi.so")
-    installed_acl = installed_library(cann, "libascendcl.so")
+    tiling = unique_file(package, "op_impl/ai_core/tbe/op_tiling/lib/linux/*/libcust_opmaster_rt2.0.so",
+                         "packaged host-tiler library")
+    built_tiling = build / "libcust_opmaster_rt2.0.so"
+    require(built_tiling.is_file() and digest(built_tiling) == digest(tiling),
+            "packaged host tiler is not the instrumented library from this strategy build")
+    opapi = package / "op_api/lib/libcust_opapi.so"
+    require(opapi.is_file(), "private CANN-8.1 OpAPI library is absent")
+    ops_config = unique_file(package, "op_impl/ai_core/tbe/config/ascend910b/*-ops-info.json",
+                             "Ascend910B op-info config")
+    proto = unique_file(package, "op_proto/lib/linux/*/libcust_opsproto_rt2.0.so", "op-proto library")
+    kernel_root = package / "op_impl/ai_core/tbe/kernel/ascend910b" / spec["cmake_op"]
+    require(Path(kernel_copy.get("private_kernel_root", "")).resolve() == kernel_root.resolve(),
+            "private kernel directory differs from its copy manifest")
+    installed_kernel_root = (cann / "opp/built-in/op_impl/ai_core/tbe/kernel/ascend910b" /
+                             spec["cmake_op"]).resolve()
+    require(Path(kernel_copy.get("installed_kernel_root", "")).resolve() == installed_kernel_root,
+            "kernel copy did not originate from the installed CANN-8.1 binary package")
+    kernel_objects = sorted(kernel_root.rglob("*.o")) if kernel_root.is_dir() else []
+    require(kernel_objects, "private package has no precompiled Ascend910B kernel objects for {}".format(
+        spec["operator"]))
+    precompiled_kernels = []
+    for kernel_object in kernel_objects:
+        metadata = kernel_object.with_suffix(".json")
+        require(metadata.is_file(), "kernel metadata is absent: {}".format(metadata))
+        relative = kernel_object.relative_to(kernel_root)
+        installed_object = installed_kernel_root / relative
+        installed_metadata = installed_object.with_suffix(".json")
+        require(installed_object.is_file() and installed_metadata.is_file() and
+                digest(installed_object) == digest(kernel_object) and
+                digest(installed_metadata) == digest(metadata),
+                "private kernel differs from its installed CANN-8.1 binary")
+        precompiled_kernels.append({
+            "object": str(kernel_object.resolve()), "object_sha256": digest(kernel_object),
+            "metadata": str(metadata.resolve()), "metadata_sha256": digest(metadata),
+            "installed_object": str(installed_object), "installed_metadata": str(installed_metadata),
+        })
+    runtime_sources = [path for path in package.glob("op_impl/ai_core/tbe/*/dynamic/**/*")
+                       if path.is_file() and path.suffix in (".py", ".cpp", ".cc")]
+    require(not runtime_sources, "private attention package unexpectedly installs runtime source")
     envelope = overlay.get("hardware_envelope_heuristic")
     require(isinstance(envelope, dict) and envelope.get("environment") == spec["envelope_env"] and
             tuple(envelope.get("divisors", ())) == (2, 4, 8), "hardware-envelope contract is invalid")
 
     manifest = {
-        "schema": "remaining_operator_cann81_host_tiler_v1",
+        "schema": "remaining_operator_cann81_prebuilt_package_v2",
         "operator": spec["operator"],
         "runtime_op": args.operator,
         "strategy_class": overlay.get("strategy_class"),
-        "source_kind": "official_{}_cann81_native_host_tiler".format(spec["source_family"]),
+        "source_kind": "official_{}_cann81_private_prebuilt_package".format(spec["source_family"]),
         "official_source_commit": expected_commit,
         "build_cann_version": "8.1.RC1",
         "cann_root": str(cann),
         "cann_version_file_sha256": digest(version),
         "project_root": str(project),
-        "package_root": str(build),
+        "package_root": str(package),
         "source_file": str(source_file),
         "source_file_sha256": digest(source_file),
         "official_tiling_source_sha256": official_hash,
         "op_tiling_library": str(tiling),
         "op_tiling_library_sha256": digest(tiling),
-        "installed_opapi_library": str(installed_opapi),
-        "installed_opapi_library_sha256": digest(installed_opapi),
-        "installed_ascendcl_library": str(installed_acl),
-        "installed_ascendcl_library_sha256": digest(installed_acl),
-        "device_kernel_origin": "installed_cann81_same_official_source_release",
+        "op_api_library": str(opapi.resolve()),
+        "op_api_library_sha256": digest(opapi),
+        "op_proto_library": str(proto),
+        "op_proto_library_sha256": digest(proto),
+        "ops_config": str(ops_config),
+        "ops_config_sha256": digest(ops_config),
+        "precompiled_device_kernels": precompiled_kernels,
+        "device_kernel_origin": "installed_cann81_binary_package_private_copy",
+        "installed_kernel_copy_manifest": str(args.kernel_copy_manifest.resolve()),
+        "installed_kernel_copy_manifest_sha256": digest(args.kernel_copy_manifest),
         "instrumentation": {
             "enabled": True,
             "mutates_tiling_context": False,
@@ -154,7 +201,7 @@ def main() -> int:
             "source_budget_environment": spec["budget_env"],
             "dispatch_environment": spec["dispatch_env"],
             "dispatch_value": spec["dispatch_value"],
-            "tiling_library_environment": spec["tiling_env"],
+            "opapi_library_environment": spec["opapi_env"],
         },
         "hardware_envelope_heuristic": envelope,
         "strategy_algorithm_changes": False,
@@ -164,9 +211,9 @@ def main() -> int:
         "matmul_included": False,
         "scatter_elements_included": False,
         "formal_data_gate": (
-            "direct-load the instrumented official CANN 8.1 host tiler, observe its raw tiling identity, "
-            "launch the installed kernel from the same CANN 8.1 official source release, and exactly match "
-            "the installed-reference output"
+            "load the complete private CANN 8.1 package and its private OpAPI, observe the instrumented raw "
+            "tiling identity, launch the read-only copy of the installed CANN-8.1 Ascend910B kernel, and exactly match the "
+            "separately generated installed-reference output"
         ),
     }
     args.manifest.parent.mkdir(parents=True, exist_ok=True)

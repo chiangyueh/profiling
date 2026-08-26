@@ -112,13 +112,13 @@ static ge::graphStatus FIASSourceAuditResult(gert::TilingContext *context, ge::g
             const uint64_t runtimeAiv = tempCompileInfoPtr.aivNum;
             const uint64_t runtimeAic = tempCompileInfoPtr.aicNum;
             if (errno != 0 || parseEnd == requestedAivText || *parseEnd != '\0' || requestedAiv == 0ULL ||
-                requestedAiv > runtimeAiv || runtimeAiv == 0ULL || runtimeAic == 0ULL || runtimeAic % runtimeAiv != 0ULL) {
+                requestedAiv > runtimeAic || runtimeAiv == 0ULL || runtimeAic == 0ULL || runtimeAiv % runtimeAic != 0ULL) {
                 OPS_LOG_E(context->GetNodeName(), "invalid FIAS source AIV cap: %s", requestedAivText);
                 return ge::GRAPH_FAILED;
             }
-            const uint64_t aicPerAiv = runtimeAic / runtimeAiv;
-            tempCompileInfoPtr.aivNum = static_cast<uint32_t>(requestedAiv);
-            tempCompileInfoPtr.aicNum = static_cast<uint32_t>(requestedAiv * aicPerAiv);
+            const uint64_t aivPerAic = runtimeAiv / runtimeAic;
+            tempCompileInfoPtr.aicNum = static_cast<uint32_t>(requestedAiv);
+            tempCompileInfoPtr.aivNum = static_cast<uint32_t>(requestedAiv * aivPerAic);
         }'''
     if source.count(assignment) != 1:
         raise RuntimeError("cannot locate FIAS PFA compile-info core assignment")
@@ -204,13 +204,13 @@ def instrument_ifa_tiler(source: str) -> str:
         const uint64_t runtimeAiv = aivNum_;
         const uint64_t runtimeAic = aicNum_;
         if (errno != 0 || parseEnd == requestedAivText || *parseEnd != '\0' || requestedAiv == 0ULL ||
-            requestedAiv > runtimeAiv || runtimeAiv == 0ULL || runtimeAic == 0ULL || runtimeAic % runtimeAiv != 0ULL) {
+            requestedAiv > runtimeAic || runtimeAiv == 0ULL || runtimeAic == 0ULL || runtimeAiv % runtimeAic != 0ULL) {
             OPS_LOG_E(context_->opName, "invalid FIAS source AIV cap: %s", requestedAivText);
             return ge::GRAPH_FAILED;
         }
-        const uint64_t aicPerAiv = runtimeAic / runtimeAiv;
-        aivNum_ = static_cast<uint32_t>(requestedAiv);
-        aicNum_ = static_cast<uint32_t>(requestedAiv * aicPerAiv);
+        const uint64_t aivPerAic = runtimeAiv / runtimeAic;
+        aicNum_ = static_cast<uint32_t>(requestedAiv);
+        aivNum_ = static_cast<uint32_t>(requestedAiv * aivPerAic);
     }
     // FIAS_SOURCE_UB_CAP_V1: same bounded source-visible UB rule as the
     // original prefill route. The decode tiler owns every resulting field.

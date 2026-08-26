@@ -22,14 +22,12 @@ import run_non_matmul_candidate_campaign as campaign
 
 LOCK = json.loads((ROOT / "remaining_operators_cann81_lock.json").read_text(encoding="utf-8"))
 OPERATOR_TYPES = {
-    "gather_elements": "GatherElementsV2",
     "flash_attention_score_grad": "FlashAttentionScoreGrad",
     "fused_infer_attention_score": "FusedInferAttentionScore",
 }
 BACKENDS = {
-    "gather_elements": "private_cann81_prebuilt_ascendc_aclnn_real_npu",
-    "flash_attention_score_grad": "private_cann81_fasg_host_tiler_installed_kernel_real_npu",
-    "fused_infer_attention_score": "private_cann81_fias_host_tiler_installed_kernel_real_npu",
+    "flash_attention_score_grad": "private_cann81_fasg_prebuilt_aclnn_real_npu",
+    "fused_infer_attention_score": "private_cann81_fias_prebuilt_aclnn_real_npu",
 }
 
 
@@ -45,10 +43,7 @@ def worker_args(runner: Path, workload: dict[str, Any], device: int, warmup: int
     values = [str(runner), "--workload-id", workload["workload_id"], "--op", workload["op"],
               "--device", str(device), "--warmup", str(warmup), "--samples", str(samples),
               "--expected-soc", "Ascend910B3"]
-    if workload["op"] == "gather_elements":
-        fields = ("shape", "index_shape", "axis", "dtype", "index_dtype")
-    else:
-        fields = ("batch", "q_heads", "kv_heads", "q_seq", "kv_seq", "head_dim", "dtype", "layout")
+    fields = ("batch", "q_heads", "kv_heads", "q_seq", "kv_seq", "head_dim", "dtype", "layout")
     for field in fields:
         item = workload[field]
         rendered = ",".join(map(str, item)) if isinstance(item, list) else str(item)
@@ -60,35 +55,9 @@ def validate_manifest(path: Path, selected: str) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError("private package manifest is absent: {}".format(path))
     item = json.loads(path.read_text(encoding="utf-8"))
-    if selected == "gather_elements":
-        if item.get("schema") != "gather_elements_v2_cann81_prebuilt_package_v2":
-            raise RuntimeError("invalid GatherElementsV2 CANN-8.1 package manifest: {}".format(path))
-        project_manifest = Path(item["project_root"]) / "gather_elements_v2_project.json"
-        if not project_manifest.is_file():
-            raise RuntimeError("GatherElementsV2 project attestation is absent")
-        provenance = json.loads(project_manifest.read_text(encoding="utf-8"))
-        compatibility = provenance.get("compatibility_port")
-        source_provenance = provenance.get("provenance")
-        if (provenance.get("source_kind") != "pinned_gather_elements_v2_algorithm_fully_compiled_by_cann81" or
-                not isinstance(compatibility, dict) or compatibility.get("target_version") !=
-                "CANN-8.1.RC1 host ABI and Ascend C device compiler" or
-                compatibility.get("runtime_python_compilation") is not False or
-                compatibility.get("tiling_algorithm_changes") is not False or
-                compatibility.get("kernel_algorithm_changes") is not False or
-                not isinstance(source_provenance, dict) or
-                not isinstance(source_provenance.get("original_tiling_cpp_sha256"), str)):
-            raise RuntimeError("GatherElementsV2 is not the attested source-preserving CANN-8.1 port")
-        item["official_tiling_source_sha256"] = source_provenance["original_tiling_cpp_sha256"]
-        item["strategy_class"] = None
-        instrumentation = item.get("instrumentation")
-        if (item.get("source_operator_type") != OPERATOR_TYPES[selected] or
-                not isinstance(instrumentation, dict) or
-                instrumentation.get("operator_type_environment") !=
-                "GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE"):
-            raise RuntimeError("GatherElementsV2 package lacks its runner operator-type contract")
-    elif (item.get("schema") != "remaining_operator_cann81_host_tiler_v1" or
-          item.get("device_kernel_origin") != "installed_cann81_same_official_source_release"):
-        raise RuntimeError("invalid CANN-8.1 host-tiler manifest: {}".format(path))
+    if (item.get("schema") != "remaining_operator_cann81_prebuilt_package_v2" or
+            item.get("device_kernel_origin") != "installed_cann81_binary_package_private_copy"):
+        raise RuntimeError("invalid complete CANN-8.1 attention package manifest: {}".format(path))
     if (item.get("runtime_op") != selected or item.get("operator") != OPERATOR_TYPES[selected] or
             item.get("build_cann_version") != "8.1.RC1" or
             item.get("runtime_python_compilation") is not False or
@@ -100,26 +69,22 @@ def validate_manifest(path: Path, selected: str) -> dict[str, Any]:
         raise RuntimeError("private package root is absent")
     artifacts = [("source_file", "source_file_sha256"),
                  ("op_tiling_library", "op_tiling_library_sha256")]
-    if selected == "gather_elements":
-        artifacts += [("op_api_library", "op_api_library_sha256"),
-                      ("op_proto_library", "op_proto_library_sha256"),
-                      ("ops_config", "ops_config_sha256")]
-    else:
-        artifacts += [("installed_opapi_library", "installed_opapi_library_sha256"),
-                      ("installed_ascendcl_library", "installed_ascendcl_library_sha256")]
+    artifacts += [("op_api_library", "op_api_library_sha256"),
+                  ("op_proto_library", "op_proto_library_sha256"),
+                  ("ops_config", "ops_config_sha256"),
+                  ("installed_kernel_copy_manifest", "installed_kernel_copy_manifest_sha256")]
     for value_key, hash_key in artifacts:
         artifact = Path(item[value_key])
         if not artifact.is_file() or digest_file(artifact) != item[hash_key]:
             raise RuntimeError("private package artifact is missing or mismatched: {}".format(artifact))
-    if selected == "gather_elements":
-        kernels = item.get("precompiled_device_kernels")
-        if not isinstance(kernels, list) or not kernels:
-            raise RuntimeError("private GatherElementsV2 package has no precompiled 910B kernels")
-        for kernel in kernels:
-            for value_key, hash_key in (("object", "object_sha256"), ("metadata", "metadata_sha256")):
-                artifact = Path(kernel[value_key])
-                if not artifact.is_file() or digest_file(artifact) != kernel[hash_key]:
-                    raise RuntimeError("precompiled GatherElementsV2 kernel artifact is missing or mismatched")
+    kernels = item.get("precompiled_device_kernels")
+    if not isinstance(kernels, list) or not kernels:
+        raise RuntimeError("private package has no precompiled Ascend910B kernels")
+    for kernel in kernels:
+        for value_key, hash_key in (("object", "object_sha256"), ("metadata", "metadata_sha256")):
+            artifact = Path(kernel[value_key])
+            if not artifact.is_file() or digest_file(artifact) != kernel[hash_key]:
+                raise RuntimeError("precompiled kernel artifact is missing or mismatched")
     version = Path(item["cann_root"]) / "opp/version.info"
     if not version.is_file() or digest_file(version) != item["cann_version_file_sha256"]:
         raise RuntimeError("package CANN root has changed")
@@ -184,17 +149,11 @@ def source_environment(base: dict[str, str], package: dict[str, Any], candidate:
     environment = dict(base)
     environment["ASCEND_OPP_PATH"] = str(Path(package["cann_root"]) / "opp")
     inst, envelope = package["instrumentation"], package["hardware_envelope_heuristic"]
-    if package["runtime_op"] == "gather_elements":
-        package_root, library = Path(package["package_root"]), Path(package["op_api_library"])
-        if library.parent != package_root / "op_api/lib":
-            raise RuntimeError("private OpAPI is outside its package")
-        environment["ASCEND_CUSTOM_OPP_PATH"] = str(package_root)
-        library_environment = inst["opapi_library_environment"]
-        environment[inst["operator_type_environment"]] = package["source_operator_type"]
-    else:
-        environment.pop("ASCEND_CUSTOM_OPP_PATH", None)
-        library = Path(package["op_tiling_library"])
-        library_environment = inst["tiling_library_environment"]
+    package_root, library = Path(package["package_root"]), Path(package["op_api_library"])
+    if library.parent != package_root / "op_api/lib":
+        raise RuntimeError("private attention OpAPI is outside its package")
+    environment["ASCEND_CUSTOM_OPP_PATH"] = str(package_root)
+    library_environment = inst["opapi_library_environment"]
     old_loader = environment.get("LD_LIBRARY_PATH", "")
     environment["LD_LIBRARY_PATH"] = str(library.parent) + (":" + old_loader if old_loader else "")
     environment[library_environment] = str(library)
@@ -230,26 +189,11 @@ def plan_packages(manifests: list[dict[str, Any]], selected: str) -> dict[str, l
 
 
 def supported(workload: dict[str, Any]) -> bool:
-    if workload["op"] == "gather_elements":
-        shape, index_shape = workload["shape"], workload["index_shape"]
-        rank = len(shape)
-        axis = workload["axis"] + rank if workload["axis"] < 0 else workload["axis"]
-        return (rank > 0 and len(index_shape) == rank and 0 <= axis < rank and
-                all(value > 0 for value in shape) and all(value > 0 for value in index_shape) and
-                all(index_shape[i] <= shape[i] for i in range(rank) if i != axis))
     return (workload["dtype"] in ("fp16", "bf16") and workload["head_dim"] % 16 == 0 and
             workload["q_heads"] % workload["kv_heads"] == 0)
 
 
 def storage(workload: dict[str, Any]) -> int:
-    if workload["op"] == "gather_elements":
-        total = 1
-        for value in workload["shape"]:
-            total *= value
-        indices = 1
-        for value in workload["index_shape"]:
-            indices *= value
-        return total + indices
     return workload["batch"] * (workload["q_heads"] * workload["q_seq"] +
                                 2 * workload["kv_heads"] * workload["kv_seq"]) * workload["head_dim"]
 
@@ -289,7 +233,7 @@ def remaining_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                 worker_args(args.runner, workload, args.device, 0, 0) + ["--source-load-only", "1"],
                 source_environment(base_env, package, candidate, audit))
             ok = rc == 0 and result.get("status") == "success" and result.get("backend") == BACKENDS[op]
-            load_kind = "private_opapi_load" if op == "gather_elements" else "private_host_tiler_load"
+            load_kind = "private_opapi_load"
             checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": load_kind,
                            "strategy": candidate["id"], "status": "passed" if ok else "failed",
                            "worker_wall_ms": wall, "worker_return_code": rc, "worker_status": result.get("status"),
@@ -335,8 +279,7 @@ def remaining_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                          result.get("backend") == BACKENDS[op] and
                          result.get("output_reference_checked") is True and result.get("output_reference_equal") is True)
             launch_failure = None if launch_ok else (reason or campaign.runner_failure(result, output))
-            launch_kind = ("private_precompiled_kernel_launch" if op == "gather_elements"
-                           else "private_host_tiler_installed_kernel_launch")
+            launch_kind = "private_precompiled_kernel_launch"
             checks.append({"operator": op, "workload_id": workload["workload_id"],
                            "kind": launch_kind, "strategy": candidate["id"],
                            "status": "passed" if launch_ok else "failed", "worker_wall_ms": wall,
@@ -406,8 +349,6 @@ def main() -> int:
         environment_keys = [library_environment, inst["audit_environment"],
                             inst["source_budget_environment"], inst["dispatch_environment"],
                             envelope["environment"]]
-        if args.operator == "gather_elements":
-            environment_keys.append(inst["operator_type_environment"])
         for key in environment_keys:
             base_env.pop(key, None)
     planned = {args.operator: sorted((row for row in workloads if supported(row)),

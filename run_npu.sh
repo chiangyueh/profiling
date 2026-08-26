@@ -14,9 +14,9 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-Runs the complete CANN-8.1 campaign for GatherElementsV2,
-FlashAttentionScoreGrad, and FusedInferAttentionScore. ScatterElements is not
-included. Each operator must produce exactly 5,000 output-validated NPU
+Runs the complete CANN-8.1 campaigns for FlashAttentionScoreGrad and
+FusedInferAttentionScore. GatherElementsV2 and ScatterElements are complete
+and are not included. Each selected operator must produce exactly 5,000 output-validated NPU
 device-event latency records in rotating JSONL logs of at most 50 MiB.
 USAGE
 }

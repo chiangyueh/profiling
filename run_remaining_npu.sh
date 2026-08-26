@@ -17,13 +17,13 @@ Usage: profiling/run_remaining_npu.sh --operator OP [-d PHYSICAL_NPU_ID]
 
 OP is one of:
   all
-  gather_elements
   flash_attention_score_grad
   fused_infer_attention_score
 
 Each selected operator produces exactly 5,000 validated device-event latency
-records in rotating JSONL logs (each <=50 MiB). "all" runs only the three
-operators listed above; ScatterElements is not part of this entry. No installed
+records in rotating JSONL logs (each <=50 MiB). "all" runs only the two
+unfinished attention operators listed above; completed GatherElements and
+ScatterElements are not part of this entry. No installed
 CANN file or login-shell setting is modified.
 USAGE
 }
@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${OPERATOR}" in
-    all|gather_elements|flash_attention_score_grad|fused_infer_attention_score) ;;
+    all|flash_attention_score_grad|fused_infer_attention_score) ;;
     *) echo "fatal: --operator is required" >&2; usage >&2; exit 2 ;;
 esac
 for value_name in PHYSICAL_DEVICE WARMUP SAMPLES; do
@@ -51,7 +51,7 @@ done
 [[ -e "/dev/davinci${PHYSICAL_DEVICE}" ]] || { echo "fatal: missing /dev/davinci${PHYSICAL_DEVICE}" >&2; exit 1; }
 
 if [[ "${OPERATOR}" == "all" ]]; then
-    for selected in gather_elements flash_attention_score_grad fused_infer_attention_score; do
+    for selected in flash_attention_score_grad fused_infer_attention_score; do
         "${ROOT}/run_remaining_npu.sh" --operator "${selected}" -d "${PHYSICAL_DEVICE}" \
             --warmup "${WARMUP}" --samples "${SAMPLES}"
     done
@@ -85,24 +85,20 @@ export TILINGKEY_PAR_COMPILE=1
 export OMP_NUM_THREADS=1
 export CANN_OPS_BUILD_JOBS=1
 unset ASCEND_CUSTOM_OPP_PATH ASCENDC_CPU_DEBUG \
-    GATHER_ELEMENTS_SOURCE_OPERATOR_TYPE GATHER_ELEMENTS_SOURCE_DISPATCH \
-    GATHER_ELEMENTS_SOURCE_OPAPI_LIBRARY GATHER_ELEMENTS_TILING_AUDIT_PATH \
-    GATHER_ELEMENTS_SOURCE_AIV_CAP GATHER_ELEMENTS_SOURCE_UB_DIVISOR \
     FASG_SOURCE_DISPATCH FASG_SOURCE_OPAPI_LIBRARY FASG_SOURCE_TILING_LIBRARY FASG_TILING_AUDIT_PATH FASG_SOURCE_AIV_CAP FASG_SOURCE_L2_DIVISOR \
     FIAS_SOURCE_DISPATCH FIAS_SOURCE_OPAPI_LIBRARY FIAS_SOURCE_TILING_LIBRARY FIAS_TILING_AUDIT_PATH FIAS_SOURCE_AIV_CAP FIAS_SOURCE_UB_DIVISOR
 
 REQUIRED=(
     source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz
     source_adapter/vendor_source/cann_ops_adv_8_1rc1.tar.gz
-    source_adapter/vendor_source/gather_elements_v2_source.zip
     source_adapter/remaining_operators_cann81_lock.json
     source_adapter/materialize_remaining_operators_cann81_source.py
-    source_adapter/prepare_gather_elements_v2_project.py
-    source_adapter/finalize_gather_elements_v2_package.py
     source_adapter/prepare_remaining_attention_cann81_overlays.py
     source_adapter/prepare_fasg_strategy_overlays.py
     source_adapter/prepare_fias_source_overlay.py
     source_adapter/finalize_remaining_cann81_package.py
+    source_adapter/materialize_installed_attention_kernels.py
+    source_adapter/materialize_attention_package_variant.py
     source_adapter/remaining_operator_candidate_catalog.py
     source_adapter/run_remaining_operator_campaign.py
     source_adapter/run_non_matmul_candidate_campaign.py
@@ -117,15 +113,14 @@ PACKAGE_ID="$({
     printf '%s\n' "${OPERATOR}"
     sha256sum "${ROOT}/source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz" \
         "${ROOT}/source_adapter/vendor_source/cann_ops_adv_8_1rc1.tar.gz" \
-        "${ROOT}/source_adapter/vendor_source/gather_elements_v2_source.zip" \
         "${ROOT}/source_adapter/remaining_operators_cann81_lock.json" \
         "${ROOT}/source_adapter/materialize_remaining_operators_cann81_source.py" \
-        "${ROOT}/source_adapter/prepare_gather_elements_v2_project.py" \
-        "${ROOT}/source_adapter/finalize_gather_elements_v2_package.py" \
         "${ROOT}/source_adapter/prepare_remaining_attention_cann81_overlays.py" \
         "${ROOT}/source_adapter/prepare_fasg_strategy_overlays.py" \
         "${ROOT}/source_adapter/prepare_fias_source_overlay.py" \
-        "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" "${VERSION_FILE}"
+        "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
+        "${ROOT}/source_adapter/materialize_installed_attention_kernels.py" \
+        "${ROOT}/source_adapter/materialize_attention_package_variant.py" "${VERSION_FILE}"
     readlink -f "${CANN_ROOT}"
 } | sha256sum | cut -c1-20)"
 RUN_ID="$({
@@ -157,6 +152,16 @@ export TMP="${TMPDIR}"
 export TEMP="${TMPDIR}"
 export ASCEND_CACHE_PATH="${STATE}/cache"
 export ASCEND_WORK_PATH="${STATE}/work"
+
+INSTALLED_KERNEL_ROOT="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/kernel/ascend910b/${OPERATOR}"
+[[ -d "${INSTALLED_KERNEL_ROOT}" ]] || {
+    echo "fatal: installed CANN-8.1 binary kernel directory is absent: ${INSTALLED_KERNEL_ROOT}" >&2
+    exit 1
+}
+find "${INSTALLED_KERNEL_ROOT}" -type f -name '*.o' -print -quit | grep -q . || {
+    echo "fatal: installed CANN-8.1 binary package has no ${OPERATOR} kernel objects" >&2
+    exit 1
+}
 
 run_logged() {
     local label="$1" log="$2"
@@ -203,29 +208,45 @@ configure_project() {
     fi
 }
 
-build_full_package() {
+build_attention_base_package() {
     local project="$1" build="$2" output="$3" cmake_op="$4" vendor="$5" log_prefix="$6"
     configure_project "${project}" "${build}" "${output}" "${cmake_op}" "${vendor}" "${log_prefix}"
     local package_root="${output}/packages/vendors/${vendor}"
     local kernel_root="${package_root}/op_impl/ai_core/tbe/kernel/ascend910b/${cmake_op}"
     local tiling_root="${package_root}/op_impl/ai_core/tbe/op_tiling/lib/linux"
+    local proto_root="${package_root}/op_proto/lib/linux"
+    local config="${package_root}/op_impl/ai_core/tbe/config/ascend910b/aic-ascend910b-ops-info.json"
     if [[ ! -f "${package_root}/op_api/lib/libcust_opapi.so" ]] || \
-       ! find "${kernel_root}" -maxdepth 1 -name '*.o' -type f -print -quit 2>/dev/null | grep -q . || \
+       [[ ! -f "${config}" ]] || \
+       ! find "${proto_root}" -name libcust_opsproto_rt2.0.so -type f -print -quit 2>/dev/null | grep -q . || \
        ! find "${tiling_root}" -name libcust_opmaster_rt2.0.so -type f -print -quit 2>/dev/null | grep -q .; then
         run_logged "${log_prefix}_BUILD" "${build}.build.log" \
-            resource_limited cmake --build "${build}" --target package --parallel 1
+            resource_limited cmake --build "${build}" --target \
+                opapi opsproto optiling optiling_compat generate_ops_info_ascend910b \
+                npu_supported_ops modify_vendor gen_version_info \
+                --parallel 1
         run_logged "${log_prefix}_INSTALL" "${build}.install.log" cmake --install "${build}"
+    fi
+    local kernel_manifest="${package_root}/installed_kernel_copy_manifest.json"
+    if [[ ! -f "${kernel_manifest}" ]]; then
+        if [[ -d "${kernel_root}" ]] && find "${kernel_root}" -type f -print -quit | grep -q .; then
+            echo "fatal: incomplete installed-kernel copy in private package: ${kernel_root}" >&2
+            exit 2
+        fi
+        run_logged "${log_prefix}_KERNEL_COPY" "${build}.kernel_copy.log" \
+            python3 "${ROOT}/source_adapter/materialize_installed_attention_kernels.py" \
+            --operator "${OPERATOR}" --cann-root "${CANN_ROOT}" --package-root "${package_root}" \
+            --manifest "${kernel_manifest}"
     fi
 }
 
-build_attention_package() {
+build_attention_host_tiler() {
     local project="$1" build="$2" output="$3" cmake_op="$4" vendor="$5" log_prefix="$6"
     configure_project "${project}" "${build}" "${output}" "${cmake_op}" "${vendor}" "${log_prefix}"
     if [[ ! -f "${build}/libcust_opmaster_rt2.0.so" ]]; then
-        # The NPU server already has the matching official CANN 8.1 device
-        # kernels. Build only the instrumented CANN 8.1 host tiler; compiling
-        # the public package target would rebuild hundreds of unrelated device
-        # objects without changing the measured kernel.
+        # Variant strategies share the base package's byte-identical original
+        # device-kernel source. Only their isolated host-tiler registrations
+        # differ, so the other seven variants build this target only.
         run_logged "${log_prefix}_BUILD" "${build}.build.log" \
             resource_limited cmake --build "${build}" --target optiling --parallel 1
     fi
@@ -237,78 +258,84 @@ build_attention_package() {
 
 MANIFESTS=()
 materialize_source cann_ops "${BASE_SOURCE}" SOURCE_BASE_CACHE
+materialize_source cann_ops_adv "${ADV_SOURCE}" SOURCE_ADV_CACHE
 
-if [[ "${OPERATOR}" == "gather_elements" ]]; then
-    PROJECT="${PROJECT_PARENT}/gather_elements_v2_source"
-    if [[ ! -f "${PROJECT}/gather_elements_v2_project.json" ]]; then
-        [[ ! -e "${PROJECT}" ]] || { echo "fatal: incomplete GatherElementsV2 project" >&2; exit 2; }
-        run_logged GATHER_PREPARE "${STATE}/prepare.log" \
-            python3 "${ROOT}/source_adapter/prepare_gather_elements_v2_project.py" \
-            --cann-ops-source "${BASE_SOURCE}" --cann-root "${CANN_ROOT}" --output "${PROJECT}"
+if [[ "${OPERATOR}" == "fused_infer_attention_score" ]]; then
+    PROJECT="${PROJECT_PARENT}/fias_source_dispatch"
+    if [[ ! -f "${PROJECT}/source_candidate_overlay.json" ]]; then
+        [[ ! -e "${PROJECT}" ]] || { echo "fatal: incomplete FIAS project" >&2; exit 2; }
+        run_logged FIAS_PREPARE "${STATE}/prepare.log" \
+            python3 "${ROOT}/source_adapter/prepare_remaining_attention_cann81_overlays.py" \
+            --operator "${OPERATOR}" --source-root "${ADV_SOURCE}" \
+            --harness-root "${BASE_SOURCE}" --output-parent "${PROJECT_PARENT}"
     fi
     BUILD="${STATE}/build"
     OUTPUT="${STATE}/output"
-    VENDOR=gather_elements_source
+    VENDOR=fias_source
     PACKAGE_ROOT="${OUTPUT}/packages/vendors/${VENDOR}"
     MANIFEST="${STATE}/package.json"
-    build_full_package "${PROJECT}" "${BUILD}" "${OUTPUT}" gather_elements_v2 "${VENDOR}" GATHER_PACKAGE
-    run_logged GATHER_VALIDATE "${STATE}/validate.log" \
-        python3 "${ROOT}/source_adapter/finalize_gather_elements_v2_package.py" \
-        --project "${PROJECT}" --package-root "${PACKAGE_ROOT}" \
+    build_attention_base_package "${PROJECT}" "${BUILD}" "${OUTPUT}" fused_infer_attention_score "${VENDOR}" \
+        FIAS_PACKAGE
+    run_logged FIAS_VALIDATE "${STATE}/validate.log" \
+        python3 "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
+        --operator "${OPERATOR}" --project "${PROJECT}" --build-root "${BUILD}" \
+        --package-root "${PACKAGE_ROOT}" \
+        --kernel-copy-manifest "${PACKAGE_ROOT}/installed_kernel_copy_manifest.json" \
         --cann-root "${CANN_ROOT}" --manifest "${MANIFEST}"
     MANIFESTS+=("${MANIFEST}")
 else
-    materialize_source cann_ops_adv "${ADV_SOURCE}" SOURCE_ADV_CACHE
-    if [[ "${OPERATOR}" == "fused_infer_attention_score" ]]; then
-        PROJECT="${PROJECT_PARENT}/fias_source_dispatch"
-        if [[ ! -f "${PROJECT}/source_candidate_overlay.json" ]]; then
-            [[ ! -e "${PROJECT}" ]] || { echo "fatal: incomplete FIAS project" >&2; exit 2; }
-            run_logged FIAS_PREPARE "${STATE}/prepare.log" \
-                python3 "${ROOT}/source_adapter/prepare_remaining_attention_cann81_overlays.py" \
-                --operator "${OPERATOR}" --source-root "${ADV_SOURCE}" \
-                --harness-root "${BASE_SOURCE}" --output-parent "${PROJECT_PARENT}"
+    BASE_PROJECT="${PROJECT_PARENT}/fasg_flashattentionscoregradtilings1s2bn2gs1s2"
+    FIRST_MANIFEST="${BASE_PROJECT}/source_candidate_overlay.json"
+    if [[ ! -f "${FIRST_MANIFEST}" ]]; then
+        if find "${PROJECT_PARENT}" -mindepth 1 -maxdepth 1 -name 'fasg_*' -print -quit | grep -q .; then
+            echo "fatal: incomplete FASG project set" >&2
+            exit 2
         fi
-        BUILD="${STATE}/build"
-        OUTPUT="${STATE}/output"
-        VENDOR=fias_source
-        MANIFEST="${STATE}/package.json"
-        build_attention_package "${PROJECT}" "${BUILD}" "${OUTPUT}" fused_infer_attention_score "${VENDOR}" \
-            FIAS_HOST_TILER
-        run_logged FIAS_VALIDATE "${STATE}/validate.log" \
-            python3 "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
-            --operator "${OPERATOR}" --project "${PROJECT}" --build-root "${BUILD}" \
-            --cann-root "${CANN_ROOT}" --manifest "${MANIFEST}"
-        MANIFESTS+=("${MANIFEST}")
-    else
-        FIRST_MANIFEST="${PROJECT_PARENT}/fasg_flashattentionscoregradtilings1s2bn2gs1s2/source_candidate_overlay.json"
-        if [[ ! -f "${FIRST_MANIFEST}" ]]; then
-            if find "${PROJECT_PARENT}" -mindepth 1 -maxdepth 1 -name 'fasg_*' -print -quit | grep -q .; then
-                echo "fatal: incomplete FASG project set" >&2
-                exit 2
-            fi
-            run_logged FASG_PREPARE "${STATE}/prepare.log" \
-                python3 "${ROOT}/source_adapter/prepare_remaining_attention_cann81_overlays.py" \
-                --operator "${OPERATOR}" --source-root "${ADV_SOURCE}" \
-                --harness-root "${BASE_SOURCE}" --output-parent "${PROJECT_PARENT}"
-        fi
-        mapfile -t FASG_PROJECTS < <(find "${PROJECT_PARENT}" -mindepth 2 -maxdepth 2 \
-            -name source_candidate_overlay.json -path '*/fasg_*/*' -printf '%h\n' | sort -u)
-        (( ${#FASG_PROJECTS[@]} == 8 )) || { echo "fatal: FASG requires exactly eight source projects" >&2; exit 2; }
-        BASE_VENDOR=fasg_source
-        for project in "${FASG_PROJECTS[@]}"; do
-            slug="$(basename "${project}")"
-            variant_build="${STATE}/build_${slug}"
-            variant_output="${STATE}/unused_${slug}"
-            manifest="${STATE}/manifests/${slug}.json"
-            build_attention_package "${project}" "${variant_build}" "${variant_output}" \
-                flash_attention_score_grad "${BASE_VENDOR}" "FASG_HOST_${slug}"
-            run_logged "FASG_VALIDATE_${slug}" "${STATE}/validate_${slug}.log" \
-                python3 "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
-                --operator "${OPERATOR}" --project "${project}" --build-root "${variant_build}" \
-                --cann-root "${CANN_ROOT}" --manifest "${manifest}"
-            MANIFESTS+=("${manifest}")
-        done
+        run_logged FASG_PREPARE "${STATE}/prepare.log" \
+            python3 "${ROOT}/source_adapter/prepare_remaining_attention_cann81_overlays.py" \
+            --operator "${OPERATOR}" --source-root "${ADV_SOURCE}" \
+            --harness-root "${BASE_SOURCE}" --output-parent "${PROJECT_PARENT}"
     fi
+    mapfile -t FASG_PROJECTS < <(find "${PROJECT_PARENT}" -mindepth 2 -maxdepth 2 \
+        -name source_candidate_overlay.json -path '*/fasg_*/*' -printf '%h\n' | sort -u)
+    (( ${#FASG_PROJECTS[@]} == 8 )) || { echo "fatal: FASG requires exactly eight source projects" >&2; exit 2; }
+    BASE_VENDOR=fasg_source
+    BASE_SLUG="$(basename "${BASE_PROJECT}")"
+    BASE_BUILD="${STATE}/build_${BASE_SLUG}"
+    BASE_OUTPUT="${STATE}/output_${BASE_SLUG}"
+    BASE_PACKAGE_ROOT="${BASE_OUTPUT}/packages/vendors/${BASE_VENDOR}"
+    build_attention_base_package "${BASE_PROJECT}" "${BASE_BUILD}" "${BASE_OUTPUT}" \
+        flash_attention_score_grad "${BASE_VENDOR}" FASG_BASE_PACKAGE
+
+    for project in "${FASG_PROJECTS[@]}"; do
+        slug="$(basename "${project}")"
+        variant_build="${STATE}/build_${slug}"
+        manifest="${STATE}/manifests/${slug}.json"
+        if [[ "${project}" == "${BASE_PROJECT}" ]]; then
+            package_root="${BASE_PACKAGE_ROOT}"
+        else
+            variant_output="${STATE}/host_only_${slug}"
+            package_root="${STATE}/variant_packages/${slug}"
+            build_attention_host_tiler "${project}" "${variant_build}" "${variant_output}" \
+                flash_attention_score_grad "${BASE_VENDOR}" "FASG_HOST_${slug}"
+            if [[ ! -f "${package_root}/fasg_prebuilt_package_variant.json" ]]; then
+                [[ ! -e "${package_root}" ]] || { echo "fatal: incomplete FASG package variant: ${slug}" >&2; exit 2; }
+                run_logged "FASG_PACKAGE_${slug}" "${STATE}/package_${slug}.log" \
+                    python3 "${ROOT}/source_adapter/materialize_attention_package_variant.py" \
+                    --base-package-root "${BASE_PACKAGE_ROOT}" --variant-build-root "${variant_build}" \
+                    --variant-project "${project}" \
+                    --base-kernel-copy-manifest "${BASE_PACKAGE_ROOT}/installed_kernel_copy_manifest.json" \
+                    --destination "${package_root}"
+            fi
+        fi
+        run_logged "FASG_VALIDATE_${slug}" "${STATE}/validate_${slug}.log" \
+            python3 "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
+            --operator "${OPERATOR}" --project "${project}" --build-root "${variant_build}" \
+            --package-root "${package_root}" \
+            --kernel-copy-manifest "${package_root}/installed_kernel_copy_manifest.json" \
+            --cann-root "${CANN_ROOT}" --manifest "${manifest}"
+        MANIFESTS+=("${manifest}")
+    done
 fi
 
 if [[ ! -f "${RUNNER_BUILD}/CMakeCache.txt" ]]; then

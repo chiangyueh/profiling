@@ -379,15 +379,28 @@ def instrument_source_core_budget(source: str) -> str:
         const uint64_t runtimeAiv = compileInfoPtr->aivNum;
         const uint64_t runtimeAic = compileInfoPtr->aicNum;
         if (errno != 0 || parseEnd == requestedAivText || *parseEnd != '\0' || requestedAiv == 0ULL ||
-            requestedAiv > runtimeAiv || runtimeAiv == 0ULL || runtimeAic == 0ULL || runtimeAic % runtimeAiv != 0ULL) {
+            requestedAiv > runtimeAic || runtimeAiv == 0ULL || runtimeAic == 0ULL || runtimeAiv % runtimeAic != 0ULL) {
             OPS_LOG_E(context, "invalid source AIV cap: %s (runtime aiv=%lu aic=%lu)", requestedAivText,
                       runtimeAiv, runtimeAic);
             return ge::GRAPH_FAILED;
         }
-        const uint64_t aicPerAiv = runtimeAic / runtimeAiv;
-        compileInfoPtr->aivNum = static_cast<uint64_t>(requestedAiv);
-        compileInfoPtr->aicNum = static_cast<uint64_t>(requestedAiv) * aicPerAiv;
-    }
+        // Ascend910B exposes two vector cores per cube core. Candidate caps
+        // enumerate physical core groups (1..20) and preserve that platform
+        // ratio; assuming the inverse ratio would reject every 910B cap.
+        const uint64_t aivPerAic = runtimeAiv / runtimeAic;
+        compileInfoPtr->aicNum = static_cast<uint64_t>(requestedAiv);
+        compileInfoPtr->aivNum = static_cast<uint64_t>(requestedAiv) * aivPerAic;
+    }"""
+    if source.count(original) != 1:
+        raise RuntimeError("cannot locate original FASG compile-info core assignment")
+    source = source.replace(original, replacement)
+
+    # L2 is populated by the original source after the AIV/AIC assignment.
+    # Apply the bounded source-visible budget only after that query; applying
+    # it above this line would read an uninitialised value and would then be
+    # overwritten by the original GetCoreMemSize call.
+    l2_anchor = """    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L2, compileInfoPtr->l2CacheSize);"""
+    l2_replacement = r"""    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L2, compileInfoPtr->l2CacheSize);
     // FASG_SOURCE_L2_CAP_V1: optional hardware-envelope heuristic. A smaller
     // source-visible L2 budget is always no larger than physical L2, so every
     // original-formula tiling produced here remains capacity-feasible on the
@@ -406,9 +419,9 @@ def instrument_source_core_budget(source: str) -> str:
         }
         compileInfoPtr->l2CacheSize = runtimeL2 / divisor;
     }"""
-    if source.count(original) != 1:
-        raise RuntimeError("cannot locate original FASG compile-info core assignment")
-    return source.replace(original, replacement)
+    if source.count(l2_anchor) != 1:
+        raise RuntimeError("cannot locate original FASG L2 capacity assignment")
+    return source.replace(l2_anchor, l2_replacement)
 
 
 def digest(path: Path) -> str:

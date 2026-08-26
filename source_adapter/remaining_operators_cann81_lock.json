@@ -14,28 +14,9 @@
       "archive": "vendor_source/cann_ops_adv_8_1rc1.tar.gz",
       "archive_sha256": "753d7f581955c088f28f478f6aa7c26abf0c66187d5f82f653658c0ce45b45d0",
       "official_commit": "d9b54c8395cfa31ab5c35cfa4225e0fb35ee5553"
-    },
-    "gather_elements_v2_port": {
-      "archive": "vendor_source/gather_elements_v2_source.zip",
-      "archive_sha256": "9f1d9753d47ec8e0f0fb3dde1de5b047e048900ff2e9a014c1ed614d7ed57470",
-      "source_version": "CANN 8.3 extracted GatherElementsV2 source",
-      "target_build": "CANN 8.1.RC1 host ABI and Ascend C device compiler",
-      "runtime_python_compilation": false,
-      "tiling_algorithm_changes": false,
-      "kernel_algorithm_changes": false
     }
   },
   "operators": {
-    "gather_elements": {
-      "source": "gather_elements_v2_port",
-      "operator_type": "GatherElementsV2",
-      "runtime_op": "gather_elements",
-      "relative_root": "src/index/gather_elements_v2",
-      "tiler": "op_host/gather_elements_v2_tiling.cpp",
-      "tiler_sha256": "c7bb8d76d1741b5c3212a8de9f28bf6f9de5fe2f7d012bfa90780b25e6f12793",
-      "cmake_op_name": "gather_elements_v2",
-      "acl_api": "aclnnPrivateGatherElementsV2"
-    },
     "flash_attention_score_grad": {
       "source": "cann_ops_adv",
       "operator_type": "FlashAttentionScoreGrad",

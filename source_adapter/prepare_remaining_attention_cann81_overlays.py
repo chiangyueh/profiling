@@ -78,8 +78,8 @@ def main() -> int:
     if args.operator == "flash_attention_score_grad":
         rows = fasg.require_pinned_source(source_root)
         harness_text, provenance = fasg.source_build_harness(harness_root, "flash_attention_score_grad")
-        result = [fasg.write_overlay(source_root, output_parent, row, rows, harness_root, harness_text, provenance)
-                  for row in rows]
+        result = fasg.write_dispatcher_overlay(
+            source_root, output_parent, rows, harness_root, harness_text, provenance)
     else:
         fias.require_pinned_source(source_root)
         harness_text, provenance = fasg.source_build_harness(harness_root, "fused_infer_attention_score")

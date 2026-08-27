@@ -55,7 +55,7 @@ def validate_manifest(path: Path, selected: str) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError("private package manifest is absent: {}".format(path))
     item = json.loads(path.read_text(encoding="utf-8"))
-    if (item.get("schema") != "remaining_operator_cann81_prebuilt_package_v2" or
+    if (item.get("schema") != "remaining_operator_cann81_prebuilt_package_v3" or
             item.get("device_kernel_origin") != "installed_cann81_binary_package_private_copy"):
         raise RuntimeError("invalid complete CANN-8.1 attention package manifest: {}".format(path))
     if (item.get("runtime_op") != selected or item.get("operator") != OPERATOR_TYPES[selected] or
@@ -94,6 +94,17 @@ def validate_manifest(path: Path, selected: str) -> dict[str, Any]:
             instrumentation.get("mutates_tiling_context") is not False or
             not isinstance(envelope, dict) or tuple(envelope.get("divisors", ())) != (2, 4, 8)):
         raise RuntimeError("package source-candidate provenance is incomplete")
+    if selected == "flash_attention_score_grad":
+        enabled = item.get("enabled_original_registrations")
+        if (item.get("strategy_class") != "official_semantic_dispatch" or
+                item.get("original_strategy_registry_preserved") is not True or
+                not isinstance(enabled, list) or len(enabled) != 8 or
+                len({(row.get("class"), row.get("priority")) for row in enabled
+                     if isinstance(row, dict)}) != 8 or
+                item.get("disabled_original_registrations") != []):
+            raise RuntimeError("FASG package does not preserve the complete official strategy registry")
+    elif item.get("strategy_class") != "original_semantic_dispatch":
+        raise RuntimeError("FIAS package is not the original semantic dispatcher")
     item["manifest_path"] = str(path)
     return item
 
@@ -179,12 +190,18 @@ def source_audit_emitted(path: Path, package: dict[str, Any], candidate: dict[st
 def plan_packages(manifests: list[dict[str, Any]], selected: str) -> dict[str, list[dict[str, Any]]]:
     if not manifests or any(item["runtime_op"] != selected for item in manifests):
         raise RuntimeError("package/operator mismatch")
+    if len(manifests) != 1:
+        raise RuntimeError("{} requires exactly one complete original dispatcher package".format(selected))
+    package = manifests[0]
     if selected == "flash_attention_score_grad":
-        strategies = {item.get("strategy_class") for item in manifests}
-        if len(manifests) != 8 or None in strategies or len(strategies) != 8:
-            raise RuntimeError("FASG requires all eight isolated original strategy packages")
-    elif len(manifests) != 1:
-        raise RuntimeError("{} requires exactly one original dispatcher package".format(selected))
+        enabled = package.get("enabled_original_registrations")
+        if (package.get("strategy_class") != "official_semantic_dispatch" or
+                package.get("original_strategy_registry_preserved") is not True or
+                not isinstance(enabled, list) or len(enabled) != 8 or
+                package.get("disabled_original_registrations") != []):
+            raise RuntimeError("FASG requires one package with all eight official registrations enabled")
+    elif package.get("strategy_class") != "original_semantic_dispatch":
+        raise RuntimeError("FIAS requires its original semantic dispatcher package")
     return {selected: manifests}
 
 
@@ -201,17 +218,24 @@ def storage(workload: dict[str, Any]) -> int:
 def remaining_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                         packages: dict[str, list[dict[str, Any]]], caps: tuple[int, ...],
                         base_env: dict[str, str]) -> list[dict[str, Any]]:
-    """Gate every private source route, then prove one eligible real kernel route.
+    """Prove one complete original dispatcher through a real kernel launch.
 
-    Some official FASG templates are intentionally shape- or deterministic-
-    only. Requiring every isolated registration to accept one common shape
-    would rewrite the official predicate contract. All eight libraries must
-    load and construct an executor; the always-capable original base template
-    then proves host audit, precompiled launch and exact output equality.
+    FASG must retain all official predicates and priorities in one host-tiler
+    library.  Preflight therefore exercises the dispatcher, not an isolated
+    strategy forced onto a shape outside that strategy's launch contract.
     """
     checks: list[dict[str, Any]] = []
     op = next(iter(planned))
-    workload = planned[op][0]
+    if op == "flash_attention_score_grad":
+        # This explicit aligned source shape is part of the reviewed catalog.
+        # Do not let storage sorting silently change preflight back to the
+        # 16x16 edge case that exposed the invalid isolated-strategy route.
+        workload = next((row for row in planned[op]
+                         if row["workload_id"] == "flash_attention_score_grad_000"), None)
+        if workload is None:
+            raise RuntimeError("reviewed FASG preflight workload is absent")
+    else:
+        workload = planned[op][0]
     temporary_root = args.log_dir.parent / "tmp"
     temporary_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="remaining_preflight_", dir=str(temporary_root)) as temporary:
@@ -241,13 +265,6 @@ def remaining_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                            "failure": None if ok else campaign.runner_failure(result, output)})
             if not ok:
                 continue
-            if (op == "flash_attention_score_grad" and package.get("strategy_class") !=
-                    "FlashAttentionScoreGradTilingS1s2Bn2gs1s2"):
-                # The other seven official registrations have shape,
-                # deterministic, or optional-input predicates. Their legality
-                # is evaluated during discovery, not falsified in preflight by
-                # forcing one common semantic shape.
-                continue
             planning = root / ("planning_" + campaign.stable_hash(candidate) + ".jsonl")
             result, output, wall, rc = campaign.run_worker(
                 worker_args(args.runner, workload, args.device, 0, 0) + ["--source-executor-planning-only", "1"],
@@ -260,14 +277,9 @@ def remaining_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                            "failure": None if ok else campaign.runner_failure(result, output)})
         if any(item["status"] != "passed" for item in checks):
             return checks
-        launch_packages = packages[op]
-        if op == "flash_attention_score_grad":
-            preferred = [item for item in launch_packages if item.get("strategy_class") ==
-                         "FlashAttentionScoreGradTilingS1s2Bn2gs1s2"]
-            launch_packages = preferred or launch_packages
         launch_ok = False
         launch_failure = "no eligible private package launched"
-        for package in launch_packages:
+        for package in packages[op]:
             candidate = campaign.candidate_descriptor(package, caps[-1])
             audit = root / ("launch_" + campaign.stable_hash(candidate) + ".jsonl")
             result, output, wall, rc = campaign.run_worker(
@@ -296,10 +308,10 @@ def configure(selected: str) -> None:
     campaign.SCHEMA = "{}_cann81_native_measurement_v1".format(selected)
     campaign.SOURCE_BACKEND = BACKENDS[selected]
     campaign.SOURCE_OPERATOR_TYPE = OPERATOR_TYPES[selected]
-    campaign.SOURCE_RULE = ("complete official CANN 8.1 {} source discovery and exact-output validation; "
+    campaign.SOURCE_RULE = ("complete official CANN 8.1 {} dispatcher discovery and exact-output validation; "
                             "deterministic timing of 20 validated source contexts; the declared hardware "
                             "capacity envelope is used only when original core-budget contexts are below 20; "
-                            "failed candidates do not count; no raw tiling field generation").format(
+                            "failed candidates do not count; no strategy forcing and no raw tiling field generation").format(
                                 OPERATOR_TYPES[selected])
     campaign.OPERATOR_RUNTIME_NAMES = {OPERATOR_TYPES[selected]: selected}
     campaign.RUNTIME_OPERATOR_NAMES = {selected: OPERATOR_TYPES[selected]}

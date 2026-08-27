@@ -98,7 +98,6 @@ REQUIRED=(
     source_adapter/prepare_fias_source_overlay.py
     source_adapter/finalize_remaining_cann81_package.py
     source_adapter/materialize_installed_attention_kernels.py
-    source_adapter/materialize_attention_package_variant.py
     source_adapter/remaining_operator_candidate_catalog.py
     source_adapter/run_remaining_operator_campaign.py
     source_adapter/run_non_matmul_candidate_campaign.py
@@ -119,8 +118,7 @@ PACKAGE_ID="$({
         "${ROOT}/source_adapter/prepare_fasg_strategy_overlays.py" \
         "${ROOT}/source_adapter/prepare_fias_source_overlay.py" \
         "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
-        "${ROOT}/source_adapter/materialize_installed_attention_kernels.py" \
-        "${ROOT}/source_adapter/materialize_attention_package_variant.py" "${VERSION_FILE}"
+        "${ROOT}/source_adapter/materialize_installed_attention_kernels.py" "${VERSION_FILE}"
     readlink -f "${CANN_ROOT}"
 } | sha256sum | cut -c1-20)"
 RUN_ID="$({
@@ -240,22 +238,6 @@ build_attention_base_package() {
     fi
 }
 
-build_attention_host_tiler() {
-    local project="$1" build="$2" output="$3" cmake_op="$4" vendor="$5" log_prefix="$6"
-    configure_project "${project}" "${build}" "${output}" "${cmake_op}" "${vendor}" "${log_prefix}"
-    if [[ ! -f "${build}/libcust_opmaster_rt2.0.so" ]]; then
-        # Variant strategies share the base package's byte-identical original
-        # device-kernel source. Only their isolated host-tiler registrations
-        # differ, so the other seven variants build this target only.
-        run_logged "${log_prefix}_BUILD" "${build}.build.log" \
-            resource_limited cmake --build "${build}" --target optiling --parallel 1
-    fi
-    [[ -f "${build}/libcust_opmaster_rt2.0.so" ]] || {
-        echo "fatal: ${log_prefix} produced no CANN 8.1 host-tiler library" >&2
-        exit 2
-    }
-}
-
 MANIFESTS=()
 materialize_source cann_ops "${BASE_SOURCE}" SOURCE_BASE_CACHE
 materialize_source cann_ops_adv "${ADV_SOURCE}" SOURCE_ADV_CACHE
@@ -284,58 +266,31 @@ if [[ "${OPERATOR}" == "fused_infer_attention_score" ]]; then
         --cann-root "${CANN_ROOT}" --manifest "${MANIFEST}"
     MANIFESTS+=("${MANIFEST}")
 else
-    BASE_PROJECT="${PROJECT_PARENT}/fasg_flashattentionscoregradtilings1s2bn2gs1s2"
-    FIRST_MANIFEST="${BASE_PROJECT}/source_candidate_overlay.json"
-    if [[ ! -f "${FIRST_MANIFEST}" ]]; then
-        if find "${PROJECT_PARENT}" -mindepth 1 -maxdepth 1 -name 'fasg_*' -print -quit | grep -q .; then
-            echo "fatal: incomplete FASG project set" >&2
-            exit 2
-        fi
+    PROJECT="${PROJECT_PARENT}/fasg_official_semantic_dispatch"
+    if [[ ! -f "${PROJECT}/source_candidate_overlay.json" ]]; then
+        [[ ! -e "${PROJECT}" ]] || { echo "fatal: incomplete FASG dispatcher project" >&2; exit 2; }
         run_logged FASG_PREPARE "${STATE}/prepare.log" \
             python3 "${ROOT}/source_adapter/prepare_remaining_attention_cann81_overlays.py" \
             --operator "${OPERATOR}" --source-root "${ADV_SOURCE}" \
             --harness-root "${BASE_SOURCE}" --output-parent "${PROJECT_PARENT}"
     fi
-    mapfile -t FASG_PROJECTS < <(find "${PROJECT_PARENT}" -mindepth 2 -maxdepth 2 \
-        -name source_candidate_overlay.json -path '*/fasg_*/*' -printf '%h\n' | sort -u)
-    (( ${#FASG_PROJECTS[@]} == 8 )) || { echo "fatal: FASG requires exactly eight source projects" >&2; exit 2; }
-    BASE_VENDOR=fasg_source
-    BASE_SLUG="$(basename "${BASE_PROJECT}")"
-    BASE_BUILD="${STATE}/build_${BASE_SLUG}"
-    BASE_OUTPUT="${STATE}/output_${BASE_SLUG}"
-    BASE_PACKAGE_ROOT="${BASE_OUTPUT}/packages/vendors/${BASE_VENDOR}"
-    build_attention_base_package "${BASE_PROJECT}" "${BASE_BUILD}" "${BASE_OUTPUT}" \
-        flash_attention_score_grad "${BASE_VENDOR}" FASG_BASE_PACKAGE
-
-    for project in "${FASG_PROJECTS[@]}"; do
-        slug="$(basename "${project}")"
-        variant_build="${STATE}/build_${slug}"
-        manifest="${STATE}/manifests/${slug}.json"
-        if [[ "${project}" == "${BASE_PROJECT}" ]]; then
-            package_root="${BASE_PACKAGE_ROOT}"
-        else
-            variant_output="${STATE}/host_only_${slug}"
-            package_root="${STATE}/variant_packages/${slug}"
-            build_attention_host_tiler "${project}" "${variant_build}" "${variant_output}" \
-                flash_attention_score_grad "${BASE_VENDOR}" "FASG_HOST_${slug}"
-            if [[ ! -f "${package_root}/fasg_prebuilt_package_variant.json" ]]; then
-                [[ ! -e "${package_root}" ]] || { echo "fatal: incomplete FASG package variant: ${slug}" >&2; exit 2; }
-                run_logged "FASG_PACKAGE_${slug}" "${STATE}/package_${slug}.log" \
-                    python3 "${ROOT}/source_adapter/materialize_attention_package_variant.py" \
-                    --base-package-root "${BASE_PACKAGE_ROOT}" --variant-build-root "${variant_build}" \
-                    --variant-project "${project}" \
-                    --base-kernel-copy-manifest "${BASE_PACKAGE_ROOT}/installed_kernel_copy_manifest.json" \
-                    --destination "${package_root}"
-            fi
-        fi
-        run_logged "FASG_VALIDATE_${slug}" "${STATE}/validate_${slug}.log" \
-            python3 "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
-            --operator "${OPERATOR}" --project "${project}" --build-root "${variant_build}" \
-            --package-root "${package_root}" \
-            --kernel-copy-manifest "${package_root}/installed_kernel_copy_manifest.json" \
-            --cann-root "${CANN_ROOT}" --manifest "${manifest}"
-        MANIFESTS+=("${manifest}")
-    done
+    BUILD="${STATE}/build"
+    OUTPUT="${STATE}/output"
+    VENDOR=fasg_source
+    PACKAGE_ROOT="${OUTPUT}/packages/vendors/${VENDOR}"
+    MANIFEST="${STATE}/package.json"
+    # Keep the complete official eight-strategy registry in one package.  The
+    # installed CANN-8.1 binary was compiled for that dispatcher contract;
+    # forcing an isolated template can create a launch-incompatible tiling.
+    build_attention_base_package "${PROJECT}" "${BUILD}" "${OUTPUT}" \
+        flash_attention_score_grad "${VENDOR}" FASG_PACKAGE
+    run_logged FASG_VALIDATE "${STATE}/validate.log" \
+        python3 "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
+        --operator "${OPERATOR}" --project "${PROJECT}" --build-root "${BUILD}" \
+        --package-root "${PACKAGE_ROOT}" \
+        --kernel-copy-manifest "${PACKAGE_ROOT}/installed_kernel_copy_manifest.json" \
+        --cann-root "${CANN_ROOT}" --manifest "${MANIFEST}"
+    MANIFESTS+=("${MANIFEST}")
 fi
 
 if [[ ! -f "${RUNNER_BUILD}/CMakeCache.txt" ]]; then

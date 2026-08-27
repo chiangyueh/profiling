@@ -97,6 +97,20 @@ def main() -> int:
             overlay.get("strategy_algorithm_changes") is False and
             overlay.get("kernel_algorithm_changes") is False,
             "wrong or source-changing overlay")
+    if args.operator == "flash_attention_score_grad":
+        enabled = overlay.get("enabled_original_registrations")
+        require(overlay.get("schema") == "fasg_original_dispatcher_overlay_v1" and
+                overlay.get("strategy_class") == "official_semantic_dispatch" and
+                overlay.get("original_strategy_registry_preserved") is True and
+                isinstance(enabled, list) and len(enabled) == 8 and
+                len({(row.get("class"), row.get("priority")) for row in enabled
+                     if isinstance(row, dict)}) == 8 and
+                overlay.get("disabled_original_registrations") == [],
+                "FASG overlay does not preserve all eight official dispatcher registrations")
+    else:
+        require(overlay.get("schema") == "fias_original_dispatch_overlay_v1" and
+                overlay.get("source_dispatch", {}).get("forced_branch") is False,
+                "FIAS overlay is not the original semantic dispatcher")
     expected_commit = LOCK["sources"][spec["source_family"]]["official_commit"]
     require(overlay.get("official_commit") == expected_commit, "wrong official CANN-8.1 commit")
 
@@ -167,10 +181,15 @@ def main() -> int:
             tuple(envelope.get("divisors", ())) == (2, 4, 8), "hardware-envelope contract is invalid")
 
     manifest = {
-        "schema": "remaining_operator_cann81_prebuilt_package_v2",
+        "schema": "remaining_operator_cann81_prebuilt_package_v3",
         "operator": spec["operator"],
         "runtime_op": args.operator,
-        "strategy_class": overlay.get("strategy_class"),
+        "strategy_class": (overlay.get("strategy_class") if args.operator == "flash_attention_score_grad"
+                           else "original_semantic_dispatch"),
+        "original_strategy_registry_preserved": (
+            overlay.get("original_strategy_registry_preserved") is True),
+        "enabled_original_registrations": overlay.get("enabled_original_registrations", []),
+        "disabled_original_registrations": overlay.get("disabled_original_registrations", []),
         "source_kind": "official_{}_cann81_private_prebuilt_package".format(spec["source_family"]),
         "official_source_commit": expected_commit,
         "build_cann_version": "8.1.RC1",
@@ -211,7 +230,8 @@ def main() -> int:
         "matmul_included": False,
         "scatter_elements_included": False,
         "formal_data_gate": (
-            "load the complete private CANN 8.1 package and its private OpAPI, observe the instrumented raw "
+            "load the complete private CANN 8.1 package and its private OpAPI, preserve the original semantic "
+            "dispatcher, observe the instrumented raw "
             "tiling identity, launch the read-only copy of the installed CANN-8.1 Ascend910B kernel, and exactly match the "
             "separately generated installed-reference output"
         ),

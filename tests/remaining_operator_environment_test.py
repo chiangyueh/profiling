@@ -25,6 +25,12 @@ def main() -> int:
         raise AssertionError("completed GatherElements is still scheduled by full mode")
     if "--target package" in remaining_entry or "--target ops_kernel" in remaining_entry:
         raise AssertionError("remaining campaign still triggers device-kernel compilation")
+    if "fasg_official_semantic_dispatch" not in remaining_entry:
+        raise AssertionError("FASG does not build the complete official dispatcher")
+    for forbidden in ("FASG_PROJECTS", "materialize_attention_package_variant.py",
+                      "fasg_flashattentionscoregradtilings1s2bn2gs1s2"):
+        if forbidden in remaining_entry:
+            raise AssertionError("obsolete isolated FASG route is still active: " + forbidden)
     required_host_targets = (
         "opapi opsproto optiling optiling_compat generate_ops_info_ascend910b",
         "materialize_installed_attention_kernels.py",
@@ -44,6 +50,31 @@ def main() -> int:
         implementation = inspect.getsource(function)
         if "runtimeAiv % runtimeAic" not in implementation or "runtimeAic % runtimeAiv" in implementation:
             raise AssertionError("attention core-cap instrumentation does not preserve the 910B AIV/AIC ratio")
+
+    dispatcher_source = inspect.getsource(fasg_overlay.write_dispatcher_overlay)
+    for required in ("original_strategy_registry_preserved", "enabled_original_registrations",
+                     '"disabled_original_registrations": []'):
+        if required not in dispatcher_source:
+            raise AssertionError("FASG dispatcher attestation is incomplete: " + required)
+    valid_fasg = {
+        "runtime_op": "flash_attention_score_grad",
+        "strategy_class": "official_semantic_dispatch",
+        "original_strategy_registry_preserved": True,
+        "enabled_original_registrations": [
+            {"class": "Strategy{}".format(index), "priority": index} for index in range(8)],
+        "disabled_original_registrations": [],
+    }
+    if remaining.plan_packages([valid_fasg], "flash_attention_score_grad") != {
+            "flash_attention_score_grad": [valid_fasg]}:
+        raise AssertionError("complete FASG dispatcher package was rejected")
+    invalid_fasg = dict(valid_fasg)
+    invalid_fasg["strategy_class"] = "FlashAttentionScoreGradTilingS1s2Bn2gs1s2"
+    try:
+        remaining.plan_packages([invalid_fasg], "flash_attention_score_grad")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("isolated FASG strategy package was accepted")
 
     for short, operator, prefix, envelope in (
         ("flash_attention_score_grad", "FlashAttentionScoreGrad", "FASG", "L2"),

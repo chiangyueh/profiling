@@ -36,6 +36,7 @@ struct Options {
     int32_t samples = 15;
     int32_t numericPreflightMaxMiB = 4;
     bool preflightOnly = false;
+    bool structuredFullPreflight = false;
 };
 
 struct Workload {
@@ -394,6 +395,115 @@ void FillOnes(std::vector<uint8_t> &buffer, const std::string &dtype)
     }
 }
 
+void StoreScalar(uint8_t *destination, const std::string &dtype, float value)
+{
+    if (dtype == "fp16") {
+        const aclFloat16 encoded = aclFloatToFloat16(value);
+        std::memcpy(destination, &encoded, sizeof(encoded));
+    } else if (dtype == "bf16") {
+        const uint16_t encoded = FloatToBfloat16(value);
+        std::memcpy(destination, &encoded, sizeof(encoded));
+    } else if (dtype == "fp32") {
+        std::memcpy(destination, &value, sizeof(value));
+    } else {
+        throw std::runtime_error("cannot encode unsupported dtype: " + dtype);
+    }
+}
+
+int PatternSign(int64_t index, int axis)
+{
+    static constexpr std::array<int64_t, 3> moduli{251, 257, 263};
+    static constexpr std::array<int64_t, 3> multipliers{73, 97, 101};
+    static constexpr std::array<int64_t, 3> offsets{19, 31, 47};
+    const int64_t mixed =
+        (index * multipliers.at(static_cast<size_t>(axis)) +
+         offsets.at(static_cast<size_t>(axis))) %
+        moduli.at(static_cast<size_t>(axis));
+    return mixed < moduli.at(static_cast<size_t>(axis)) / 2 ? -1 : 1;
+}
+
+std::vector<uint8_t> EncodedPatternVector(
+    int64_t elements,
+    int axis,
+    int multiplier,
+    float magnitude,
+    const std::string &dtype)
+{
+    const size_t elementBytes = ElementBytes(dtype);
+    std::vector<uint8_t> output(static_cast<size_t>(elements) * elementBytes);
+    for (int64_t index = 0; index < elements; ++index) {
+        const float value = static_cast<float>(
+            multiplier * PatternSign(index, axis)) * magnitude;
+        StoreScalar(
+            output.data() + static_cast<size_t>(index) * elementBytes,
+            dtype, value);
+    }
+    return output;
+}
+
+void CopyRows(
+    std::vector<uint8_t> &destination,
+    int64_t rows,
+    const std::vector<uint8_t> &positive,
+    const std::vector<uint8_t> &negative,
+    int signAxis)
+{
+    const size_t rowBytes = positive.size();
+    if (negative.size() != rowBytes ||
+        destination.size() != static_cast<size_t>(rows) * rowBytes) {
+        throw std::runtime_error("structured numeric row size mismatch");
+    }
+    for (int64_t row = 0; row < rows; ++row) {
+        const auto &source =
+            PatternSign(row, signAxis) > 0 ? positive : negative;
+        std::memcpy(
+            destination.data() + static_cast<size_t>(row) * rowBytes,
+            source.data(), rowBytes);
+    }
+}
+
+void FillStructuredInputs(
+    std::vector<uint8_t> &a,
+    std::vector<uint8_t> &b,
+    const Workload &workload)
+{
+    const auto kPositive = EncodedPatternVector(
+        workload.k, 2, 1, 1.0F, workload.dtype);
+    const auto kNegative = EncodedPatternVector(
+        workload.k, 2, -1, 1.0F, workload.dtype);
+    const auto rowPositive = EncodedPatternVector(
+        workload.m, 0, 1, 1.0F, workload.dtype);
+    const auto rowNegative = EncodedPatternVector(
+        workload.m, 0, -1, 1.0F, workload.dtype);
+    const auto columnPositive = EncodedPatternVector(
+        workload.n, 1, 1, 1.0F, workload.dtype);
+    const auto columnNegative = EncodedPatternVector(
+        workload.n, 1, -1, 1.0F, workload.dtype);
+
+    if (workload.transA) {
+        CopyRows(a, workload.k, rowPositive, rowNegative, 2);
+    } else {
+        CopyRows(a, workload.m, kPositive, kNegative, 0);
+    }
+    if (workload.transB) {
+        CopyRows(b, workload.n, kPositive, kNegative, 1);
+    } else {
+        CopyRows(b, workload.k, columnPositive, columnNegative, 2);
+    }
+}
+
+void FillStructuredExpectedOutput(
+    std::vector<uint8_t> &output,
+    const Workload &workload)
+{
+    const float magnitude = static_cast<float>(workload.k);
+    const auto positive = EncodedPatternVector(
+        workload.n, 1, 1, magnitude, workload.dtype);
+    const auto negative = EncodedPatternVector(
+        workload.n, 1, -1, magnitude, workload.dtype);
+    CopyRows(output, workload.m, positive, negative, 0);
+}
+
 double DecodeOutput(uint32_t observed, const std::string &dtype)
 {
     if (dtype == "fp16") {
@@ -497,18 +607,30 @@ ProfileSummary ProfileOfficial(
         const bool numericPreflight =
             numericLimit > 0 && aBytes <= numericLimit && bBytes <= numericLimit - aBytes &&
             workload.k <= 60000;
+        if (options.structuredFullPreflight && !numericPreflight) {
+            throw std::runtime_error(
+                "structured full numeric preflight required but A+B bytes=" +
+                std::to_string(aBytes + bBytes) + " exceed limit=" +
+                std::to_string(numericLimit) + " or K exceeds 60000");
+        }
         if (numericPreflight) {
             std::vector<uint8_t> aHost(aBytes);
             std::vector<uint8_t> bHost(bBytes);
-            FillOnes(aHost, workload.dtype);
-            FillOnes(bHost, workload.dtype);
+            if (options.structuredFullPreflight) {
+                FillStructuredInputs(aHost, bHost, workload);
+            } else {
+                FillOnes(aHost, workload.dtype);
+                FillOnes(bHost, workload.dtype);
+            }
             CheckAcl(aclrtMemcpy(
                 a.ptr, a.bytes, aHost.data(), aHost.size(), ACL_MEMCPY_HOST_TO_DEVICE),
                 "aclrtMemcpy official numeric A");
             CheckAcl(aclrtMemcpy(
                 b.ptr, b.bytes, bHost.data(), bHost.size(), ACL_MEMCPY_HOST_TO_DEVICE),
                 "aclrtMemcpy official numeric B");
-            summary.preflightMode = "numeric_ones_grid9_v1";
+            summary.preflightMode = options.structuredFullPreflight
+                ? "numeric_signed_axes_full_v3"
+                : "numeric_ones_grid9_v1";
         } else {
             CheckAcl(aclrtMemset(a.ptr, a.bytes, 0, a.bytes), "aclrtMemset official A");
             CheckAcl(aclrtMemset(b.ptr, b.bytes, 0, b.bytes), "aclrtMemset official B");
@@ -562,47 +684,84 @@ ProfileSummary ProfileOfficial(
         CheckAcl(aclrtSynchronizeStream(stream), "official preflight synchronize");
         LogStage(workload, "preflight_sync_done");
         const size_t outputBytes = ElementBytes(workload.dtype);
-        constexpr int64_t coverageGrid = 9;
-        std::set<int64_t> sampleIndices;
-        for (int64_t rowProbe = 0; rowProbe < coverageGrid; ++rowProbe) {
-            const int64_t row =
-                (workload.m - 1) * rowProbe / (coverageGrid - 1);
-            for (int64_t columnProbe = 0; columnProbe < coverageGrid;
-                 ++columnProbe) {
-                const int64_t column =
-                    (workload.n - 1) * columnProbe / (coverageGrid - 1);
-                sampleIndices.insert(row * workload.n + column);
-            }
-        }
-        for (int64_t index : sampleIndices) {
-            uint32_t observed = 0;
-            auto *source =
-                static_cast<uint8_t *>(c.ptr) + static_cast<size_t>(index) * outputBytes;
+        if (numericPreflight && options.structuredFullPreflight) {
+            std::vector<uint8_t> observed(cBytes);
             CheckAcl(aclrtMemcpy(
-                &observed, outputBytes, source, outputBytes, ACL_MEMCPY_DEVICE_TO_HOST),
-                "aclrtMemcpy official preflight sample");
-            if (numericPreflight) {
-                const double actual = DecodeOutput(observed, workload.dtype);
-                const double expected = ExpectedOnesOutput(workload.k, workload.dtype);
-                const double tolerance = std::max(0.03, std::abs(expected) * 0.01);
-                if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
+                observed.data(), observed.size(), c.ptr, c.bytes,
+                ACL_MEMCPY_DEVICE_TO_HOST),
+                "aclrtMemcpy official full numeric output");
+            std::vector<uint8_t> expected(cBytes);
+            FillStructuredExpectedOutput(expected, workload);
+            if (std::memcmp(observed.data(), expected.data(), cBytes) != 0) {
+                const size_t elements = cBytes / outputBytes;
+                for (size_t index = 0; index < elements; ++index) {
+                    const size_t offset = index * outputBytes;
+                    if (std::memcmp(
+                            observed.data() + offset,
+                            expected.data() + offset,
+                            outputBytes) == 0) {
+                        continue;
+                    }
+                    uint32_t actualBits = 0;
+                    uint32_t expectedBits = 0;
+                    std::memcpy(
+                        &actualBits, observed.data() + offset, outputBytes);
+                    std::memcpy(
+                        &expectedBits, expected.data() + offset, outputBytes);
                     throw std::runtime_error(
-                        "official numeric preflight failed at C index=" +
-                        std::to_string(index) + ", actual=" + std::to_string(actual) +
-                        ", expected=" + std::to_string(expected));
+                        "official structured numeric preflight failed at C index=" +
+                        std::to_string(index) + ", actual=" +
+                        std::to_string(DecodeOutput(actualBits, workload.dtype)) +
+                        ", expected=" +
+                        std::to_string(DecodeOutput(expectedBits, workload.dtype)));
                 }
-            } else {
-                const auto *bytes = reinterpret_cast<const uint8_t *>(&observed);
-                for (size_t byte = 0; byte < outputBytes; ++byte) {
-                    if (bytes[byte] != 0) {
-                        std::ostringstream detail;
-                        detail << "official output coverage failed at C index="
-                               << index << ", observed=0x"
-                               << std::hex << std::setfill('0')
-                               << std::setw(static_cast<int>(outputBytes * 2))
-                               << observed;
+                throw std::runtime_error(
+                    "official structured numeric preflight output mismatch");
+            }
+        } else {
+            constexpr int64_t coverageGrid = 9;
+            std::set<int64_t> sampleIndices;
+            for (int64_t rowProbe = 0; rowProbe < coverageGrid; ++rowProbe) {
+                const int64_t row =
+                    (workload.m - 1) * rowProbe / (coverageGrid - 1);
+                for (int64_t columnProbe = 0; columnProbe < coverageGrid;
+                     ++columnProbe) {
+                    const int64_t column =
+                        (workload.n - 1) * columnProbe / (coverageGrid - 1);
+                    sampleIndices.insert(row * workload.n + column);
+                }
+            }
+            for (int64_t index : sampleIndices) {
+                uint32_t observed = 0;
+                auto *source = static_cast<uint8_t *>(c.ptr) +
+                    static_cast<size_t>(index) * outputBytes;
+                CheckAcl(aclrtMemcpy(
+                    &observed, outputBytes, source, outputBytes,
+                    ACL_MEMCPY_DEVICE_TO_HOST),
+                    "aclrtMemcpy official preflight sample");
+                if (numericPreflight) {
+                    const double actual = DecodeOutput(observed, workload.dtype);
+                    const double expected = ExpectedOnesOutput(workload.k, workload.dtype);
+                    const double tolerance = std::max(0.03, std::abs(expected) * 0.01);
+                    if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
                         throw std::runtime_error(
-                            detail.str());
+                            "official numeric preflight failed at C index=" +
+                            std::to_string(index) + ", actual=" +
+                            std::to_string(actual) + ", expected=" +
+                            std::to_string(expected));
+                    }
+                } else {
+                    const auto *bytes = reinterpret_cast<const uint8_t *>(&observed);
+                    for (size_t byte = 0; byte < outputBytes; ++byte) {
+                        if (bytes[byte] != 0) {
+                            std::ostringstream detail;
+                            detail << "official output coverage failed at C index="
+                                   << index << ", observed=0x"
+                                   << std::hex << std::setfill('0')
+                                   << std::setw(static_cast<int>(outputBytes * 2))
+                                   << observed;
+                            throw std::runtime_error(detail.str());
+                        }
                     }
                 }
             }
@@ -726,7 +885,8 @@ std::unordered_map<std::string, std::string> ParseArgs(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
         if (key == "--help" || key == "-h" || key == "--validate-input" ||
-            key == "--acl-only" || key == "--preflight-only") {
+            key == "--acl-only" || key == "--preflight-only" ||
+            key == "--structured-full-preflight") {
             args[key] = "1";
             continue;
         }
@@ -770,6 +930,7 @@ void PrintUsage()
         << "  --only-workload ID\n"
         << "  --workload-limit N\n"
         << "  --numeric-preflight-max-mib N\n"
+        << "  --structured-full-preflight  signed-axis inputs and full C comparison\n"
         << "  --preflight-only     launch once, synchronize, and validate output; no timing\n"
         << "  --acl-only            initialize the linked ACL runtime without profiling\n"
         << "  --validate-input       validate input and CSV schema without ACL/NPU\n";
@@ -798,6 +959,8 @@ int main(int argc, char **argv)
         options.numericPreflightMaxMiB =
             GetInt(args, "--numeric-preflight-max-mib", options.numericPreflightMaxMiB);
         options.preflightOnly = args.count("--preflight-only") != 0;
+        options.structuredFullPreflight =
+            args.count("--structured-full-preflight") != 0;
         if (options.warmup < 0 || options.repeat <= 0 || options.samples <= 0) {
             throw std::runtime_error("warmup/repeat/samples values are invalid");
         }

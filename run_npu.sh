@@ -9,7 +9,7 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-Runs 100 deterministic MatMulV3 shapes through the installed original tiler.
+Runs 5,000 deterministic MatMulV3 boundary shapes through the installed original tiler.
 Correct shapes are silent. Each wrong result produces one JSON object.
 USAGE
 }
@@ -26,7 +26,7 @@ done
 [[ "${MODE}" == "full" ]] || exit 2
 [[ "${PHYSICAL_DEVICE}" =~ ^[0-9]+$ ]] || exit 2
 
-PRIVATE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/matmul-original-100.XXXXXX")"
+PRIVATE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/matmul-original-5000.XXXXXX")"
 cleanup() {
     [[ -n "${PRIVATE_ROOT:-}" && -d "${PRIVATE_ROOT}" ]] && rm -rf -- "${PRIVATE_ROOT}"
 }
@@ -60,107 +60,55 @@ if [[ ! -x "${RUNNER}" ]] ||
 fi
 
 WORKLOADS="${PRIVATE_ROOT}/workloads.csv"
-printf '%s\n' 'workload_id,m,n,k,dtype,trans_a,trans_b
-matmul_001_skinny_n,3072,16,16383,fp16,0,0
-matmul_002_skinny_n,3072,32,16384,bf16,0,1
-matmul_003_skinny_n,3072,48,16385,fp16,1,0
-matmul_004_skinny_n,3072,64,24575,bf16,1,1
-matmul_005_skinny_n,3072,80,24576,fp16,0,0
-matmul_006_skinny_n,3072,96,24577,bf16,0,1
-matmul_007_skinny_n,4096,16,8191,fp16,1,0
-matmul_008_skinny_n,4096,32,8192,bf16,1,1
-matmul_009_skinny_n,4096,48,8193,fp16,0,0
-matmul_010_skinny_n,4096,64,12287,bf16,0,1
-matmul_011_skinny_n,4096,80,12288,fp16,1,0
-matmul_012_skinny_n,4096,96,12289,bf16,1,1
-matmul_013_skinny_n,5120,16,16383,fp16,0,0
-matmul_014_skinny_n,5120,32,16384,bf16,0,1
-matmul_015_skinny_n,5120,48,16385,fp16,1,0
-matmul_016_skinny_n,3840,64,32767,bf16,1,1
-matmul_017_skinny_n,3840,80,32768,fp16,0,0
-matmul_018_skinny_n,3840,96,32769,bf16,0,1
-matmul_019_skinny_n,6144,16,4095,fp16,1,0
-matmul_020_skinny_n,6144,32,4096,bf16,1,1
-matmul_021_skinny_n,6144,48,4097,fp16,0,0
-matmul_022_skinny_n,6144,64,8191,bf16,0,1
-matmul_023_skinny_n,6144,80,8192,fp16,1,0
-matmul_024_skinny_n,6144,96,8193,bf16,1,1
-matmul_025_skinny_m,16,3072,16383,fp16,0,0
-matmul_026_skinny_m,32,3072,16384,bf16,0,1
-matmul_027_skinny_m,48,3072,16385,fp16,1,0
-matmul_028_skinny_m,64,3072,24575,bf16,1,1
-matmul_029_skinny_m,80,3072,24576,fp16,0,0
-matmul_030_skinny_m,96,3072,24577,bf16,0,1
-matmul_031_skinny_m,16,4096,8191,fp16,1,0
-matmul_032_skinny_m,32,4096,8192,bf16,1,1
-matmul_033_skinny_m,48,4096,8193,fp16,0,0
-matmul_034_skinny_m,64,4096,12287,bf16,0,1
-matmul_035_skinny_m,80,4096,12288,fp16,1,0
-matmul_036_skinny_m,96,4096,12289,bf16,1,1
-matmul_037_skinny_m,16,5120,16383,fp16,0,0
-matmul_038_skinny_m,32,5120,16384,bf16,0,1
-matmul_039_skinny_m,48,5120,16385,fp16,1,0
-matmul_040_skinny_m,64,3840,32767,bf16,1,1
-matmul_041_skinny_m,80,3840,32768,fp16,0,0
-matmul_042_skinny_m,96,3840,32769,bf16,0,1
-matmul_043_split_k,16,16,8191,fp16,0,0
-matmul_044_split_k,16,32,8192,bf16,0,1
-matmul_045_split_k,32,16,8193,fp32,1,0
-matmul_046_split_k,32,32,16383,fp16,1,1
-matmul_047_split_k,48,64,16384,bf16,0,0
-matmul_048_split_k,64,48,16385,fp32,0,1
-matmul_049_split_k,64,64,24575,fp16,1,0
-matmul_050_split_k,96,128,24576,bf16,1,1
-matmul_051_split_k,128,96,24577,fp32,0,0
-matmul_052_split_k,128,128,32767,fp16,0,1
-matmul_053_split_k,160,160,32768,bf16,1,0
-matmul_054_split_k,192,128,32769,fp32,1,1
-matmul_055_split_k,128,192,49151,fp16,0,0
-matmul_056_split_k,256,256,49152,bf16,0,1
-matmul_057_split_k,16,48,12287,bf16,0,0
-matmul_058_split_k,16,64,12288,fp16,1,0
-matmul_059_split_k,32,48,12289,fp32,1,1
-matmul_060_split_k,32,64,20479,bf16,0,1
-matmul_061_split_k,48,16,20480,fp16,0,0
-matmul_062_split_k,64,16,20481,fp32,1,0
-matmul_063_split_k,48,48,28671,bf16,1,1
-matmul_064_split_k,80,80,28672,fp16,0,1
-matmul_065_split_k,96,96,28673,fp32,0,0
-matmul_066_split_k,112,112,40959,bf16,1,0
-matmul_067_split_k,144,144,40960,fp16,1,1
-matmul_068_split_k,176,176,40961,fp32,0,1
-matmul_069_split_k,224,224,57343,bf16,0,0
-matmul_070_split_k,240,240,57344,fp16,1,0
-matmul_071_tile_tail,112,240,4095,fp16,0,0
-matmul_072_tile_tail,128,256,4096,bf16,0,1
-matmul_073_tile_tail,144,272,4097,fp32,1,0
-matmul_074_tile_tail,240,496,3071,fp16,1,1
-matmul_075_tile_tail,256,512,3072,bf16,0,0
-matmul_076_tile_tail,272,528,3073,fp32,0,1
-matmul_077_tile_tail,496,752,6143,fp16,1,0
-matmul_078_tile_tail,512,768,6144,bf16,1,1
-matmul_079_tile_tail,528,784,6145,fp32,0,0
-matmul_080_tile_tail,752,1008,8191,fp16,0,1
-matmul_081_tile_tail,768,1024,8192,bf16,1,0
-matmul_082_tile_tail,784,1040,8193,fp32,1,1
-matmul_083_tile_tail,1008,1520,12287,fp16,0,0
-matmul_084_tile_tail,1024,1536,12288,bf16,0,1
-matmul_085_tile_tail,1040,1552,12289,fp32,1,0
-matmul_086_tile_tail,1520,2032,4095,fp16,1,1
-matmul_087_tile_tail,1536,2048,4096,bf16,0,0
-matmul_088_tile_tail,1552,2064,4097,fp32,0,1
-matmul_089_l2_grid,2544,1264,6161,fp16,0,0
-matmul_090_l2_grid,2560,1280,6160,bf16,0,1
-matmul_091_l2_grid,2576,1296,6159,fp32,1,0
-matmul_092_l2_grid,3056,2032,12289,fp16,1,1
-matmul_093_l2_grid,3072,2048,12288,bf16,0,0
-matmul_094_l2_grid,3088,2064,12287,fp32,0,1
-matmul_095_l2_grid,4080,2544,4097,fp16,1,0
-matmul_096_l2_grid,4096,2560,4096,bf16,1,1
-matmul_097_l2_grid,4112,2576,4095,fp32,0,0
-matmul_098_l2_grid,5104,1008,8193,fp16,0,1
-matmul_099_l2_grid,5120,1024,8192,bf16,1,0
-matmul_100_l2_grid,5136,1040,8191,fp32,1,1' >"${WORKLOADS}"
+{
+    printf 'workload_id,m,n,k,dtype,trans_a,trans_b\n'
+    dimensions=(
+        16 32 48 64 80 96 112 128 144 160 176 192 208 224 240 256
+        272 288 304 320 336 352 368 384 400 416 432 448 464 480 496 512
+        528 544 560 576 624 640 656 752 768 784 1008 1024 1040 1264
+        1280 1296 1520 1536 1552 1776 1792 1808 2032 2048 2064 2288
+        2304 2320 2544 2560 2576 3056 3072 3088 3568 3584 3600 4080
+        4096 4112
+    )
+    k_boundaries=(
+        63 64 65 127 128 129 255 256 257 511 512 513
+        1023 1024 1025 2047 2048 2049 3071 3072 3073
+        4095 4096 4097 6143 6144 6145 8191 8192 8193
+        12287 12288 12289 16383 16384 16385 24575 24576 24577
+        32767 32768 32769 40959 40960 40961 49151 49152 49153
+        57343 57344 57345
+    )
+    dtypes=(fp16 bf16 fp32)
+    trans_a=(0 0 1 1)
+    trans_b=(0 1 0 1)
+    dimension_count=${#dimensions[@]}
+    pair_count=$((dimension_count * dimension_count))
+    for ((sequence = 0; sequence < 5000; ++sequence)); do
+        flat=$(((sequence * 5179) % pair_count))
+        m_index=$((flat / dimension_count))
+        n_index=$((flat % dimension_count))
+        m=${dimensions[m_index]}
+        n=${dimensions[n_index]}
+        dtype_index=$(((m_index + n_index + sequence) % ${#dtypes[@]}))
+        dtype=${dtypes[dtype_index]}
+        if [[ "${dtype}" == "fp32" ]]; then
+            element_bytes=4
+        else
+            element_bytes=2
+        fi
+        max_k=$(((192 * 1024 * 1024) / ((m + n) * element_bytes)))
+        ((max_k > 60000)) && max_k=60000
+        valid_k=()
+        for k in "${k_boundaries[@]}"; do
+            ((k <= max_k)) && valid_k+=("${k}")
+        done
+        k_index=$(((m_index * 17 + n_index * 29 + sequence * 7) % ${#valid_k[@]}))
+        trans_index=$(((m_index + n_index * 2 + sequence) % 4))
+        printf 'matmul_%04d_boundary_grid,%d,%d,%d,%s,%d,%d\n' \
+            "$((sequence + 1))" "${m}" "${n}" "${valid_k[k_index]}" \
+            "${dtype}" "${trans_a[trans_index]}" "${trans_b[trans_index]}"
+    done
+} >"${WORKLOADS}"
 
 REMAINING="${WORKLOADS}"
 batch=0

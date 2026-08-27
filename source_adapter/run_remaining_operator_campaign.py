@@ -54,7 +54,7 @@ def validate_manifest(path: Path, selected: str) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError("private package manifest is absent: {}".format(path))
     item = json.loads(path.read_text(encoding="utf-8"))
-    if (item.get("schema") != "remaining_operator_exact_cann81_package_v4" or
+    if (item.get("schema") != "remaining_operator_exact_cann81_package_v5" or
             item.get("device_kernel_origin") != "installed_cann81_binary_package_private_copy"):
         raise RuntimeError("invalid complete CANN-8.1 attention package manifest: {}".format(path))
     if (item.get("runtime_op") != selected or item.get("operator") != OPERATOR_TYPES[selected] or
@@ -110,11 +110,16 @@ def validate_manifest(path: Path, selected: str) -> dict[str, Any]:
             instrumentation.get("mutates_process_local_platform_view_before_official_tiler") is not True or
             not isinstance(envelope, dict) or tuple(envelope.get("divisors", ())) != (2, 4, 8)):
         raise RuntimeError("package source-candidate provenance is incomplete")
-    for key in ("official_tiling_library", "op_api_library"):
+    for entrypoint_key, library_key in (("official_tiling_entrypoint", "official_tiling_library"),
+                                        ("op_api_entrypoint", "op_api_library")):
         try:
-            Path(item[key]).resolve().relative_to(cann_root)
+            entrypoint = Path(item[entrypoint_key])
+            entrypoint.relative_to(cann_root)
+            library = Path(item[library_key]).resolve()
         except (KeyError, ValueError):
-            raise RuntimeError("{} is not supplied by the selected installed CANN 8.1".format(key))
+            raise RuntimeError("{} is not selected through the installed CANN 8.1 entrypoint".format(library_key))
+        if not entrypoint.is_file() or entrypoint.resolve() != library:
+            raise RuntimeError("{} CANN 8.1 entrypoint target has changed".format(library_key))
     if selected == "flash_attention_score_grad":
         if (item.get("strategy_class") != "official_semantic_dispatch" or
                 item.get("original_strategy_registry_preserved") is not True or

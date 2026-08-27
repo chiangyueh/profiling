@@ -59,11 +59,7 @@ if [[ "${OPERATOR}" == "all" ]]; then
     exit 0
 fi
 
-BOOTSTRAP_LOGS="${ROOT}/results/${OPERATOR}_cann81_native/bootstrap_logs"
-mkdir -p "${BOOTSTRAP_LOGS}"
-TERMINAL_LOG="${BOOTSTRAP_LOGS}/$(date -u +%Y%m%dT%H%M%SZ)_$$.log"
-exec > >(tee -a "${TERMINAL_LOG}") 2>&1
-echo "CAMPAIGN_BOOTSTRAP operator=${OPERATOR} device=${PHYSICAL_DEVICE} terminal_log=${TERMINAL_LOG}"
+echo "CAMPAIGN_BOOTSTRAP operator=${OPERATOR} device=${PHYSICAL_DEVICE}"
 
 CANN_ROOT="${CANN_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
 VERSION_FILE="${CANN_ROOT}/opp/version.info"

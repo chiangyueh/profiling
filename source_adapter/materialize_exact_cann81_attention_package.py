@@ -52,11 +52,11 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
-def installed_library(cann: Path, architecture: str, relative: Path) -> Path:
+def installed_library(cann: Path, architecture: str, relative: Path) -> tuple[Path, Path]:
     candidates = (cann / (architecture + "-linux") / relative, cann / relative)
     for candidate in candidates:
         if candidate.is_file():
-            return candidate.resolve()
+            return candidate, candidate.resolve()
     raise RuntimeError("installed CANN 8.1 library is absent: {}".format(relative))
 
 
@@ -95,10 +95,11 @@ def main() -> int:
                              for path in compiled),
             "alpha001 attention tiler object entered the exact CANN 8.1 bridge")
     architecture = platform.machine()
-    official_tiling = (cann / "opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux" /
-                       architecture / "liboptiling.so").resolve()
+    official_tiling_entrypoint = (cann / "opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux" /
+                                  architecture / "liboptiling.so")
+    official_tiling = official_tiling_entrypoint.resolve()
     require(official_tiling.is_file(), "installed exact CANN 8.1 host tiler is absent")
-    opapi = installed_library(cann, architecture, Path("lib64/libopapi.so"))
+    opapi_entrypoint, opapi = installed_library(cann, architecture, Path("lib64/libopapi.so"))
     installed_config = (cann / "opp/built-in/op_impl/ai_core/tbe/config/ascend910b" /
                         "aic-ascend910b-ops-info.json").resolve()
     require(installed_config.is_file(), "installed exact CANN 8.1 op config is absent")
@@ -155,7 +156,7 @@ def main() -> int:
     private_config = (package / "op_impl/ai_core/tbe/config/ascend910b" /
                       "aic-ascend910b-ops-info.json")
     manifest = {
-        "schema": "remaining_operator_exact_cann81_package_v4",
+        "schema": "remaining_operator_exact_cann81_package_v5",
         "operator": spec["operator"],
         "runtime_op": args.operator,
         "strategy_class": "official_semantic_dispatch",
@@ -169,10 +170,12 @@ def main() -> int:
         "source_file": str(delegate),
         "source_file_sha256": digest(delegate),
         "official_tiling_source_sha256": digest(official_tiling),
+        "official_tiling_entrypoint": str(official_tiling_entrypoint),
         "official_tiling_library": str(official_tiling),
         "official_tiling_library_sha256": digest(official_tiling),
         "op_tiling_library": str(custom_tiling),
         "op_tiling_library_sha256": digest(custom_tiling),
+        "op_api_entrypoint": str(opapi_entrypoint),
         "op_api_library": str(opapi),
         "op_api_library_sha256": digest(opapi),
         "ops_config": str(private_config),

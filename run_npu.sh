@@ -39,9 +39,11 @@ export TILINGKEY_PAR_COMPILE=0
 # The upstream install rule requires this common include directory even when
 # this MatMul-only checkout intentionally contains none of its optional files.
 mkdir -p "$ROOT/src/common/inc/kernel"
+: >"$ROOT/src/common/inc/kernel/matmul_only_placeholder.h"
 
 SOURCE_HASH="$({
-    find "$ROOT/src/matmul/mat_mul_v3" "$ROOT/src/common" "$ROOT/cmake" "$ROOT/third_party" -type f -print0
+    find "$ROOT/src/matmul/mat_mul_v3" "$ROOT/src/common" "$ROOT/cmake" "$ROOT/third_party" \
+        -type f ! -name matmul_only_placeholder.h -print0
     printf '%s\0' "$ROOT/CMakeLists.txt" "$ROOT/CMakePresets.json"
 } | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
 STATE="$ROOT/.benchmark_state/matmul_original_${SOURCE_HASH:0:20}"

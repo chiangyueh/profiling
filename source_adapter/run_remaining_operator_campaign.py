@@ -454,5 +454,23 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except RuntimeError as error:
+        # Manifest and argument failures can happen before main() creates its
+        # writer. Preserve those failures in the same numbered, size-rotated
+        # JSONL stream as every other campaign record.
+        try:
+            log_index = sys.argv.index("--log-dir")
+            operator_index = sys.argv.index("--operator")
+            fatal_log_dir = Path(sys.argv[log_index + 1])
+            fatal_operator = sys.argv[operator_index + 1]
+            fatal_schema = "{}_cann81_native_measurement_v1".format(fatal_operator)
+            campaign.RotatingJsonl(fatal_log_dir).append({
+                "schema": fatal_schema,
+                "record_type": "campaign_fatal",
+                "operator": fatal_operator,
+                "status": "failed",
+                "error": str(error),
+            })
+        except (IndexError, OSError, ValueError):
+            pass
         print("SOURCE_TILING_CAMPAIGN_FATAL " + json.dumps({"error": str(error)}), file=sys.stderr)
         raise SystemExit(2)

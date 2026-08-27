@@ -339,9 +339,10 @@ for sequence in range(mn_pairs * len(ks) * len(dtypes) * 4):
         continue
     seen.add(key)
     element_bytes = 4 if dtype == "fp32" else 2
-    memory = (m * k + k * n + m * n) * element_bytes
+    tensor_elements = m * k + k * n + m * n
+    memory = tensor_elements * element_bytes
     operations = 2 * m * n * k
-    if memory > 64 * 1024 * 1024 or operations > 2_000_000_000:
+    if tensor_elements > 200_000 or memory > 64 * 1024 * 1024 or operations > 100_000_000:
         continue
     candidates.append(key)
     if len(candidates) == 5000:

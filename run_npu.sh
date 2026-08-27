@@ -140,12 +140,15 @@ for index, (m, n, k) in enumerate(shapes, 1):
         "    output_shape = [16, 16]": f"    output_shape = [{m}, {n}]",
     }
     patched = source
-    for old, new in replacements.items():
+    expected_changed = []
+    for line_no, (old, new) in zip((18, 19, 20), replacements.items()):
         if patched.count(old) != 1:
             raise SystemExit(f"official generator shape anchor mismatch: {old}")
         patched = patched.replace(old, new)
+        if old != new:
+            expected_changed.append(line_no)
     changed = [line_no for line_no, (old, new) in enumerate(zip(original_lines, patched.splitlines()), 1) if old != new]
-    if changed != [18, 19, 20]:
+    if changed != expected_changed:
         raise SystemExit(f"generator changed outside the three shape lines: {changed}")
     if "    golden = self @ mat2" not in patched:
         raise SystemExit("official NumPy golden expression is absent")

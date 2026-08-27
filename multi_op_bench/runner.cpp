@@ -34,6 +34,7 @@ namespace {
 
 std::string JsonEscape(const std::string &value);
 void CheckAcl(aclError rc, const std::string &what);
+void Stage(const std::string &stage, const std::string &detail = "");
 std::string gWorkloadId = "unknown";
 std::string gBackend = "aclnn_real_npu";
 #ifndef SCATTER_ELEMENTS_ONLY
@@ -50,18 +51,41 @@ struct GatherElementsPrivateApi {
     std::string path;
 };
 
-using FlashAttentionScoreGradGetWorkspace = decltype(&aclnnFlashAttentionScoreGradGetWorkspaceSize);
-using FlashAttentionScoreGradLaunch = decltype(&aclnnFlashAttentionScoreGrad);
-using FusedInferAttentionScoreGetWorkspace = decltype(&aclnnFusedInferAttentionScoreGetWorkspaceSize);
-using FusedInferAttentionScoreLaunch = decltype(&aclnnFusedInferAttentionScore);
+#endif
 
-template <typename GetWorkspace, typename Launch>
-struct AttentionPrivateApi {
-    void *library = nullptr;
-    GetWorkspace getWorkspace = nullptr;
-    Launch launch = nullptr;
-    std::string path;
-};
+#ifndef SCATTER_ELEMENTS_ONLY
+void LoadAttentionTilingBridge(const char *officialPath, const char *bridgePath, const std::string &label)
+{
+    if (officialPath == nullptr || *officialPath == '\0' || bridgePath == nullptr || *bridgePath == '\0') {
+        throw std::runtime_error(label + " tiling library path is absent");
+    }
+    static void *official = nullptr;
+    static void *bridge = nullptr;
+    static std::string loadedOfficial;
+    static std::string loadedBridge;
+    if (official != nullptr || bridge != nullptr) {
+        if (loadedOfficial != officialPath || loadedBridge != bridgePath) {
+            throw std::runtime_error(label + " tiling library path changed within one worker");
+        }
+        return;
+    }
+    Stage("official_cann81_tiling_load_begin", label);
+    official = dlopen(officialPath, RTLD_NOW | RTLD_GLOBAL);
+    if (official == nullptr) {
+        const char *error = dlerror();
+        throw std::runtime_error("cannot load exact installed CANN 8.1 tiler: " +
+                                 std::string(error == nullptr ? "unknown dlopen error" : error));
+    }
+    bridge = dlopen(bridgePath, RTLD_NOW | RTLD_GLOBAL);
+    if (bridge == nullptr) {
+        const char *error = dlerror();
+        throw std::runtime_error("cannot load process-local CANN 8.1 tiling bridge: " +
+                                 std::string(error == nullptr ? "unknown dlopen error" : error));
+    }
+    loadedOfficial = officialPath;
+    loadedBridge = bridgePath;
+    Stage("attention_tiling_bridge_load_done", label);
+}
 #endif
 
 #ifndef REMAINING_OPERATOR_ONLY
@@ -78,49 +102,13 @@ struct ScatterElementsPrivateApi {
 };
 #endif
 
-void Stage(const std::string &stage, const std::string &detail = "")
+void Stage(const std::string &stage, const std::string &detail)
 {
     std::cout << "MULTIOP_NPU_STAGE {\"workload_id\":\"" << JsonEscape(gWorkloadId)
               << "\",\"stage\":\"" << JsonEscape(stage) << "\"";
     if (!detail.empty()) std::cout << ",\"detail\":\"" << JsonEscape(detail) << "\"";
     std::cout << "}" << std::endl;
 }
-
-#ifndef SCATTER_ELEMENTS_ONLY
-template <typename GetWorkspace, typename Launch>
-const AttentionPrivateApi<GetWorkspace, Launch> &LoadAttentionPrivateApi(
-    const char *path, const char *getWorkspaceSymbol, const char *launchSymbol,
-    const std::string &label)
-{
-    if (path == nullptr || *path == '\0') throw std::runtime_error(label + " path is absent");
-    static AttentionPrivateApi<GetWorkspace, Launch> *api = nullptr;
-    if (api != nullptr) {
-        if (api->path != path) throw std::runtime_error(label + " path changed within one worker");
-        return *api;
-    }
-    Stage("private_opapi_load_begin", label);
-    void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (handle == nullptr) {
-        const char *error = dlerror();
-        throw std::runtime_error("cannot load " + label + ": " +
-                                 (error == nullptr ? "unknown dlopen error" : std::string(error)));
-    }
-    dlerror();
-    void *getWorkspace = dlsym(handle, getWorkspaceSymbol);
-    const char *getError = dlerror();
-    dlerror();
-    void *launch = dlsym(handle, launchSymbol);
-    const char *launchError = dlerror();
-    if (getError != nullptr || launchError != nullptr || getWorkspace == nullptr || launch == nullptr) {
-        throw std::runtime_error(label + " does not export its required CANN 8.1 ACLNN entry points");
-    }
-    api = new AttentionPrivateApi<GetWorkspace, Launch>{
-        handle, reinterpret_cast<GetWorkspace>(getWorkspace), reinterpret_cast<Launch>(launch), path};
-    Stage("private_opapi_load_done", label);
-    return *api;  // Isolated worker owns the private package until process exit.
-}
-
-#endif
 
 #ifndef SCATTER_ELEMENTS_ONLY
 const GatherElementsPrivateApi &LoadGatherElementsPrivateApi(const char *libraryPath)
@@ -1111,30 +1099,20 @@ Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream
     layoutText.push_back('\0');
     const double scale = 1.0 / std::sqrt(static_cast<double>(headDim));
     const char *dispatch = std::getenv("FASG_SOURCE_DISPATCH");
-    const bool privateSource = dispatch != nullptr;
+    const bool exactSource = dispatch != nullptr;
     const bool auditRequested = std::getenv("FASG_TILING_AUDIT_PATH") != nullptr;
-    if (privateSource && std::string(dispatch) != "cann81_prebuilt_aclnn") throw std::runtime_error("invalid FASG_SOURCE_DISPATCH");
-    if (privateSource != auditRequested) throw std::runtime_error("FASG source audit/dispatch mismatch");
-    const AttentionPrivateApi<FlashAttentionScoreGradGetWorkspace, FlashAttentionScoreGradLaunch> *privateApi = nullptr;
-    if (privateSource) {
-        privateApi = &LoadAttentionPrivateApi<FlashAttentionScoreGradGetWorkspace, FlashAttentionScoreGradLaunch>(
-            std::getenv("FASG_SOURCE_OPAPI_LIBRARY"), "aclnnFlashAttentionScoreGradGetWorkspaceSize",
-            "aclnnFlashAttentionScoreGrad", "FlashAttentionScoreGrad private CANN-8.1 OpAPI");
-        gBackend = "private_cann81_fasg_prebuilt_aclnn_real_npu";
+    if (exactSource && std::string(dispatch) != "exact_cann81_installed_delegate") throw std::runtime_error("invalid FASG_SOURCE_DISPATCH");
+    if (exactSource != auditRequested) throw std::runtime_error("FASG source audit/dispatch mismatch");
+    if (exactSource) {
+        LoadAttentionTilingBridge(std::getenv("FASG_OFFICIAL_TILING_LIBRARY"),
+                                  std::getenv("FASG_SOURCE_TILING_LIBRARY"), "FlashAttentionScoreGrad");
+        gBackend = "exact_cann81_fasg_delegate_real_npu";
         if (args.Has("source-load-only")) {
-            Stage("private_opapi_load_probe_done");
+            Stage("exact_cann81_tiling_bridge_load_probe_done");
             return Measurement{};
         }
     }
     const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
-        if (privateApi != nullptr) {
-            return privateApi->getWorkspace(
-                qTensor.Get(), kTensor.Get(), vTensor.Get(), dyTensor.Get(),
-                nullptr, nullptr, nullptr, nullptr, maxTensor.Get(), sumTensor.Get(), nullptr, attentionTensor.Get(),
-                nullptr, scale, 1.0, std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max(),
-                qHeads, layoutText.data(), 0, 0, dqTensor.Get(), dkTensor.Get(), dvTensor.Get(), nullptr,
-                workspace, executor);
-        }
         return aclnnFlashAttentionScoreGradGetWorkspaceSize(
             qTensor.Get(), kTensor.Get(), vTensor.Get(), dyTensor.Get(),
             nullptr, nullptr, nullptr, nullptr, maxTensor.Get(), sumTensor.Get(), nullptr, attentionTensor.Get(),
@@ -1143,14 +1121,13 @@ Measurement RunFlashAttentionScoreGrad(const Arguments &args, aclrtStream stream
             workspace, executor);
     };
     const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
-        if (privateApi != nullptr) return privateApi->launch(workspace, bytes, executor, launchStream);
         return aclnnFlashAttentionScoreGrad(workspace, bytes, executor, launchStream);
     };
     if (args.Has("source-executor-planning-only")) {
         Measurement result;
         Executor executor;
-        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "private FASG GetWorkspaceSize probe");
-        if (executor.ptr == nullptr) throw std::runtime_error("private FASG returned null executor");
+        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "exact CANN 8.1 FASG GetWorkspaceSize probe");
+        if (executor.ptr == nullptr) throw std::runtime_error("exact CANN 8.1 FASG returned null executor");
         executor.ReleaseToIsolatedProcessExit();
         return result;
     }
@@ -1192,29 +1169,20 @@ Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream strea
     layoutText.push_back('\0');
     const double scale = 1.0 / std::sqrt(static_cast<double>(headDim));
     const char *dispatch = std::getenv("FIAS_SOURCE_DISPATCH");
-    const bool privateSource = dispatch != nullptr;
+    const bool exactSource = dispatch != nullptr;
     const bool auditRequested = std::getenv("FIAS_TILING_AUDIT_PATH") != nullptr;
-    if (privateSource && std::string(dispatch) != "cann81_prebuilt_aclnn") throw std::runtime_error("invalid FIAS_SOURCE_DISPATCH");
-    if (privateSource != auditRequested) throw std::runtime_error("FIAS source audit/dispatch mismatch");
-    const AttentionPrivateApi<FusedInferAttentionScoreGetWorkspace, FusedInferAttentionScoreLaunch> *privateApi = nullptr;
-    if (privateSource) {
-        privateApi = &LoadAttentionPrivateApi<FusedInferAttentionScoreGetWorkspace, FusedInferAttentionScoreLaunch>(
-            std::getenv("FIAS_SOURCE_OPAPI_LIBRARY"), "aclnnFusedInferAttentionScoreGetWorkspaceSize",
-            "aclnnFusedInferAttentionScore", "FusedInferAttentionScore private CANN-8.1 OpAPI");
-        gBackend = "private_cann81_fias_prebuilt_aclnn_real_npu";
+    if (exactSource && std::string(dispatch) != "exact_cann81_installed_delegate") throw std::runtime_error("invalid FIAS_SOURCE_DISPATCH");
+    if (exactSource != auditRequested) throw std::runtime_error("FIAS source audit/dispatch mismatch");
+    if (exactSource) {
+        LoadAttentionTilingBridge(std::getenv("FIAS_OFFICIAL_TILING_LIBRARY"),
+                                  std::getenv("FIAS_SOURCE_TILING_LIBRARY"), "FusedInferAttentionScore");
+        gBackend = "exact_cann81_fias_delegate_real_npu";
         if (args.Has("source-load-only")) {
-            Stage("private_opapi_load_probe_done");
+            Stage("exact_cann81_tiling_bridge_load_probe_done");
             return Measurement{};
         }
     }
     const auto getWorkspace = [&](uint64_t *workspace, aclOpExecutor **executor) {
-        if (privateApi != nullptr) {
-            return privateApi->getWorkspace(
-                qTensor.Get(), keyList.Get(), valueList.Get(), nullptr, nullptr, nullptr, nullptr,
-                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                qHeads, scale, std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::max(),
-                layoutText.data(), kvHeads, 0, 0, 0, 0, false, outputTensor.Get(), nullptr, workspace, executor);
-        }
         return aclnnFusedInferAttentionScoreGetWorkspaceSize(
             qTensor.Get(), keyList.Get(), valueList.Get(), nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -1222,14 +1190,13 @@ Measurement RunFusedInferAttentionScore(const Arguments &args, aclrtStream strea
             layoutText.data(), kvHeads, 0, 0, 0, 0, false, outputTensor.Get(), nullptr, workspace, executor);
     };
     const auto launch = [&](void *workspace, uint64_t bytes, aclOpExecutor *executor, aclrtStream launchStream) {
-        if (privateApi != nullptr) return privateApi->launch(workspace, bytes, executor, launchStream);
         return aclnnFusedInferAttentionScore(workspace, bytes, executor, launchStream);
     };
     if (args.Has("source-executor-planning-only")) {
         Measurement result;
         Executor executor;
-        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "private FIAS GetWorkspaceSize probe");
-        if (executor.ptr == nullptr) throw std::runtime_error("private FIAS returned null executor");
+        CheckAclnn(getWorkspace(&result.workspaceBytes, &executor.ptr), "exact CANN 8.1 FIAS GetWorkspaceSize probe");
+        if (executor.ptr == nullptr) throw std::runtime_error("exact CANN 8.1 FIAS returned null executor");
         executor.ReleaseToIsolatedProcessExit();
         return result;
     }

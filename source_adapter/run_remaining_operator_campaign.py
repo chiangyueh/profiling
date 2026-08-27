@@ -20,14 +20,13 @@ import remaining_operator_candidate_catalog as catalog_module
 import run_non_matmul_candidate_campaign as campaign
 
 
-LOCK = json.loads((ROOT / "remaining_operators_cann81_lock.json").read_text(encoding="utf-8"))
 OPERATOR_TYPES = {
     "flash_attention_score_grad": "FlashAttentionScoreGrad",
     "fused_infer_attention_score": "FusedInferAttentionScore",
 }
 BACKENDS = {
-    "flash_attention_score_grad": "private_cann81_fasg_prebuilt_aclnn_real_npu",
-    "fused_infer_attention_score": "private_cann81_fias_prebuilt_aclnn_real_npu",
+    "flash_attention_score_grad": "exact_cann81_fasg_delegate_real_npu",
+    "fused_infer_attention_score": "exact_cann81_fias_delegate_real_npu",
 }
 
 
@@ -55,7 +54,7 @@ def validate_manifest(path: Path, selected: str) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError("private package manifest is absent: {}".format(path))
     item = json.loads(path.read_text(encoding="utf-8"))
-    if (item.get("schema") != "remaining_operator_cann81_prebuilt_package_v3" or
+    if (item.get("schema") != "remaining_operator_exact_cann81_package_v4" or
             item.get("device_kernel_origin") != "installed_cann81_binary_package_private_copy"):
         raise RuntimeError("invalid complete CANN-8.1 attention package manifest: {}".format(path))
     if (item.get("runtime_op") != selected or item.get("operator") != OPERATOR_TYPES[selected] or
@@ -67,12 +66,15 @@ def validate_manifest(path: Path, selected: str) -> dict[str, Any]:
     package_root = Path(item["package_root"])
     if not package_root.is_dir():
         raise RuntimeError("private package root is absent")
+    cann_root = Path(item["cann_root"]).resolve()
+    if (item.get("alpha001_host_tiling_compiled") is not False or
+            (package_root / "op_api").exists() or (package_root / "op_proto").exists()):
+        raise RuntimeError("attention package contains a non-final OpAPI, proto, or alpha001 host tiler")
     artifacts = [("source_file", "source_file_sha256"),
-                 ("op_tiling_library", "op_tiling_library_sha256")]
-    artifacts += [("op_api_library", "op_api_library_sha256"),
-                  ("op_proto_library", "op_proto_library_sha256"),
-                  ("ops_config", "ops_config_sha256"),
-                  ("installed_kernel_copy_manifest", "installed_kernel_copy_manifest_sha256")]
+                 ("op_tiling_library", "op_tiling_library_sha256"),
+                 ("official_tiling_library", "official_tiling_library_sha256"),
+                 ("op_api_library", "op_api_library_sha256"),
+                 ("ops_config", "ops_config_sha256")]
     for value_key, hash_key in artifacts:
         artifact = Path(item[value_key])
         if not artifact.is_file() or digest_file(artifact) != item[hash_key]:
@@ -85,25 +87,42 @@ def validate_manifest(path: Path, selected: str) -> dict[str, Any]:
             artifact = Path(kernel[value_key])
             if not artifact.is_file() or digest_file(artifact) != kernel[hash_key]:
                 raise RuntimeError("precompiled kernel artifact is missing or mismatched")
+        installed_object = Path(kernel["installed_object"])
+        installed_metadata = Path(kernel["installed_metadata"])
+        if (not installed_object.is_file() or not installed_metadata.is_file() or
+                digest_file(installed_object) != kernel["object_sha256"] or
+                digest_file(installed_metadata) != kernel["metadata_sha256"]):
+            raise RuntimeError("private attention kernel is not an exact installed CANN 8.1 copy")
+    private_config = json.loads(Path(item["ops_config"]).read_text(encoding="utf-8"))
+    installed_config = json.loads(Path(item["installed_ops_config"]).read_text(encoding="utf-8"))
+    if (set(private_config) != {item["operator"]} or
+            private_config[item["operator"]] != installed_config.get(item["operator"])):
+        raise RuntimeError("private operator config differs from exact installed CANN 8.1")
     version = Path(item["cann_root"]) / "opp/version.info"
     if not version.is_file() or digest_file(version) != item["cann_version_file_sha256"]:
         raise RuntimeError("package CANN root has changed")
     instrumentation = item.get("instrumentation")
     envelope = item.get("hardware_envelope_heuristic")
     if (not isinstance(instrumentation, dict) or instrumentation.get("enabled") is not True or
-            instrumentation.get("mutates_tiling_context") is not False or
+            instrumentation.get("mutates_tiling_output_fields") is not False or
+            instrumentation.get("temporarily_mutates_compile_info_before_official_tiler") is not
+            (selected == "flash_attention_score_grad") or
+            instrumentation.get("mutates_process_local_platform_view_before_official_tiler") is not True or
             not isinstance(envelope, dict) or tuple(envelope.get("divisors", ())) != (2, 4, 8)):
         raise RuntimeError("package source-candidate provenance is incomplete")
+    for key in ("official_tiling_library", "op_api_library"):
+        try:
+            Path(item[key]).resolve().relative_to(cann_root)
+        except (KeyError, ValueError):
+            raise RuntimeError("{} is not supplied by the selected installed CANN 8.1".format(key))
     if selected == "flash_attention_score_grad":
-        enabled = item.get("enabled_original_registrations")
         if (item.get("strategy_class") != "official_semantic_dispatch" or
                 item.get("original_strategy_registry_preserved") is not True or
-                not isinstance(enabled, list) or len(enabled) != 8 or
-                len({(row.get("class"), row.get("priority")) for row in enabled
-                     if isinstance(row, dict)}) != 8 or
+                item.get("original_strategy_registry_origin") != "installed_cann81_rc1_liboptiling" or
+                item.get("official_dispatch_delegated_without_strategy_forcing") is not True or
                 item.get("disabled_original_registrations") != []):
-            raise RuntimeError("FASG package does not preserve the complete official strategy registry")
-    elif item.get("strategy_class") != "original_semantic_dispatch":
+            raise RuntimeError("FASG package does not delegate the exact installed official dispatcher")
+    elif item.get("strategy_class") != "official_semantic_dispatch":
         raise RuntimeError("FIAS package is not the original semantic dispatcher")
     item["manifest_path"] = str(path)
     return item
@@ -160,14 +179,10 @@ def source_environment(base: dict[str, str], package: dict[str, Any], candidate:
     environment = dict(base)
     environment["ASCEND_OPP_PATH"] = str(Path(package["cann_root"]) / "opp")
     inst, envelope = package["instrumentation"], package["hardware_envelope_heuristic"]
-    package_root, library = Path(package["package_root"]), Path(package["op_api_library"])
-    if library.parent != package_root / "op_api/lib":
-        raise RuntimeError("private attention OpAPI is outside its package")
+    package_root = Path(package["package_root"])
     environment["ASCEND_CUSTOM_OPP_PATH"] = str(package_root)
-    library_environment = inst["opapi_library_environment"]
-    old_loader = environment.get("LD_LIBRARY_PATH", "")
-    environment["LD_LIBRARY_PATH"] = str(library.parent) + (":" + old_loader if old_loader else "")
-    environment[library_environment] = str(library)
+    environment[inst["official_tiling_library_environment"]] = package["official_tiling_library"]
+    environment[inst["custom_tiling_library_environment"]] = package["op_tiling_library"]
     environment[inst["audit_environment"]] = str(audit)
     environment[inst["dispatch_environment"]] = inst["dispatch_value"]
     environment[inst["source_budget_environment"]] = str(candidate["aiv_core_cap"])
@@ -194,13 +209,13 @@ def plan_packages(manifests: list[dict[str, Any]], selected: str) -> dict[str, l
         raise RuntimeError("{} requires exactly one complete original dispatcher package".format(selected))
     package = manifests[0]
     if selected == "flash_attention_score_grad":
-        enabled = package.get("enabled_original_registrations")
         if (package.get("strategy_class") != "official_semantic_dispatch" or
                 package.get("original_strategy_registry_preserved") is not True or
-                not isinstance(enabled, list) or len(enabled) != 8 or
+                package.get("original_strategy_registry_origin") != "installed_cann81_rc1_liboptiling" or
+                package.get("official_dispatch_delegated_without_strategy_forcing") is not True or
                 package.get("disabled_original_registrations") != []):
-            raise RuntimeError("FASG requires one package with all eight official registrations enabled")
-    elif package.get("strategy_class") != "original_semantic_dispatch":
+            raise RuntimeError("FASG requires the exact installed official dispatcher")
+    elif package.get("strategy_class") != "official_semantic_dispatch":
         raise RuntimeError("FIAS requires its original semantic dispatcher package")
     return {selected: manifests}
 
@@ -257,7 +272,7 @@ def remaining_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                 worker_args(args.runner, workload, args.device, 0, 0) + ["--source-load-only", "1"],
                 source_environment(base_env, package, candidate, audit))
             ok = rc == 0 and result.get("status") == "success" and result.get("backend") == BACKENDS[op]
-            load_kind = "private_opapi_load"
+            load_kind = "exact_cann81_tiling_bridge_load"
             checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": load_kind,
                            "strategy": candidate["id"], "status": "passed" if ok else "failed",
                            "worker_wall_ms": wall, "worker_return_code": rc, "worker_status": result.get("status"),
@@ -270,7 +285,8 @@ def remaining_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                 worker_args(args.runner, workload, args.device, 0, 0) + ["--source-executor-planning-only", "1"],
                 source_environment(base_env, package, candidate, planning))
             ok = rc == 0 and result.get("status") == "success" and result.get("backend") == BACKENDS[op]
-            checks.append({"operator": op, "workload_id": workload["workload_id"], "kind": "private_executor_planning",
+            checks.append({"operator": op, "workload_id": workload["workload_id"],
+                           "kind": "exact_cann81_executor_planning",
                            "strategy": candidate["id"], "status": "passed" if ok else "failed",
                            "worker_wall_ms": wall, "worker_return_code": rc, "worker_status": result.get("status"),
                            "runner_backend": result.get("backend"), "last_stage": campaign.parse_worker_stage(output),
@@ -278,7 +294,7 @@ def remaining_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
         if any(item["status"] != "passed" for item in checks):
             return checks
         launch_ok = False
-        launch_failure = "no eligible private package launched"
+        launch_failure = "no eligible exact CANN 8.1 package launched"
         for package in packages[op]:
             candidate = campaign.candidate_descriptor(package, caps[-1])
             audit = root / ("launch_" + campaign.stable_hash(candidate) + ".jsonl")
@@ -291,7 +307,7 @@ def remaining_preflight(args: Any, planned: dict[str, list[dict[str, Any]]],
                          result.get("backend") == BACKENDS[op] and
                          result.get("output_reference_checked") is True and result.get("output_reference_equal") is True)
             launch_failure = None if launch_ok else (reason or campaign.runner_failure(result, output))
-            launch_kind = "private_precompiled_kernel_launch"
+            launch_kind = "exact_cann81_precompiled_kernel_launch"
             checks.append({"operator": op, "workload_id": workload["workload_id"],
                            "kind": launch_kind, "strategy": candidate["id"],
                            "status": "passed" if launch_ok else "failed", "worker_wall_ms": wall,
@@ -355,10 +371,11 @@ def main() -> int:
     base_env.pop("ASCEND_CUSTOM_OPP_PATH", None)
     for package in packages[args.operator]:
         inst, envelope = package["instrumentation"], package["hardware_envelope_heuristic"]
-        library_environment = inst.get("opapi_library_environment", inst.get("tiling_library_environment"))
-        if not isinstance(library_environment, str):
-            raise RuntimeError("source library environment is absent")
-        environment_keys = [library_environment, inst["audit_environment"],
+        official_library_environment = inst.get("official_tiling_library_environment")
+        custom_library_environment = inst.get("custom_tiling_library_environment")
+        if not isinstance(official_library_environment, str) or not isinstance(custom_library_environment, str):
+            raise RuntimeError("official tiler or exact bridge environment is absent")
+        environment_keys = [official_library_environment, custom_library_environment, inst["audit_environment"],
                             inst["source_budget_environment"], inst["dispatch_environment"],
                             envelope["environment"]]
         for key in environment_keys:

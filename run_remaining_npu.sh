@@ -86,7 +86,9 @@ export OMP_NUM_THREADS=1
 export CANN_OPS_BUILD_JOBS=1
 unset ASCEND_CUSTOM_OPP_PATH ASCENDC_CPU_DEBUG \
     FASG_SOURCE_DISPATCH FASG_SOURCE_OPAPI_LIBRARY FASG_SOURCE_TILING_LIBRARY FASG_TILING_AUDIT_PATH FASG_SOURCE_AIV_CAP FASG_SOURCE_L2_DIVISOR \
-    FIAS_SOURCE_DISPATCH FIAS_SOURCE_OPAPI_LIBRARY FIAS_SOURCE_TILING_LIBRARY FIAS_TILING_AUDIT_PATH FIAS_SOURCE_AIV_CAP FIAS_SOURCE_UB_DIVISOR
+    FASG_OFFICIAL_TILING_LIBRARY \
+    FIAS_SOURCE_DISPATCH FIAS_SOURCE_OPAPI_LIBRARY FIAS_SOURCE_TILING_LIBRARY FIAS_TILING_AUDIT_PATH FIAS_SOURCE_AIV_CAP FIAS_SOURCE_UB_DIVISOR \
+    FIAS_OFFICIAL_TILING_LIBRARY
 
 REQUIRED=(
     source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz
@@ -96,8 +98,7 @@ REQUIRED=(
     source_adapter/prepare_remaining_attention_cann81_overlays.py
     source_adapter/prepare_fasg_strategy_overlays.py
     source_adapter/prepare_fias_source_overlay.py
-    source_adapter/finalize_remaining_cann81_package.py
-    source_adapter/materialize_installed_attention_kernels.py
+    source_adapter/materialize_exact_cann81_attention_package.py
     source_adapter/remaining_operator_candidate_catalog.py
     source_adapter/run_remaining_operator_campaign.py
     source_adapter/run_non_matmul_candidate_campaign.py
@@ -117,8 +118,7 @@ PACKAGE_ID="$({
         "${ROOT}/source_adapter/prepare_remaining_attention_cann81_overlays.py" \
         "${ROOT}/source_adapter/prepare_fasg_strategy_overlays.py" \
         "${ROOT}/source_adapter/prepare_fias_source_overlay.py" \
-        "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
-        "${ROOT}/source_adapter/materialize_installed_attention_kernels.py" "${VERSION_FILE}"
+        "${ROOT}/source_adapter/materialize_exact_cann81_attention_package.py" "${VERSION_FILE}"
     readlink -f "${CANN_ROOT}"
 } | sha256sum | cut -c1-20)"
 RUN_ID="$({
@@ -206,35 +206,18 @@ configure_project() {
     fi
 }
 
-build_attention_base_package() {
-    local project="$1" build="$2" output="$3" cmake_op="$4" vendor="$5" log_prefix="$6"
-    configure_project "${project}" "${build}" "${output}" "${cmake_op}" "${vendor}" "${log_prefix}"
-    local package_root="${output}/packages/vendors/${vendor}"
-    local kernel_root="${package_root}/op_impl/ai_core/tbe/kernel/ascend910b/${cmake_op}"
-    local tiling_root="${package_root}/op_impl/ai_core/tbe/op_tiling/lib/linux"
-    local proto_root="${package_root}/op_proto/lib/linux"
-    local config="${package_root}/op_impl/ai_core/tbe/config/ascend910b/aic-ascend910b-ops-info.json"
-    if [[ ! -f "${package_root}/op_api/lib/libcust_opapi.so" ]] || \
-       [[ ! -f "${config}" ]] || \
-       ! find "${proto_root}" -name libcust_opsproto_rt2.0.so -type f -print -quit 2>/dev/null | grep -q . || \
-       ! find "${tiling_root}" -name libcust_opmaster_rt2.0.so -type f -print -quit 2>/dev/null | grep -q .; then
+build_attention_delegate_package() {
+    local project="$1" build="$2" package_root="$3" manifest="$4" cmake_op="$5" vendor="$6" log_prefix="$7"
+    configure_project "${project}" "${build}" "${STATE}/unused_install" "${cmake_op}" "${vendor}" "${log_prefix}"
+    if [[ ! -f "${build}/libcust_opmaster_rt2.0.so" ]]; then
         run_logged "${log_prefix}_BUILD" "${build}.build.log" \
-            resource_limited cmake --build "${build}" --target \
-                opapi opsproto optiling optiling_compat generate_ops_info_ascend910b \
-                npu_supported_ops modify_vendor gen_version_info \
-                --parallel 1
-        run_logged "${log_prefix}_INSTALL" "${build}.install.log" cmake --install "${build}"
+            resource_limited cmake --build "${build}" --target optiling optiling_compat --parallel 1
     fi
-    local kernel_manifest="${package_root}/installed_kernel_copy_manifest.json"
-    if [[ ! -f "${kernel_manifest}" ]]; then
-        if [[ -d "${kernel_root}" ]] && find "${kernel_root}" -type f -print -quit | grep -q .; then
-            echo "fatal: incomplete installed-kernel copy in private package: ${kernel_root}" >&2
-            exit 2
-        fi
-        run_logged "${log_prefix}_KERNEL_COPY" "${build}.kernel_copy.log" \
-            python3 "${ROOT}/source_adapter/materialize_installed_attention_kernels.py" \
-            --operator "${OPERATOR}" --cann-root "${CANN_ROOT}" --package-root "${package_root}" \
-            --manifest "${kernel_manifest}"
+    if [[ ! -f "${manifest}" ]]; then
+        run_logged "${log_prefix}_PACKAGE" "${build}.package.log" \
+            python3 "${ROOT}/source_adapter/materialize_exact_cann81_attention_package.py" \
+            --operator "${OPERATOR}" --project "${project}" --build-root "${build}" \
+            --cann-root "${CANN_ROOT}" --package-root "${package_root}" --manifest "${manifest}"
     fi
 }
 
@@ -252,18 +235,11 @@ if [[ "${OPERATOR}" == "fused_infer_attention_score" ]]; then
             --harness-root "${BASE_SOURCE}" --output-parent "${PROJECT_PARENT}"
     fi
     BUILD="${STATE}/build"
-    OUTPUT="${STATE}/output"
     VENDOR=fias_source
-    PACKAGE_ROOT="${OUTPUT}/packages/vendors/${VENDOR}"
+    PACKAGE_ROOT="${STATE}/package/vendors/${VENDOR}"
     MANIFEST="${STATE}/package.json"
-    build_attention_base_package "${PROJECT}" "${BUILD}" "${OUTPUT}" fused_infer_attention_score "${VENDOR}" \
-        FIAS_PACKAGE
-    run_logged FIAS_VALIDATE "${STATE}/validate.log" \
-        python3 "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
-        --operator "${OPERATOR}" --project "${PROJECT}" --build-root "${BUILD}" \
-        --package-root "${PACKAGE_ROOT}" \
-        --kernel-copy-manifest "${PACKAGE_ROOT}/installed_kernel_copy_manifest.json" \
-        --cann-root "${CANN_ROOT}" --manifest "${MANIFEST}"
+    build_attention_delegate_package "${PROJECT}" "${BUILD}" "${PACKAGE_ROOT}" "${MANIFEST}" \
+        fused_infer_attention_score "${VENDOR}" FIAS_PACKAGE
     MANIFESTS+=("${MANIFEST}")
 else
     PROJECT="${PROJECT_PARENT}/fasg_official_semantic_dispatch"
@@ -275,21 +251,11 @@ else
             --harness-root "${BASE_SOURCE}" --output-parent "${PROJECT_PARENT}"
     fi
     BUILD="${STATE}/build"
-    OUTPUT="${STATE}/output"
     VENDOR=fasg_source
-    PACKAGE_ROOT="${OUTPUT}/packages/vendors/${VENDOR}"
+    PACKAGE_ROOT="${STATE}/package/vendors/${VENDOR}"
     MANIFEST="${STATE}/package.json"
-    # Keep the complete official eight-strategy registry in one package.  The
-    # installed CANN-8.1 binary was compiled for that dispatcher contract;
-    # forcing an isolated template can create a launch-incompatible tiling.
-    build_attention_base_package "${PROJECT}" "${BUILD}" "${OUTPUT}" \
+    build_attention_delegate_package "${PROJECT}" "${BUILD}" "${PACKAGE_ROOT}" "${MANIFEST}" \
         flash_attention_score_grad "${VENDOR}" FASG_PACKAGE
-    run_logged FASG_VALIDATE "${STATE}/validate.log" \
-        python3 "${ROOT}/source_adapter/finalize_remaining_cann81_package.py" \
-        --operator "${OPERATOR}" --project "${PROJECT}" --build-root "${BUILD}" \
-        --package-root "${PACKAGE_ROOT}" \
-        --kernel-copy-manifest "${PACKAGE_ROOT}/installed_kernel_copy_manifest.json" \
-        --cann-root "${CANN_ROOT}" --manifest "${MANIFEST}"
     MANIFESTS+=("${MANIFEST}")
 fi
 

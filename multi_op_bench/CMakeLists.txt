@@ -40,10 +40,10 @@ if(REMAINING_OPERATOR)
 endif()
 target_include_directories(multi_op_npu_runner PRIVATE "${CANN_INCLUDE}")
 target_link_directories(multi_op_npu_runner PRIVATE "${CANN_LIB}")
-# The installed OpAPI remains linked only for the independent reference run.
-# Formal candidates resolve the checkout-local private CANN 8.1 OpAPI by
-# absolute path; its package contains the matching host tiler and precompiled
-# Ascend910B kernel. No Python/TBE runtime compiler is involved.
+# Both the reference and candidate launch use the exact installed CANN 8.1
+# OpAPI. Candidate workers additionally load a checkout-local host-tiling
+# bridge that delegates to the installed final-RC1 tiler. No Python/TBE
+# runtime compiler or alpha host implementation is involved.
 target_link_libraries(multi_op_npu_runner PRIVATE ascendcl nnopbase opapi pthread dl)
 target_link_options(
     multi_op_npu_runner PRIVATE

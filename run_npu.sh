@@ -60,28 +60,107 @@ if [[ ! -x "${RUNNER}" ]] ||
 fi
 
 WORKLOADS="${PRIVATE_ROOT}/workloads.csv"
-{
-    printf 'workload_id,m,n,k,dtype,trans_a,trans_b\n'
-    m_values=(16 32 48 64 80 96 112 128 256 1024)
-    n_values=(16 32 48 64 80 96 112 128 256 896)
-    k_values=(80 128 256 320 384 768 1536 3072 8192 24576)
-    dtypes=(fp16 bf16 fp32)
-    trans_a=(0 0 1 1)
-    trans_b=(0 1 0 1)
-    ordinal=0
-    for i in "${!m_values[@]}"; do
-        for j in "${!n_values[@]}"; do
-            ordinal=$((ordinal + 1))
-            k_index=$(((i * 3 + j * 7) % ${#k_values[@]}))
-            dtype_index=$(((i + j) % ${#dtypes[@]}))
-            trans_index=$(((i * 2 + j) % 4))
-            printf 'matmul_%03d,%d,%d,%d,%s,%d,%d\n' \
-                "${ordinal}" "${m_values[i]}" "${n_values[j]}" \
-                "${k_values[k_index]}" "${dtypes[dtype_index]}" \
-                "${trans_a[trans_index]}" "${trans_b[trans_index]}"
-        done
-    done
-} >"${WORKLOADS}"
+printf '%s\n' 'workload_id,m,n,k,dtype,trans_a,trans_b
+matmul_001_skinny_n,3072,16,16383,fp16,0,0
+matmul_002_skinny_n,3072,32,16384,bf16,0,1
+matmul_003_skinny_n,3072,48,16385,fp16,1,0
+matmul_004_skinny_n,3072,64,24575,bf16,1,1
+matmul_005_skinny_n,3072,80,24576,fp16,0,0
+matmul_006_skinny_n,3072,96,24577,bf16,0,1
+matmul_007_skinny_n,4096,16,8191,fp16,1,0
+matmul_008_skinny_n,4096,32,8192,bf16,1,1
+matmul_009_skinny_n,4096,48,8193,fp16,0,0
+matmul_010_skinny_n,4096,64,12287,bf16,0,1
+matmul_011_skinny_n,4096,80,12288,fp16,1,0
+matmul_012_skinny_n,4096,96,12289,bf16,1,1
+matmul_013_skinny_n,5120,16,16383,fp16,0,0
+matmul_014_skinny_n,5120,32,16384,bf16,0,1
+matmul_015_skinny_n,5120,48,16385,fp16,1,0
+matmul_016_skinny_n,3840,64,32767,bf16,1,1
+matmul_017_skinny_n,3840,80,32768,fp16,0,0
+matmul_018_skinny_n,3840,96,32769,bf16,0,1
+matmul_019_skinny_n,6144,16,4095,fp16,1,0
+matmul_020_skinny_n,6144,32,4096,bf16,1,1
+matmul_021_skinny_n,6144,48,4097,fp16,0,0
+matmul_022_skinny_n,6144,64,8191,bf16,0,1
+matmul_023_skinny_n,6144,80,8192,fp16,1,0
+matmul_024_skinny_n,6144,96,8193,bf16,1,1
+matmul_025_skinny_m,16,3072,16383,fp16,0,0
+matmul_026_skinny_m,32,3072,16384,bf16,0,1
+matmul_027_skinny_m,48,3072,16385,fp16,1,0
+matmul_028_skinny_m,64,3072,24575,bf16,1,1
+matmul_029_skinny_m,80,3072,24576,fp16,0,0
+matmul_030_skinny_m,96,3072,24577,bf16,0,1
+matmul_031_skinny_m,16,4096,8191,fp16,1,0
+matmul_032_skinny_m,32,4096,8192,bf16,1,1
+matmul_033_skinny_m,48,4096,8193,fp16,0,0
+matmul_034_skinny_m,64,4096,12287,bf16,0,1
+matmul_035_skinny_m,80,4096,12288,fp16,1,0
+matmul_036_skinny_m,96,4096,12289,bf16,1,1
+matmul_037_skinny_m,16,5120,16383,fp16,0,0
+matmul_038_skinny_m,32,5120,16384,bf16,0,1
+matmul_039_skinny_m,48,5120,16385,fp16,1,0
+matmul_040_skinny_m,64,3840,32767,bf16,1,1
+matmul_041_skinny_m,80,3840,32768,fp16,0,0
+matmul_042_skinny_m,96,3840,32769,bf16,0,1
+matmul_043_split_k,16,16,8191,fp16,0,0
+matmul_044_split_k,16,32,8192,bf16,0,1
+matmul_045_split_k,32,16,8193,fp32,1,0
+matmul_046_split_k,32,32,16383,fp16,1,1
+matmul_047_split_k,48,64,16384,bf16,0,0
+matmul_048_split_k,64,48,16385,fp32,0,1
+matmul_049_split_k,64,64,24575,fp16,1,0
+matmul_050_split_k,96,128,24576,bf16,1,1
+matmul_051_split_k,128,96,24577,fp32,0,0
+matmul_052_split_k,128,128,32767,fp16,0,1
+matmul_053_split_k,160,160,32768,bf16,1,0
+matmul_054_split_k,192,128,32769,fp32,1,1
+matmul_055_split_k,128,192,49151,fp16,0,0
+matmul_056_split_k,256,256,49152,bf16,0,1
+matmul_057_split_k,16,48,12287,bf16,0,0
+matmul_058_split_k,16,64,12288,fp16,1,0
+matmul_059_split_k,32,48,12289,fp32,1,1
+matmul_060_split_k,32,64,20479,bf16,0,1
+matmul_061_split_k,48,16,20480,fp16,0,0
+matmul_062_split_k,64,16,20481,fp32,1,0
+matmul_063_split_k,48,48,28671,bf16,1,1
+matmul_064_split_k,80,80,28672,fp16,0,1
+matmul_065_split_k,96,96,28673,fp32,0,0
+matmul_066_split_k,112,112,40959,bf16,1,0
+matmul_067_split_k,144,144,40960,fp16,1,1
+matmul_068_split_k,176,176,40961,fp32,0,1
+matmul_069_split_k,224,224,57343,bf16,0,0
+matmul_070_split_k,240,240,57344,fp16,1,0
+matmul_071_tile_tail,112,240,4095,fp16,0,0
+matmul_072_tile_tail,128,256,4096,bf16,0,1
+matmul_073_tile_tail,144,272,4097,fp32,1,0
+matmul_074_tile_tail,240,496,3071,fp16,1,1
+matmul_075_tile_tail,256,512,3072,bf16,0,0
+matmul_076_tile_tail,272,528,3073,fp32,0,1
+matmul_077_tile_tail,496,752,6143,fp16,1,0
+matmul_078_tile_tail,512,768,6144,bf16,1,1
+matmul_079_tile_tail,528,784,6145,fp32,0,0
+matmul_080_tile_tail,752,1008,8191,fp16,0,1
+matmul_081_tile_tail,768,1024,8192,bf16,1,0
+matmul_082_tile_tail,784,1040,8193,fp32,1,1
+matmul_083_tile_tail,1008,1520,12287,fp16,0,0
+matmul_084_tile_tail,1024,1536,12288,bf16,0,1
+matmul_085_tile_tail,1040,1552,12289,fp32,1,0
+matmul_086_tile_tail,1520,2032,4095,fp16,1,1
+matmul_087_tile_tail,1536,2048,4096,bf16,0,0
+matmul_088_tile_tail,1552,2064,4097,fp32,0,1
+matmul_089_l2_grid,2544,1264,6161,fp16,0,0
+matmul_090_l2_grid,2560,1280,6160,bf16,0,1
+matmul_091_l2_grid,2576,1296,6159,fp32,1,0
+matmul_092_l2_grid,3056,2032,12289,fp16,1,1
+matmul_093_l2_grid,3072,2048,12288,bf16,0,0
+matmul_094_l2_grid,3088,2064,12287,fp32,0,1
+matmul_095_l2_grid,4080,2544,4097,fp16,1,0
+matmul_096_l2_grid,4096,2560,4096,bf16,1,1
+matmul_097_l2_grid,4112,2576,4095,fp32,0,0
+matmul_098_l2_grid,5104,1008,8193,fp16,0,1
+matmul_099_l2_grid,5120,1024,8192,bf16,1,0
+matmul_100_l2_grid,5136,1040,8191,fp32,1,1' >"${WORKLOADS}"
 
 REMAINING="${WORKLOADS}"
 batch=0

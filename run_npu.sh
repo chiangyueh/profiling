@@ -20,7 +20,7 @@ done
 
 [[ "$MODE" == full && "$PHYSICAL_DEVICE" =~ ^[0-9]+$ ]] || exit 2
 [[ -f "$CANN_ROOT/version.cfg" ]] || {
-    printf '%s\n' '{"shape":"","official_validator":"not_run","current_validator":"not_run","error":"CANN 8.1 environment is absent"}'
+    printf '%s\n' '{"status":"failed","error":"CANN 8.1 environment is absent"}'
     exit 1
 }
 
@@ -36,7 +36,7 @@ export MAX_COMPILE_CORE_NUMBER=1
 export TBE_PARALLEL_COMPILER=1
 export TILINGKEY_PAR_COMPILE=0
 
-# The upstream install rule requires this directory even in a MatMul-only tree.
+# Required by the unmodified upstream install rule in this MatMul-only tree.
 mkdir -p "$ROOT/src/common/inc/kernel"
 : >"$ROOT/src/common/inc/kernel/matmul_only_placeholder.h"
 
@@ -45,19 +45,18 @@ SOURCE_HASH="$({
         -type f ! -name matmul_only_placeholder.h -print0
     printf '%s\0' "$ROOT/CMakeLists.txt" "$ROOT/CMakePresets.json"
 } | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
-# Reuse the already completed official MatMulV3 build from the preceding
-# numeric campaign; run_npu.sh is deliberately excluded from SOURCE_HASH.
+# The official source hash is unchanged, so reuse the completed prior build.
 STATE="$ROOT/.benchmark_state/matmul_original_${SOURCE_HASH:0:20}"
 BUILD="$STATE/build"
 INSTALL="$STATE/install"
 LOGS="$STATE/logs"
-ARTIFACTS="$STATE/artifacts"
-mkdir -p "$BUILD" "$INSTALL" "$LOGS" "$ARTIFACTS"
+CASES="$STATE/official_golden_cases"
+mkdir -p "$BUILD" "$INSTALL" "$LOGS" "$CASES"
 
 fail_infra() {
     python3 - "$1" <<'PY'
 import json, sys
-print(json.dumps({"shape":"", "official_validator":"not_run", "current_validator":"not_run", "error":sys.argv[1]}, separators=(",", ":")))
+print(json.dumps({"status":"failed", "error":sys.argv[1]}, separators=(",", ":")))
 PY
     exit 1
 }
@@ -86,38 +85,96 @@ if [[ -f "$CUSTOM_VENDOR/bin/set_env.bash" ]]; then
     source "$CUSTOM_VENDOR/bin/set_env.bash" >"$LOGS/private_env.log" 2>&1
 fi
 
-RUNNER_CPP="$STATE/matmul_dual_numeric.cpp"
-RUNNER="$STATE/matmul_dual_numeric"
+OFFICIAL_EXAMPLE="$ROOT/src/matmul/mat_mul_v3/examples/AclNNInvocationNaive"
+OFFICIAL_GENERATOR="$OFFICIAL_EXAMPLE/gen_data.py"
+OFFICIAL_VERIFY="$OFFICIAL_EXAMPLE/verify_result.py"
+EXPECTED_GENERATOR_SHA256="bb047fa1f8090493a3ad164107b83ad6fb1df2fb748badc0e1715f0722d0d7d4"
+EXPECTED_VERIFY_SHA256="763fcd171b2e9704e5957ba9ae7f941c632b8fb1357e699ae21f0788671104de"
+[[ "$(sha256sum "$OFFICIAL_GENERATOR" | cut -d' ' -f1)" == "$EXPECTED_GENERATOR_SHA256" ]] \
+    || fail_infra 'official gen_data.py differs from Gitee master'
+[[ "$(sha256sum "$OFFICIAL_VERIFY" | cut -d' ' -f1)" == "$EXPECTED_VERIFY_SHA256" ]] \
+    || fail_infra 'official verify_result.py differs from Gitee master'
+
+SHAPES="$STATE/official_golden_shapes_100.txt"
+python3 - "$OFFICIAL_GENERATOR" "$SHAPES" "$CASES" <<'PY'
+import hashlib
+import os
+import pathlib
+import sys
+
+generator = pathlib.Path(sys.argv[1])
+shape_path = pathlib.Path(sys.argv[2])
+case_root = pathlib.Path(sys.argv[3])
+source = generator.read_text(encoding="utf-8")
+if hashlib.sha256(generator.read_bytes()).hexdigest() != "bb047fa1f8090493a3ad164107b83ad6fb1df2fb748badc0e1715f0722d0d7d4":
+    raise SystemExit("official generator hash mismatch")
+
+dims = [1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 95, 96, 97, 127, 128, 129, 191, 192, 193, 255, 256, 257]
+ks = [15, 16, 17, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 191, 192, 193, 255, 256, 257]
+shapes = [(16, 16, 32)]
+seen = set(shapes)
+total = len(dims) * len(dims) * len(ks)
+for sequence in range(total):
+    flat = (sequence * 5179) % total
+    m = dims[flat // (len(dims) * len(ks))]
+    remainder = flat % (len(dims) * len(ks))
+    n = dims[remainder // len(ks)]
+    k = ks[remainder % len(ks)]
+    shape = (m, n, k)
+    if shape in seen:
+        continue
+    seen.add(shape)
+    shapes.append(shape)
+    if len(shapes) == 100:
+        break
+if len(shapes) != 100:
+    raise SystemExit("failed to construct 100 distinct bounded shapes")
+
+shape_path.write_text("".join(f"{m} {n} {k}\n" for m, n, k in shapes), encoding="utf-8")
+original_lines = source.splitlines()
+previous_cwd = os.getcwd()
+for index, (m, n, k) in enumerate(shapes, 1):
+    replacements = {
+        "    self_shape = [16, 32]": f"    self_shape = [{m}, {k}]",
+        "    mat2_shape = [32, 16]": f"    mat2_shape = [{k}, {n}]",
+        "    output_shape = [16, 16]": f"    output_shape = [{m}, {n}]",
+    }
+    patched = source
+    for old, new in replacements.items():
+        if patched.count(old) != 1:
+            raise SystemExit(f"official generator shape anchor mismatch: {old}")
+        patched = patched.replace(old, new)
+    changed = [line_no for line_no, (old, new) in enumerate(zip(original_lines, patched.splitlines()), 1) if old != new]
+    if changed != [18, 19, 20]:
+        raise SystemExit(f"generator changed outside the three shape lines: {changed}")
+    if "    golden = self @ mat2" not in patched:
+        raise SystemExit("official NumPy golden expression is absent")
+    case_dir = case_root / f"case_{index}"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    namespace = {"__name__": "official_gen_data_shape_only"}
+    exec(compile(patched, str(generator), "exec"), namespace)
+    try:
+        os.chdir(case_dir)
+        namespace["gen_golden_data_simple"]()
+    finally:
+        os.chdir(previous_cwd)
+PY
+
+RUNNER_CPP="$STATE/matmul_official_golden_100.cpp"
+RUNNER="$STATE/matmul_official_golden_100"
 cat >"$RUNNER_CPP" <<'CPP'
 #include <acl/acl.h>
 #include <aclnn_matmul.h>
-#include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
 
-static uint16_t FloatToHalf(float value) {
-    uint32_t bits;
-    std::memcpy(&bits, &value, sizeof(bits));
-    uint32_t sign = (bits >> 16) & 0x8000u;
-    uint32_t mantissa = bits & 0x7fffffu;
-    int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xffu) - 127 + 15;
-    if (exponent <= 0) {
-        if (exponent < -10) return static_cast<uint16_t>(sign);
-        mantissa = (mantissa | 0x800000u) >> (1 - exponent);
-        mantissa += 0x0fffu + ((mantissa >> 13) & 1u);
-        return static_cast<uint16_t>(sign | (mantissa >> 13));
-    }
-    if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
-    mantissa += 0x0fffu + ((mantissa >> 13) & 1u);
-    if (mantissa & 0x800000u) {
-        mantissa = 0;
-        ++exponent;
-        if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
-    }
-    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
+static bool ReadBinary(const std::string &path, std::vector<uint16_t> &data) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) return false;
+    stream.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(uint16_t)));
+    return stream.gcount() == static_cast<std::streamsize>(data.size() * sizeof(uint16_t));
 }
 
 static bool WriteBinary(const std::string &path, const std::vector<uint16_t> &data) {
@@ -131,14 +188,12 @@ struct TensorBuffer {
     void *device = nullptr;
 };
 
-static int MakeTensor(const std::vector<uint16_t> &host, const std::vector<int64_t> &logical,
-                      const std::vector<int64_t> &strides, const std::vector<int64_t> &storage,
-                      TensorBuffer &result) {
+static int MakeTensor(const std::vector<uint16_t> &host, const std::vector<int64_t> &shape, TensorBuffer &result) {
     size_t bytes = host.size() * sizeof(uint16_t);
     if (aclrtMalloc(&result.device, bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) return 1;
     if (aclrtMemcpy(result.device, bytes, host.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) return 2;
-    result.tensor = aclCreateTensor(logical.data(), logical.size(), ACL_FLOAT16, strides.data(), 0,
-                                    ACL_FORMAT_ND, storage.data(), storage.size(), result.device);
+    result.tensor = aclCreateTensor(shape.data(), shape.size(), ACL_FLOAT16, nullptr, 0,
+                                    ACL_FORMAT_ND, shape.data(), shape.size(), result.device);
     return result.tensor ? 0 : 3;
 }
 
@@ -153,7 +208,7 @@ int main(int argc, char **argv) {
     if (argc != 4) return 2;
     std::ifstream shapes(argv[1]);
     std::ofstream report(argv[2], std::ios::trunc);
-    const std::string artifactDir = argv[3];
+    const std::string caseRoot = argv[3];
     if (!shapes || !report) return 2;
     if (aclInit(nullptr) != ACL_SUCCESS) return 10;
     if (aclrtSetDevice(0) != ACL_SUCCESS) return 11;
@@ -161,38 +216,22 @@ int main(int argc, char **argv) {
     if (aclrtCreateStream(&stream) != ACL_SUCCESS) return 12;
 
     int64_t m, n, k;
-    int ta, tb;
-    size_t line = 0;
-    while (shapes >> m >> n >> k >> ta >> tb) {
-        ++line;
-        const size_t aCount = static_cast<size_t>(m) * k;
-        const size_t bCount = static_cast<size_t>(k) * n;
-        const size_t cCount = static_cast<size_t>(m) * n;
-        std::vector<uint16_t> hostA(aCount), hostB(bCount), hostC(cCount, 0);
-        for (int64_t i = 0; i < m; ++i) for (int64_t p = 0; p < k; ++p) {
-            size_t index = ta ? static_cast<size_t>(p) * m + i : static_cast<size_t>(i) * k + p;
-            hostA[index] = FloatToHalf(((i & 1) ? -1.0f : 1.0f) * ((p & 1) ? 0.5f : 1.0f));
+    size_t index = 0;
+    while (shapes >> m >> n >> k) {
+        ++index;
+        const std::string caseDir = caseRoot + "/case_" + std::to_string(index);
+        std::vector<uint16_t> hostA(static_cast<size_t>(m) * k);
+        std::vector<uint16_t> hostB(static_cast<size_t>(k) * n);
+        std::vector<uint16_t> hostC(static_cast<size_t>(m) * n, 0);
+        if (!ReadBinary(caseDir + "/input/input_self.bin", hostA) ||
+            !ReadBinary(caseDir + "/input/input_mat2.bin", hostB)) {
+            report << index << '\t' << m << '\t' << n << '\t' << k << "\tinput_read_failed\t0\t0\n";
+            continue;
         }
-        for (int64_t p = 0; p < k; ++p) for (int64_t j = 0; j < n; ++j) {
-            size_t index = tb ? static_cast<size_t>(j) * k + p : static_cast<size_t>(p) * n + j;
-            hostB[index] = FloatToHalf(((j & 1) ? -1.0f : 1.0f) * ((p % 3) ? 1.0f : 0.25f));
-        }
-
-        float expectedMagnitude = 0.0f;
-        for (int64_t p = 0; p < k; ++p) {
-            expectedMagnitude += ((p & 1) ? 0.5f : 1.0f) * ((p % 3) ? 1.0f : 0.25f);
-        }
-
-        std::vector<int64_t> aLogical{m, k}, bLogical{k, n}, cLogical{m, n};
-        std::vector<int64_t> aStorage = ta ? std::vector<int64_t>{k, m} : aLogical;
-        std::vector<int64_t> bStorage = tb ? std::vector<int64_t>{n, k} : bLogical;
-        std::vector<int64_t> aStrides = ta ? std::vector<int64_t>{1, m} : std::vector<int64_t>{k, 1};
-        std::vector<int64_t> bStrides = tb ? std::vector<int64_t>{1, k} : std::vector<int64_t>{n, 1};
-        std::vector<int64_t> cStrides{n, 1};
         TensorBuffer a, b, c;
-        int stage = MakeTensor(hostA, aLogical, aStrides, aStorage, a);
-        if (!stage) stage = MakeTensor(hostB, bLogical, bStrides, bStorage, b);
-        if (!stage) stage = MakeTensor(hostC, cLogical, cStrides, cLogical, c);
+        int stage = MakeTensor(hostA, {m, k}, a);
+        if (!stage) stage = MakeTensor(hostB, {k, n}, b);
+        if (!stage) stage = MakeTensor(hostC, {m, n}, c);
         uint64_t workspaceSize = 0;
         aclOpExecutor *executor = nullptr;
         void *workspace = nullptr;
@@ -206,30 +245,13 @@ int main(int argc, char **argv) {
             status = aclrtMemcpy(hostC.data(), hostC.size() * sizeof(uint16_t), c.device,
                                  hostC.size() * sizeof(uint16_t), ACL_MEMCPY_DEVICE_TO_HOST);
         }
-        if (stage || status != ACL_SUCCESS) {
-            report << line << '\t' << m << '\t' << n << '\t' << k << '\t' << ta << '\t' << tb
-                   << "\texecution_failed\t" << stage << '\t' << status << '\n';
-            if (workspace) aclrtFree(workspace);
-            Release(a); Release(b); Release(c);
-            continue;
+        bool outputOk = false;
+        if (!stage && status == ACL_SUCCESS) {
+            outputOk = WriteBinary(caseDir + "/output/output.bin", hostC);
         }
-
-        bool analyticPass = true;
-        size_t firstMismatch = cCount;
-        for (int64_t i = 0; i < m; ++i) for (int64_t j = 0; j < n; ++j) {
-            size_t index = static_cast<size_t>(i) * n + j;
-            uint16_t expected = FloatToHalf(((i ^ j) & 1) ? -expectedMagnitude : expectedMagnitude);
-            if (hostC[index] != expected && analyticPass) {
-                analyticPass = false;
-                firstMismatch = index;
-            }
-        }
-        const std::string prefix = artifactDir + "/case_" + std::to_string(line);
-        bool filesOk = WriteBinary(prefix + "_a.bin", hostA) && WriteBinary(prefix + "_b.bin", hostB) &&
-                       WriteBinary(prefix + "_c.bin", hostC);
-        report << line << '\t' << m << '\t' << n << '\t' << k << '\t' << ta << '\t' << tb << '\t'
-               << (filesOk ? (analyticPass ? "passed" : "failed") : "artifact_write_failed") << '\t'
-               << (firstMismatch == cCount ? -1 : static_cast<int64_t>(firstMismatch)) << "\t0\n";
+        report << index << '\t' << m << '\t' << n << '\t' << k << '\t'
+               << ((!stage && status == ACL_SUCCESS && outputOk) ? "passed" : "execution_failed")
+               << '\t' << stage << '\t' << status << '\n';
         if (workspace) aclrtFree(workspace);
         Release(a); Release(b); Release(c);
     }
@@ -245,84 +267,60 @@ if [[ ! -x "$RUNNER" || "$RUNNER_CPP" -nt "$RUNNER" ]]; then
         -L"$CUSTOM_VENDOR/op_api/lib" -L"$CANN_ROOT/lib64" \
         -Wl,-rpath,"$CUSTOM_VENDOR/op_api/lib" -Wl,-rpath,"$CANN_ROOT/lib64" \
         -lcust_opapi -lascendcl -lacl_op_compiler -lnnopbase -ldl \
-        >"$LOGS/runner_build.log" 2>&1 || fail_infra 'MatMulV3 dual-validator runner build failed'
+        >"$LOGS/runner_build.log" 2>&1 || fail_infra 'official-golden MatMulV3 runner build failed'
 fi
 
-SHAPES="$STATE/shapes.txt"
-cat >"$SHAPES" <<'EOF'
-16 16 32 0 0
-17 31 33 0 0
-31 17 65 0 1
-64 65 127 1 0
-97 113 129 1 1
-257 193 257 0 0
-EOF
-
-REPORT="$STATE/npu_report.tsv"
-rm -f "$ARTIFACTS"/case_*.bin "$REPORT"
-if ! "$RUNNER" "$SHAPES" "$REPORT" "$ARTIFACTS" >"$LOGS/runner.log" 2>&1; then
-    fail_infra 'MatMulV3 NPU runner failed before validation'
+REPORT="$STATE/official_golden_npu_report.tsv"
+if ! "$RUNNER" "$SHAPES" "$REPORT" "$CASES" >"$LOGS/runner.log" 2>&1; then
+    fail_infra 'MatMulV3 NPU runner failed before official validation'
 fi
 
-OFFICIAL_VERIFY="$ROOT/src/matmul/mat_mul_v3/examples/AclNNInvocationNaive/verify_result.py"
-[[ -f "$OFFICIAL_VERIFY" ]] || fail_infra 'official verify_result.py is absent'
-
-python3 - "$REPORT" "$ARTIFACTS" "$OFFICIAL_VERIFY" <<'PY'
+python3 - "$REPORT" "$CASES" "$OFFICIAL_VERIFY" <<'PY'
+import contextlib
+import hashlib
+import importlib.util
+import io
 import json
 import pathlib
-import subprocess
 import sys
 
-import numpy as np
-
 report_path = pathlib.Path(sys.argv[1])
-artifacts = pathlib.Path(sys.argv[2])
-official_verify = pathlib.Path(sys.argv[3])
-rows = []
-all_agree = True
-all_pass = True
+case_root = pathlib.Path(sys.argv[2])
+verify_path = pathlib.Path(sys.argv[3])
+if hashlib.sha256(verify_path.read_bytes()).hexdigest() != "763fcd171b2e9704e5957ba9ae7f941c632b8fb1357e699ae21f0788671104de":
+    raise SystemExit("official verifier hash mismatch")
+spec = importlib.util.spec_from_file_location("official_matmul_verify_result", verify_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
 
-for raw in report_path.read_text(encoding="utf-8").splitlines():
+failures = []
+passed = 0
+rows = report_path.read_text(encoding="utf-8").splitlines()
+for raw in rows:
     fields = raw.split("\t")
-    line, m, n, k, ta, tb = map(int, fields[:6])
-    current = fields[6]
-    shape = f"{m}x{n}x{k} fp16 trans={ta}{tb}"
-    if current == "execution_failed":
-        row = {"shape":shape, "official_validator":"not_run", "current_validator":"not_run", "validators_agree":False,
-               "error":f"NPU execution failed: stage={fields[7]}, status={fields[8]}"}
-        rows.append(row)
-        all_agree = False
-        all_pass = False
+    index, m, n, k = map(int, fields[:4])
+    shape = f"{m}x{n}x{k} fp16"
+    if fields[4] != "passed":
+        failures.append({"shape":shape, "official_validator":"not_run",
+                         "error":f"NPU execution failed: stage={fields[5]}, status={fields[6]}"})
         continue
-    if current == "artifact_write_failed":
-        rows.append({"shape":shape, "official_validator":"not_run", "current_validator":"not_run",
-                     "validators_agree":False, "error":"artifact write failed"})
-        all_agree = False
-        all_pass = False
-        continue
+    case_dir = case_root / f"case_{index}"
+    output = case_dir / "output/output.bin"
+    golden = case_dir / "output/golden.bin"
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        result = bool(module.verify_result(str(output), str(golden)))
+    if result:
+        passed += 1
+    else:
+        failures.append({"shape":shape, "official_validator":"failed"})
 
-    prefix = artifacts / f"case_{line}"
-    a_storage = np.fromfile(str(prefix) + "_a.bin", dtype=np.float16).reshape((k, m) if ta else (m, k))
-    b_storage = np.fromfile(str(prefix) + "_b.bin", dtype=np.float16).reshape((n, k) if tb else (k, n))
-    a = a_storage.T if ta else a_storage
-    b = b_storage.T if tb else b_storage
-    golden = a @ b
-    golden_path = pathlib.Path(str(prefix) + "_golden.bin")
-    golden.astype(np.float16, copy=False).tofile(golden_path)
-    output_path = pathlib.Path(str(prefix) + "_c.bin")
-    process = subprocess.run([sys.executable, str(official_verify), str(output_path), str(golden_path)],
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    official = "passed" if process.returncode == 0 and "test pass" in process.stdout else "failed"
-    current_status = "passed" if current == "passed" else "failed"
-    agree = official == current_status
-    all_agree = all_agree and agree
-    all_pass = all_pass and official == "passed" and current_status == "passed"
-    rows.append({"shape":shape, "official_validator":official, "current_validator":current_status,
-                 "validators_agree":agree})
-
-for row in rows:
-    print(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
-print(json.dumps({"summary":{"cases":len(rows), "validators_agree":all_agree,
-                             "both_validators_passed_all_cases":all_pass}}, separators=(",", ":")))
-raise SystemExit(0 if all_agree and all_pass else 1)
+for failure in failures:
+    print(json.dumps(failure, ensure_ascii=False, separators=(",", ":")))
+print(json.dumps({"status":"passed" if not failures and passed == 100 else "failed",
+                  "shapes":len(rows), "official_validator_passed":passed,
+                  "golden":"unmodified official gen_data.py except shape lines",
+                  "validator":"unmodified official verify_result.py"},
+                 ensure_ascii=False, separators=(",", ":")))
+raise SystemExit(0 if not failures and passed == 100 else 1)
 PY

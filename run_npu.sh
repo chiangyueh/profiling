@@ -46,5 +46,6 @@ for value_name in PHYSICAL_DEVICE WARMUP SAMPLES; do
 done
 (( SAMPLES >= 1 )) || { echo "fatal: samples must be at least 1" >&2; exit 2; }
 
+echo "ATTENTION_CAMPAIGN_START operators=flash_attention_score_grad,fused_infer_attention_score device=${PHYSICAL_DEVICE} records_per_operator=5000"
 exec "${ROOT}/run_remaining_npu.sh" --operator all -d "${PHYSICAL_DEVICE}" \
     --warmup "${WARMUP}" --samples "${SAMPLES}"

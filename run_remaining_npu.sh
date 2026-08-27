@@ -52,11 +52,18 @@ done
 
 if [[ "${OPERATOR}" == "all" ]]; then
     for selected in flash_attention_score_grad fused_infer_attention_score; do
+        echo "ATTENTION_CAMPAIGN_OPERATOR_START operator=${selected}"
         "${ROOT}/run_remaining_npu.sh" --operator "${selected}" -d "${PHYSICAL_DEVICE}" \
             --warmup "${WARMUP}" --samples "${SAMPLES}"
     done
     exit 0
 fi
+
+BOOTSTRAP_LOGS="${ROOT}/results/${OPERATOR}_cann81_native/bootstrap_logs"
+mkdir -p "${BOOTSTRAP_LOGS}"
+TERMINAL_LOG="${BOOTSTRAP_LOGS}/$(date -u +%Y%m%dT%H%M%SZ)_$$.log"
+exec > >(tee -a "${TERMINAL_LOG}") 2>&1
+echo "CAMPAIGN_BOOTSTRAP operator=${OPERATOR} device=${PHYSICAL_DEVICE} terminal_log=${TERMINAL_LOG}"
 
 CANN_ROOT="${CANN_ROOT:-/usr/local/Ascend/ascend-toolkit/latest}"
 VERSION_FILE="${CANN_ROOT}/opp/version.info"
@@ -74,9 +81,11 @@ for candidate in "${CANN_ROOT}/set_env.sh" "$(dirname "${CANN_ROOT}")/set_env.sh
 done
 [[ -n "${ENV_FILE}" ]] || { echo "fatal: CANN set_env.sh is absent" >&2; exit 1; }
 
+echo "CANN_ENV_LOAD begin root=${CANN_ROOT}"
 set +u
 source "${ENV_FILE}"
 set -u
+echo "CANN_ENV_LOAD passed"
 export ASCEND_HOME_PATH="${CANN_ROOT}"
 export ASCEND_TOOLKIT_HOME="${CANN_ROOT}"
 export ASCEND_OPP_PATH="${CANN_ROOT}/opp"
@@ -108,7 +117,9 @@ REQUIRED=(
 for relative in "${REQUIRED[@]}"; do
     [[ -f "${ROOT}/${relative}" ]] || { echo "fatal: missing repository input: ${relative}" >&2; exit 1; }
 done
+echo "CAMPAIGN_INPUT_CHECK passed"
 
+echo "CAMPAIGN_ID_CALCULATION begin"
 PACKAGE_ID="$({
     printf '%s\n' "${OPERATOR}"
     sha256sum "${ROOT}/source_adapter/vendor_source/cann_ops_8_1rc1.tar.gz" \
@@ -135,6 +146,7 @@ SOURCE_BUNDLE_ID="$({
         "${ROOT}/source_adapter/vendor_source/cann_ops_adv_8_1rc1.tar.gz" \
         "${ROOT}/source_adapter/remaining_operators_cann81_lock.json"
 } | sha256sum | cut -c1-20)"
+echo "CAMPAIGN_ID_CALCULATION passed package=${PACKAGE_ID} run=${RUN_ID}"
 SOURCE_PARENT="${ROOT}/.source_cache/remaining_operators_cann81/${SOURCE_BUNDLE_ID}"
 BASE_SOURCE="${SOURCE_PARENT}/cann_ops"
 ADV_SOURCE="${SOURCE_PARENT}/cann_ops_adv"
@@ -160,6 +172,7 @@ find "${INSTALLED_KERNEL_ROOT}" -type f -name '*.o' -print -quit | grep -q . || 
     echo "fatal: installed CANN-8.1 binary package has no ${OPERATOR} kernel objects" >&2
     exit 1
 }
+echo "INSTALLED_CANN81_KERNEL_CHECK passed operator=${OPERATOR}"
 
 run_logged() {
     local label="$1" log="$2"

@@ -36,6 +36,10 @@ export MAX_COMPILE_CORE_NUMBER=1
 export TBE_PARALLEL_COMPILER=1
 export TILINGKEY_PAR_COMPILE=0
 
+# The upstream install rule requires this common include directory even when
+# this MatMul-only checkout intentionally contains none of its optional files.
+mkdir -p "$ROOT/src/common/inc/kernel"
+
 SOURCE_HASH="$({
     find "$ROOT/src/matmul/mat_mul_v3" "$ROOT/src/common" "$ROOT/cmake" "$ROOT/third_party" -type f -print0
     printf '%s\0' "$ROOT/CMakeLists.txt" "$ROOT/CMakePresets.json"

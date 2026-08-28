@@ -37,6 +37,7 @@ source_suffixes = {
     ".yaml", ".yml", ".toml", ".proto", ".md", ".txt",
 }
 source_names = {"CMakeLists.txt", "Makefile", "Dockerfile"}
+metadata_suffixes = {".a", ".bin", ".bbit", ".o", ".so"}
 skip_directories = {
     ".git", "__pycache__", "input", "output", "profiler", "profiling",
     "build", "out", ".cache", ".pytest_cache",
@@ -46,20 +47,30 @@ source_files = []
 metadata_files = []
 symlinks = []
 
+def is_transient_directory(name):
+    upper = name.upper()
+    lower = name.lower()
+    return (
+        name in skip_directories
+        or upper.startswith("OPPROF")
+        or lower.startswith("msprof")
+        or lower.startswith("prof_")
+    )
+
 for current, directories, files in os.walk(source_root, topdown=True, followlinks=False):
-    directories[:] = sorted(name for name in directories if name not in skip_directories)
+    directories[:] = sorted(name for name in directories if not is_transient_directory(name))
     current_path = pathlib.Path(current)
     for name in sorted(files):
         path = current_path / name
         relative = path.relative_to(source_root).as_posix()
         if path.is_symlink():
-            symlinks.append((relative, os.readlink(path)))
+            symlinks.append((relative, path))
             continue
         if not path.is_file():
             continue
         if name in source_names or path.suffix.lower() in source_suffixes:
             source_files.append((relative, path))
-        else:
+        elif path.suffix.lower() in metadata_suffixes:
             metadata_files.append((relative, path))
 
 source_files.sort()
@@ -78,48 +89,72 @@ def digest(path):
             hasher.update(chunk)
     return size, hasher.hexdigest()
 
+records = []
+transient_missing = []
+
+for relative, path in symlinks:
+    try:
+        target = os.readlink(path)
+    except FileNotFoundError:
+        transient_missing.append(relative)
+        continue
+    records.append({
+        "record_type": "symlink",
+        "path": relative,
+        "target": target,
+    })
+
+for relative, path in source_files:
+    try:
+        mode = format(stat.S_IMODE(path.stat().st_mode), "04o")
+        data = path.read_bytes()
+    except FileNotFoundError:
+        transient_missing.append(relative)
+        continue
+    records.append({
+        "record_type": "source_file",
+        "path": relative,
+        "mode": mode,
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "encoding": "base64",
+        "content": base64.b64encode(data).decode("ascii"),
+    })
+
+for relative, path in metadata_files:
+    try:
+        mode = format(stat.S_IMODE(path.stat().st_mode), "04o")
+        size, sha256 = digest(path)
+    except FileNotFoundError:
+        transient_missing.append(relative)
+        continue
+    records.append({
+        "record_type": "non_source_file",
+        "path": relative,
+        "mode": mode,
+        "size": size,
+        "sha256": sha256,
+    })
+
+for relative in transient_missing:
+    records.append({
+        "record_type": "transient_missing",
+        "path": relative,
+    })
+
 with output_path.open("w", encoding="utf-8", newline="\n") as output:
     header = {
         "record_type": "source_export",
         "schema": "matmul_v3_source_export_v1",
         "source_root": str(source_root),
-        "source_file_count": len(source_files),
-        "metadata_file_count": len(metadata_files),
-        "symlink_count": len(symlinks),
+        "source_file_count": sum(row["record_type"] == "source_file" for row in records),
+        "metadata_file_count": sum(row["record_type"] == "non_source_file" for row in records),
+        "symlink_count": sum(row["record_type"] == "symlink" for row in records),
+        "transient_missing_count": len(transient_missing),
         "content_encoding": "base64",
     }
     output.write(json.dumps(header, sort_keys=True, separators=(",", ":")) + "\n")
-
-    for relative, target in symlinks:
-        row = {
-            "record_type": "symlink",
-            "path": relative,
-            "target": target,
-        }
-        output.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
-
-    for relative, path in source_files:
-        data = path.read_bytes()
-        row = {
-            "record_type": "source_file",
-            "path": relative,
-            "mode": format(stat.S_IMODE(path.stat().st_mode), "04o"),
-            "size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "encoding": "base64",
-            "content": base64.b64encode(data).decode("ascii"),
-        }
-        output.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
-
-    for relative, path in metadata_files:
-        size, sha256 = digest(path)
-        row = {
-            "record_type": "non_source_file",
-            "path": relative,
-            "mode": format(stat.S_IMODE(path.stat().st_mode), "04o"),
-            "size": size,
-            "sha256": sha256,
-        }
+    for row in records:
         output.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
 PY
 

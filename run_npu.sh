@@ -23,6 +23,5 @@ done
 [[ "$MODE" == "full" && "$PHYSICAL_DEVICE" =~ ^[0-9]+$ ]] || exit 2
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# +++ BEGIN: the comparison itself is contained in the colleague project.
-exec "$ROOT_DIR/colleague_matmul_v3/run_compare.sh" -d "$PHYSICAL_DEVICE"
-# +++ END: colleague-local comparison entry point.
+export ASCEND_RT_VISIBLE_DEVICES="$PHYSICAL_DEVICE"
+exec bash "$ROOT_DIR/matmul_v3_official_host_tiler/run.sh" -r npu -v Ascend910B3

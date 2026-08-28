@@ -8,7 +8,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 # ===============================================================================
 
-import argparse
+import sys
 import numpy as np
 
 # for float32
@@ -17,13 +17,9 @@ absolute_tol = 1e-9
 error_tol = 1e-4
 
 
-def verify_result(output: str, golden: str, dtype_name: str = "fp32") -> bool:
-    # +++ BEGIN: official CANN MatMulV3 returns FP16; the retained colleague
-    # direct-launch program returns FP32.
-    dtype = np.float16 if dtype_name == "fp16" else np.float32
-    # +++ END: route-specific output contract.
-    output = np.fromfile(output, dtype=dtype).reshape(-1)
-    golden = np.fromfile(golden, dtype=dtype).reshape(-1)
+def verify_result(output: str, golden: str) -> bool:
+    output = np.fromfile(output, dtype=np.float32).reshape(-1)
+    golden = np.fromfile(golden, dtype=np.float32).reshape(-1)
     different_element_results = np.isclose(output,
                                            golden,
                                            rtol=relative_tol,
@@ -46,16 +42,8 @@ def verify_result(output: str, golden: str, dtype_name: str = "fp32") -> bool:
 
 
 if __name__ == '__main__':
-    # +++ BEGIN: optional dtype flag; no flag preserves the colleague verifier's
-    # original FP32 behavior used by 4.log.
-    parser = argparse.ArgumentParser()
-    parser.add_argument("output")
-    parser.add_argument("golden")
-    parser.add_argument("--dtype", choices=("fp16", "fp32"), default="fp32")
-    args = parser.parse_args()
-    # +++ END: route-specific verifier input.
     try:
-        res = verify_result(args.output, args.golden, args.dtype)
+        res = verify_result(sys.argv[1], sys.argv[2])
         if not res:
             raise ValueError("[ERROR] result error")
         else:

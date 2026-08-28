@@ -56,7 +56,12 @@ fi
 
 printf 'MATMUL_NPU_AND_VERIFY begin\n'
 set +e
-bash "$FIXED_DIR/run.sh" -r npu -v Ascend910B3 >"$LOG_DIR/3.log" 2>&1
+MM_M=512 MM_N=512 MM_K=512 \
+MM_BASE_M=16 MM_BASE_N=32 MM_BASE_K=96 \
+MM_SINGLE_M=16 MM_SINGLE_N=32 MM_SINGLE_K=256 \
+MM_STEP_M=1 MM_STEP_N=1 MM_STEP_Ka=4 MM_STEP_Kb=4 \
+MM_ITER_ORDER=0 MM_OP_TILING=0 \
+    bash "$FIXED_DIR/run.sh" -r npu -v Ascend910B3 >"$LOG_DIR/3.log" 2>&1
 run_rc=$?
 if (( run_rc == 0 )); then
     python3 "$FIXED_DIR/scripts/verify_result.py" \

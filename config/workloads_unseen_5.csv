@@ -1,6 +1,0 @@
-id,m,n,k,dtype,trans_a,trans_b,max_cores
-unseen_rectangular_m2048_n768_k4096,2048,768,4096,fp16,0,0,20
-unseen_skinny_n_48_k16k,4352,48,16384,fp16,0,0,20
-unseen_split_k_24k,128,128,24576,fp16,0,0,20
-unseen_tail_m769_n1216_k6160,769,1216,6160,fp16,0,0,20
-unseen_rectangular_m1536_n320_k6144,1536,320,6144,fp16,0,0,20

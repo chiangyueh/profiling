@@ -62,6 +62,7 @@ PY
 }
 
 if [[ ! -f "$INSTALL/.complete" ]]; then
+    printf '%s\n' 'MATMUL_ORIGINAL_512_BUILD begin'
     cmake -S "$ROOT" -B "$BUILD" \
         -DBUILD_OPEN_PROJECT=ON \
         -DASCEND_COMPUTE_UNIT=ascend910b \
@@ -75,6 +76,9 @@ if [[ ! -f "$INSTALL/.complete" ]]; then
     cmake --build "$BUILD" --target install -j1 >"$LOGS/build.log" 2>&1 \
         || fail_infra 'official MatMulV3 build failed'
     touch "$INSTALL/.complete"
+    printf '%s\n' 'MATMUL_ORIGINAL_512_BUILD passed'
+else
+    printf '%s\n' 'MATMUL_ORIGINAL_512_BUILD reused'
 fi
 
 CUSTOM_VENDOR="$INSTALL/packages/vendors/customize"
@@ -255,9 +259,11 @@ if [[ ! -x "$RUNNER" || "$RUNNER_CPP" -nt "$RUNNER" ]]; then
 fi
 
 REPORT="$STATE/official_golden_npu_report.tsv"
+printf '%s\n' 'MATMUL_ORIGINAL_512_RUN begin'
 if ! "$RUNNER" "$SHAPES" "$REPORT" "$CASES" >"$LOGS/runner.log" 2>&1; then
     fail_infra 'MatMulV3 NPU runner failed before official validation'
 fi
+printf '%s\n' 'MATMUL_ORIGINAL_512_RUN completed'
 
 python3 - "$REPORT" "$CASES" "$OFFICIAL_VERIFY" <<'PY'
 import contextlib

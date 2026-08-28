@@ -150,7 +150,7 @@ def main() -> int:
         is_stop=lambda _results: False,
         validator=ExactCandidateValidator(),
     )
-    runner.audit_validator = valids.MatmulValidator(
+    runner.audit_validator = valids.MatmulV3BaseTilingValidator(
         limits.MatmulLimits(
             max_cores=20,
             L0A_size=64 * 1024,

@@ -22,7 +22,7 @@ class ValidationDetails:
     tiling: dict[str, int]
 
 
-class MatmulV3BaseTilingRules:
+class MatmulV3BaseTilingValidator:
     """The MatMulV3 BASE-template correctness rules.
 
     This validator is deliberately independent of measured latency and output.

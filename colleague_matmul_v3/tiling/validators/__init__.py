@@ -1,2 +1,2 @@
 from .MatmulValidator import MatmulValidator
-from .MatmulV3BaseTilingRules import MatmulV3BaseTilingRules, ValidationDetails
+from .MatmulV3BaseTilingValidator import MatmulV3BaseTilingValidator, ValidationDetails

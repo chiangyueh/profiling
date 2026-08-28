@@ -17,9 +17,7 @@ TEMP_FILE="$(mktemp "$LOG_DIR/.1.log.tmp.XXXXXX")"
 trap 'rm -f "$TEMP_FILE"' EXIT
 
 python3 - "$SOURCE_DIR" "$TEMP_FILE" <<'PY'
-import base64
 import hashlib
-import json
 import os
 import pathlib
 import stat
@@ -37,17 +35,12 @@ source_suffixes = {
     ".yaml", ".yml", ".toml", ".proto", ".md", ".txt",
 }
 source_names = {"CMakeLists.txt", "Makefile", "Dockerfile"}
-metadata_suffixes = {".a", ".bin", ".bbit", ".o", ".so"}
 skip_directories = {
     ".git", "__pycache__", "input", "output", "profiler", "profiling",
     "build", "out", ".cache", ".pytest_cache",
 }
 
-source_files = []
-metadata_files = []
-symlinks = []
-
-def is_transient_directory(name):
+def is_skipped_directory(name):
     upper = name.upper()
     lower = name.lower()
     return (
@@ -57,105 +50,63 @@ def is_transient_directory(name):
         or lower.startswith("prof_")
     )
 
+paths = []
 for current, directories, files in os.walk(source_root, topdown=True, followlinks=False):
-    directories[:] = sorted(name for name in directories if not is_transient_directory(name))
+    directories[:] = sorted(name for name in directories if not is_skipped_directory(name))
     current_path = pathlib.Path(current)
     for name in sorted(files):
         path = current_path / name
-        relative = path.relative_to(source_root).as_posix()
-        if path.is_symlink():
-            symlinks.append((relative, path))
-            continue
-        if not path.is_file():
-            continue
-        if name in source_names or path.suffix.lower() in source_suffixes:
-            source_files.append((relative, path))
-        elif path.suffix.lower() in metadata_suffixes:
-            metadata_files.append((relative, path))
+        if path.is_symlink() or name in source_names or path.suffix.lower() in source_suffixes:
+            paths.append(path)
 
-source_files.sort()
-metadata_files.sort()
-symlinks.sort()
-
-def digest(path):
-    hasher = hashlib.sha256()
-    size = 0
-    with path.open("rb") as stream:
-        while True:
-            chunk = stream.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            hasher.update(chunk)
-    return size, hasher.hexdigest()
-
-records = []
+snapshots = []
 transient_missing = []
-
-for relative, path in symlinks:
+for path in sorted(paths):
+    relative = path.relative_to(source_root).as_posix()
     try:
-        target = os.readlink(path)
-    except FileNotFoundError:
-        transient_missing.append(relative)
-        continue
-    records.append({
-        "record_type": "symlink",
-        "path": relative,
-        "target": target,
-    })
-
-for relative, path in source_files:
-    try:
-        mode = format(stat.S_IMODE(path.stat().st_mode), "04o")
+        if path.is_symlink():
+            snapshots.append(("symlink", relative, os.readlink(path), None, None))
+            continue
+        file_stat = path.stat()
         data = path.read_bytes()
     except FileNotFoundError:
         transient_missing.append(relative)
         continue
-    records.append({
-        "record_type": "source_file",
-        "path": relative,
-        "mode": mode,
-        "size": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "encoding": "base64",
-        "content": base64.b64encode(data).decode("ascii"),
-    })
+    snapshots.append((
+        "file",
+        relative,
+        data,
+        format(stat.S_IMODE(file_stat.st_mode), "04o"),
+        hashlib.sha256(data).hexdigest(),
+    ))
 
-for relative, path in metadata_files:
-    try:
-        mode = format(stat.S_IMODE(path.stat().st_mode), "04o")
-        size, sha256 = digest(path)
-    except FileNotFoundError:
-        transient_missing.append(relative)
-        continue
-    records.append({
-        "record_type": "non_source_file",
-        "path": relative,
-        "mode": mode,
-        "size": size,
-        "sha256": sha256,
-    })
+file_count = sum(entry[0] == "file" for entry in snapshots)
+symlink_count = sum(entry[0] == "symlink" for entry in snapshots)
 
-for relative in transient_missing:
-    records.append({
-        "record_type": "transient_missing",
-        "path": relative,
-    })
+with output_path.open("wb") as output:
+    output.write(b"MATMUL_V3 SOURCE EXPORT\n")
+    output.write(f"source_root={source_root}\n".encode("utf-8"))
+    output.write(f"source_files={file_count}\n".encode("ascii"))
+    output.write(f"symlinks={symlink_count}\n".encode("ascii"))
+    output.write(f"transient_missing={len(transient_missing)}\n\n".encode("ascii"))
 
-with output_path.open("w", encoding="utf-8", newline="\n") as output:
-    header = {
-        "record_type": "source_export",
-        "schema": "matmul_v3_source_export_v1",
-        "source_root": str(source_root),
-        "source_file_count": sum(row["record_type"] == "source_file" for row in records),
-        "metadata_file_count": sum(row["record_type"] == "non_source_file" for row in records),
-        "symlink_count": sum(row["record_type"] == "symlink" for row in records),
-        "transient_missing_count": len(transient_missing),
-        "content_encoding": "base64",
-    }
-    output.write(json.dumps(header, sort_keys=True, separators=(",", ":")) + "\n")
-    for row in records:
-        output.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+    for kind, relative, content, mode, sha256 in snapshots:
+        if kind == "symlink":
+            output.write(f"===== SYMLINK: {relative} =====\n".encode("utf-8"))
+            output.write(f"target={content}\n".encode("utf-8"))
+            output.write(f"===== END SYMLINK: {relative} =====\n\n".encode("utf-8"))
+            continue
+
+        output.write(
+            f"===== BEGIN FILE: {relative} | mode={mode} | size={len(content)} | sha256={sha256} =====\n".encode("utf-8")
+        )
+        output.write(content)
+        if not content.endswith(b"\n"):
+            output.write(b"\n")
+        output.write(f"===== END FILE: {relative} =====\n\n".encode("utf-8"))
+
+    for relative in transient_missing:
+        output.write(f"===== TRANSIENT FILE DISAPPEARED: {relative} =====\n".encode("utf-8"))
 PY
 
 ACTUAL_BYTES="$(stat -c '%s' "$TEMP_FILE")"
@@ -166,5 +117,4 @@ fi
 
 mv -f "$TEMP_FILE" "$LOG_FILE"
 trap - EXIT
-printf 'MATMUL_V3_SOURCE_EXPORT passed files=%s bytes=%s log=%s\n' \
-    "$(wc -l < "$LOG_FILE")" "$ACTUAL_BYTES" "$LOG_FILE"
+printf 'MATMUL_V3_SOURCE_EXPORT passed bytes=%s log=%s\n' "$ACTUAL_BYTES" "$LOG_FILE"

@@ -123,9 +123,8 @@ class BaseAlgo:
         legacy_valid = self.validator.is_valid(params)
         if legacy_valid:
             if audit_enabled:
-                # Import lazily to avoid BaseValidator's module import cycle.
-                from tiling.validators.CostModelValidator import CostModelValidator
-                filter_verdict = CostModelValidator().explain(params)
+                audit_validator = getattr(self, "audit_validator", self.validator)
+                filter_verdict = audit_validator.explain(params)
             else:
                 filter_verdict = None
             dur = self._run_estimator(params)

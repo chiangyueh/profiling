@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 from scripts.gen_data import gen_golden_data
-from tiling import base
+from tiling import base, limits, valids
 
 
 class ExactCandidateValidator(base.BaseValidator):
@@ -149,6 +149,17 @@ def main() -> int:
     runner = ShapeSweepReal(
         is_stop=lambda _results: False,
         validator=ExactCandidateValidator(),
+    )
+    runner.audit_validator = valids.MatmulValidator(
+        limits.MatmulLimits(
+            max_cores=20,
+            L0A_size=64 * 1024,
+            L0B_size=64 * 1024,
+            L0C_size=128 * 1024,
+            L1_size=512 * 1024,
+            domains={},
+            dtype_size=2,
+        )
     )
     print("MATMUL_FILTER_SHAPE_AUDIT_BEGIN shapes=200 accepted=100 rejected=100")
     for index, shape in enumerate(shapes):

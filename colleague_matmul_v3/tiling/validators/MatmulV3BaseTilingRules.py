@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from tiling.base.Base import BaseParam
+from tiling.limits import MatmulLimits
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -15,14 +16,14 @@ def _align_up(value: int, alignment: int) -> int:
 
 
 @dataclass(frozen=True)
-class FilterVerdict:
+class ValidationDetails:
     valid: bool
     rules: tuple[str, ...]
     tiling: dict[str, int]
 
 
-class CostModelValidator:
-    """The BASE-template hard gate used by the hardware cost model.
+class MatmulV3BaseTilingRules:
+    """The MatMulV3 BASE-template correctness rules.
 
     This validator is deliberately independent of measured latency and output.
     It predicts legality before the candidate is launched, so its prediction can
@@ -31,20 +32,9 @@ class CostModelValidator:
 
     def __init__(
         self,
-        *,
-        aic_cores: int = 20,
-        l0a_bytes: int = 64 * 1024,
-        l0b_bytes: int = 64 * 1024,
-        l0c_bytes: int = 128 * 1024,
-        l1_bytes: int = 512 * 1024,
-        input_bytes: int = 2,
+        limits: MatmulLimits,
     ) -> None:
-        self.aic_cores = aic_cores
-        self.l0a_bytes = l0a_bytes
-        self.l0b_bytes = l0b_bytes
-        self.l0c_bytes = l0c_bytes
-        self.l1_bytes = l1_bytes
-        self.input_bytes = input_bytes
+        self.limits = limits
 
     @staticmethod
     def _params_dict(params: Iterable[BaseParam]) -> dict[str, int]:
@@ -69,7 +59,7 @@ class CostModelValidator:
             "M": m,
             "N": n,
             "K": k,
-            "usedCoreNum": int(p.get("MM_USED_CORE_NUM", min(logical_blocks, self.aic_cores))),
+            "usedCoreNum": int(p.get("MM_USED_CORE_NUM", min(logical_blocks, self.limits.max_cores))),
             "singleCoreM": single_m,
             "singleCoreN": single_n,
             "singleCoreK": k,
@@ -101,11 +91,11 @@ class CostModelValidator:
             "tilingEnable": 0,
         }
 
-    def classify(self, params: Iterable[BaseParam]) -> bool:
+    def is_valid(self, params: Iterable[BaseParam]) -> bool:
         """Return the final gate decision: True accepts, False rejects."""
         return self.explain(params).valid
 
-    def explain(self, params: Iterable[BaseParam]) -> FilterVerdict:
+    def explain(self, params: Iterable[BaseParam]) -> ValidationDetails:
         """Return the decision together with the rules used by audit logs."""
         t = self.materialize_base_tiling(params)
         rules: list[str] = []
@@ -120,7 +110,7 @@ class CostModelValidator:
             rules.append("NON_POSITIVE_REQUIRED_FIELD")
         if t["l2MTileBlock"] < 0 or t["l2NTileBlock"] < 0:
             rules.append("NEGATIVE_L2_TILE_BLOCK")
-        if t["usedCoreNum"] > self.aic_cores:
+        if t["usedCoreNum"] > self.limits.max_cores:
             rules.append("USED_CORE_NUM_EXCEEDS_AIC_COUNT")
         if t["iterateOrder"] not in (0, 1):
             rules.append("ITERATE_ORDER_UNSUPPORTED")
@@ -137,11 +127,11 @@ class CostModelValidator:
         if t["baseK"] % 16:
             rules.append("BASE_K_NOT_16_ALIGNED")
 
-        if t["baseM"] * t["baseK"] * self.input_bytes * t["dbL0A"] > self.l0a_bytes:
+        if t["baseM"] * t["baseK"] * self.limits.dtype_size * t["dbL0A"] > self.limits.L0A_size:
             rules.append("L0A_CAPACITY_EXCEEDED")
-        if t["baseN"] * t["baseK"] * self.input_bytes * t["dbL0B"] > self.l0b_bytes:
+        if t["baseN"] * t["baseK"] * self.limits.dtype_size * t["dbL0B"] > self.limits.L0B_size:
             rules.append("L0B_CAPACITY_EXCEEDED")
-        if t["baseM"] * t["baseN"] * 4 * t["dbL0C"] > self.l0c_bytes:
+        if t["baseM"] * t["baseN"] * 4 * t["dbL0C"] > self.limits.L0C_size:
             rules.append("L0C_CAPACITY_EXCEEDED")
 
         one_a = t["stepM"] * t["stepKa"]
@@ -155,14 +145,14 @@ class CostModelValidator:
         elif t["depthB1"] // one_b not in (1, 2):
             rules.append("DEPTH_B1_BUFFERING_UNSUPPORTED")
 
-        a1 = t["baseM"] * t["baseK"] * t["depthA1"] * self.input_bytes
-        b1 = t["baseN"] * t["baseK"] * t["depthB1"] * self.input_bytes
-        if a1 + b1 > self.l1_bytes:
+        a1 = t["baseM"] * t["baseK"] * t["depthA1"] * self.limits.dtype_size
+        b1 = t["baseN"] * t["baseK"] * t["depthB1"] * self.limits.dtype_size
+        if a1 + b1 > self.limits.L1_size:
             rules.append("L1_CAPACITY_EXCEEDED")
         if t["stepKa"] % t["stepKb"] and t["stepKb"] % t["stepKa"]:
             rules.append("STEP_KA_KB_INCOMMENSURATE")
 
-        # Exact BASE/no-split/no-full-load contract from the cost model.
+        # Exact BASE/no-split/no-full-load kernel contract.
         if t["singleCoreK"] != t["K"]:
             rules.append("BASE_SINGLE_CORE_K_MUST_EQUAL_K")
         if t["singleCoreM"] > t["stepM"] * t["baseM"]:
@@ -199,7 +189,7 @@ class CostModelValidator:
                 rules.append("L2_N_TAIL_OUT_OF_RANGE")
 
         unique_rules = tuple(dict.fromkeys(rules))
-        return FilterVerdict(
+        return ValidationDetails(
             valid=not unique_rules,
             rules=unique_rules,
             tiling=t,

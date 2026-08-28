@@ -15,12 +15,12 @@ class MatmulValidator(BaseValidator):
         super().__init__()
 
     def is_valid(self, params: list[BaseParam]) -> bool:
-        p = {p.name: p.value for p in params}
-        return all(self._base_tiles_is_valid(p['MM_BASE_M'], p['MM_BASE_N'], p['MM_BASE_K'],
-                                             p['MM_DB_L0A'], p['MM_DB_L0B'], p['MM_DB_L0C'])) and \
-            self._single_core_is_valid(p['MM_M'], p['MM_N'], p['MM_SINGLE_M'], p['MM_SINGLE_N']) and \
-            self._l1_size_is_valid(p['MM_BASE_M'], p['MM_BASE_N'], p['MM_BASE_K'],
-                                   p['MM_STEP_M'], p['MM_STEP_N'], p['MM_STEP_Ka'], p['MM_STEP_Kb'])
+        return self.explain(params).valid
+
+    def explain(self, params: list[BaseParam]):
+        from .MatmulV3BaseTilingRules import MatmulV3BaseTilingRules
+
+        return MatmulV3BaseTilingRules(self.limits).explain(params)
 
     def repair(self, params: list[BaseParam]) -> list[BaseParam]:
         ps_dict = {p.name: p for p in params}

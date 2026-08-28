@@ -1,2 +1,2 @@
 from .MatmulValidator import MatmulValidator
-from .CostModelValidator import CostModelValidator, FilterVerdict
+from .MatmulV3BaseTilingRules import MatmulV3BaseTilingRules, ValidationDetails

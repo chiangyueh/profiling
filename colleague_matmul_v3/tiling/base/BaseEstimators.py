@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .Base import BaseAlgo, BaseParam
 from pathlib import Path
+import math
 import os
 import shutil
 import subprocess
@@ -54,35 +55,43 @@ class BaseAlgoReal(BaseAlgo):
         env = dict(os.environ)
         for param in params:
             env[param.name] = str(param.value)
-
-        cceprint = Path("cceprint")
-        if cceprint.exists():
-            for f in cceprint.glob("*.cce"):
-                f.unlink()
-        for d in Path(".").glob("OPPROF_*"):
-            shutil.rmtree(d)
-        output_path = Path("output/output.bin")
-        output_path.unlink(missing_ok=True)
-        completed = subprocess.run(
-            ["bash", self.runner, "-r", "npu", "-v", "Ascend910B3"],
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        self._last_run = {
-            "status": "passed" if completed.returncode == 0 else "failed",
-            "return_code": completed.returncode,
-            "stdout_tail": completed.stdout[-2000:],
-            "stderr_tail": completed.stderr[-2000:],
-        }
-
-        if completed.returncode != 0:
-            return float("inf")
-
-        dur = self._get_time()
-        if dur == float("inf"):
-            self._last_run["status"] = "timing_missing"
-        return dur
+        max_attempts = max(1, int(os.environ.get("MATMUL_AUDIT_PROFILE_ATTEMPTS", "2")))
+        history = []
+        for attempt in range(1, max_attempts + 1):
+            cceprint = Path("cceprint")
+            if cceprint.exists():
+                for f in cceprint.glob("*.cce"):
+                    f.unlink()
+            for d in Path(".").glob("OPPROF_*"):
+                shutil.rmtree(d)
+            Path("output/output.bin").unlink(missing_ok=True)
+            completed = subprocess.run(
+                ["bash", self.runner, "-r", "npu", "-v", "Ascend910B3"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            attempt_status = "failed" if completed.returncode else "timing_missing"
+            duration = float("inf")
+            if completed.returncode == 0:
+                duration = self._get_time()
+                if math.isfinite(duration):
+                    attempt_status = "passed"
+            history.append({
+                "attempt": attempt,
+                "status": attempt_status,
+                "return_code": completed.returncode,
+            })
+            self._last_run = {
+                "status": attempt_status,
+                "return_code": completed.returncode,
+                "profile_attempts": history,
+                "stdout_tail": completed.stdout[-2000:],
+                "stderr_tail": completed.stderr[-2000:],
+            }
+            if attempt_status == "passed":
+                return duration
+        return float("inf")
     
     def _get_time(self) -> float:
         try:
@@ -90,7 +99,9 @@ class BaseAlgoReal(BaseAlgo):
             if not opprofs:
                 return float("inf")
             opprof = max(opprofs, key=lambda d: d.stat().st_mtime)
-            latency = pd.read_csv(f"{opprof}/OpBasicInfo.csv")['Task Duration(us)'].iloc[0]
+            latency = float(pd.read_csv(f"{opprof}/OpBasicInfo.csv")['Task Duration(us)'].iloc[0])
+            if not math.isfinite(latency):
+                return float("inf")
         except Exception:
             latency = float("inf")
         return latency

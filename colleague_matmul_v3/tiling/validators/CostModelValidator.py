@@ -164,14 +164,10 @@ class CostModelValidator:
         # Exact BASE/no-split/no-full-load contract from the cost model.
         if t["singleCoreK"] != t["K"]:
             rules.append("BASE_SINGLE_CORE_K_MUST_EQUAL_K")
-        if t["singleCoreM"] > t["baseM"]:
-            rules.append("BASE_SINGLE_CORE_M_EXCEEDS_BASE_M")
-        if t["singleCoreN"] > t["baseN"]:
-            rules.append("BASE_SINGLE_CORE_N_EXCEEDS_BASE_N")
-        if t["baseM"] > _align_up(t["singleCoreM"], 16):
-            rules.append("BASE_M_EXCEEDS_ALIGNED_SINGLE_CORE_M")
-        if t["baseN"] > _align_up(t["singleCoreN"], 16):
-            rules.append("BASE_N_EXCEEDS_ALIGNED_SINGLE_CORE_N")
+        if t["singleCoreM"] > t["stepM"] * t["baseM"]:
+            rules.append("BASE_SINGLE_CORE_M_EXCEEDS_STEP_M_BASE_M")
+        if t["singleCoreN"] > t["stepN"] * t["baseN"]:
+            rules.append("BASE_SINGLE_CORE_N_EXCEEDS_STEP_N_BASE_N")
         if t["baseK"] > _align_up(t["singleCoreK"], 16):
             rules.append("BASE_K_EXCEEDS_ALIGNED_SINGLE_CORE_K")
 

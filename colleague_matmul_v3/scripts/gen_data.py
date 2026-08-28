@@ -12,8 +12,9 @@ import numpy as np
 import os
 
 
-def gen_golden_data(m: int, n: int, k: int):
-    print(f"[gen_data] M={m} N={n} K={k}")
+def gen_golden_data(m: int, n: int, k: int, *, announce: bool = True):
+    if announce:
+        print(f"[gen_data] M={m} N={n} K={k}")
 
     seed = int(os.environ.get("MM_DATA_SEED", "20260828"))
     rng = np.random.default_rng(seed)

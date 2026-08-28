@@ -195,11 +195,18 @@ class BaseAlgo:
             predicted = (
                 filter_verdict.predicted if filter_verdict is not None else "not_classified"
             )
+            materialized = filter_verdict.tiling if filter_verdict is not None else {}
+            shape_text = (
+                f"{materialized.get('M', 'NA')}x"
+                f"{materialized.get('N', 'NA')}x"
+                f"{materialized.get('K', 'NA')}"
+            )
             latency = record["execution"]["latency_us"]
             latency_text = "NA" if latency is None else f"{latency:.6f}"
             print(
                 "MATMUL_FILTER_AUDIT_CANDIDATE "
                 f"algorithm={record['algorithm']} index={self._audit_index} "
+                f"shape={shape_text} "
                 f"filter={predicted} actual={numeric['status']} "
                 f"latency_us={latency_text} classification={classification}",
                 flush=True,

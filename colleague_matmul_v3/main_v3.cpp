@@ -1,3 +1,6 @@
+// --- BEGIN: colleague standalone path retained verbatim for the 4.log comparison.
+// This path hand-fills MatmulTilingData and launches MM_KERNEL=0 directly.
+#if !defined(MM_USE_OFFICIAL_HOST_TILER) || MM_USE_OFFICIAL_HOST_TILER == 0
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -215,3 +218,120 @@ CHECK_ACL(aclInit(nullptr));
     free(tilingHost);
     return 0;
 }
+// --- END: colleague standalone path retained verbatim.
+
+#else
+
+// +++ BEGIN: official MatMulV3 operator path used for 3.log.
+// aclnnMatmulGetWorkspaceSize enters the operator framework, which creates the
+// gert::TilingContext and invokes the registered MatmulV3TilingFunc.  No tiling
+// field, blockDim, tiling key, or kernel family is selected in this runner.
+#include <cstdlib>
+#include <iostream>
+#include <vector>
+
+#include "acl/acl.h"
+#include "aclnn_matmul.h"
+#include "data_utils.h"
+
+#define OFFICIAL_ACL_CALL(expr)                                                                    \
+    do {                                                                                            \
+        const auto officialRet = (expr);                                                           \
+        if (officialRet != ACL_SUCCESS) {                                                          \
+            std::cerr << #expr << " failed, rc=" << officialRet << std::endl;                     \
+            return 1;                                                                              \
+        }                                                                                           \
+    } while (0)
+
+static int32_t OfficialEnvI(const char *name, int32_t defaultValue)
+{
+    const char *value = std::getenv(name);
+    return value != nullptr && *value != '\0' ? std::atoi(value) : defaultValue;
+}
+
+static aclTensor *CreateOfficialNdTensor(const std::vector<int64_t> &shape, aclDataType dtype, void *deviceAddress)
+{
+    return aclCreateTensor(shape.data(), shape.size(), dtype, nullptr, 0, ACL_FORMAT_ND, shape.data(), shape.size(),
+                           deviceAddress);
+}
+
+int main()
+{
+    const int32_t m = OfficialEnvI("MM_M", 512);
+    const int32_t n = OfficialEnvI("MM_N", 512);
+    const int32_t k = OfficialEnvI("MM_K", 512);
+
+    const size_t aSize = static_cast<size_t>(m) * k * sizeof(uint16_t);
+    const size_t bSize = static_cast<size_t>(k) * n * sizeof(uint16_t);
+    const size_t cSize = static_cast<size_t>(m) * n * sizeof(uint16_t);
+
+    std::vector<uint8_t> aHost(aSize);
+    std::vector<uint8_t> bHost(bSize);
+    std::vector<uint8_t> cHost(cSize);
+    size_t fileSize = 0;
+    if (!ReadFile("./input/x1_gm.bin", fileSize, aHost.data(), aSize) ||
+        !ReadFile("./input/x2_gm.bin", fileSize, bHost.data(), bSize)) {
+        return 1;
+    }
+
+    OFFICIAL_ACL_CALL(aclInit(nullptr));
+    OFFICIAL_ACL_CALL(aclrtSetDevice(0));
+    aclrtStream stream = nullptr;
+    OFFICIAL_ACL_CALL(aclrtCreateStream(&stream));
+
+    void *aDevice = nullptr;
+    void *bDevice = nullptr;
+    void *cDevice = nullptr;
+    OFFICIAL_ACL_CALL(aclrtMalloc(&aDevice, aSize, ACL_MEM_MALLOC_HUGE_FIRST));
+    OFFICIAL_ACL_CALL(aclrtMalloc(&bDevice, bSize, ACL_MEM_MALLOC_HUGE_FIRST));
+    OFFICIAL_ACL_CALL(aclrtMalloc(&cDevice, cSize, ACL_MEM_MALLOC_HUGE_FIRST));
+    OFFICIAL_ACL_CALL(aclrtMemcpy(aDevice, aSize, aHost.data(), aSize, ACL_MEMCPY_HOST_TO_DEVICE));
+    OFFICIAL_ACL_CALL(aclrtMemcpy(bDevice, bSize, bHost.data(), bSize, ACL_MEMCPY_HOST_TO_DEVICE));
+
+    const std::vector<int64_t> aShape = {m, k};
+    const std::vector<int64_t> bShape = {k, n};
+    const std::vector<int64_t> cShape = {m, n};
+    aclTensor *aTensor = CreateOfficialNdTensor(aShape, ACL_FLOAT16, aDevice);
+    aclTensor *bTensor = CreateOfficialNdTensor(bShape, ACL_FLOAT16, bDevice);
+    aclTensor *cTensor = CreateOfficialNdTensor(cShape, ACL_FLOAT16, cDevice);
+    if (aTensor == nullptr || bTensor == nullptr || cTensor == nullptr) {
+        std::cerr << "aclCreateTensor failed" << std::endl;
+        return 1;
+    }
+
+    uint64_t workspaceSize = 0;
+    aclOpExecutor *executor = nullptr;
+    constexpr int8_t cubeMathType = 1;
+    std::cout << "OFFICIAL_HOST_TILER_BEGIN shape=" << m << "x" << n << "x" << k << std::endl;
+    OFFICIAL_ACL_CALL(
+        aclnnMatmulGetWorkspaceSize(aTensor, bTensor, cTensor, cubeMathType, &workspaceSize, &executor));
+
+    void *workspace = nullptr;
+    if (workspaceSize > 0) {
+        OFFICIAL_ACL_CALL(aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST));
+    }
+    OFFICIAL_ACL_CALL(aclnnMatmul(workspace, workspaceSize, executor, stream));
+    OFFICIAL_ACL_CALL(aclrtSynchronizeStream(stream));
+    OFFICIAL_ACL_CALL(aclrtMemcpy(cHost.data(), cSize, cDevice, cSize, ACL_MEMCPY_DEVICE_TO_HOST));
+    if (!WriteFile("./output/output.bin", cHost.data(), cSize)) {
+        return 1;
+    }
+    std::cout << "OFFICIAL_HOST_TILER_END workspace_bytes=" << workspaceSize << std::endl;
+
+    aclDestroyTensor(aTensor);
+    aclDestroyTensor(bTensor);
+    aclDestroyTensor(cTensor);
+    if (workspace != nullptr) {
+        OFFICIAL_ACL_CALL(aclrtFree(workspace));
+    }
+    OFFICIAL_ACL_CALL(aclrtFree(aDevice));
+    OFFICIAL_ACL_CALL(aclrtFree(bDevice));
+    OFFICIAL_ACL_CALL(aclrtFree(cDevice));
+    OFFICIAL_ACL_CALL(aclrtDestroyStream(stream));
+    // Shared-server safety: deliberately do not call aclrtResetDevice.
+    OFFICIAL_ACL_CALL(aclFinalize());
+    return 0;
+}
+// +++ END: official MatMulV3 operator path used for 3.log.
+
+#endif

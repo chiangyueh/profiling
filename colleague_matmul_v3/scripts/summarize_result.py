@@ -11,6 +11,9 @@ def main() -> int:
     parser.add_argument("--variant", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--golden", required=True, type=Path)
+    # +++ BEGIN: official Gitee MatMulV3 emits FP16; colleague direct kernel emits FP32.
+    parser.add_argument("--dtype", choices=("fp16", "fp32"), default="fp32")
+    # +++ END: route-specific output dtype.
     args = parser.parse_args()
 
     record = {"variant": args.variant}
@@ -19,8 +22,11 @@ def main() -> int:
         print(json.dumps(record, separators=(",", ":")))
         return 1
 
-    output = np.fromfile(args.output, dtype=np.float32)
-    golden = np.fromfile(args.golden, dtype=np.float32)
+    # +++ BEGIN: decode each route using its real output contract.
+    dtype = np.float16 if args.dtype == "fp16" else np.float32
+    output = np.fromfile(args.output, dtype=dtype)
+    golden = np.fromfile(args.golden, dtype=dtype)
+    # +++ END: route-specific output decoding.
     if output.size != golden.size:
         record.update(
             status="wrong_output_size",

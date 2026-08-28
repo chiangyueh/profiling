@@ -491,9 +491,22 @@ foreach (_op_name ${OP_LIST})
     )
 endforeach ()
 
-install(DIRECTORY ${OPS_ADV_UTILS_KERNEL_INC}/
-        DESTINATION ${IMPL_INSTALL_DIR}/ascendc/common
-)
+# --- BEGIN: upstream full-tree packaging rule retained for reference.
+# The one-operator MatMulV3 source extraction does not contain src/common/inc/kernel.
+# install(DIRECTORY ${OPS_ADV_UTILS_KERNEL_INC}/
+#         DESTINATION ${IMPL_INSTALL_DIR}/ascendc/common
+# )
+# --- END: upstream full-tree packaging rule retained for reference.
+
+# +++ BEGIN: package the optional common-kernel directory only when it is present.
+# MatMulV3 includes its own op_kernel headers plus CANN's kernel_operator/matmul
+# headers, so this changes packaging only; it does not alter tiling or execution.
+if (EXISTS ${OPS_ADV_UTILS_KERNEL_INC})
+    install(DIRECTORY ${OPS_ADV_UTILS_KERNEL_INC}/
+            DESTINATION ${IMPL_INSTALL_DIR}/ascendc/common
+    )
+endif ()
+# +++ END: package the optional common-kernel directory only when it is present.
 
 foreach (op_dir ${OP_DIR_LIST})
     get_filename_component(_op_name "${op_dir}" NAME)

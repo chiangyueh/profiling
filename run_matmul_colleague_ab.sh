@@ -17,10 +17,18 @@ done
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$ROOT_DIR/colleague_matmul_v3"
+OFFICIAL_SOURCE_DIR="$ROOT_DIR/src/matmul/mat_mul_v3"
 CANN_ROOT="/usr/local/Ascend/ascend-toolkit/latest"
 SOC_VERSION="Ascend910B3"
 SOURCE_SIGNATURE="$(sha256sum \
     "$ROOT_DIR/run_matmul_colleague_ab.sh" \
+    "$ROOT_DIR/build.sh" \
+    "$OFFICIAL_SOURCE_DIR/CMakeLists.txt" \
+    "$OFFICIAL_SOURCE_DIR/op_host/mat_mul_v3_tiling.cpp" \
+    "$OFFICIAL_SOURCE_DIR/op_host/mat_mul_v3_base_tiling.cpp" \
+    "$OFFICIAL_SOURCE_DIR/op_host/mat_mul_v3_l2_cache.cpp" \
+    "$OFFICIAL_SOURCE_DIR/op_host/aclnn_matmul.cpp" \
+    "$OFFICIAL_SOURCE_DIR/op_kernel/mat_mul_v3.cpp" \
     "$SOURCE_DIR/CMakeLists.txt" \
     "$SOURCE_DIR/cmake/npu_lib.cmake" \
     "$SOURCE_DIR/matmul_v3_launch.cpp" \
@@ -29,6 +37,11 @@ SOURCE_SIGNATURE="$(sha256sum \
 STATE_DIR="$ROOT_DIR/.benchmark_state/matmul_v3_colleague_ab/$SOURCE_SIGNATURE"
 RESULT_DIR="$ROOT_DIR/results/matmul_v3_colleague_ab/$SOURCE_SIGNATURE"
 LOG_DIR="$RESULT_DIR/logs"
+PRIVATE_OPP_DIR="$STATE_DIR/private_opp"
+# +++ BEGIN: direct package extraction keeps the exact packaged vendor tree
+# below this run's private state; no installer writes to a system OPP path.
+PRIVATE_VENDOR_ROOT="$PRIVATE_OPP_DIR/packages/vendors/customize"
+# +++ END: run-local packaged vendor root.
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
@@ -42,7 +55,7 @@ report_unhandled_error() {
 }
 trap report_unhandled_error ERR
 
-printf '{"status":"begin","shape":"512x512x512","original_tiling":{"base":"16x32x96","single":"176x192x512","used_cores":9},"prediction":{"computed_elements":4608,"total_elements":262144,"error_ratio":0.982421875},"device":%s,"workdir":"%s","logs":"%s"}\n' \
+printf '{"status":"begin","shape":"512x512x512","log_3":"unmodified_gitee_MatMulV3_host_tiler_and_numeric_verification","log_4":"colleague_hand_filled_tiling_comparison","device":%s,"workdir":"%s","logs":"%s"}\n' \
     "$PHYSICAL_DEVICE" "$STATE_DIR" "$LOG_DIR"
 
 if [[ ! -f "$CANN_ROOT/bin/setenv.bash" ]]; then
@@ -57,6 +70,7 @@ fi
 # CANN's setenv scripts contain optional probes whose intermediate nonzero
 # statuses are harmless but would make an errexit caller terminate silently.
 printf '{"stage":"cann_environment","status":"begin"}\n'
+: >"$LOG_DIR/1.log"
 trap - ERR
 set +e
 set +u
@@ -76,14 +90,68 @@ for required_tool in cmake python3 msprof; do
 done
 printf '{"stage":"cann_environment","status":"passed","setenv_return_code":%d}\n' "$setenv_rc"
 
-build_kernel() {
+# +++ BEGIN: build and privately install the complete unmodified Gitee MatMulV3 package.
+build_official_package() {
+    local log_file="$LOG_DIR/1.log"
+    local package_file
+
+    if [[ -f "$PRIVATE_VENDOR_ROOT/op_api/lib/libcust_opapi.so" ]] &&
+       find "$PRIVATE_VENDOR_ROOT/op_impl/ai_core/tbe/op_tiling" -type f -name 'libcust_opmaster_rt2.0.so' -print -quit |
+           grep -q .; then
+        printf '{"stage":"official_operator_package","status":"cached"}\n'
+        return 0
+    fi
+
+    printf '{"stage":"official_operator_package","status":"begin","source":"%s","parallel":1}\n' \
+        "$OFFICIAL_SOURCE_DIR"
+    # Host-only packaging retains the official dynamic kernel source.  The NPU
+    # compiler therefore builds only the one key actually selected for this
+    # 512x512x512 launch instead of prebuilding every dtype/key combination.
+    if ! CANN_OPS_BUILD_JOBS=1 bash "$ROOT_DIR/build.sh" \
+        -n mat_mul_v3 -c ascend910b -p "$CANN_ROOT" -b host >>"$log_file" 2>&1; then
+        printf '{"stage":"official_operator_package","status":"failed","log":"%s"}\n' "$log_file"
+        return 1
+    fi
+
+    package_file="$(find "$ROOT_DIR/output" -maxdepth 1 -type f -name 'CANN-custom_ops-*.run' -print -quit)"
+    if [[ -z "$package_file" ]]; then
+        printf '{"stage":"official_operator_package","status":"failed","reason":"package installer missing","log":"%s"}\n' \
+            "$log_file"
+        return 1
+    fi
+    mkdir -p "$PRIVATE_OPP_DIR"
+    # --- BEGIN: package installer route retained for reference.
+    # "$package_file" --quiet --install-path="$PRIVATE_OPP_DIR"
+    # --- END: package installer route retained for reference.
+
+    # +++ BEGIN: extract the exact package payload without running install.sh.
+    # The archive is confined to PRIVATE_OPP_DIR, and ASCEND_CUSTOM_OPP_PATH is
+    # set only in the child process that produces 3.log.
+    if ! "$package_file" --tar xf -C "$PRIVATE_OPP_DIR" >>"$log_file" 2>&1; then
+        printf '{"stage":"official_operator_package","status":"failed","reason":"private package extraction failed","log":"%s"}\n' \
+            "$log_file"
+        return 1
+    fi
+    # +++ END: exact run-local package extraction.
+    if [[ ! -f "$PRIVATE_VENDOR_ROOT/op_api/lib/libcust_opapi.so" ]]; then
+        printf '{"stage":"official_operator_package","status":"failed","reason":"private cust_opapi missing","log":"%s"}\n' \
+            "$log_file"
+        return 1
+    fi
+    printf '{"stage":"official_operator_package","status":"passed","private_vendor":"%s"}\n' \
+        "$PRIVATE_VENDOR_ROOT"
+}
+# +++ END: private unmodified Gitee MatMulV3 package.
+
+build_runners() {
     local build_dir="$STATE_DIR/build"
     local out_dir="$STATE_DIR/out"
     local log_file="$LOG_DIR/1.log"
 
-    if [[ ! -x "$out_dir/bin/ascendc_kernels_bbit" ]]; then
+    build_official_package
+    if [[ ! -x "$out_dir/bin/ascendc_kernels_bbit" ||
+          ! -x "$out_dir/bin/ascendc_kernels_bbit_official" ]]; then
         printf '{"stage":"configure","status":"begin"}\n'
-        : >"$log_file"
         if ! cmake -S "$SOURCE_DIR" -B "$build_dir" \
             -DRUN_MODE=npu \
             -DSOC_VERSION="$SOC_VERSION" \
@@ -91,6 +159,7 @@ build_kernel() {
             -DCMAKE_INSTALL_PREFIX="$out_dir" \
             -DASCEND_CANN_PACKAGE_PATH="$CANN_ROOT" \
             -DMMV3_OP_KERNEL_DIR="$SOURCE_DIR/op_kernel" \
+            -DMM_LOCAL_VENDOR_ROOT="$PRIVATE_VENDOR_ROOT" \
             -DMM_ASCEND_KERNEL_LAUNCH_ONLY=ON \
             -DMM_SHARED_SERVER_SAFE=ON >>"$log_file" 2>&1; then
             printf '{"status":"failed","stage":"configure","log":"%s"}\n' "$log_file"
@@ -113,6 +182,58 @@ build_kernel() {
         printf '{"stage":"device_build","status":"cached"}\n'
     fi
 }
+
+# +++ BEGIN: run the unmodified Gitee operator route and write its result to 3.log.
+run_official_variant() {
+    local out_dir="$STATE_DIR/out"
+    local run_dir="$STATE_DIR/run_official_gitee"
+    local log_file="$LOG_DIR/3.log"
+    local tiling_lib_dir
+    local summary
+
+    tiling_lib_dir="$(find "$PRIVATE_VENDOR_ROOT/op_impl/ai_core/tbe/op_tiling/lib/linux" \
+        -mindepth 1 -maxdepth 1 -type d -print -quit)"
+    mkdir -p "$run_dir/input" "$run_dir/output"
+    cp "$STATE_DIR/input/x1_gm.bin" "$run_dir/input/x1_gm.bin"
+    cp "$STATE_DIR/input/x2_gm.bin" "$run_dir/input/x2_gm.bin"
+    cp "$STATE_DIR/output/golden_fp16.bin" "$run_dir/output/golden.bin"
+    rm -f "$run_dir/output/output.bin"
+    : >"$log_file"
+    printf '{"variant":"official_gitee_host_tiler","stage":"npu_run","status":"begin","log":"3.log"}\n'
+
+    set +e
+    (
+        cd "$run_dir"
+        export ASCEND_RT_VISIBLE_DEVICES="$PHYSICAL_DEVICE"
+        export ASCEND_CUSTOM_OPP_PATH="$PRIVATE_VENDOR_ROOT${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+        export LD_LIBRARY_PATH="$PRIVATE_VENDOR_ROOT/op_api/lib:$tiling_lib_dir:$out_dir/lib:$out_dir/lib64:$CANN_ROOT/lib64:${LD_LIBRARY_PATH:-}"
+        export MM_M=512 MM_N=512 MM_K=512
+        msprof op "$out_dir/bin/ascendc_kernels_bbit_official"
+    ) >>"$log_file" 2>&1
+    local run_rc=$?
+
+    if (( run_rc != 0 )); then
+        set -e
+        printf '{"variant":"official_gitee_host_tiler","stage":"npu_run","status":"failed","return_code":%d,"log":"%s"}\n' \
+            "$run_rc" "$log_file"
+        return 1
+    fi
+    printf '{"variant":"official_gitee_host_tiler","stage":"npu_run","status":"passed"}\n'
+    printf '{"variant":"official_gitee_host_tiler","stage":"numeric_verification","status":"begin"}\n'
+    python3 "$OFFICIAL_SOURCE_DIR/examples/AclNNInvocationNaive/verify_result.py" \
+        "$run_dir/output/output.bin" "$run_dir/output/golden.bin" >>"$log_file" 2>&1
+    summary="$(python3 "$SOURCE_DIR/scripts/summarize_result.py" \
+        --variant official_gitee_host_tiler \
+        --dtype fp16 \
+        --output "$run_dir/output/output.bin" \
+        --golden "$run_dir/output/golden.bin")"
+    local summary_rc=$?
+    printf '%s\n' "$summary" >>"$log_file"
+    set -e
+    printf '%s\n' "$summary"
+    return "$summary_rc"
+}
+# +++ END: official route recorded in 3.log.
 
 run_variant() {
     local variant="$1"
@@ -173,9 +294,9 @@ run_variant() {
     [[ $summary_rc -eq 0 && $verify_rc -eq 0 ]]
 }
 
-build_kernel
+build_runners
 
-if [[ ! -f "$STATE_DIR/output/golden.bin" ]]; then
+if [[ ! -f "$STATE_DIR/output/golden.bin" || ! -f "$STATE_DIR/output/golden_fp16.bin" ]]; then
     printf '{"stage":"input_generation","status":"begin"}\n'
     mkdir -p "$STATE_DIR/input" "$STATE_DIR/output"
     (
@@ -188,22 +309,23 @@ else
     printf '{"stage":"input_generation","status":"cached"}\n'
 fi
 
-original_passed=0
-legal_passed=0
-run_variant original 16 32 96 176 192 3 && original_passed=1 || true
-if (( original_passed == 0 )) && [[ -f "$STATE_DIR/run_original/output/output.bin" ]]; then
-    python3 "$SOURCE_DIR/scripts/validate_base_tiling.py" \
-        --base-m 16 --base-n 32 --single-m 176 --single-n 192 --step-m 1 --step-n 1
-fi
-run_variant legal_base 128 256 64 128 256 4 && legal_passed=1 || true
+official_passed=0
+colleague_passed=0
+run_official_variant && official_passed=1 || true
 
-if (( original_passed == 0 && legal_passed == 1 )); then
-    printf '{"status":"root_cause_confirmed","cause":"BASE singleCoreM/singleCoreN exceed stepM*baseM/stepN*baseN; one Iterate/GetTensorC produces one scheduled base region per core","validator":{"status":"rejected","rules":["BASE_SINGLE_CORE_M_EXCEEDS_STEP_M_BASE_M","BASE_SINGLE_CORE_N_EXCEEDS_STEP_N_BASE_N"]}}\n'
+# --- BEGIN: retained colleague hand-filled tiling path, now isolated in 4.log.
+run_variant colleague_hand_filled 16 32 96 176 192 4 && colleague_passed=1 || true
+if (( colleague_passed == 0 )) && [[ -f "$STATE_DIR/run_colleague_hand_filled/output/output.bin" ]]; then
+    python3 "$SOURCE_DIR/scripts/validate_base_tiling.py" \
+        --base-m 16 --base-n 32 --single-m 176 --single-n 192 --step-m 1 --step-n 1 >>"$LOG_DIR/4.log" 2>&1
+fi
+# --- END: retained colleague hand-filled tiling comparison.
+
+if (( official_passed == 1 )); then
+    printf '{"status":"completed","official_gitee_numeric_result":"passed","official_log":"%s","colleague_hand_filled_result":"%s","comparison_log":"%s"}\n' \
+        "$LOG_DIR/3.log" "$([[ $colleague_passed -eq 1 ]] && printf passed || printf wrong_output)" "$LOG_DIR/4.log"
     exit 0
 fi
-if (( original_passed == 1 && legal_passed == 1 )); then
-    printf '{"status":"not_reproduced","cause":"both variants passed"}\n'
-    exit 3
-fi
-printf '{"status":"inconclusive","cause":"legal BASE control did not pass","logs":"%s"}\n' "$LOG_DIR"
+printf '{"status":"failed","cause":"unmodified Gitee MatMulV3 did not pass numeric verification","official_log":"%s","comparison_log":"%s"}\n' \
+    "$LOG_DIR/3.log" "$LOG_DIR/4.log"
 exit 1

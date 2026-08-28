@@ -23,4 +23,6 @@ done
 [[ "$MODE" == "full" && "$PHYSICAL_DEVICE" =~ ^[0-9]+$ ]] || exit 2
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$ROOT_DIR/run_matmul_colleague_ab.sh" -d "$PHYSICAL_DEVICE"
+# +++ BEGIN: the comparison itself is contained in the colleague project.
+exec "$ROOT_DIR/colleague_matmul_v3/run_compare.sh" -d "$PHYSICAL_DEVICE"
+# +++ END: colleague-local comparison entry point.

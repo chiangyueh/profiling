@@ -7,10 +7,6 @@ set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/latest"
     CACHE STRING "ASCEND CANN package installation directory"
 )
 
-# +++ BEGIN: private official MatMulV3 package built from ../src/matmul/mat_mul_v3.
-set(MM_LOCAL_VENDOR_ROOT "" CACHE PATH "private customize vendor root containing the official MatMulV3 package")
-# +++ END: private official MatMulV3 package.
-
 # Путь к исходникам кернела mat_mul_v3 (нужен ХОСТУ ради mat_mul_v3_tiling_data.h).
 # Сам кернел подключается по абсолютному пути внутри matmul_v3_launch.cpp.
 set(MMV3_OP_KERNEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel"
@@ -76,11 +72,7 @@ target_link_libraries(ascendc_kernels_bbit PRIVATE
 )
 # --- END: colleague standalone direct-launch target retained for 4.log.
 
-# +++ BEGIN: official operator/host-tiler target used for 3.log.
-if(NOT MM_LOCAL_VENDOR_ROOT)
-    message(FATAL_ERROR "MM_LOCAL_VENDOR_ROOT must point to the private installed MatMulV3 vendor directory")
-endif()
-
+# +++ BEGIN: installed CANN 8.1 official MatMulV3 host-tiler target used for 3.log.
 add_executable(ascendc_kernels_bbit_official
     ${CMAKE_CURRENT_SOURCE_DIR}/main_v3.cpp
 )
@@ -92,22 +84,19 @@ target_compile_features(ascendc_kernels_bbit_official PRIVATE cxx_std_17)
 target_compile_options(ascendc_kernels_bbit_official PRIVATE -O2 -Wall)
 target_include_directories(ascendc_kernels_bbit_official PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/include
-    ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/matmul/mat_mul_v3/op_host
 )
 target_link_directories(ascendc_kernels_bbit_official PRIVATE
-    ${MM_LOCAL_VENDOR_ROOT}/op_api/lib
     ${ASCEND_CANN_PACKAGE_PATH}/lib64
     ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/lib64
 )
 target_link_libraries(ascendc_kernels_bbit_official PRIVATE
     ascendcl
-    cust_opapi
+    opapi
     acl_op_compiler
     nnopbase
     dl
 )
-# +++ END: official operator/host-tiler target used for 3.log.
+# +++ END: installed CANN 8.1 official MatMulV3 host-tiler target used for 3.log.
 
 install(TARGETS ascendc_kernels_bbit
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

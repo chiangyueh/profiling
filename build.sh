@@ -405,20 +405,10 @@ else
     exit 1
 fi
 
-# --- BEGIN: original build used twice every visible logical CPU.
-# if [ "${PARENT_JOB}" == "false" ];then
-#     CPU_NUM=$(($(cat /proc/cpuinfo | grep "^processor" | wc -l)*2))
-#     JOB_NUM="-j${CPU_NUM}"
-# fi
-# --- END: original unrestricted parallel build.
-
-# +++ BEGIN: bounded build pressure for the shared NPU server.
 if [ "${PARENT_JOB}" == "false" ];then
-    CANN_OPS_BUILD_JOBS=${CANN_OPS_BUILD_JOBS:-1}
-    [[ "${CANN_OPS_BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]] || CANN_OPS_BUILD_JOBS=1
-    JOB_NUM="-j${CANN_OPS_BUILD_JOBS}"
+    CPU_NUM=$(($(cat /proc/cpuinfo | grep "^processor" | wc -l)*2))
+    JOB_NUM="-j${CPU_NUM}"
 fi
-# +++ END: bounded build pressure.
 
 CUSTOM_OPTION="${CUSTOM_OPTION} -DCUSTOM_ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH} -DCHECK_COMPATIBLE=${CHECK_COMPATIBLE}"
 

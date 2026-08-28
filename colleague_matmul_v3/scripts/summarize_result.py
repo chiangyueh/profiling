@@ -11,7 +11,7 @@ def main() -> int:
     parser.add_argument("--variant", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--golden", required=True, type=Path)
-    # +++ BEGIN: official Gitee MatMulV3 emits FP16; colleague direct kernel emits FP32.
+    # +++ BEGIN: official CANN 8.1 MatMulV3 emits FP16; colleague direct kernel emits FP32.
     parser.add_argument("--dtype", choices=("fp16", "fp32"), default="fp32")
     # +++ END: route-specific output dtype.
     args = parser.parse_args()

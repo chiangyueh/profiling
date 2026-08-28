@@ -222,7 +222,7 @@ CHECK_ACL(aclInit(nullptr));
 
 #else
 
-// +++ BEGIN: official MatMulV3 operator path used for 3.log.
+// +++ BEGIN: installed CANN 8.1 official MatMulV3 operator path used for 3.log.
 // aclnnMatmulGetWorkspaceSize enters the operator framework, which creates the
 // gert::TilingContext and invokes the registered MatmulV3TilingFunc.  No tiling
 // field, blockDim, tiling key, or kernel family is selected in this runner.
@@ -231,7 +231,7 @@ CHECK_ACL(aclInit(nullptr));
 #include <vector>
 
 #include "acl/acl.h"
-#include "aclnn_matmul.h"
+#include "aclnnop/aclnn_matmul.h"
 #include "data_utils.h"
 
 #define OFFICIAL_ACL_CALL(expr)                                                                    \
@@ -332,6 +332,6 @@ int main()
     OFFICIAL_ACL_CALL(aclFinalize());
     return 0;
 }
-// +++ END: official MatMulV3 operator path used for 3.log.
+// +++ END: installed CANN 8.1 official MatMulV3 operator path used for 3.log.
 
 #endif

@@ -7,6 +7,7 @@ set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/latest"
     CACHE STRING "ASCEND CANN package installation directory"
 )
 
+# --- BEGIN: colleague standalone direct-launch build path retained for 4.log.
 # Путь к исходникам кернела mat_mul_v3 (нужен ХОСТУ ради mat_mul_v3_tiling_data.h).
 # Сам кернел подключается по абсолютному пути внутри matmul_v3_launch.cpp.
 set(MMV3_OP_KERNEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel"
@@ -37,7 +38,6 @@ else()
     message("invalid RUN_MODE: ${RUN_MODE}")
 endif()
 
-# --- BEGIN: colleague standalone direct-launch target retained for 4.log.
 # Хост: тайлинг заполняется прямо в main_v3.cpp, отдельного tiling.cpp нет.
 add_executable(ascendc_kernels_bbit
     ${CMAKE_CURRENT_SOURCE_DIR}/main_v3.cpp
@@ -70,7 +70,13 @@ target_link_libraries(ascendc_kernels_bbit PRIVATE
     ascendalog
     dl
 )
-# --- END: colleague standalone direct-launch target retained for 4.log.
+
+install(TARGETS ascendc_kernels_bbit
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+# --- END: colleague standalone direct-launch build path retained for 4.log.
 
 # +++ BEGIN: installed CANN 8.1 official MatMulV3 host-tiler target used for 3.log.
 add_executable(ascendc_kernels_bbit_official
@@ -97,12 +103,6 @@ target_link_libraries(ascendc_kernels_bbit_official PRIVATE
     dl
 )
 # +++ END: installed CANN 8.1 official MatMulV3 host-tiler target used for 3.log.
-
-install(TARGETS ascendc_kernels_bbit
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
 
 # +++ BEGIN: install the official host-tiler runner beside the retained runner.
 install(TARGETS ascendc_kernels_bbit_official

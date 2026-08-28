@@ -56,6 +56,7 @@ fi
 
 # CANN's setenv scripts contain optional probes whose intermediate nonzero
 # statuses are harmless but would make an errexit caller terminate silently.
+printf '{"stage":"cann_environment","status":"begin"}\n'
 trap - ERR
 set +e
 set +u
@@ -73,6 +74,7 @@ for required_tool in cmake python3 msprof; do
         exit 1
     fi
 done
+printf '{"stage":"cann_environment","status":"passed","setenv_return_code":%d}\n' "$setenv_rc"
 
 build_kernel() {
     local build_dir="$STATE_DIR/build"
@@ -80,7 +82,7 @@ build_kernel() {
     local log_file="$LOG_DIR/1.log"
 
     if [[ ! -x "$out_dir/bin/ascendc_kernels_bbit" ]]; then
-        printf '{"status":"building","parallel":1}\n'
+        printf '{"stage":"configure","status":"begin"}\n'
         : >"$log_file"
         if ! cmake -S "$SOURCE_DIR" -B "$build_dir" \
             -DRUN_MODE=npu \
@@ -94,17 +96,21 @@ build_kernel() {
             printf '{"status":"failed","stage":"configure","log":"%s"}\n' "$log_file"
             return 1
         fi
+        printf '{"stage":"configure","status":"passed"}\n'
+        printf '{"stage":"device_build","status":"begin","parallel":1}\n'
         if ! cmake --build "$build_dir" --parallel 1 >>"$log_file" 2>&1; then
             printf '{"status":"failed","stage":"build","log":"%s"}\n' "$log_file"
             return 1
         fi
+        printf '{"stage":"device_build","status":"passed"}\n'
+        printf '{"stage":"install","status":"begin"}\n'
         if ! cmake --install "$build_dir" >>"$log_file" 2>&1; then
             printf '{"status":"failed","stage":"install","log":"%s"}\n' "$log_file"
             return 1
         fi
-        printf '{"status":"build_passed"}\n'
+        printf '{"stage":"install","status":"passed"}\n'
     else
-        printf '{"status":"build_cached"}\n'
+        printf '{"stage":"device_build","status":"cached"}\n'
     fi
 }
 
@@ -127,7 +133,7 @@ run_variant() {
     cp "$STATE_DIR/output/golden.bin" "$run_dir/output/golden.bin"
     rm -f "$run_dir/output/output.bin"
     : >"$log_file"
-    printf '{"variant":"%s","status":"npu_run_begin"}\n' "$variant"
+    printf '{"variant":"%s","stage":"npu_run","status":"begin"}\n' "$variant"
 
     set +e
     (
@@ -143,6 +149,13 @@ run_variant() {
     ) >>"$log_file" 2>&1
     local run_rc=$?
 
+    if (( run_rc == 0 )); then
+        printf '{"variant":"%s","stage":"npu_run","status":"passed"}\n' "$variant"
+    else
+        printf '{"variant":"%s","stage":"npu_run","status":"failed","return_code":%d,"log":"%s"}\n' \
+            "$variant" "$run_rc" "$log_file"
+    fi
+    printf '{"variant":"%s","stage":"numeric_verification","status":"begin"}\n' "$variant"
     python3 "$SOURCE_DIR/scripts/verify_result.py" \
         "$run_dir/output/output.bin" "$run_dir/output/golden.bin" >>"$log_file" 2>&1
     local verify_rc=$?
@@ -154,8 +167,6 @@ run_variant() {
     set -e
 
     if (( run_rc != 0 )); then
-        printf '{"variant":"%s","status":"failed","stage":"npu_run","return_code":%d,"log":"%s"}\n' \
-            "$variant" "$run_rc" "$log_file"
         return 1
     fi
     printf '%s\n' "$summary"
@@ -165,13 +176,16 @@ run_variant() {
 build_kernel
 
 if [[ ! -f "$STATE_DIR/output/golden.bin" ]]; then
-    printf '{"status":"generating_shared_input"}\n'
+    printf '{"stage":"input_generation","status":"begin"}\n'
     mkdir -p "$STATE_DIR/input" "$STATE_DIR/output"
     (
         cd "$STATE_DIR"
         export MM_M=512 MM_N=512 MM_K=512
         python3 "$SOURCE_DIR/scripts/gen_data.py"
     ) >>"$LOG_DIR/2.log" 2>&1
+    printf '{"stage":"input_generation","status":"passed"}\n'
+else
+    printf '{"stage":"input_generation","status":"cached"}\n'
 fi
 
 original_passed=0

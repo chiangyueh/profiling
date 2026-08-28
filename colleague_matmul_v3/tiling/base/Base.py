@@ -125,7 +125,7 @@ class BaseAlgo:
             if audit_enabled:
                 # Import lazily to avoid BaseValidator's module import cycle.
                 from tiling.validators.CostModelValidator import CostModelValidator
-                filter_verdict = CostModelValidator().classify(params)
+                filter_verdict = CostModelValidator().explain(params)
             else:
                 filter_verdict = None
             dur = self._run_estimator(params)
@@ -148,27 +148,27 @@ class BaseAlgo:
                 classification = "legacy_rejected_not_audited"
             elif run_info.get("status") == "failed":
                 classification = (
-                    "yes_execution_failed"
+                    "accepted_execution_failed"
                     if filter_verdict.valid
-                    else "no_execution_failed"
+                    else "rejected_execution_failed"
                 )
             elif numeric["status"] == "correct":
                 classification = (
-                    "yes_correct"
+                    "accepted_correct"
                     if filter_verdict.valid
-                    else "no_correct_filter_false_negative"
+                    else "rejected_correct_filter_false_negative"
                 )
             elif numeric["status"] == "wrong":
                 classification = (
-                    "yes_wrong_filter_false_positive"
+                    "accepted_wrong_filter_false_positive"
                     if filter_verdict.valid
-                    else "no_wrong"
+                    else "rejected_wrong"
                 )
             else:
                 classification = (
-                    "yes_execution_failed"
+                    "accepted_execution_failed"
                     if filter_verdict.valid
-                    else "no_execution_failed"
+                    else "rejected_execution_failed"
                 )
             record = {
                 "schema": "matmul_cost_filter_audit_v1",
@@ -178,9 +178,9 @@ class BaseAlgo:
                 "algorithm": getattr(self, "audit_algorithm", type(self).__name__),
                 "proposed_params": proposed,
                 "executed_params": {p.name: int(p.value) for p in params},
-                "legacy_resource_filter": "yes" if legacy_valid else "no",
+                "legacy_resource_filter": legacy_valid,
                 "cost_model_filter": None if filter_verdict is None else {
-                    "predicted": filter_verdict.predicted,
+                    "accepted": filter_verdict.valid,
                     "rules": list(filter_verdict.rules),
                     "materialized_tiling": filter_verdict.tiling,
                 },
@@ -192,9 +192,7 @@ class BaseAlgo:
                 "classification": classification,
             }
             self._append_audit(record)
-            predicted = (
-                filter_verdict.predicted if filter_verdict is not None else "not_classified"
-            )
+            accepted = filter_verdict.valid if filter_verdict is not None else None
             materialized = filter_verdict.tiling if filter_verdict is not None else {}
             shape_text = (
                 f"{materialized.get('M', 'NA')}x"
@@ -207,7 +205,7 @@ class BaseAlgo:
                 "MATMUL_FILTER_AUDIT_CANDIDATE "
                 f"algorithm={record['algorithm']} index={self._audit_index} "
                 f"shape={shape_text} "
-                f"filter={predicted} actual={numeric['status']} "
+                f"filter={str(accepted).lower()} actual={numeric['status']} "
                 f"latency_us={latency_text} classification={classification}",
                 flush=True,
             )

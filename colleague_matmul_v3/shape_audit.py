@@ -111,7 +111,10 @@ def load_candidate_rows(log_dir: Path) -> list[dict]:
 def summarize(log_dir: Path, summary_path: Path) -> dict:
     rows = load_candidate_rows(log_dir)
     classifications = Counter(row["classification"] for row in rows)
-    predictions = Counter(row["cost_model_filter"]["predicted"] for row in rows)
+    decisions = Counter(
+        "accepted" if row["cost_model_filter"]["accepted"] else "rejected"
+        for row in rows
+    )
     numeric = Counter(row["numeric"]["status"] for row in rows)
     shapes = {
         (
@@ -128,12 +131,12 @@ def summarize(log_dir: Path, summary_path: Path) -> dict:
         "total": len(rows),
         "unique_shapes": len(shapes),
         "classifications": dict(sorted(classifications.items())),
-        "predictions": dict(sorted(predictions.items())),
+        "filter_decisions": dict(sorted(decisions.items())),
         "numeric": dict(sorted(numeric.items())),
         "latency_available": sum(row["execution"]["latency_us"] is not None for row in rows),
         "attention": {
-            "filter_false_negative": classifications["no_correct_filter_false_negative"],
-            "filter_false_positive": classifications["yes_wrong_filter_false_positive"],
+            "filter_false_negative": classifications["rejected_correct_filter_false_negative"],
+            "filter_false_positive": classifications["accepted_wrong_filter_false_positive"],
         },
     }
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -147,7 +150,7 @@ def main() -> int:
         is_stop=lambda _results: False,
         validator=ExactCandidateValidator(),
     )
-    print("MATMUL_FILTER_SHAPE_AUDIT_BEGIN shapes=200 predicted_yes=100 predicted_no=100")
+    print("MATMUL_FILTER_SHAPE_AUDIT_BEGIN shapes=200 accepted=100 rejected=100")
     for index, shape in enumerate(shapes):
         gen_golden_data(*shape, announce=False)
         runner._duration(candidate_params(index, shape))

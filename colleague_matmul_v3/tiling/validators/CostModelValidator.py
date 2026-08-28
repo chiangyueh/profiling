@@ -16,13 +16,9 @@ def _align_up(value: int, alignment: int) -> int:
 
 @dataclass(frozen=True)
 class FilterVerdict:
-    predicted: str
+    valid: bool
     rules: tuple[str, ...]
     tiling: dict[str, int]
-
-    @property
-    def valid(self) -> bool:
-        return self.predicted == "yes"
 
 
 class CostModelValidator:
@@ -105,7 +101,12 @@ class CostModelValidator:
             "tilingEnable": 0,
         }
 
-    def classify(self, params: Iterable[BaseParam]) -> FilterVerdict:
+    def classify(self, params: Iterable[BaseParam]) -> bool:
+        """Return the final gate decision: True accepts, False rejects."""
+        return self.explain(params).valid
+
+    def explain(self, params: Iterable[BaseParam]) -> FilterVerdict:
+        """Return the decision together with the rules used by audit logs."""
         t = self.materialize_base_tiling(params)
         rules: list[str] = []
 
@@ -199,7 +200,7 @@ class CostModelValidator:
 
         unique_rules = tuple(dict.fromkeys(rules))
         return FilterVerdict(
-            predicted="no" if unique_rules else "yes",
+            valid=not unique_rules,
             rules=unique_rules,
             tiling=t,
         )

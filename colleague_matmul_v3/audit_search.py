@@ -209,8 +209,8 @@ def summarize(
             for name, values in sorted(by_algorithm.items())
         },
         "attention": {
-            "filter_false_negative": counts["no_correct_filter_false_negative"],
-            "filter_false_positive": counts["yes_wrong_filter_false_positive"],
+            "filter_false_negative": counts["rejected_correct_filter_false_negative"],
+            "filter_false_positive": counts["accepted_wrong_filter_false_positive"],
         },
     }
     summary_path.write_text(

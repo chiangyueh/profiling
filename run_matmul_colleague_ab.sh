@@ -20,6 +20,7 @@ SOURCE_DIR="$ROOT_DIR/colleague_matmul_v3"
 CANN_ROOT="/usr/local/Ascend/ascend-toolkit/latest"
 SOC_VERSION="Ascend910B3"
 SOURCE_SIGNATURE="$(sha256sum \
+    "$ROOT_DIR/run_matmul_colleague_ab.sh" \
     "$SOURCE_DIR/CMakeLists.txt" \
     "$SOURCE_DIR/cmake/npu_lib.cmake" \
     "$SOURCE_DIR/matmul_v3_launch.cpp" \
@@ -31,6 +32,19 @@ LOG_DIR="$RESULT_DIR/logs"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
+report_unhandled_error() {
+    local rc=$?
+    local line="${BASH_LINENO[0]:-unknown}"
+    trap - ERR
+    printf '{"status":"failed","stage":"shell","return_code":%d,"line":"%s","logs":"%s"}\n' \
+        "$rc" "$line" "$LOG_DIR" >&2
+    exit "$rc"
+}
+trap report_unhandled_error ERR
+
+printf '{"status":"begin","shape":"512x512x512","original_tiling":{"base":"16x32x96","single":"176x192x512","used_cores":9},"prediction":{"computed_elements":4608,"total_elements":262144,"error_ratio":0.982421875},"device":%s,"workdir":"%s","logs":"%s"}\n' \
+    "$PHYSICAL_DEVICE" "$STATE_DIR" "$LOG_DIR"
+
 if [[ ! -f "$CANN_ROOT/bin/setenv.bash" ]]; then
     printf '{"status":"failed","stage":"environment","reason":"CANN setenv.bash not found"}\n'
     exit 1
@@ -40,9 +54,25 @@ if ! grep -q 'toolkit_running_version=.*8\.1\.RC1' "$CANN_ROOT/version.cfg"; the
     exit 1
 fi
 
+# CANN's setenv scripts contain optional probes whose intermediate nonzero
+# statuses are harmless but would make an errexit caller terminate silently.
+trap - ERR
+set +e
 set +u
-source "$CANN_ROOT/bin/setenv.bash" >/dev/null 2>&1
+source "$CANN_ROOT/bin/setenv.bash" >>"$LOG_DIR/1.log" 2>&1
+setenv_rc=$?
 set -u
+set -e
+trap report_unhandled_error ERR
+printf 'CANN_SETENV_RETURN_CODE=%d\n' "$setenv_rc" >>"$LOG_DIR/1.log"
+
+for required_tool in cmake python3 msprof; do
+    if ! command -v "$required_tool" >/dev/null 2>&1; then
+        printf '{"status":"failed","stage":"environment","reason":"required tool not found","tool":"%s","logs":"%s"}\n' \
+            "$required_tool" "$LOG_DIR"
+        exit 1
+    fi
+done
 
 build_kernel() {
     local build_dir="$STATE_DIR/build"
@@ -131,9 +161,6 @@ run_variant() {
     printf '%s\n' "$summary"
     [[ $summary_rc -eq 0 && $verify_rc -eq 0 ]]
 }
-
-printf '{"status":"begin","shape":"512x512x512","original_tiling":{"base":"16x32x96","single":"176x192x512","used_cores":9},"prediction":{"computed_elements":4608,"total_elements":262144,"error_ratio":0.982421875},"device":%s,"workdir":"%s","logs":"%s"}\n' \
-    "$PHYSICAL_DEVICE" "$STATE_DIR" "$LOG_DIR"
 
 build_kernel
 

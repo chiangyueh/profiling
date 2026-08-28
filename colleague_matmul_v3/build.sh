@@ -90,11 +90,10 @@ cmake -B build \
     -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
     -DCMAKE_INSTALL_PREFIX=${INSTALL_PREFIX} \
     -DASCEND_CANN_PACKAGE_PATH=${_ASCEND_INSTALL_PATH}
-cmake --build build -j
+cmake --build build -j1
 cmake --install build
 
 rm -f ascendc_kernels_bbit
 cp ./out/bin/ascendc_kernels_bbit ./
 
 export LD_LIBRARY_PATH=$(pwd)/out/lib:$(pwd)/out/lib64:${_ASCEND_INSTALL_PATH}/lib64:$LD_LIBRARY_PATH
-

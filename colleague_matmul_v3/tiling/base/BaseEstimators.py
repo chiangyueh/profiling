@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .Base import BaseAlgo, BaseParam
 from pathlib import Path
 import os
@@ -59,10 +61,27 @@ class BaseAlgoReal(BaseAlgo):
                 f.unlink()
         for d in Path(".").glob("OPPROF_*"):
             shutil.rmtree(d)
-        subprocess.run(["bash", self.runner, "-r", "npu"], env=env,
-                       capture_output=True, text=True)
+        output_path = Path("output/output.bin")
+        output_path.unlink(missing_ok=True)
+        completed = subprocess.run(
+            ["bash", self.runner, "-r", "npu", "-v", "Ascend910B3"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self._last_run = {
+            "status": "passed" if completed.returncode == 0 else "failed",
+            "return_code": completed.returncode,
+            "stdout_tail": completed.stdout[-2000:],
+            "stderr_tail": completed.stderr[-2000:],
+        }
+
+        if completed.returncode != 0:
+            return float("inf")
 
         dur = self._get_time()
+        if dur == float("inf"):
+            self._last_run["status"] = "timing_missing"
         return dur
     
     def _get_time(self) -> float:

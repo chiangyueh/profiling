@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from tiling.validators import MatmulValidator
 from .GaParam import GaParam
 
@@ -5,4 +7,3 @@ from .GaParam import GaParam
 class GaMatmulValidator(MatmulValidator):
     def _make_param(self, name: str, value: int, is_const: bool, domain: list[int] | None = None) -> GaParam:
         return GaParam(name=name, value=value, is_const=is_const, domain=domain or [value])
-        

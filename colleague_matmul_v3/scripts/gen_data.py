@@ -15,8 +15,10 @@ import os
 def gen_golden_data(m: int, n: int, k: int):
     print(f"[gen_data] M={m} N={n} K={k}")
 
-    x1_gm = np.random.randint(1, 10, [m, k]).astype(np.float16)
-    x2_gm = np.random.randint(1, 10, [k, n]).astype(np.float16)
+    seed = int(os.environ.get("MM_DATA_SEED", "20260828"))
+    rng = np.random.default_rng(seed)
+    x1_gm = rng.integers(1, 10, [m, k]).astype(np.float16)
+    x2_gm = rng.integers(1, 10, [k, n]).astype(np.float16)
     golden = np.matmul(x1_gm.astype(np.float32), x2_gm.astype(np.float32)).astype(np.float32)
     os.system("mkdir -p input")
     os.system("mkdir -p output")

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from tiling.base import BaseValidator, BaseParam
 from tiling.limits import MatmulLimits
 import random

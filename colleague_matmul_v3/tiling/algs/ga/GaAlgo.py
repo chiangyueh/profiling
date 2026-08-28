@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from tiling.base.Base import BaseAlgo, BaseResult, BaseValidator
 from .Population import Individual, Population
 from typing import Callable

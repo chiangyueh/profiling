@@ -68,7 +68,9 @@ elif [ "${RUN_MODE}" = "cpu" ]; then
 fi
 
 if [ "${RUN_MODE}" = "npu" ]; then
-    MM_M=$MM_M MM_N=$MM_N MM_K=$MM_K python3 scripts/gen_data.py
+    if [ "${MM_REUSE_GOLDEN:-0}" != "1" ] || [ ! -s input/x1_gm.bin ] || [ ! -s input/x2_gm.bin ] || [ ! -s output/golden.bin ]; then
+        MM_M=$MM_M MM_N=$MM_N MM_K=$MM_K python3 scripts/gen_data.py
+    fi
     msprof op ./ascendc_kernels_bbit
 elif [ "${RUN_MODE}" = "sim" ]; then
     msprof op simulator --soc-version=${SOC_VERSION} ./ascendc_kernels_bbit

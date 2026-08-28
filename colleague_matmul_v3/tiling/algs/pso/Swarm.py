@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from tiling.base.Base import BaseParam
 import random
 import copy

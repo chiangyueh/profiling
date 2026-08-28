@@ -58,7 +58,7 @@ int32_t main(int32_t argc, char *argv[])
     const uint32_t kCnt = CeilDiv(K, singleCoreK);
 
     uint32_t usedCoreNum = isMultiK ? (mCnt * nCnt * kCnt) : (mCnt * nCnt);
-    usedCoreNum = Min(usedCoreNum, 24u);
+    usedCoreNum = static_cast<uint32_t>(EnvI("MM_USED_CORE_NUM", Min(usedCoreNum, 20u)));
 
     size_t aSize = static_cast<size_t>(M) * K * sizeof(uint16_t);
     size_t bSize = static_cast<size_t>(K) * N * sizeof(uint16_t);
@@ -114,12 +114,18 @@ int32_t main(int32_t argc, char *argv[])
     t->matmulRunInfo.isNzA  = 0;
     t->matmulRunInfo.isNzB  = 0;
 
+    // One legal L2 partition containing the full logical output grid by default.
+    // Environment overrides remain available for later L2-specific audits.
+    const uint32_t l2MBlock = static_cast<uint32_t>(EnvI("MM_L2_M_TILE_BLOCK", mCnt));
+    const uint32_t l2NBlock = static_cast<uint32_t>(EnvI("MM_L2_N_TILE_BLOCK", nCnt));
     t->l2cacheUseInfo.l2CacheFlag   = 0;
-    t->tileL2cacheTiling.mTileCntL2 = 1;
-    t->tileL2cacheTiling.nTileCntL2 = 1;
-    t->tileL2cacheTiling.mTileBlock = 1;
-    t->tileL2cacheTiling.nTileBlock = 1;
-    t->tileL2cacheTiling.calOrder   = 0;
+    t->tileL2cacheTiling.mTileCntL2 = static_cast<uint32_t>(EnvI(
+        "MM_L2_M_TILE_CNT", l2MBlock ? CeilDiv(mCnt, l2MBlock) : 1));
+    t->tileL2cacheTiling.nTileCntL2 = static_cast<uint32_t>(EnvI(
+        "MM_L2_N_TILE_CNT", l2NBlock ? CeilDiv(nCnt, l2NBlock) : 1));
+    t->tileL2cacheTiling.mTileBlock = l2MBlock;
+    t->tileL2cacheTiling.nTileBlock = l2NBlock;
+    t->tileL2cacheTiling.calOrder   = static_cast<uint32_t>(EnvI("MM_L2_ITERATE_ORDER", 0));
 
     uint32_t blockDim = t->matmulTiling.usedCoreNum;
 
@@ -206,7 +212,6 @@ CHECK_ACL(aclInit(nullptr));
     CHECK_ACL(aclrtFreeHost(aHost));  CHECK_ACL(aclrtFreeHost(bHost));
     CHECK_ACL(aclrtFreeHost(cHost));
     CHECK_ACL(aclrtDestroyStream(stream));
-    CHECK_ACL(aclrtResetDevice(deviceId));
     CHECK_ACL(aclFinalize());
 #endif
 

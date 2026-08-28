@@ -9,7 +9,7 @@ set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/latest"
 
 # Путь к исходникам кернела mat_mul_v3 (нужен ХОСТУ ради mat_mul_v3_tiling_data.h).
 # Сам кернел подключается по абсолютному пути внутри matmul_v3_launch.cpp.
-set(MMV3_OP_KERNEL_DIR "/home/spbgu_jointlab/matmul_v3/op_kernel"
+set(MMV3_OP_KERNEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/op_kernel"
     CACHE STRING "path to mat_mul_v3 op_kernel sources"
 )
 

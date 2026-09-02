@@ -9,7 +9,7 @@ from itertools import product
 from math import floor, gcd, prod
 
 from .hardware import Hardware
-from .ir import AccessMode, Axis, MemorySpace, Operator
+from .ir import AccessMode, Axis, MemorySpace, Operator, dtype_bytes
 from .schedule import (
     RankedTiling,
     IdealRegion,
@@ -148,6 +148,14 @@ def _algorithm_tile_levels(
     preserve_declared: bool = False,
 ) -> tuple[tuple[tuple[int, int, int], ...], ...]:
     algorithm = operator.algorithms[algorithm_index]
+    unknown_coupled = set(space.coupled_task_axes) - {
+        axis.name for axis in operator.axes
+    }
+    if unknown_coupled:
+        raise ValueError(
+            "coupled task axes are not present in the operator: "
+            + ", ".join(sorted(unknown_coupled))
+        )
     core_count = hardware.core_count(algorithm.core_resource)
     inner_options = _algorithm_tile_options(
         operator, algorithm_index, hardware, space, preserve_declared
@@ -160,7 +168,9 @@ def _algorithm_tile_levels(
         explicit_cache = explicit_caches.get(axis.name)
         levels: list[tuple[int, int, int]] = []
         for inner in inner_options[axis.name]:
-            if explicit is not None:
+            if axis.name in space.coupled_task_axes:
+                tasks = (inner,)
+            elif explicit is not None:
                 tasks = tuple(sorted(set(
                     value
                     for value in explicit
@@ -795,6 +805,503 @@ def _replace_plan(plan: TilingPlan, **changes) -> TilingPlan:
     return TilingPlan(**values)
 
 
+def _level_for_targets(
+    levels: tuple[tuple[int, int, int], ...],
+    inner: int,
+    task: int,
+    cache: int,
+) -> tuple[int, int, int]:
+    """Select the declared legal level nearest three physical targets."""
+
+    same_inner = tuple(level for level in levels if level[0] == inner)
+    return _nearest_level(same_inner or levels, (inner, task, cache))
+
+
+def _local_memory_pressure(
+    operator: Operator,
+    algorithm,
+    axis_names: tuple[str, ...],
+    levels: tuple[tuple[int, int, int], ...],
+    buffers: tuple[tuple[MemorySpace, int], ...],
+    reductions: tuple[tuple[str, int], ...],
+    hardware: Hardware,
+) -> float:
+    """Return the largest scratchpad-capacity ratio for an inner tile."""
+
+    tiles = {
+        name: level[0] for name, level in zip(axis_names, levels)
+    }
+    buffer_counts = dict(buffers)
+    allocations: dict[tuple[str, MemorySpace], int] = {}
+    for stage in algorithm.stages:
+        for access in stage.accesses:
+            tensor = operator.tensor(access.tensor)
+            element_bytes = dtype_bytes(access.local_dtype or tensor.dtype)
+            elements = prod(
+                min(operator.axis(axis).extent, tiles[axis])
+                for axis in access.axes
+            ) if access.axes else 1
+            for memory in access.path:
+                if memory in (MemorySpace.GM, MemorySpace.L2):
+                    continue
+                key = (tensor.name, memory)
+                allocations[key] = max(
+                    allocations.get(key, 0), elements * element_bytes
+                )
+    usage: dict[MemorySpace, int] = {}
+    for (_, memory), byte_count in allocations.items():
+        usage[memory] = usage.get(memory, 0) + (
+            byte_count * buffer_counts.get(memory, 1)
+        )
+    if prod(value for _, value in reductions) > 1:
+        output_elements = prod(tiles[axis] for axis in algorithm.output_axes)
+        usage[MemorySpace.UB] = usage.get(MemorySpace.UB, 0) + (
+            2 * output_elements * dtype_bytes(algorithm.partial_dtype)
+        )
+    return max(
+        (
+            byte_count / capacity
+            for memory, byte_count in usage.items()
+            if (capacity := hardware.capacities.get(memory, 0)) > 0
+        ),
+        default=0.0,
+    )
+
+
+def _fit_inner_capacity(
+    operator: Operator,
+    algorithm,
+    axis_names: tuple[str, ...],
+    levels_by_axis: tuple[tuple[tuple[int, int, int], ...], ...],
+    levels: tuple[tuple[int, int, int], ...],
+    buffers: tuple[tuple[MemorySpace, int], ...],
+    reductions: tuple[tuple[str, int], ...],
+    hardware: Hardware,
+) -> tuple[tuple[int, int, int], ...]:
+    """Project a target geometry onto all declared scratchpad constraints."""
+
+    current = levels
+    pressure = _local_memory_pressure(
+        operator, algorithm, axis_names, current, buffers, reductions, hardware
+    )
+    while pressure > 1.0:
+        alternatives: list[
+            tuple[float, int, tuple[tuple[int, int, int], ...]]
+        ] = []
+        for axis_index, options in enumerate(levels_by_axis):
+            inner_values = sorted(set(level[0] for level in options))
+            position = inner_values.index(current[axis_index][0])
+            if position == 0:
+                continue
+            inner = inner_values[position - 1]
+            changed = list(current)
+            changed[axis_index] = _level_for_targets(
+                options,
+                inner,
+                max(inner, current[axis_index][1]),
+                max(inner, current[axis_index][2]),
+            )
+            changed_tuple = tuple(changed)
+            next_pressure = _local_memory_pressure(
+                operator, algorithm, axis_names, changed_tuple,
+                buffers, reductions, hardware,
+            )
+            retained_volume = prod(level[0] for level in changed_tuple)
+            alternatives.append(
+                (next_pressure, -retained_volume, changed_tuple)
+            )
+        if not alternatives:
+            break
+        next_pressure, _, current = min(alternatives)
+        if next_pressure >= pressure and current == levels:
+            break
+        pressure = next_pressure
+    return current
+
+
+def _balanced_output_parts(
+    operator: Operator,
+    algorithm,
+    levels: tuple[tuple[int, int, int], ...],
+    core_count: int,
+) -> dict[str, int]:
+    """Factor one physical core wave over output axes by useful extent."""
+
+    by_name = {
+        axis.name: level for axis, level in zip(operator.axes, levels)
+    }
+    parts = {axis: 1 for axis in algorithm.output_axes}
+    limits = {
+        axis: ceil_div(
+            operator.axis(axis).extent,
+            min(operator.axis(axis).extent, by_name[axis][0]),
+        )
+        for axis in algorithm.output_axes
+    }
+    while prod(parts.values()) < core_count:
+        candidates = tuple(
+            axis for axis in algorithm.output_axes
+            if parts[axis] < limits[axis]
+        )
+        if not candidates:
+            break
+        selected = max(
+            candidates,
+            key=lambda axis: (
+                operator.axis(axis).extent
+                / (parts[axis] * by_name[axis][0]),
+                -algorithm.output_axes.index(axis),
+            ),
+        )
+        parts[selected] += 1
+    return parts
+
+
+def _output_part_profiles(
+    operator: Operator,
+    algorithm,
+    levels_by_axis: tuple[tuple[tuple[int, int, int], ...], ...],
+    levels: tuple[tuple[int, int, int], ...],
+    core_count: int,
+    coupled_task_axes: frozenset[str],
+) -> tuple[tuple[tuple[str, int], ...], ...]:
+    """Derive exact core-wave grids without a tile Cartesian product."""
+
+    by_name = {
+        axis.name: level for axis, level in zip(operator.axes, levels)
+    }
+    axes = algorithm.output_axes
+    options_by_name = {
+        axis.name: options
+        for axis, options in zip(operator.axes, levels_by_axis)
+    }
+    limits = {}
+    for axis in axes:
+        inner = (
+            min(level[0] for level in options_by_name[axis])
+            if axis in coupled_task_axes else by_name[axis][0]
+        )
+        limits[axis] = ceil_div(
+            operator.axis(axis).extent,
+            min(operator.axis(axis).extent, inner),
+        )
+    profiles: list[tuple[tuple[str, int], ...]] = []
+
+    def add(parts: dict[str, int]) -> None:
+        profile = tuple((axis, parts.get(axis, 1)) for axis in axes)
+        if profile not in profiles:
+            profiles.append(profile)
+
+    add(_balanced_output_parts(
+        operator, algorithm, levels, core_count
+    ))
+    for left_index, left in enumerate(axes):
+        if core_count <= limits[left]:
+            add({left: core_count})
+        for right in axes[left_index + 1:]:
+            for left_parts in range(1, core_count + 1):
+                if core_count % left_parts:
+                    continue
+                right_parts = core_count // left_parts
+                if left_parts <= limits[left] and right_parts <= limits[right]:
+                    add({left: left_parts, right: right_parts})
+    return tuple(profiles)
+
+
+def _retarget_tasks(
+    operator: Operator,
+    algorithm,
+    levels_by_axis: tuple[tuple[tuple[int, int, int], ...], ...],
+    levels: tuple[tuple[int, int, int], ...],
+    output_parts: tuple[tuple[str, int], ...],
+    coupled_task_axes: frozenset[str],
+) -> tuple[tuple[int, int, int], ...]:
+    parts = dict(output_parts)
+    result: list[tuple[int, int, int]] = []
+    for axis, options, level in zip(operator.axes, levels_by_axis, levels):
+        inner = level[0]
+        task = (
+            align_up(ceil_div(axis.extent, parts[axis.name]), axis.alignment)
+            if axis.name in parts else inner
+        )
+        if axis.name in parts and axis.name in coupled_task_axes:
+            result.append(_nearest_level(options, (task, task, task)))
+        else:
+            result.append(_level_for_targets(options, inner, task, task))
+    return tuple(result)
+
+
+def _l2_footprint(
+    operator: Operator,
+    algorithm,
+    axis_names: tuple[str, ...],
+    levels: tuple[tuple[int, int, int], ...],
+    reductions: tuple[tuple[str, int], ...],
+) -> int:
+    caches = {
+        name: level[2] for name, level in zip(axis_names, levels)
+    }
+    reduction_values = dict(reductions)
+    reduction_count = prod(reduction_values.values()) if reductions else 1
+    allocations: dict[str, int] = {}
+    for stage in algorithm.stages:
+        for access in stage.accesses:
+            if MemorySpace.GM not in access.path:
+                continue
+            tensor = operator.tensor(access.tensor)
+            value_dtype = (
+                algorithm.partial_dtype
+                if access.is_result and reduction_count > 1 else tensor.dtype
+            )
+            elements = 1
+            for axis_name in access.axes:
+                axis = operator.axis(axis_name)
+                if axis_name in algorithm.output_axes:
+                    extent = min(axis.extent, caches[axis_name])
+                elif axis_name in algorithm.reduction_axes:
+                    extent = ceil_div(
+                        axis.extent, reduction_values.get(axis_name, 1)
+                    )
+                else:
+                    extent = axis.extent
+                elements *= extent
+            allocations[tensor.name] = max(
+                allocations.get(tensor.name, 0),
+                elements * dtype_bytes(value_dtype),
+            )
+    return sum(allocations.values())
+
+
+def _reuse_axis_weights(operator: Operator, algorithm, traversal) -> dict[str, int]:
+    """Count source bytes that one larger cache axis can reuse."""
+
+    weights = {axis: 0 for axis in algorithm.output_axes}
+    for stage in algorithm.stages:
+        for access in stage.accesses:
+            if (
+                access.mode != AccessMode.READ
+                or MemorySpace.GM not in access.path
+                or not any(
+                    memory in access.path
+                    for memory in (MemorySpace.L1, MemorySpace.UB)
+                )
+            ):
+                continue
+            tensor = operator.tensor(access.tensor)
+            for axis_name in reversed(traversal):
+                if axis_name in access.axes:
+                    break
+                weights[axis_name] += tensor.elements * dtype_bytes(tensor.dtype)
+    return weights
+
+
+def _expand_cache_for_reuse(
+    operator: Operator,
+    algorithm,
+    axis_names: tuple[str, ...],
+    levels_by_axis: tuple[tuple[tuple[int, int, int], ...], ...],
+    levels: tuple[tuple[int, int, int], ...],
+    reductions: tuple[tuple[str, int], ...],
+    traversal: tuple[str, ...],
+    hardware: Hardware,
+) -> tuple[tuple[int, int, int], ...]:
+    """Grow only reuse-bearing cache axes up to the physical L2 boundary."""
+
+    capacity = hardware.capacities.get(MemorySpace.L2, 0)
+    if capacity <= 0:
+        return levels
+    weights = _reuse_axis_weights(operator, algorithm, traversal)
+    current = levels
+    while True:
+        alternatives: list[
+            tuple[float, int, tuple[tuple[int, int, int], ...]]
+        ] = []
+        for axis_index, (axis, options) in enumerate(
+            zip(operator.axes, levels_by_axis)
+        ):
+            weight = weights.get(axis.name, 0)
+            if weight <= 0:
+                continue
+            compatible = tuple(
+                level for level in options
+                if level[0] == current[axis_index][0]
+                and level[1] == current[axis_index][1]
+            )
+            cache_values = sorted(set(level[2] for level in compatible))
+            position = cache_values.index(current[axis_index][2])
+            if position + 1 == len(cache_values):
+                continue
+            changed = list(current)
+            changed[axis_index] = (
+                current[axis_index][0], current[axis_index][1],
+                cache_values[position + 1],
+            )
+            changed_tuple = tuple(changed)
+            footprint = _l2_footprint(
+                operator, algorithm, axis_names, changed_tuple, reductions
+            )
+            if footprint <= capacity:
+                gain = weight * (
+                    cache_values[position + 1] / current[axis_index][2] - 1.0
+                )
+                alternatives.append((-gain, footprint, changed_tuple))
+        if not alternatives:
+            return current
+        _, _, current = min(alternatives)
+
+
+def _best_feasible_buffer(
+    operator: Operator,
+    algorithm,
+    axis_names: tuple[str, ...],
+    levels: tuple[tuple[int, int, int], ...],
+    reductions: tuple[tuple[str, int], ...],
+    profiles: tuple[tuple[tuple[MemorySpace, int], ...], ...],
+    hardware: Hardware,
+) -> tuple[tuple[MemorySpace, int], ...]:
+    """Maximize declared pipeline overlap without overflowing scratchpads."""
+
+    boundaries = algorithm.pipeline_boundaries or tuple(
+        (memory,) for memory in algorithm.buffered_spaces
+    )
+    feasible = tuple(
+        profile for profile in profiles
+        if _local_memory_pressure(
+            operator, algorithm, axis_names, levels, profile,
+            reductions, hardware,
+        ) <= 1.0
+    )
+    if not feasible:
+        return profiles[0]
+    return max(
+        feasible,
+        key=lambda profile: (
+            sum(
+                all(dict(profile).get(memory, 1) == 2 for memory in boundary)
+                for boundary in boundaries
+            ),
+            -sum(dict(profile).values()),
+        ),
+    )
+
+
+def _direct_hardware_anchors(
+    operator: Operator,
+    hardware: Hardware,
+    space: ScheduleSpace,
+    algorithm_index: int,
+    levels_by_axis: tuple[tuple[tuple[int, int, int], ...], ...],
+    buffers: tuple[tuple[tuple[MemorySpace, int], ...], ...],
+    traversals: tuple[tuple[str, ...], ...],
+) -> tuple[TilingPlan, ...]:
+    """Solve capacity, core-wave, reuse and reduction boundaries directly."""
+
+    algorithm = operator.algorithms[algorithm_index]
+    axis_names = tuple(axis.name for axis in operator.axes)
+    core_allowed = _core_options(operator, algorithm_index, hardware, space)
+    core_count = core_allowed[-1]
+    single_buffers = min(buffers, key=lambda profile: sum(dict(profile).values()))
+    boundaries = algorithm.pipeline_boundaries or tuple(
+        (memory,) for memory in algorithm.buffered_spaces
+    )
+    overlap_buffers = max(
+        buffers,
+        key=lambda profile: (
+            sum(
+                all(dict(profile).get(memory, 1) == 2 for memory in boundary)
+                for boundary in boundaries
+            ),
+            -sum(dict(profile).values()),
+        ),
+    )
+    serial = tuple((axis, 1) for axis in algorithm.reduction_axes)
+
+    output_rank = max(1, len(algorithm.output_axes))
+    parallel: list[tuple[int, int, int]] = []
+    for axis, levels in zip(operator.axes, levels_by_axis):
+        if axis.name in algorithm.output_axes:
+            chunks = max(1, round(core_count ** (1.0 / output_rank)))
+            task_target = align_up(ceil_div(axis.extent, chunks), axis.alignment)
+            inner_target = min(task_target, max(level[0] for level in levels))
+        else:
+            inner_target = max(level[0] for level in levels)
+            task_target = inner_target
+        parallel.append(_nearest_level(
+            levels, (inner_target, task_target, task_target)
+        ))
+    scheduled_axes = set(algorithm.output_axes) | set(algorithm.reduction_axes)
+    issue_geometry = tuple(
+        min(levels) if axis.name in scheduled_axes else max(levels)
+        for axis, levels in zip(operator.axes, levels_by_axis)
+    )
+    target_geometries = (
+        issue_geometry,
+        tuple(parallel),
+        tuple(max(levels) for levels in levels_by_axis),
+    )
+    inner_geometries = tuple(dict.fromkeys(
+        _fit_inner_capacity(
+            operator, algorithm, axis_names, levels_by_axis, geometry,
+            fit_buffers, serial, hardware,
+        )
+        for geometry in target_geometries
+        for fit_buffers in dict.fromkeys((single_buffers, overlap_buffers))
+    ))
+
+    result: list[TilingPlan] = []
+    coupled_task_axes = frozenset(space.coupled_task_axes)
+    for geometry in inner_geometries:
+        part_profiles = (
+            (),
+            *_output_part_profiles(
+                operator, algorithm, levels_by_axis, geometry, core_count,
+                coupled_task_axes,
+            ),
+        )
+        for output_parts in part_profiles:
+            task_levels = _retarget_tasks(
+                operator, algorithm, levels_by_axis, geometry,
+                output_parts, coupled_task_axes,
+            )
+            prototype = _plan_from_levels(
+                algorithm_index, axis_names, task_levels, serial,
+                core_count, single_buffers, traversals[0],
+            )
+            reduction_profiles = [serial]
+            if algorithm.parallel_reduction:
+                reduction_profiles.extend((
+                    _reduction_fill_profile(
+                        operator, algorithm_index, prototype, hardware, space
+                    ),
+                    _reduction_chunk_profile(
+                        operator, algorithm_index, prototype, hardware, space
+                    ),
+                ))
+            for reductions in tuple(dict.fromkeys(reduction_profiles)):
+                for traversal in traversals:
+                    cache_levels = _expand_cache_for_reuse(
+                        operator, algorithm, axis_names, levels_by_axis,
+                        task_levels, reductions, traversal, hardware,
+                    )
+                    buffer_profile = _best_feasible_buffer(
+                        operator, algorithm, axis_names, cache_levels,
+                        reductions, buffers, hardware,
+                    )
+                    candidate = _plan_from_levels(
+                        algorithm_index, axis_names, cache_levels, reductions,
+                        core_count, buffer_profile, traversal,
+                    )
+                    candidate = _replace_plan(
+                        candidate,
+                        used_cores=_useful_core_values(
+                            _total_task_count(operator, algorithm, candidate),
+                            core_allowed,
+                        )[-1],
+                    )
+                    result.append(candidate)
+    return tuple(dict.fromkeys(result))
+
+
 def _ideal_neighbours(
     operator: Operator,
     hardware: Hardware,
@@ -878,7 +1385,7 @@ def derive_ideal_region(
     space: ScheduleSpace | None = None,
     policy: SearchPolicy | None = None,
 ) -> IdealRegion:
-    """Find hardware-model optima, then expand one legal transition around them.
+    """Project hardware-model optima, then expand one legal transition.
 
     The same implementation consumes every algorithm graph declared by the
     operator IR.  It never branches on operator/algorithm names and never
@@ -916,93 +1423,40 @@ def derive_ideal_region(
         )
         buffers = _transition_buffers(algorithm, space, policy)
         traversals = _transition_traversals(algorithm, space)
-        core_allowed = _core_options(operator, algorithm_index, hardware, space)
         algorithm_contexts[algorithm_index] = (
             levels_by_axis, buffers, traversals
         )
-
-        output_rank = max(1, len(algorithm.output_axes))
-        axis_seeds: list[tuple[tuple[int, int, int], ...]] = []
-        low = tuple(min(levels) for levels in levels_by_axis)
-        high = tuple(max(levels) for levels in levels_by_axis)
-        parallel: list[tuple[int, int, int]] = []
-        for axis, levels in zip(operator.axes, levels_by_axis):
-            if axis.name in algorithm.output_axes:
-                chunks = max(1, round(
-                    hardware.core_count(algorithm.core_resource)
-                    ** (1.0 / output_rank)
-                ))
-                task_target = align_up(ceil_div(axis.extent, chunks), axis.alignment)
-                inner_target = min(task_target, max(level[0] for level in levels))
-            else:
-                inner_target = max(level[0] for level in levels)
-                task_target = inner_target
-            parallel.append(_nearest_level(
-                levels, (inner_target, task_target, task_target)
-            ))
-        axis_seeds.extend((low, tuple(parallel), high))
-
-        for levels in tuple(dict.fromkeys(axis_seeds)):
-            prototype = _plan_from_levels(
-                algorithm_index, axis_names, levels,
-                tuple((axis, 1) for axis in algorithm.reduction_axes),
-                1, buffers[0], traversals[0],
-            )
-            reduction_profiles = [prototype.reduction_parts]
-            if algorithm.parallel_reduction:
-                reduction_profiles.append(_reduction_fill_profile(
-                    operator, algorithm_index, prototype, hardware, space
-                ))
-                reduction_profiles.append(_reduction_chunk_profile(
-                    operator, algorithm_index, prototype, hardware, space
-                ))
-            for reduction_profile in tuple(dict.fromkeys(reduction_profiles)):
-                # Buffer and traversal alternatives are coordinates in every
-                # neighbourhood, so multiplying all of them into the starting
-                # set adds repeated walks without exposing a new basin.
-                candidate = _replace_plan(
-                    prototype,
-                    reduction_parts=reduction_profile,
-                    buffers=buffers[0],
-                    traversal=traversals[0],
-                )
-                candidate = _replace_plan(
-                    candidate,
-                    used_cores=_useful_core_values(
-                        _total_task_count(operator, algorithm, candidate),
-                        core_allowed,
-                    )[-1],
-                )
-                current = candidate
-                current_result = evaluate(current)
-                while current_result is not None:
-                    neighbourhood = _ideal_neighbours(
-                        operator, hardware, space, policy,
-                        levels_by_axis, buffers, traversals, current,
-                        vary_reductions=False,
-                    )
-                    scored = []
-                    for neighbour in neighbourhood:
-                        result = evaluate(neighbour)
-                        if result is not None and result.valid:
-                            scored.append((result.total_cycles, neighbour, result))
-                    if not scored:
-                        break
-                    scored.sort(key=lambda item: (item[0], item[1].as_dict().__repr__()))
-                    best_cycles, best_plan, best_result = scored[0]
-                    if current_result.valid and best_cycles >= current_result.total_cycles:
-                        break
-                    current, current_result = best_plan, best_result
-                if current_result is not None and current_result.valid:
-                    anchors.append(current)
-                if stopped:
-                    break
-            if stopped:
+        direct = _direct_hardware_anchors(
+            operator, hardware, space, algorithm_index,
+            levels_by_axis, buffers, traversals,
+        )
+        # Keep the best feasible direct solution in every numeric reduction
+        # topology.  This retains serial and each independently partitioned
+        # reduction graph without assigning names or fixed quotas to them.
+        best_by_topology: dict[tuple[object, ...], tuple[float, TilingPlan]] = {}
+        for candidate in direct:
+            result = evaluate(candidate)
+            if result is None:
                 break
-
-        unique_algorithm_anchors = tuple(dict.fromkeys(
-            plan for plan in anchors if plan.algorithm == algorithm_index
-        ))
+            if not result.valid:
+                continue
+            topology = tuple(
+                candidate.reductions.get(axis, 1) > 1
+                for axis in algorithm.reduction_axes
+            )
+            key = (result.total_cycles, candidate.as_dict().__repr__())
+            previous = best_by_topology.get(topology)
+            if previous is None or key < (
+                previous[0], previous[1].as_dict().__repr__()
+            ):
+                best_by_topology[topology] = (
+                    result.total_cycles, candidate
+                )
+        unique_algorithm_anchors = tuple(
+            value[1]
+            for _, value in sorted(best_by_topology.items())
+        )
+        anchors.extend(unique_algorithm_anchors)
         algorithm_anchor_counts[algorithm_index] = len(unique_algorithm_anchors)
         if stopped:
             break
@@ -1086,6 +1540,6 @@ def solve_ideal_region(
             "anchor_count": len(region.anchors),
             "algorithm_anchor_counts": dict(region.algorithm_anchor_counts),
             "algorithm_region_counts": dict(region.algorithm_region_counts),
-            "method": "hardware_transition_local_optima",
+            "method": "hardware_equation_projection",
         },
     )

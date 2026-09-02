@@ -12,7 +12,7 @@ import analyze_matmul_model_validation as analysis
 import generate_matmul_model_validation_candidates as candidates
 import generate_matmul_model_validation_workloads as workloads
 import refine_matmul_v3_candidates as old
-from npu_cost_model import plan_from_cann
+from npu_cost_model import MemorySpace, TilingPlan, plan_from_cann
 from profile_official_tilings import IncrementalJsonl
 
 
@@ -54,6 +54,32 @@ def test_hardware_simulator_ranks_the_full_legal_pool(monkeypatch) -> None:
     assert new_ns > 0
     assert len({row["knowledge"]["usedCoreNum"] for row in ranked}) >= 2
     assert all(row["selection"] == "new_hardware_simulator" for row in ranked)
+
+
+def test_base_abi_materialization_preserves_task_geometry_and_k_extent() -> None:
+    workload = old.Workload(
+        "short_k", 96, 80, 128, "fp16", False, False, 20
+    )
+    plan = TilingPlan(
+        algorithm=0,
+        axis_tiles=(("m", 16), ("n", 16), ("k", 256)),
+        task_tiles=(("m", 96), ("n", 80), ("k", 256)),
+        cache_tiles=(("m", 96), ("n", 80), ("k", 256)),
+        used_cores=1,
+        reduction_parts=(("k", 1),),
+        buffers=(
+            (MemorySpace.L1, 1),
+            (MemorySpace.L0A, 1),
+            (MemorySpace.L0B, 1),
+            (MemorySpace.L0C, 1),
+        ),
+        traversal=("m", "n"),
+    )
+    knowledge = candidates.make_base_from_plan(workload, HARDWARE, plan)
+    assert knowledge is not None
+    assert knowledge["singleCoreM"] == knowledge["baseM"] == 96
+    assert knowledge["singleCoreN"] == knowledge["baseN"] == 80
+    assert knowledge["baseK"] == 128
 
 
 def test_paired_result_uses_measured_noise_threshold() -> None:

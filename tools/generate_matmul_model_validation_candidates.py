@@ -77,13 +77,22 @@ def make_base_from_plan(
     hardware: old.Hardware,
     plan,
 ) -> dict[str, int] | None:
-    base_m = plan.tiles["m"]
-    base_n = plan.tiles["n"]
-    base_k = plan.tiles["k"]
-    m_parts = old.ceil_div(workload.m, base_m)
-    n_parts = old.ceil_div(workload.n, base_n)
-    l2_m = max(1, min(m_parts, old.ceil_div(plan.caches["m"], base_m)))
-    l2_n = max(1, min(n_parts, old.ceil_div(plan.caches["n"], base_n)))
+    # CANN 8.1 BASE has no independent task tile below singleCoreM/N:
+    # its legal contract requires baseM/N to cover that complete core task.
+    # Preserve the generic task geometry at the ABI boundary rather than
+    # silently replacing it with the smaller scratchpad inner tile.
+    single_m = min(workload.m, plan.tasks["m"])
+    single_n = min(workload.n, plan.tasks["n"])
+    base_m = old.align_up(single_m, 16)
+    base_n = old.align_up(single_n, 16)
+    base_k = min(
+        plan.tiles["k"],
+        old.align_up(workload.k, old.base_k_alignment(workload)),
+    )
+    m_parts = old.ceil_div(workload.m, single_m)
+    n_parts = old.ceil_div(workload.n, single_n)
+    l2_m = max(1, min(m_parts, old.ceil_div(plan.caches["m"], single_m)))
+    l2_n = max(1, min(n_parts, old.ceil_div(plan.caches["n"], single_n)))
     traversal = plan.traversal or ("m", "n")
     l2_order = 1 if traversal[-1] == "n" else 2
     iterate_order = 0 if traversal[-1] == "n" else 1
@@ -91,8 +100,8 @@ def make_base_from_plan(
     cores = min(plan.used_cores, m_parts * n_parts, workload.max_cores)
     knowledge = {
         "usedCoreNum": cores,
-        "singleCoreM": base_m,
-        "singleCoreN": base_n,
+        "singleCoreM": single_m,
+        "singleCoreN": single_n,
         "singleCoreK": workload.k,
         "baseM": base_m,
         "baseN": base_n,
@@ -198,7 +207,13 @@ def derive_proposals(
     region = derive_ideal_region(
         operator,
         generic,
-        ScheduleSpace(core_options=tuple(range(1, core_cap + 1))),
+        ScheduleSpace(
+            core_options=tuple(range(1, core_cap + 1)),
+            # CANN 8.1 BASE exposes one M/N geometry for both the Cube tile
+            # and the per-core task. Declare that backend contract so the
+            # solver does not score an unrepresentable schedule.
+            coupled_task_axes=("m", "n"),
+        ),
         SearchPolicy(top_k=1, max_evaluations=10000),
     )
     result: list[dict[str, int]] = []

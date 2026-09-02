@@ -291,6 +291,85 @@ def test_reduction_schedule_is_discovered_without_a_named_splitk_path() -> None:
     assert region.plans == renamed_region.plans
 
 
+def test_hardware_projection_matches_exhaustive_optimum_on_a_finite_space() -> None:
+    operator = matmul(96, 80, 512)
+    space = ScheduleSpace(
+        tile_options=(
+            ("m", (16, 32)),
+            ("n", (16, 32)),
+            ("k", (16, 32)),
+        ),
+        task_tile_options=(("m", (32,)), ("n", (32,))),
+        cache_tile_options=(("m", (64,)), ("n", (64,))),
+        core_options=(1, 8, 20),
+        reduction_options=(("k", (1, 8)),),
+        buffer_options=((1, 1, 1, 1), (2, 2, 2, 1)),
+        traversal_options=(("m", "n"), ("n", "m")),
+    )
+    policy = SearchPolicy(top_k=5, max_evaluations=10_000)
+    exhaustive = solve(operator, HARDWARE, space, policy)
+    projected = solve_ideal_region(operator, HARDWARE, space, policy)
+    assert exhaustive.exhaustive
+    assert projected.best.cycles == exhaustive.best.cycles
+    assert projected.evaluated * 4 < exhaustive.evaluated
+    assert projected.search_metadata["method"] == "hardware_equation_projection"
+
+
+def test_core_factor_projection_matches_coupled_exhaustive_optimum() -> None:
+    operator = matmul(160, 80, 192, "fp16")
+    space = ScheduleSpace(
+        tile_options=(
+            ("m", (16, 32, 48, 64)),
+            ("n", (16, 32, 48)),
+            ("k", (16, 64, 192)),
+        ),
+        cache_tile_options=(("m", (64, 160)), ("n", (48, 80))),
+        core_options=(1, 4, 8, 12, 20),
+        reduction_options=(("k", (1, 4)),),
+        buffer_options=((1, 1, 1, 1), (2, 2, 2, 2)),
+        traversal_options=(("m", "n"), ("n", "m")),
+        coupled_task_axes=("m", "n"),
+    )
+    policy = SearchPolicy(top_k=5, max_evaluations=10_000)
+    exhaustive = solve(operator, HARDWARE, space, policy)
+    projected = solve_ideal_region(operator, HARDWARE, space, policy)
+    assert exhaustive.exhaustive
+    assert projected.best.cycles == exhaustive.best.cycles
+    assert projected.evaluated * 100 < exhaustive.evaluated
+
+
+def test_schedule_space_can_couple_inner_and_task_geometry() -> None:
+    operator = matmul(192, 160, 384, "fp16")
+    region = derive_ideal_region(
+        operator,
+        ascend_910b3(),
+        ScheduleSpace(coupled_task_axes=("m", "n")),
+    )
+    assert region.plans
+    assert all(
+        plan.tasks[axis] == plan.tiles[axis]
+        for plan in region.plans
+        for axis in ("m", "n")
+    )
+
+
+def test_coupled_task_geometry_overrides_independent_task_options() -> None:
+    operator = matmul(192, 160, 384, "fp16")
+    region = derive_ideal_region(
+        operator,
+        ascend_910b3(),
+        ScheduleSpace(
+            task_tile_options=(("m", (192,)), ("n", (160,))),
+            coupled_task_axes=("m", "n"),
+        ),
+    )
+    assert all(
+        plan.tasks[axis] == plan.tiles[axis]
+        for plan in region.plans
+        for axis in ("m", "n")
+    )
+
+
 def test_l2_traversal_and_pipeline_boundaries_change_cycles() -> None:
     operator = matmul(512, 128, 1024)
     common = dict(

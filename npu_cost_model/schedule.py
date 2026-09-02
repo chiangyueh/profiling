@@ -94,7 +94,8 @@ class ScheduleSpace:
     """Declarative bounds for legal schedule generation.
 
     Empty option lists ask the solver to derive hardware breakpoints from the
-    axis extent/alignment and available cores.
+    axis extent/alignment and available cores. ``coupled_task_axes`` declares
+    backend schedules whose inner and per-core task geometry is the same.
     """
 
     tile_options: tuple[tuple[str, tuple[int, ...]], ...] = ()
@@ -104,11 +105,14 @@ class ScheduleSpace:
     reduction_options: tuple[tuple[str, tuple[int, ...]], ...] = ()
     buffer_options: tuple[tuple[int, ...], ...] = ()
     traversal_options: tuple[tuple[str, ...], ...] = ()
+    coupled_task_axes: tuple[str, ...] = ()
     max_axis_values: int = 8
 
     def __post_init__(self) -> None:
         if self.max_axis_values <= 0:
             raise ValueError("max_axis_values must be positive")
+        if len(self.coupled_task_axes) != len(set(self.coupled_task_axes)):
+            raise ValueError("coupled_task_axes contains duplicate axes")
         if any(value <= 0 for value in self.core_options):
             raise ValueError("core options must be positive")
         if any(
@@ -225,12 +229,12 @@ class SolveResult:
 
 @dataclass(frozen=True)
 class IdealRegion:
-    """Finite schedule neighbourhood around hardware-model local optima.
+    """Finite schedule neighbourhood around hardware-projected optima.
 
-    ``anchors`` are local optima reached from hardware-derived starting
-    points. ``plans`` contains those anchors and exactly one declared
-    schedule transition around each anchor.  Neither collection is a random
-    sample or a fixed per-kernel quota.
+    ``anchors`` are selected from capacity, issue-width, core-wave, reuse,
+    pipeline and reduction projections. ``plans`` contains those anchors and
+    one declared schedule transition around each anchor. Neither collection
+    is a random sample or a fixed per-kernel quota.
     """
 
     plans: tuple[TilingPlan, ...]

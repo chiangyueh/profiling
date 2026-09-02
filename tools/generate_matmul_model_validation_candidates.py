@@ -7,9 +7,14 @@ import argparse
 import csv
 import json
 import math
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import refine_matmul_v3_candidates as old
 import generate_matmul_controlled_candidates as controlled

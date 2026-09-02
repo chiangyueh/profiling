@@ -2315,11 +2315,14 @@ def analytical_score(
     )
     # The BASE kernel synchronizes scheduling at every L2 tile boundary.
     # Global task balance alone therefore underestimates idle AIC slots when a
-    # legal L2 tail contains fewer than one complete core round.
-    round_balance = max(
-        round_balance,
-        1.0 / max(1.0 / active_cores, l2_efficiency),
-    )
+    # legal L2 tail contains fewer than one complete core round.  Split-K
+    # schedules the K slices across AICs instead; applying the BASE output-tile
+    # efficiency there cancels the very K parallelism that the kernel creates.
+    if split == 0:
+        round_balance = max(
+            round_balance,
+            1.0 / max(1.0 / active_cores, l2_efficiency),
+        )
 
     def critical(total: float) -> float:
         return total / active_cores * round_balance

@@ -99,6 +99,92 @@ class RunnerProfileError(ProfileError):
         self.return_code = return_code
 
 
+class IncrementalJsonl:
+    """Append crash-resilient measurement records to <= max_bytes files."""
+
+    def __init__(self, directory: Path | None, max_bytes: int) -> None:
+        self.directory = directory
+        self.max_bytes = max_bytes
+        self.seen: set[str] = set()
+        self.index = 0
+        self.size = 0
+        self.stream = None
+        if directory is None:
+            return
+        directory.mkdir(parents=True, exist_ok=True)
+        paths = sorted(
+            (
+                path for path in directory.glob("[0-9]*.log")
+                if path.stem.isdigit()
+            ),
+            key=lambda path: int(path.stem),
+        )
+        for path in paths:
+            if path.stat().st_size > max_bytes:
+                raise ProfileError(f"incremental log exceeds size limit: {path}")
+            with path.open(encoding="utf-8", errors="replace") as source:
+                for line in source:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    key = str(record.get("record_key", ""))
+                    if key:
+                        self.seen.add(key)
+        if paths and paths[-1].read_bytes().endswith(b"\n"):
+            self.index = int(paths[-1].stem)
+            self.size = paths[-1].stat().st_size
+            self.stream = paths[-1].open("ab")
+        else:
+            self.index = int(paths[-1].stem) if paths else 0
+            self._rotate()
+
+    def _rotate(self) -> None:
+        if self.stream is not None:
+            self.stream.close()
+        assert self.directory is not None
+        self.index += 1
+        self.size = 0
+        self.stream = (self.directory / f"{self.index}.log").open("ab")
+
+    def write(self, key: str, record: dict) -> None:
+        if self.directory is None or key in self.seen:
+            return
+        record = {"record_key": key, **record}
+        data = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+        if len(data) > self.max_bytes:
+            raise ProfileError(f"one incremental log record is too large: {key}")
+        if self.size and self.size + len(data) > self.max_bytes:
+            self._rotate()
+        assert self.stream is not None
+        self.stream.write(data)
+        self.stream.flush()
+        self.size += len(data)
+        self.seen.add(key)
+
+    def close(self) -> None:
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
+
+
+def incremental_measurement_record(
+    record_type: str,
+    workload: dict[str, str],
+    profile: dict[str, str],
+    samples: list[dict[str, str]],
+    candidate: dict[str, str] | None = None,
+) -> dict:
+    return {
+        "schema": "matmul_model_validation_measurement_v1",
+        "record_type": record_type,
+        "workload": dict(workload),
+        "candidate": dict(candidate or {}),
+        "measurement": dict(profile),
+        "samples_ms": [as_float(row, "latency_ms") for row in samples],
+    }
+
+
 @dataclass(frozen=True)
 class BankSpec:
     soc: str
@@ -1625,6 +1711,10 @@ def main() -> int:
     )
     parser.add_argument("--timeout-sec", type=int, default=60)
     parser.add_argument("--progress-every", type=int, default=10)
+    parser.add_argument("--jsonl-log-directory", type=Path)
+    parser.add_argument(
+        "--jsonl-log-max-bytes", type=int, default=50 * 1024 * 1024
+    )
     parser.add_argument(
         "--validate-only",
         action="store_true",
@@ -1650,6 +1740,8 @@ def main() -> int:
     args.candidates = args.candidates.resolve()
     args.workloads = args.workloads.resolve()
     args.cann_root = args.cann_root.resolve()
+    if args.jsonl_log_directory is not None:
+        args.jsonl_log_directory = args.jsonl_log_directory.resolve()
     if args.history is not None:
         args.history = args.history.resolve()
     args.profile_history = [
@@ -1680,6 +1772,22 @@ def main() -> int:
 
     candidates = read_csv(args.candidates)
     workloads = load_workloads(args.workloads)
+    incremental_log = IncrementalJsonl(
+        args.jsonl_log_directory, args.jsonl_log_max_bytes
+    )
+    incremental_log.write(
+        "campaign:begin",
+        {
+            "schema": "matmul_model_validation_measurement_v1",
+            "record_type": "campaign_begin",
+            "workload_count": len(workloads),
+            "candidate_count": len(candidates),
+            "device_event_samples": args.samples,
+            "warmup": args.warmup,
+            "repeat": args.repeat,
+            "full_numeric_validation": args.structured_full_preflight,
+        },
+    )
     history_baselines, history_candidates = load_history(
         args.history, args.soc, args.aic_cores
     )
@@ -2087,6 +2195,12 @@ def main() -> int:
                 args.official_samples_output, samples,
                 "-1", "official_operator_baseline",
             )
+            incremental_log.write(
+                f"baseline:{workload_id}:success",
+                incremental_measurement_record(
+                    "official_baseline", workload, measured, samples
+                ),
+            )
             api_auto = candidate_profile(
                 None, measured, "0",
                 "official_default", "api_auto_baseline",
@@ -2197,6 +2311,14 @@ def main() -> int:
                             control_rank,
                             control_role,
                         )
+                        incremental_log.write(
+                            f"candidate:{workload_id}:{control_role}:"
+                            f"{control_rank}:failed",
+                            incremental_measurement_record(
+                                "candidate_failed", workload, failed,
+                                exception.samples, control,
+                            ),
+                        )
                         print_tiling_failure(
                             control, control_knowledge, exception
                         )
@@ -2221,6 +2343,14 @@ def main() -> int:
                     control_samples,
                     control_rank,
                     control_role,
+                )
+                incremental_log.write(
+                    f"candidate:{workload_id}:{control_role}:"
+                    f"{control_rank}:success",
+                    incremental_measurement_record(
+                        "candidate_measurement", workload,
+                        bank_control_profile, control_samples, control,
+                    ),
                 )
                 successful_tilings += 1
                 control_speedup, control_delta, _, control_status = (
@@ -2340,6 +2470,13 @@ def main() -> int:
                             rank,
                             "searched",
                         )
+                        incremental_log.write(
+                            f"candidate:{workload_id}:searched:{rank}:failed",
+                            incremental_measurement_record(
+                                "candidate_failed", workload, failed,
+                                exception.samples, candidate,
+                            ),
+                        )
                         print_tiling_failure(
                             candidate, knowledge, exception
                         )
@@ -2369,6 +2506,13 @@ def main() -> int:
                 append_row(args.custom_output, PROFILE_COLUMNS, profiled)
                 append_samples(
                     args.custom_samples_output, samples, rank, "searched"
+                )
+                incremental_log.write(
+                    f"candidate:{workload_id}:searched:{rank}:success",
+                    incremental_measurement_record(
+                        "candidate_measurement", workload, profiled,
+                        samples, candidate,
+                    ),
                 )
                 successful_tilings += 1
                 candidate_ms = as_float(profiled, "median_ms")
@@ -2423,6 +2567,19 @@ def main() -> int:
                 f"minimum={group_required or 'not_set'}",
                 flush=True,
             )
+            incremental_log.write(
+                f"group:{workload_id}:"
+                f"{'admitted' if group_admitted else 'rejected'}:"
+                f"{successful_tilings}",
+                {
+                    "schema": "matmul_model_validation_measurement_v1",
+                    "record_type": "workload_group_result",
+                    "workload_id": workload_id,
+                    "status": "admitted" if group_admitted else "rejected",
+                    "valid_latency_count": successful_tilings,
+                    "minimum": group_required,
+                },
+            )
             bank_control_ms = (
                 as_float(bank_control_profile, "median_ms")
                 if bank_control_profile is not None
@@ -2455,6 +2612,18 @@ def main() -> int:
                 f"{incomplete_groups} workload groups did not reach "
                 f"{args.successful_tilings_per_workload} successful tilings"
             )
+        incremental_log.write(
+            "campaign:measurement_complete",
+            {
+                "schema": "matmul_model_validation_measurement_v1",
+                "record_type": "measurement_summary",
+                "status": "complete",
+                "workload_count": len(workloads) - unsupported,
+                "searched_attempts": candidate_index,
+                "runtime_rejected": runtime_rejected,
+            },
+        )
+        incremental_log.close()
     return 0
 
 

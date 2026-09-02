@@ -220,6 +220,12 @@ if [[ "${SUCCESSFUL_TILINGS_PER_WORKLOAD:-0}" -gt 0 ]]; then
         "${SUCCESSFUL_TILINGS_PER_WORKLOAD}"
     )
 fi
+if [[ -n "${MEASUREMENT_JSONL_LOG_DIRECTORY:-}" ]]; then
+    PROFILE_MODE_ARGS+=(
+        --jsonl-log-directory "${MEASUREMENT_JSONL_LOG_DIRECTORY}"
+        --jsonl-log-max-bytes "${MEASUREMENT_JSONL_LOG_MAX_BYTES:-52428800}"
+    )
+fi
 
 profile_rc=0
 if python3 tools/profile_official_tilings.py \

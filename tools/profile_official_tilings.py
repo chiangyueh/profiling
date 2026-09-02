@@ -11,6 +11,7 @@ import signal
 import struct
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +44,9 @@ PROFILE_COLUMNS = [
     "tiling_solver_select_ms", "tiling_solver_callback_ms",
     "tiling_solver_callback_count", "tiling_solver_extra_ms",
     "tiling_solver_total_ms",
+    "bank_prepare_ms", "host_runner_wall_ms",
+    "device_prepare_ms", "executor_setup_ms", "numeric_preflight_ms",
+    "warmup_wall_ms", "measurement_wall_ms", "runner_total_ms",
     "measurement_source",
 ]
 SAMPLE_COLUMNS = ["workload_id", "rank", "candidate_role", "sample", "latency_ms"]
@@ -1253,9 +1257,10 @@ def run_logged_process(
     env: dict[str, str],
     log_path: Path,
     timeout_sec: int,
-) -> tuple[int, str, bool]:
+) -> tuple[int, str, bool, float]:
     """Run one isolated candidate without reusing a subprocess pipe."""
     timed_out = False
+    started = time.perf_counter_ns()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as runner_log:
         process = subprocess.Popen(
@@ -1281,7 +1286,8 @@ def run_logged_process(
                 process.wait()
             raise
     output = log_path.read_text(encoding="utf-8", errors="replace")
-    return process.returncode, output, timed_out
+    wall_ms = (time.perf_counter_ns() - started) / 1_000_000.0
+    return process.returncode, output, timed_out, wall_ms
 
 
 def run_official(
@@ -1309,7 +1315,7 @@ def run_official(
     if args.structured_full_preflight:
         command.append("--structured-full-preflight")
     try:
-        return_code, output, timed_out = run_logged_process(
+        return_code, output, timed_out, host_runner_wall_ms = run_logged_process(
             command, env, output_dir / "runner.log", args.timeout_sec
         )
     except (OSError, ValueError, subprocess.SubprocessError) as exception:
@@ -1375,6 +1381,7 @@ def run_official(
             return_code,
         )
     row = profile_rows[0]
+    row["host_runner_wall_ms"] = f"{host_runner_wall_ms:.9g}"
     if row.get("workload_id") != workload_id:
         raise ProfileError("official runner returned the wrong workload")
     if return_code != 0 or not truthy(row.get("success")):
@@ -1453,6 +1460,14 @@ def candidate_profile(
         "tiling_solver_callback_count": "tiling_solver_callback_count",
         "tiling_solver_extra_ms": "tiling_solver_extra_ms",
         "tiling_solver_total_ms": "tiling_solver_total_ms",
+        "bank_prepare_ms": "bank_prepare_ms",
+        "host_runner_wall_ms": "host_runner_wall_ms",
+        "device_prepare_ms": "device_prepare_ms",
+        "executor_setup_ms": "executor_setup_ms",
+        "numeric_preflight_ms": "numeric_preflight_ms",
+        "warmup_wall_ms": "warmup_wall_ms",
+        "measurement_wall_ms": "measurement_wall_ms",
+        "runner_total_ms": "runner_total_ms",
     }
     for destination, origin in mapping.items():
         result[destination] = candidate.get(origin, "")
@@ -1992,6 +2007,7 @@ def main() -> int:
         prepared_candidates: dict[
             tuple[str, str, str], tuple[dict[str, str] | None, dict]
         ] = {}
+        bank_prepare_ms: dict[tuple[str, str, str], float] = {}
         query_modes: set[str] = set()
         history_prepared = 0
         bank_prepared = 0
@@ -2006,6 +2022,7 @@ def main() -> int:
                     None,
                     knowledge,
                 )
+                bank_prepare_ms[(workload_id, role, rank)] = 0.0
                 history_prepared += 1
                 continue
             candidate_root = (
@@ -2016,6 +2033,7 @@ def main() -> int:
             candidate_cache = candidate_root / "cache"
             candidate_cache.mkdir(parents=True)
             try:
+                bank_started = time.perf_counter_ns()
                 candidate_env, query_mode, knowledge = create_candidate_bank(
                     candidate,
                     spec,
@@ -2023,6 +2041,9 @@ def main() -> int:
                     bank_root,
                     candidate_cache,
                 )
+                bank_elapsed_ms = (
+                    time.perf_counter_ns() - bank_started
+                ) / 1_000_000.0
             except ProfileError as exception:
                 raise ProfileError(
                     f"{workload_id} role={role} rank={rank}: {exception}"
@@ -2031,6 +2052,7 @@ def main() -> int:
                 candidate_env,
                 knowledge,
             )
+            bank_prepare_ms[(workload_id, role, rank)] = bank_elapsed_ms
             bank_prepared += 1
             query_modes.add(query_mode)
             if (
@@ -2302,6 +2324,7 @@ def main() -> int:
                             control_role,
                             control_knowledge,
                         )
+                        failed["bank_prepare_ms"] = f"{bank_prepare_ms.get((workload_id, control_role, control_rank), 0.0):.9g}"
                         append_row(
                             args.custom_output, PROFILE_COLUMNS, failed
                         )
@@ -2333,6 +2356,7 @@ def main() -> int:
                     control_role,
                     control_knowledge,
                 )
+                bank_control_profile["bank_prepare_ms"] = f"{bank_prepare_ms.get((workload_id, control_role, control_rank), 0.0):.9g}"
                 append_row(
                     args.custom_output,
                     PROFILE_COLUMNS,
@@ -2461,6 +2485,7 @@ def main() -> int:
                             "searched",
                             knowledge,
                         )
+                        failed["bank_prepare_ms"] = f"{bank_prepare_ms.get((workload_id, 'searched', rank), 0.0):.9g}"
                         append_row(
                             args.custom_output, PROFILE_COLUMNS, failed
                         )
@@ -2503,6 +2528,7 @@ def main() -> int:
                     candidate, measured, rank,
                     candidate.get("source", "searched"), "searched", knowledge,
                 )
+                profiled["bank_prepare_ms"] = f"{bank_prepare_ms.get((workload_id, 'searched', rank), 0.0):.9g}"
                 append_row(args.custom_output, PROFILE_COLUMNS, profiled)
                 append_samples(
                     args.custom_samples_output, samples, rank, "searched"

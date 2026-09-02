@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -63,7 +64,21 @@ struct ProfileSummary {
     double p95 = 0.0;
     double maximum = 0.0;
     double tflops = 0.0;
+    double devicePrepareMs = 0.0;
+    double executorSetupMs = 0.0;
+    double numericPreflightMs = 0.0;
+    double warmupWallMs = 0.0;
+    double measurementWallMs = 0.0;
+    double runnerTotalMs = 0.0;
 };
+
+using SteadyClock = std::chrono::steady_clock;
+
+double ElapsedMs(const SteadyClock::time_point &started)
+{
+    return std::chrono::duration<double, std::milli>(
+        SteadyClock::now() - started).count();
+}
 
 struct DeviceBuffer {
     void *ptr = nullptr;
@@ -239,6 +254,8 @@ const std::vector<std::string> &ProfileColumns()
         "proxy_total", "success", "preflight_passed", "preflight_mode", "error",
         "min_ms", "mean_ms", "median_ms", "stddev_ms", "p95_ms", "max_ms",
         "tflops", "warmup", "repeat", "samples", "tiling_signature", "tiling_bin",
+        "device_prepare_ms", "executor_setup_ms", "numeric_preflight_ms",
+        "warmup_wall_ms", "measurement_wall_ms", "runner_total_ms",
     };
     return columns;
 }
@@ -586,6 +603,7 @@ ProfileSummary ProfileOfficial(
     std::ofstream &samplesOutput)
 {
     ProfileSummary summary;
+    const auto runnerStarted = SteadyClock::now();
     if (workload.dtype == "int8") {
         summary.supported = false;
         summary.error = "unsupported_by_aclnnMatmul:int8";
@@ -593,6 +611,7 @@ ProfileSummary ProfileOfficial(
     }
 
     try {
+        const auto devicePrepareStarted = SteadyClock::now();
         const size_t elementBytes = ElementBytes(workload.dtype);
         const size_t aBytes = CheckedBytes(workload.m, workload.k, elementBytes, "A");
         const size_t bBytes = CheckedBytes(workload.k, workload.n, elementBytes, "B");
@@ -656,7 +675,9 @@ ProfileSummary ProfileOfficial(
         TensorHandle aTensor = CreateTensor(a.ptr, dtype, aView, aStrides, aStorage);
         TensorHandle bTensor = CreateTensor(b.ptr, dtype, bView, bStrides, bStorage);
         TensorHandle cTensor = CreateTensor(c.ptr, dtype, cView, cStrides, cView);
+        summary.devicePrepareMs = ElapsedMs(devicePrepareStarted);
 
+        const auto executorSetupStarted = SteadyClock::now();
         uint64_t workspaceBytes = 0;
         ExecutorHandle executor;
         LogStage(workload, "get_workspace");
@@ -670,6 +691,7 @@ ProfileSummary ProfileOfficial(
             aclSetAclOpExecutorRepeatable(executor.ptr),
             "aclSetAclOpExecutorRepeatable");
         DeviceBuffer workspace(static_cast<size_t>(workspaceBytes));
+        summary.executorSetupMs = ElapsedMs(executorSetupStarted);
 
         auto launch = [&]() {
             CheckAclnn(
@@ -677,6 +699,7 @@ ProfileSummary ProfileOfficial(
                 "aclnnMatmul");
         };
 
+        const auto preflightStarted = SteadyClock::now();
         LogStage(workload, "preflight_launch_begin");
         launch();
         LogStage(workload, "preflight_launch_returned");
@@ -766,17 +789,22 @@ ProfileSummary ProfileOfficial(
                 }
             }
         }
+        summary.numericPreflightMs = ElapsedMs(preflightStarted);
         summary.preflightPassed = true;
         if (options.preflightOnly) {
             summary.success = true;
+            summary.runnerTotalMs = ElapsedMs(runnerStarted);
             LogStage(workload, "preflight_complete");
             return summary;
         }
 
+        const auto warmupStarted = SteadyClock::now();
         LogStage(workload, "warmup");
         for (int32_t i = 0; i < options.warmup; ++i) launch();
         CheckAcl(aclrtSynchronizeStream(stream), "official warmup synchronize");
+        summary.warmupWallMs = ElapsedMs(warmupStarted);
 
+        const auto measurementStarted = SteadyClock::now();
         aclrtEvent start = nullptr;
         aclrtEvent end = nullptr;
         CheckAcl(aclrtCreateEvent(&start), "aclrtCreateEvent official start");
@@ -807,10 +835,12 @@ ProfileSummary ProfileOfficial(
             if (start != nullptr) aclrtDestroyEvent(start);
             throw;
         }
+        summary.measurementWallMs = ElapsedMs(measurementStarted);
         ComputeStats(summary, workload);
     } catch (const std::exception &exception) {
         summary.error = exception.what();
     }
+    summary.runnerTotalMs = ElapsedMs(runnerStarted);
     return summary;
 }
 
@@ -859,6 +889,12 @@ void WriteProfileRow(
         ToText(options.samples),
         "installed_cann_aclnn_matmul",
         "",
+        ToText(summary.devicePrepareMs),
+        ToText(summary.executorSetupMs),
+        ToText(summary.numericPreflightMs),
+        ToText(summary.warmupWallMs),
+        ToText(summary.measurementWallMs),
+        ToText(summary.runnerTotalMs),
     });
     output.flush();
 }

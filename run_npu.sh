@@ -9,8 +9,8 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-Paired MatMulV3 model validation: 200 unique shapes, 24 validated tilings
-per shape, plus one official autotiling baseline per shape (5,000 records).
+Paired MatMulV3 model validation: 200 unique shapes, one final simulator
+tiling and one official autotiling baseline per shape (400 latency records).
 USAGE
 }
 
@@ -42,6 +42,7 @@ export MKL_NUM_THREADS=1
 unset ASCEND_CUSTOM_OPP_PATH || true
 source "${ROOT}/scripts/env.sh" >/dev/null
 
+catalog_started_ns="$(date +%s%N)"
 CATALOG_TMP="$(mktemp "${TMPDIR:-/tmp}/matmul-model-validation.XXXXXX.csv")"
 cleanup() {
     [[ -f "${CATALOG_TMP:-}" ]] && rm -f -- "${CATALOG_TMP}"
@@ -50,6 +51,7 @@ trap cleanup EXIT
 
 python3 tools/generate_matmul_model_validation_workloads.py \
     --output "${CATALOG_TMP}" >/dev/null
+catalog_wall_ms=$(( ($(date +%s%N) - catalog_started_ns) / 1000000 ))
 CAMPAIGN_ID="$({
     sha256sum \
         "${CATALOG_TMP}" \
@@ -62,7 +64,7 @@ CAMPAIGN_ID="$({
         runner/official_matmul_runner.cpp \
         npu_cost_model/*.py
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_model_validation_v1/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_model_validation_v2/${CAMPAIGN_ID}"
 CATALOG="${CAMPAIGN_DIR}/catalog.csv"
 WORKLOADS="${CAMPAIGN_DIR}/workloads.csv"
 CANDIDATES="${CAMPAIGN_DIR}/candidates.csv"
@@ -77,15 +79,16 @@ cp "${CATALOG_TMP}" "${CATALOG}"
 
 if [[ -s "${ANALYSIS}" ]] && \
    grep -q '"status": "complete"' "${ANALYSIS}"; then
-    echo "MATMUL_MODEL_VALIDATION_COMPLETE shapes=200 records=5000"
+    echo "MATMUL_MODEL_VALIDATION_COMPLETE shapes=200 records=400"
     echo "analysis=${ANALYSIS} logs=${LOG_DIR}"
     exit 0
 fi
 
-echo "CAMPAIGN_READY operator=matmul shapes=200 tilings_per_shape=24 records=5000 device=${PHYSICAL_DEVICE}"
-echo "comparison=official_autotiling,old_cost_model,new_hardware_simulator"
+echo "CAMPAIGN_READY operator=matmul shapes=200 selected_tilings_per_shape=1 records=400 device=${PHYSICAL_DEVICE}"
+echo "comparison=official_matmul_v3,new_hardware_simulator"
 echo "families=base:160,deterministic_split_k:40"
 echo "logs=${LOG_DIR}"
+echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
 BUILD_INPUT_HASH="$({
     find host runner cmake_npu -type f -print0
@@ -99,6 +102,7 @@ if [[ ! -f "${BUILD_STAMP}" && -f "${LEGACY_BUILD_STAMP}" && \
       -x build/tiling_bank_probe ]]; then
     printf '%s\n' "${BUILD_INPUT_HASH}" >"${BUILD_STAMP}"
 fi
+build_started_ns="$(date +%s%N)"
 if [[ ! -x build/matmul_tiling_search || \
       ! -x build/official_matmul_runner || \
       ! -x build/tiling_bank_probe || \
@@ -108,16 +112,22 @@ if [[ ! -x build/matmul_tiling_search || \
     BUILD_JOBS=1 scripts/build_all.sh >"${CAMPAIGN_DIR}/build.log" 2>&1
     printf '%s\n' "${BUILD_INPUT_HASH}" >"${BUILD_STAMP}"
     echo "RUNNER_BUILD passed"
+    build_cached=0
 else
     echo "RUNNER_BUILD cached"
+    build_cached=1
 fi
+build_wall_ms=$(( ($(date +%s%N) - build_started_ns) / 1000000 ))
+echo "CAMPAIGN_STAGE_TIMING stage=runner_build wall_ms=${build_wall_ms} cached=${build_cached}"
 
 export DISABLE_MEASUREMENT_HISTORY=1
-export SEARCH_SCOPE=matmul_model_validation_v1
+export SEARCH_SCOPE=matmul_model_validation_v2
 export SEARCH_OUTPUT="${CANDIDATES}"
 export SEARCH_ALL_OUTPUT="${ALL_CANDIDATES}"
 export SEARCH_TILING_DIR="${TILING_DIR}"
 export MODEL_VALIDATION_WORKLOADS_OUTPUT="${WORKLOADS}"
+export MEASUREMENT_JSONL_LOG_DIRECTORY="${LOG_DIR}"
+export MEASUREMENT_JSONL_LOG_MAX_BYTES=52428800
 
 if python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" <<'PY' >/dev/null 2>&1
 import csv
@@ -130,10 +140,6 @@ if not all(Path(value).is_file() for value in sys.argv[1:]):
 workloads = list(csv.DictReader(open(sys.argv[1], newline="", encoding="utf-8")))
 candidates = list(csv.DictReader(open(sys.argv[2], newline="", encoding="utf-8")))
 families = Counter(row.get("search_family", "") for row in workloads)
-controls = Counter(
-    row["workload_id"] for row in candidates
-    if row.get("candidate_role") == "bank_seed_control"
-)
 searched = Counter(
     row["workload_id"] for row in candidates
     if row.get("candidate_role") == "searched"
@@ -146,9 +152,9 @@ for row in candidates:
 if (
     len(workloads) != 200
     or families != {"base": 160, "deterministic_split_k": 40}
-    or len(controls) != 200 or set(controls.values()) != {1}
-    or len(searched) != 200 or set(searched.values()) != {31}
-    or len(hashes) != 200 or {len(value) for value in hashes.values()} != {32}
+    or len(candidates) != 200
+    or len(searched) != 200 or set(searched.values()) != {1}
+    or len(hashes) != 200 or {len(value) for value in hashes.values()} != {1}
 ):
     raise SystemExit(1)
 PY
@@ -157,6 +163,7 @@ then
 fi
 
 SEARCH_LOG="${CAMPAIGN_DIR}/candidate_generation.log"
+search_started_ns="$(date +%s%N)"
 set +e
 source "${ROOT}/scripts/run_search.sh" "${CATALOG}" \
     > >(tee "${SEARCH_LOG}" | awk '
@@ -168,6 +175,8 @@ source "${ROOT}/scripts/run_search.sh" "${CATALOG}" \
     ') 2>&1
 search_rc=$?
 set -e
+search_wall_ms=$(( ($(date +%s%N) - search_started_ns) / 1000000 ))
+echo "CAMPAIGN_STAGE_TIMING stage=tiling_selection wall_ms=${search_wall_ms}" | tee -a "${SEARCH_LOG}"
 if [[ "${search_rc}" -ne 0 ]]; then
     echo "CANDIDATE_GENERATION_FAILED log=${SEARCH_LOG}"
     exit "${search_rc}"
@@ -176,21 +185,21 @@ export PLATFORM_AIC_CORES PLATFORM_L0A_BYTES PLATFORM_L0B_BYTES
 export PLATFORM_L0C_BYTES PLATFORM_L1_BYTES PLATFORM_L2_BYTES
 export PLATFORM_L2_BPC PLATFORM_HBM_BPC
 
-echo "NPU_MEASUREMENT_BEGIN shapes=200 tilings=4800 official_baselines=200"
+echo "NPU_MEASUREMENT_BEGIN shapes=200 simulator_tilings=200 official_baselines=200"
 export KEEP_DETAILS=1
 export WARMUP=2
 export REPEAT=20
 export SAMPLES=7
-export RANK_LIMIT=31
-export SUCCESSFUL_TILINGS_PER_WORKLOAD=24
+export RANK_LIMIT=1
+export SUCCESSFUL_TILINGS_PER_WORKLOAD=1
+export SKIP_BANK_SEED_CONTROL=1
 export STRUCTURED_FULL_PREFLIGHT=1
 export NUMERIC_PREFLIGHT_MAX_MIB=256
 export PROFILE_STALL_TIMEOUT_SEC=0
 export PROFILE_PROGRESS_EVERY=50
-export MEASUREMENT_JSONL_LOG_DIRECTORY="${LOG_DIR}"
-export MEASUREMENT_JSONL_LOG_MAX_BYTES=52428800
 
 PROFILE_LOG="${CAMPAIGN_DIR}/measurement_progress.log"
+profile_started_ns="$(date +%s%N)"
 set +e
 "${ROOT}/scripts/profile_npu.sh" \
     "${CANDIDATES}" "${OUT_STEM}" "${WORKLOADS}" \
@@ -199,6 +208,8 @@ set +e
     ') 2>&1
 profile_rc=$?
 set -e
+profile_wall_ms=$(( ($(date +%s%N) - profile_started_ns) / 1000000 ))
+echo "CAMPAIGN_STAGE_TIMING stage=npu_measurement wall_ms=${profile_wall_ms}" | tee -a "${PROFILE_LOG}"
 if [[ "${profile_rc}" -ne 0 ]]; then
     echo "NPU_MEASUREMENT_INCOMPLETE log=${PROFILE_LOG} records=${LOG_DIR}"
     exit "${profile_rc}"
@@ -213,6 +224,7 @@ for required in \
     }
 done
 
+analysis_started_ns="$(date +%s%N)"
 python3 tools/analyze_matmul_model_validation.py \
     --workloads "${WORKLOADS}" \
     --candidates "${CANDIDATES}" \
@@ -220,4 +232,6 @@ python3 tools/analyze_matmul_model_validation.py \
     --official-profile "${DETAILS_DIR}/official_profile.csv" \
     --output "${ANALYSIS}" \
     --log-directory "${LOG_DIR}"
+analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
+echo "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 echo "analysis=${ANALYSIS}"

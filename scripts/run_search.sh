@@ -80,7 +80,13 @@ if [[ "${PLATFORM_AIC_CORES}" -le 0 ]]; then
     exit 1
 fi
 
-if [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v1" ]]; then
+if [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v2" ]]; then
+    MODEL_VALIDATION_LOG_ARGS=()
+    if [[ -n "${MEASUREMENT_JSONL_LOG_DIRECTORY:-}" ]]; then
+        MODEL_VALIDATION_LOG_ARGS=(
+            --jsonl-log-directory "${MEASUREMENT_JSONL_LOG_DIRECTORY}"
+        )
+    fi
     if [[ "${REUSE_MODEL_VALIDATION_CANDIDATES:-0}" == "1" && \
           -s "${SEARCH_OUTPUT}" && -s "${SEARCH_ALL_OUTPUT}" && \
           -s "${MODEL_VALIDATION_WORKLOADS_OUTPUT:?}" ]]; then
@@ -100,7 +106,8 @@ if [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v1" ]]; then
             --l1-bytes "${PLATFORM_L1_BYTES}" \
             --l2-bytes "${PLATFORM_L2_BYTES}" \
             --l2-bytes-per-cycle-per-core "${PLATFORM_L2_BPC}" \
-            --hbm-bytes-per-cycle-per-core "${PLATFORM_HBM_BPC}"
+            --hbm-bytes-per-cycle-per-core "${PLATFORM_HBM_BPC}" \
+            "${MODEL_VALIDATION_LOG_ARGS[@]}"
     fi
 elif [[ "${SEARCH_SCOPE}" == "controlled_frontier_v1" ]]; then
     if [[ "${REUSE_CONTROLLED_CANDIDATES:-0}" == "1" && \

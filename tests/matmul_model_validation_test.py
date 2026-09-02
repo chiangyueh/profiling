@@ -38,30 +38,31 @@ def test_catalog_has_200_plus_unique_shapes_and_colleague_anchors() -> None:
     ) == 60
 
 
-def test_shared_pool_varies_real_core_count_and_both_models_rank_it() -> None:
+def test_hardware_simulator_ranks_the_full_legal_pool(monkeypatch) -> None:
     workload = old.Workload(
         "anchor", 2048, 1536, 7168, "fp16", False, False, 20
     )
     proposals = candidates.proposal_space(workload, HARDWARE, 20)
-    ranked, old_ns, new_ns = candidates.ranked_pool(
+    def old_model_must_not_run(*_args, **_kwargs):
+        raise AssertionError("old analytical cost model was called")
+
+    monkeypatch.setattr(old, "analytical_score", old_model_must_not_run)
+    ranked, new_ns = candidates.ranked_pool(
         workload, proposals, HARDWARE
     )
     assert len(proposals) >= 31
     assert len(ranked) == len(proposals)
-    assert old_ns > 0 and new_ns > 0
-    assert len({row["knowledge"]["usedCoreNum"] for row in ranked[:24]}) >= 3
-    assert any(row["selection"] == "old_frontier" for row in ranked[:24])
-    assert any(row["selection"] == "new_frontier" for row in ranked[:24])
-    assert any("hardware_coverage" in row["selection"] for row in ranked[:24])
+    assert new_ns > 0
+    assert len({row["knowledge"]["usedCoreNum"] for row in ranked}) >= 3
+    assert all(row["selection"] == "new_hardware_simulator" for row in ranked)
 
 
-def test_noise_filtered_pairs_do_not_score_indistinguishable_latency() -> None:
-    correct, comparable = analysis.pair_accuracy(
-        [1.0, 2.0, 3.0],
-        [1.0, 1.005, 1.2],
-        [0.001, 0.001, 0.001],
-    )
-    assert (correct, comparable) == (2, 2)
+def test_paired_result_uses_measured_noise_threshold() -> None:
+    official = {"median_ms": "1", "stddev_ms": "0.001"}
+    close = {"median_ms": "1.005", "stddev_ms": "0.001"}
+    faster = {"median_ms": "0.97", "stddev_ms": "0.001"}
+    assert analysis.paired_result(official, close)["verdict"] == "within_noise"
+    assert analysis.paired_result(official, faster)["verdict"] == "improved"
 
 
 def test_deterministic_splitk_is_lowered_as_numeric_reduction_parts() -> None:

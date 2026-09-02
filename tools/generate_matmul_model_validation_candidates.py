@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build one callback-fixed pool scored by both MatMul cost models."""
+"""Select one callback-fixed MatMul tiling with the hardware simulator."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 import refine_matmul_v3_candidates as old
 import generate_matmul_controlled_candidates as controlled
+from profile_official_tilings import IncrementalJsonl
 from npu_cost_model import (
     MemorySpace,
     Resource,
@@ -29,24 +30,29 @@ from npu_cost_model.operators import matmul
 
 
 SELECTED_WORKLOADS = 200
-SEARCHED_CANDIDATES = 31
-MEASURED_TILINGS = 24
-MODEL_FRONTIER = 6
+SEARCHED_CANDIDATES = 1
+MEASURED_TILINGS = 1
 GEOMETRY_LIMIT = 192
 CUSTOM_COLUMNS = (
     "search_core_cap",
     "pool_sequence",
     "pool_size",
     "pool_selection",
-    "old_model_cycles",
-    "old_model_rank",
-    "old_model_breakdown",
     "new_model_cycles",
+    "new_model_ratio_vs_official",
     "new_model_rank",
     "new_model_bottleneck",
     "new_model_breakdown",
-    "old_model_score_ns",
     "new_model_score_ns",
+    "candidate_generation_ms",
+    "static_legality_ms",
+    "official_callback_ms",
+    "final_callback_ms",
+    "final_callback_count",
+    "final_callback_rejections",
+    "generated_candidate_count",
+    "legal_candidate_count",
+    "simulator_valid_candidate_count",
     "model_input_source",
 )
 
@@ -276,7 +282,7 @@ def ranked_pool(
     workload: old.Workload,
     proposals: list[dict[str, int]],
     platform: old.Hardware,
-) -> tuple[list[dict], int, int]:
+) -> tuple[list[dict], int]:
     generic = generic_hardware(platform)
     operator = matmul(
         workload.m,
@@ -287,12 +293,8 @@ def ranked_pool(
         trans_b=workload.trans_b,
     )
     scored: list[dict] = []
-    old_ns = 0
     new_ns = 0
     for sequence, knowledge in enumerate(proposals, 1):
-        started = time.perf_counter_ns()
-        old_result = old.analytical_score(workload, knowledge, platform)
-        old_ns += time.perf_counter_ns() - started
         started = time.perf_counter_ns()
         new_result = simulate(
             operator,
@@ -305,67 +307,22 @@ def ranked_pool(
         scored.append({
             "knowledge": knowledge,
             "pool_sequence": sequence,
-            "old": old_result,
             "new": new_result,
         })
-    old_order = sorted(scored, key=lambda item: (
-        item["old"].cycles, old.knowledge_signature(item["knowledge"])
-    ))
     new_order = sorted(scored, key=lambda item: (
         item["new"].total_cycles, old.knowledge_signature(item["knowledge"])
     ))
-    for rank, item in enumerate(old_order, 1):
-        item["old_rank_all"] = rank
     for rank, item in enumerate(new_order, 1):
         item["new_rank_all"] = rank
-
-    priority: list[dict] = []
-    source: dict[tuple[int, ...], set[str]] = {}
-    for rank in range(MODEL_FRONTIER):
-        for name, ordered in (("new_frontier", new_order), ("old_frontier", old_order)):
-            if rank >= len(ordered):
-                continue
-            item = ordered[rank]
-            signature = old.knowledge_signature(item["knowledge"])
-            source.setdefault(signature, set()).add(name)
-            if item not in priority:
-                priority.append(item)
-
-    diversity = sorted(scored, key=lambda item: (
-        item["knowledge"]["usedCoreNum"],
-        item["knowledge"]["baseM"] * item["knowledge"]["baseN"],
-        item["knowledge"]["baseK"],
-        item["knowledge"]["l2IterateOrder"],
-        old.knowledge_signature(item["knowledge"]),
-    ))
-    if diversity:
-        for index in range(12):
-            item = diversity[round(index * (len(diversity) - 1) / 11)]
-            signature = old.knowledge_signature(item["knowledge"])
-            source.setdefault(signature, set()).add("hardware_coverage")
-            if item not in priority:
-                priority.append(item)
-    for item in sorted(scored, key=lambda value: (
-        min(value["old_rank_all"], value["new_rank_all"]),
-        max(value["old_rank_all"], value["new_rank_all"]),
-    )):
-        if item not in priority:
-            priority.append(item)
-    for item in priority:
-        item["selection"] = "+".join(sorted(
-            source.get(old.knowledge_signature(item["knowledge"]), {"backup"})
-        ))
-    return priority, old_ns, new_ns
+        item["selection"] = "new_hardware_simulator"
+    return new_order, new_ns
 
 
 def attach_models(
     row: dict[str, str],
-    old_result,
     new_result,
     *,
-    old_rank: int,
     new_rank: int,
-    old_ns: int,
     new_ns: int,
     core_cap: int,
     pool_sequence: int,
@@ -377,16 +334,40 @@ def attach_models(
         "pool_sequence": str(pool_sequence),
         "pool_size": str(pool_size),
         "pool_selection": selection,
-        "old_model_cycles": f"{old_result.cycles:.12g}",
-        "old_model_rank": str(old_rank),
-        "old_model_breakdown": old_result.breakdown(),
         "new_model_cycles": f"{new_result.total_cycles:.12g}",
         "new_model_rank": str(new_rank),
         "new_model_bottleneck": new_result.bottleneck,
         "new_model_breakdown": new_breakdown(new_result),
-        "old_model_score_ns": str(old_ns),
         "new_model_score_ns": str(new_ns),
         "model_input_source": "parameters_only_no_latency_history_no_cce_table",
+    })
+
+
+def attach_callback(
+    row: dict[str, str],
+    callback: old.CallbackTiling,
+    official: old.CallbackTiling,
+) -> None:
+    row.update({
+        "callback_tiling_sha256": callback.sha256,
+        "callback_tiling_bytes": str(len(callback.blob)),
+        "callback_tiling_key": str(callback.key),
+        "callback_block_dim": str(callback.block_dim),
+        "callback_workspace_bytes": str(sum(callback.workspaces)),
+        "callback_l2_cache_flag": str(callback.derived.get("l2CacheFlag", "")),
+        "callback_base_an": str(callback.derived.get("baseAN", "")),
+        "callback_base_ad": str(callback.derived.get("baseAD", "")),
+        "callback_base_bn": str(callback.derived.get("baseBN", "")),
+        "callback_base_bd": str(callback.derived.get("baseBD", "")),
+        "callback_kernel_suffix": str(old.kernel_suffix(callback.key)),
+        "callback_kernel_variant": old.kernel_variant(callback.key),
+        "callback_kernel_family": old.kernel_family(callback.key),
+        "callback_derived_diff_vs_default": old.callback_derived_diff(
+            official, callback
+        ),
+        "callback_derived_diff_vs_bank_seed": old.callback_derived_diff(
+            official, callback
+        ),
     })
 
 
@@ -413,10 +394,13 @@ def main() -> int:
         "--searched-candidates", type=int, default=SEARCHED_CANDIDATES
     )
     parser.add_argument("--splitk-workloads", type=int)
+    parser.add_argument("--jsonl-log-directory", type=Path)
     args = parser.parse_args()
 
-    if args.selected_workloads <= 0 or args.searched_candidates <= 0:
-        raise old.SearchError("selected workload and candidate counts must be positive")
+    if args.selected_workloads <= 0 or args.searched_candidates != 1:
+        raise old.SearchError(
+            "model validation selects exactly one simulator tiling per shape"
+        )
 
     platform = old.Hardware(
         args.aic_cores, args.l0a_bytes, args.l0b_bytes, args.l0c_bytes,
@@ -456,6 +440,19 @@ def main() -> int:
         if args.selected_workloads >= 3 and anchor_ids <= catalog_ids
         else set()
     )
+    timing_log = IncrementalJsonl(
+        args.jsonl_log_directory.resolve()
+        if args.jsonl_log_directory is not None else None,
+        50 * 1024 * 1024,
+    )
+    campaign_started = time.perf_counter_ns()
+    stage_totals = {
+        "official_callback_ns": 0,
+        "candidate_generation_ns": 0,
+        "static_legality_ns": 0,
+        "simulator_scoring_ns": 0,
+        "final_callback_ns": 0,
+    }
 
     for catalog_index, metadata in enumerate(catalog_rows, 1):
         if len(selected_workloads) >= args.selected_workloads:
@@ -472,35 +469,40 @@ def main() -> int:
         )
         core_cap = min(int(metadata["search_core_cap"]), args.aic_cores)
         search_workload = replace(callback_workload, max_cores=core_cap)
-        seed_started = time.perf_counter_ns()
-        seed = old.parse_seed(callback_workload)
-        official_family = old.template_name(seed.bank.knowledge)
-        if official_family not in {"BASE", "DETERMINISTIC_SPLIT_K"}:
-            print(
-                f"MODEL_VALIDATION_SKIP [{catalog_index}/{len(catalog_rows)}] "
-                f"{metadata['workload_id']} official_family="
-                f"{official_family}",
-                flush=True,
-            )
-            continue
+        shape_started = time.perf_counter_ns()
+
+        started = time.perf_counter_ns()
+        official = old.invoke_official_callback(callback_workload)
+        official_callback_ns = time.perf_counter_ns() - started
+
+        started = time.perf_counter_ns()
         proposals = proposal_space_for(
-            search_workload, seed, platform, core_cap, search_family
+            search_workload, None, platform, core_cap, search_family
         )
-        seed_signature = old.knowledge_signature(seed.bank.knowledge)
-        proposals = [
-            knowledge for knowledge in proposals
-            if old.knowledge_signature(knowledge) != seed_signature
-        ]
-        priority, old_score_ns, new_score_ns = ranked_pool(
-            search_workload, proposals, platform
-        )
-        if not priority:
+        candidate_generation_ns = time.perf_counter_ns() - started
+        generated_count = len(proposals)
+
+        started = time.perf_counter_ns()
+        official_signature = old.knowledge_signature(official.knowledge)
+        legal: list[dict[str, int]] = []
+        legal_signatures: set[tuple[int, ...]] = set()
+        for knowledge in proposals:
+            signature = old.knowledge_signature(knowledge)
+            if (
+                signature == official_signature
+                or signature in legal_signatures
+                or not old.hard_legal(search_workload, knowledge, platform)
+            ):
+                continue
+            legal_signatures.add(signature)
+            legal.append(knowledge)
+        static_legality_ns = time.perf_counter_ns() - started
+
+        ranked, new_score_ns = ranked_pool(search_workload, legal, platform)
+        if not ranked:
             continue
 
-        seed_old = old.analytical_score(
-            callback_workload, seed.bank.knowledge, platform
-        )
-        seed_operator = matmul(
+        official_operator = matmul(
             callback_workload.m,
             callback_workload.n,
             callback_workload.k,
@@ -508,47 +510,57 @@ def main() -> int:
             trans_a=callback_workload.trans_a,
             trans_b=callback_workload.trans_b,
         )
-        seed_new = simulate(
-            seed_operator,
+        started = time.perf_counter_ns()
+        official_new = simulate(
+            official_operator,
             plan_from_cann(
                 callback_workload.m,
                 callback_workload.n,
                 callback_workload.k,
-                seed.bank.knowledge,
+                official.knowledge,
             ),
             generic_hardware(platform),
         )
-        if not seed_new.valid:
+        new_score_ns += time.perf_counter_ns() - started
+        if not official_new.valid:
             continue
-        control = old.bank_seed_control(fields, callback_workload, seed, platform)
-        accepted: list[dict] = []
+
         callback_failures = 0
         callback_duplicates = 0
         callback_ns = 0
-        callback_hashes = {seed.bank.sha256}
-        for item in priority:
+        callback_count = 0
+        selected: dict | None = None
+        for item in ranked:
+            ratio = item["new"].total_cycles / max(
+                1.0, official_new.total_cycles
+            )
             state = old.State(
                 row=old.row_from_state(
                     fields, None, callback_workload, item["knowledge"],
-                    "paired_parameter_frontier_v1",
+                    "generic_hardware_simulator_v1",
                     old.template_name(item["knowledge"]),
-                    item["old"].cycles / max(1.0, seed_old.cycles),
-                    item["old"].hbm_bytes, item["old"].l2_bytes, seed.key,
-                    guidance=item["selection"], estimate=item["old"],
-                    bottleneck="paired_model_validation",
-                    rationale="shared legal parameter pool for old/new model ranking",
+                    ratio,
+                    item["new"].gm_read_bytes + item["new"].gm_write_bytes,
+                    item["new"].l2_bytes,
+                    official.key,
+                    guidance=item["selection"], estimate=None,
+                    bottleneck=item["new"].bottleneck,
+                    rationale="lowest predicted cycles from the hardware simulator",
                     resume_policy="allow_new",
                 ),
                 knowledge=item["knowledge"],
-                model_score=item["old"].cycles,
-                normalized_score=item["old"].cycles / max(1.0, seed_old.cycles),
-                hbm_bytes=item["old"].hbm_bytes,
-                l2_bytes=item["old"].l2_bytes,
+                model_score=item["new"].total_cycles,
+                normalized_score=ratio,
+                hbm_bytes=(
+                    item["new"].gm_read_bytes + item["new"].gm_write_bytes
+                ),
+                l2_bytes=item["new"].l2_bytes,
                 template=old.template_name(item["knowledge"]),
                 guidance=item["selection"],
-                estimate=item["old"],
+                estimate=None,
             )
             started = time.perf_counter_ns()
+            callback_count += 1
             try:
                 callback = old.validate_callback(callback_workload, state)
             except Exception:
@@ -556,92 +568,111 @@ def main() -> int:
                 callback_failures += 1
                 continue
             callback_ns += time.perf_counter_ns() - started
-            if callback.sha256 in callback_hashes:
+            if callback.sha256 == official.sha256:
                 callback_duplicates += 1
                 continue
-            callback_hashes.add(callback.sha256)
-            old.update_callback_columns(
-                state, callback, seed, seed_old, platform, callback_workload
-            )
+            state.callback = callback
+            attach_callback(state.row, callback, official)
             item["state"] = state
-            accepted.append(item)
-            if len(accepted) == args.searched_candidates:
-                break
-        if len(accepted) < args.searched_candidates:
+            selected = item
+            break
+        if selected is None:
             print(
                 f"MODEL_VALIDATION_SKIP [{catalog_index}/{len(catalog_rows)}] "
-                f"{metadata['workload_id']} callback_fixed={len(accepted)} "
-                f"required={args.searched_candidates} callback_rejected={callback_failures} "
+                f"{metadata['workload_id']} no_final_callback_fixed_candidate "
+                f"callback_rejected={callback_failures} "
                 f"callback_duplicates={callback_duplicates}",
                 flush=True,
             )
             continue
 
-        combined = [
-            {
-                "row": control.row,
-                "old": seed_old,
-                "new": seed_new,
-                "pool_sequence": 0,
-                "selection": "official_autotiling_control",
-            },
-            *(
-                {
-                    "row": item["state"].row,
-                    "old": item["old"],
-                    "new": item["new"],
-                    "pool_sequence": item["pool_sequence"],
-                    "selection": item["selection"],
-                }
-                for item in accepted
-            ),
-        ]
-        old_order = {
-            id(item): rank for rank, item in enumerate(
-                sorted(combined, key=lambda value: value["old"].cycles), 1
-            )
+        row = selected["state"].row
+        row["rank"] = "1"
+        attach_models(
+            row,
+            selected["new"],
+            new_rank=selected["new_rank_all"],
+            new_ns=new_score_ns,
+            core_cap=core_cap,
+            pool_sequence=selected["pool_sequence"],
+            pool_size=len(legal),
+            selection=selected["selection"],
+        )
+        total_ns = time.perf_counter_ns() - shape_started
+        timing_values = {
+            "candidate_generation_ms": candidate_generation_ns / 1e6,
+            "static_legality_ms": static_legality_ns / 1e6,
+            "official_callback_ms": official_callback_ns / 1e6,
+            "final_callback_ms": callback_ns / 1e6,
         }
-        new_order = {
-            id(item): rank for rank, item in enumerate(
-                sorted(combined, key=lambda value: value["new"].total_cycles), 1
-            )
-        }
-        total_score_ns = max(1, old_score_ns + new_score_ns)
-        for execution_rank, item in enumerate(combined):
-            row = item["row"]
-            row["rank"] = str(execution_rank)
-            attach_models(
-                row, item["old"], item["new"],
-                old_rank=old_order[id(item)], new_rank=new_order[id(item)],
-                old_ns=old_score_ns, new_ns=new_score_ns,
-                core_cap=core_cap, pool_sequence=item["pool_sequence"],
-                pool_size=len(proposals), selection=item["selection"],
-            )
-            row["tiling_solver_select_ms"] = f"{total_score_ns / 1e6:.9g}"
-            row["tiling_solver_callback_ms"] = f"{callback_ns / 1e6:.9g}"
-            row["tiling_solver_callback_count"] = str(
-                len(accepted) + callback_failures
-            )
-            total_ms = (time.perf_counter_ns() - seed_started) / 1e6
-            row["tiling_solver_total_ms"] = f"{total_ms:.9g}"
-            selected_rows.append(dict(row))
-            all_rows.append(dict(row))
+        row.update({
+            **{name: f"{value:.9g}" for name, value in timing_values.items()},
+            "final_callback_count": str(callback_count),
+            "final_callback_rejections": str(callback_failures),
+            "generated_candidate_count": str(generated_count),
+            "legal_candidate_count": str(len(legal)),
+            "simulator_valid_candidate_count": str(len(ranked)),
+            "tiling_official_callback_ms": f"{official_callback_ns / 1e6:.9g}",
+            "tiling_runtime_kb_seed_ms": "0",
+            "tiling_solver_select_ms": f"{new_score_ns / 1e6:.9g}",
+            "tiling_solver_callback_ms": f"{callback_ns / 1e6:.9g}",
+            "tiling_solver_callback_count": str(callback_count),
+            "tiling_solver_extra_ms": f"{(candidate_generation_ns + static_legality_ns) / 1e6:.9g}",
+            "tiling_solver_total_ms": f"{total_ns / 1e6:.9g}",
+            "search_model_cycles": f"{selected['new'].total_cycles:.12g}",
+            "search_model_raw_ratio_vs_bank_seed": f"{selected['state'].normalized_score:.12g}",
+            "search_model_ratio_vs_bank_seed": f"{selected['state'].normalized_score:.12g}",
+            "new_model_ratio_vs_official": f"{selected['state'].normalized_score:.12g}",
+            "search_model_breakdown": new_breakdown(selected["new"]),
+        })
+        selected_rows.append(dict(row))
+        all_rows.append(dict(row))
         selected_workloads.append(metadata)
         family_counts[search_family] += 1
+        stage_totals["official_callback_ns"] += official_callback_ns
+        stage_totals["candidate_generation_ns"] += candidate_generation_ns
+        stage_totals["static_legality_ns"] += static_legality_ns
+        stage_totals["simulator_scoring_ns"] += new_score_ns
+        stage_totals["final_callback_ns"] += callback_ns
+        timing_log.write(
+            f"selection:{metadata['workload_id']}",
+            {
+                "schema": "matmul_hardware_simulator_selection_v2",
+                "record_type": "tiling_selection_timing",
+                "workload": metadata,
+                "generated_candidates": generated_count,
+                "legal_candidates": len(legal),
+                "simulator_valid_candidates": len(ranked),
+                "selected_new_model_rank": selected["new_rank_all"],
+                "selected_used_core_num": selected["knowledge"]["usedCoreNum"],
+                "callback_attempts": callback_count,
+                "callback_rejections": callback_failures,
+                "timing_ms": {
+                    **timing_values,
+                    "simulator_scoring_ms": new_score_ns / 1e6,
+                    "total_ms": total_ns / 1e6,
+                },
+            },
+        )
         print(
             f"MODEL_VALIDATION_CANDIDATES [{len(selected_workloads)}/{args.selected_workloads}] "
             f"{metadata['workload_id']} shape={metadata['m']}x{metadata['n']}x{metadata['k']} "
             f"dtype={metadata['dtype']} trans={metadata['trans_a']}{metadata['trans_b']} "
-            f"core_cap={core_cap} pool={len(proposals)} callback_fixed={len(accepted)} "
-            f"family={search_family} callback_rejected={callback_failures} "
-            f"callback_duplicates={callback_duplicates}",
+            f"core_cap={core_cap} pool={generated_count} legal={len(legal)} "
+            f"family={search_family} selected_core={selected['knowledge']['usedCoreNum']} "
+            f"generation_ms={timing_values['candidate_generation_ms']:.3f} "
+            f"legality_ms={timing_values['static_legality_ms']:.3f} "
+            f"model_ms={new_score_ns / 1e6:.3f} "
+            f"official_callback_ms={timing_values['official_callback_ms']:.3f} "
+            f"final_callback_ms={timing_values['final_callback_ms']:.3f} "
+            f"total_ms={total_ns / 1e6:.3f}",
             flush=True,
         )
 
     if len(selected_workloads) != args.selected_workloads:
         raise old.SearchError(
-            f"only {len(selected_workloads)} BASE workloads have {args.searched_candidates} "
-            f"callback-fixed candidates; required {args.selected_workloads}"
+            f"only {len(selected_workloads)} workloads produced a callback-fixed "
+            f"simulator selection; required {args.selected_workloads}"
         )
     if not required_anchors <= {row["workload_id"] for row in selected_workloads}:
         raise old.SearchError("one or more colleague anchor shapes were not admitted")
@@ -663,11 +694,31 @@ def main() -> int:
             writer.writerows(rows)
     print(
         f"MATMUL_MODEL_VALIDATION_CANDIDATES shapes={len(selected_workloads)} "
-        f"tilings_per_shape={args.searched_candidates + 1} "
+        "tilings_per_shape=1 "
         f"measured_per_shape={MEASURED_TILINGS} "
-        f"families={family_counts}",
+        f"families={family_counts} "
+        f"wall_ms={(time.perf_counter_ns() - campaign_started) / 1e6:.3f} "
+        + " ".join(
+            f"{name[:-3]}_ms={value / 1e6:.3f}"
+            for name, value in stage_totals.items()
+        ),
         flush=True,
     )
+    timing_log.write(
+        "selection:campaign_complete",
+        {
+            "schema": "matmul_hardware_simulator_selection_v2",
+            "record_type": "tiling_selection_timing_summary",
+            "status": "complete",
+            "shape_count": len(selected_workloads),
+            "timing_ms": {
+                name[:-3]: value / 1e6
+                for name, value in stage_totals.items()
+            },
+            "wall_ms": (time.perf_counter_ns() - campaign_started) / 1e6,
+        },
+    )
+    timing_log.close()
     return 0
 
 

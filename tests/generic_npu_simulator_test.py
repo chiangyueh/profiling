@@ -18,9 +18,11 @@ from npu_cost_model import (
     Tensor,
     TilingPlan,
     ascend_910b3,
+    derive_ideal_region,
     generate_plans,
     simulate,
     solve,
+    solve_ideal_region,
 )
 from npu_cost_model.operators import (
     elementwise_add,
@@ -234,7 +236,9 @@ def test_generated_matmul_plans_are_aligned_and_solver_returns_legal_top_k() -> 
 
 
 def test_public_solver_has_no_history_or_callback_input() -> None:
-    for function in (generate_plans, solve, simulate):
+    for function in (
+        generate_plans, derive_ideal_region, solve, solve_ideal_region, simulate
+    ):
         parameters = inspect.signature(function).parameters
         assert "history" not in parameters
         assert "callback" not in parameters
@@ -257,6 +261,34 @@ def test_capped_search_covers_every_hardware_dimension_not_a_prefix() -> None:
     assert {plan.used_cores for plan in plans} >= {1, 20}
     assert {plan.reductions["k"] for plan in plans} >= {1, 20}
     assert len({plan.buffers for plan in plans}) > 2
+
+
+def test_ideal_region_is_local_bounded_and_uses_every_declared_algorithm() -> None:
+    original = _copy_operator()
+    second = replace(original.algorithms[0], name="second_execution_graph")
+    operator = replace(original, algorithms=(original.algorithms[0], second))
+    region = derive_ideal_region(operator, HARDWARE)
+    assert region.exhaustive
+    assert region.plans
+    assert len(region.plans) < 100
+    assert dict(region.algorithm_anchor_counts).keys() == {0, 1}
+    assert dict(region.algorithm_region_counts).keys() == {0, 1}
+    assert all(simulate(operator, plan, HARDWARE).valid for plan in region.plans)
+
+
+def test_reduction_schedule_is_discovered_without_a_named_splitk_path() -> None:
+    operator = matmul(128, 128, 16384)
+    region = derive_ideal_region(operator, HARDWARE)
+    partitions = {plan.reductions["k"] for plan in region.plans}
+    assert 1 in partitions
+    assert max(partitions) > 1
+    renamed = replace(
+        operator,
+        algorithms=(replace(operator.algorithms[0], name="renamed"),),
+        name="renamed_operator",
+    )
+    renamed_region = derive_ideal_region(renamed, HARDWARE)
+    assert region.plans == renamed_region.plans
 
 
 def test_l2_traversal_and_pipeline_boundaries_change_cycles() -> None:

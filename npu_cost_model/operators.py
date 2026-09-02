@@ -50,14 +50,17 @@ def matmul(
     b_shape = (n, k) if trans_b else (k, n)
     axes = (
         Axis(
-            "m", m, AxisKind.PARALLEL, 16, _power_tiles(16, 256),
+            "m", m, AxisKind.PARALLEL, 16, tuple(range(16, 257, 16)),
             independent_task_tiling=True, independent_cache_tiling=True,
         ),
         Axis(
-            "n", n, AxisKind.PARALLEL, 16, _power_tiles(16, 256),
+            "n", n, AxisKind.PARALLEL, 16, tuple(range(16, 257, 16)),
             independent_task_tiling=True, independent_cache_tiling=True,
         ),
-        Axis("k", k, AxisKind.REDUCTION, k0, _power_tiles(k0, 256), False),
+        Axis(
+            "k", k, AxisKind.REDUCTION, k0,
+            tuple(range(k0, 257, k0)), False,
+        ),
     )
     tensors = (
         Tensor("A", a_shape, dtype),

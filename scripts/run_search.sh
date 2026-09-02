@@ -80,7 +80,7 @@ if [[ "${PLATFORM_AIC_CORES}" -le 0 ]]; then
     exit 1
 fi
 
-if [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v2" ]]; then
+if [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v3" ]]; then
     MODEL_VALIDATION_LOG_ARGS=()
     if [[ -n "${MEASUREMENT_JSONL_LOG_DIRECTORY:-}" ]]; then
         MODEL_VALIDATION_LOG_ARGS=(

@@ -17,12 +17,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import refine_matmul_v3_candidates as old
-import generate_matmul_controlled_candidates as controlled
 from profile_official_tilings import IncrementalJsonl
 from npu_cost_model import (
     MemorySpace,
     Resource,
+    ScheduleSpace,
+    SearchPolicy,
     ascend_910b3,
+    derive_ideal_region,
     plan_from_cann,
     simulate,
 )
@@ -32,7 +34,6 @@ from npu_cost_model.operators import matmul
 SELECTED_WORKLOADS = 200
 SEARCHED_CANDIDATES = 1
 MEASURED_TILINGS = 1
-GEOMETRY_LIMIT = 192
 CUSTOM_COLUMNS = (
     "search_core_cap",
     "pool_sequence",
@@ -53,6 +54,10 @@ CUSTOM_COLUMNS = (
     "generated_candidate_count",
     "legal_candidate_count",
     "simulator_valid_candidate_count",
+    "ideal_anchor_count",
+    "ideal_region_count",
+    "ideal_discovery_evaluations",
+    "execution_graphs_represented",
     "model_input_source",
 )
 
@@ -67,80 +72,23 @@ def truthy(value: object) -> bool:
     return str(value or "").lower() in {"1", "true", "yes", "on"}
 
 
-def axis_values(extent: int, core_cap: int) -> tuple[int, ...]:
-    values = {16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256}
-    for parts in {1, 2, 3, 4, 5, 8, 10, 12, 16, 20, core_cap}:
-        value = old.align_up(old.ceil_div(extent, parts), 16)
-        if value <= 256:
-            values.add(value)
-    return tuple(sorted(value for value in values if value <= max(16, extent)))
-
-
-def core_values(core_cap: int, tasks: int) -> tuple[int, ...]:
-    return tuple(sorted(
-        value for value in {1, 2, 3, 4, 5, 8, 10, 12, 16, 20, core_cap, tasks}
-        if value <= core_cap and value <= tasks
-    ))
-
-
-def geometry_values(
-    workload: old.Workload,
-    core_cap: int,
-) -> list[tuple[int, int, int]]:
-    k0 = old.base_k_alignment(workload)
-    k_values = tuple(k0 * factor for factor in (1, 2, 4, 8, 16))
-    combinations = [
-        (base_m, base_n, base_k)
-        for base_m in axis_values(workload.m, core_cap)
-        for base_n in axis_values(workload.n, core_cap)
-        for base_k in k_values
-    ]
-    combinations.sort(key=lambda item: (
-        (item[0] * 73856093 ^ item[1] * 19349663 ^ item[2] * 83492791)
-        % 2147483647,
-        item,
-    ))
-    preferred = [
-        item for item in combinations
-        if item[0] in (64, 128, 256)
-        and item[1] in (64, 128, 256)
-        and item[2] in (4 * k0, 8 * k0)
-    ]
-    result: list[tuple[int, int, int]] = []
-    for item in (*preferred, *combinations):
-        if item not in result:
-            result.append(item)
-        if len(result) == GEOMETRY_LIMIT:
-            break
-    return result
-
-
-def l2_profiles(m_parts: int, n_parts: int, cores: int) -> tuple[tuple[int, int, int], ...]:
-    ideal_m = max(1, min(m_parts, round(math.sqrt(
-        cores * m_parts / max(1, n_parts)
-    ))))
-    profiles = {
-        (m_parts, n_parts, 0),
-        (ideal_m, max(1, min(n_parts, old.ceil_div(cores, ideal_m))), 0),
-        (min(m_parts, cores), 1, 1),
-        (1, min(n_parts, cores), 2),
-    }
-    return tuple(sorted(profiles))
-
-
-def make_base(
+def make_base_from_plan(
     workload: old.Workload,
     hardware: old.Hardware,
-    base_m: int,
-    base_n: int,
-    base_k: int,
-    cores: int,
-    l2_m: int,
-    l2_n: int,
-    l2_order: int,
-    iterate_order: int,
-    buffers: tuple[int, int, int],
+    plan,
 ) -> dict[str, int] | None:
+    base_m = plan.tiles["m"]
+    base_n = plan.tiles["n"]
+    base_k = plan.tiles["k"]
+    m_parts = old.ceil_div(workload.m, base_m)
+    n_parts = old.ceil_div(workload.n, base_n)
+    l2_m = max(1, min(m_parts, old.ceil_div(plan.caches["m"], base_m)))
+    l2_n = max(1, min(n_parts, old.ceil_div(plan.caches["n"], base_n)))
+    traversal = plan.traversal or ("m", "n")
+    l2_order = 1 if traversal[-1] == "n" else 2
+    iterate_order = 0 if traversal[-1] == "n" else 1
+    buffers = plan.buffer_counts
+    cores = min(plan.used_cores, m_parts * n_parts, workload.max_cores)
     knowledge = {
         "usedCoreNum": cores,
         "singleCoreM": base_m,
@@ -156,9 +104,9 @@ def make_base(
         "iterateOrder": iterate_order,
         "stepKa": 1,
         "stepKb": 1,
-        "dbL0A": buffers[0],
-        "dbL0B": buffers[1],
-        "dbL0C": buffers[2],
+        "dbL0A": buffers.get(MemorySpace.L0A, 1),
+        "dbL0B": buffers.get(MemorySpace.L0B, 1),
+        "dbL0C": buffers.get(MemorySpace.L0C, 1),
         "l2MTileCnt": old.ceil_div(old.ceil_div(workload.m, base_m), l2_m),
         "l2NTileCnt": old.ceil_div(old.ceil_div(workload.n, base_n), l2_n),
         "l2MTileBlock": l2_m,
@@ -178,43 +126,105 @@ def make_base(
     return knowledge if old.hard_legal(workload, knowledge, hardware) else None
 
 
+def make_parallel_reduction_from_plan(
+    workload: old.Workload,
+    hardware: old.Hardware,
+    plan,
+) -> dict[str, int] | None:
+    """Encode a numeric parallel-reduction plan in the CANN 8.1 ABI.
+
+    The fixed values are the public deterministic-reduction execution-graph
+    contract. They do not decide whether reduction parallelism is searched or
+    how it is ranked; the generic IR solver has already made that decision.
+    """
+
+    in_bytes = old.INPUT_BYTES[workload.dtype]
+    base_k = 256 // in_bytes
+    single_k = 3 * base_k
+    k_chunks = old.ceil_div(workload.k, single_k)
+    if k_chunks < 2:
+        return None
+    traversal = plan.traversal or ("m", "n")
+    if traversal[-1] == "n":
+        step_m, step_n, depth_a, depth_b = 3, 1, 9, 6
+        iterate_order, l2_order = 1, 0
+        single_m, single_n = 384, max(128, workload.n)
+    else:
+        step_m, step_n, depth_a, depth_b = 1, 3, 6, 9
+        iterate_order, l2_order = 0, 1
+        single_m, single_n = max(128, workload.m), 384
+    m_chunks = old.ceil_div(workload.m, single_m)
+    n_chunks = old.ceil_div(workload.n, single_n)
+    knowledge = {
+        "usedCoreNum": min(
+            plan.used_cores, k_chunks, workload.max_cores, hardware.aic_cores
+        ),
+        "singleCoreM": single_m,
+        "singleCoreN": single_n,
+        "singleCoreK": single_k,
+        "baseM": 128,
+        "baseN": 128,
+        "baseK": base_k,
+        "depthA1": depth_a,
+        "depthB1": depth_b,
+        "stepM": step_m,
+        "stepN": step_n,
+        "iterateOrder": iterate_order,
+        "stepKa": 3,
+        "stepKb": 3,
+        "dbL0A": 2,
+        "dbL0B": 2,
+        "dbL0C": 2,
+        "l2MTileCnt": 1,
+        "l2NTileCnt": 1,
+        "l2MTileBlock": max(1, m_chunks),
+        "l2NTileBlock": max(1, n_chunks),
+        "l2IterateOrder": l2_order,
+        "tilingEnable": 3,
+    }
+    return knowledge if old.hard_legal(workload, knowledge, hardware) else None
+
+
+def derive_proposals(
+    workload: old.Workload,
+    hardware: old.Hardware,
+    core_cap: int,
+):
+    generic = generic_hardware(hardware)
+    operator = matmul(
+        workload.m, workload.n, workload.k, workload.dtype,
+        trans_a=workload.trans_a, trans_b=workload.trans_b,
+    )
+    region = derive_ideal_region(
+        operator,
+        generic,
+        ScheduleSpace(core_options=tuple(range(1, core_cap + 1))),
+        SearchPolicy(top_k=1, max_evaluations=10000),
+    )
+    result: list[dict[str, int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for plan in region.plans:
+        reduction_parts = math.prod(plan.reductions.values()) if plan.reductions else 1
+        knowledge = (
+            make_base_from_plan(workload, hardware, plan)
+            if reduction_parts == 1
+            else make_parallel_reduction_from_plan(workload, hardware, plan)
+        )
+        if knowledge is None:
+            continue
+        signature = old.knowledge_signature(knowledge)
+        if signature not in seen:
+            seen.add(signature)
+            result.append(knowledge)
+    return result, region
+
+
 def proposal_space(
     workload: old.Workload,
     hardware: old.Hardware,
     core_cap: int,
 ) -> list[dict[str, int]]:
-    result: list[dict[str, int]] = []
-    seen: set[tuple[int, ...]] = set()
-    for base_m, base_n, base_k in geometry_values(workload, core_cap):
-        m_parts = old.ceil_div(workload.m, base_m)
-        n_parts = old.ceil_div(workload.n, base_n)
-        maximum_cores = min(core_cap, m_parts * n_parts)
-        if maximum_cores <= 0:
-            continue
-
-        specs: list[tuple[int, int, int, int, int, tuple[int, int, int]]] = []
-        for cores in core_values(core_cap, m_parts * n_parts):
-            specs.append((cores, m_parts, n_parts, 0, 0, (2, 2, 1)))
-        for l2_m, l2_n, l2_order in l2_profiles(m_parts, n_parts, maximum_cores):
-            specs.append((maximum_cores, l2_m, l2_n, l2_order, 0, (2, 2, 1)))
-        specs.extend(
-            (maximum_cores, m_parts, n_parts, 0, order, buffers)
-            for order in (0, 1)
-            for buffers in ((1, 1, 1), (2, 2, 1), (2, 2, 2))
-        )
-        for cores, l2_m, l2_n, l2_order, order, buffers in specs:
-            knowledge = make_base(
-                workload, hardware, base_m, base_n, base_k, cores,
-                l2_m, l2_n, l2_order, order, buffers,
-            )
-            if knowledge is None:
-                continue
-            signature = old.knowledge_signature(knowledge)
-            if signature in seen:
-                continue
-            seen.add(signature)
-            result.append(knowledge)
-    return result
+    return derive_proposals(workload, hardware, core_cap)[0]
 
 
 def proposal_space_for(
@@ -222,18 +232,10 @@ def proposal_space_for(
     seed: old.Seed,
     hardware: old.Hardware,
     core_cap: int,
-    search_family: str,
+    search_family: str = "hardware_ideal_region",
 ) -> list[dict[str, int]]:
-    if search_family == "base":
-        return proposal_space(workload, hardware, core_cap)
-    if search_family == "deterministic_split_k":
-        return [
-            knowledge
-            for knowledge, _, _, _
-            in controlled.deterministic_splitk_candidates(workload, hardware)
-            if knowledge["usedCoreNum"] <= core_cap
-        ]
-    raise old.SearchError(f"unknown model-validation search family: {search_family}")
+    del seed, search_family
+    return proposal_space(workload, hardware, core_cap)
 
 
 def generic_hardware(platform: old.Hardware):
@@ -393,7 +395,6 @@ def main() -> int:
     parser.add_argument(
         "--searched-candidates", type=int, default=SEARCHED_CANDIDATES
     )
-    parser.add_argument("--splitk-workloads", type=int)
     parser.add_argument("--jsonl-log-directory", type=Path)
     args = parser.parse_args()
 
@@ -421,18 +422,7 @@ def main() -> int:
     selected_workloads: list[dict[str, str]] = []
     selected_rows: list[dict[str, str]] = []
     all_rows: list[dict[str, str]] = []
-    split_target = (
-        args.splitk_workloads
-        if args.splitk_workloads is not None
-        else 40 if args.selected_workloads >= 200 else 0
-    )
-    if not 0 <= split_target <= args.selected_workloads:
-        raise old.SearchError("split-K workload count is outside the selected total")
-    family_targets = {
-        "base": args.selected_workloads - split_target,
-        "deterministic_split_k": split_target,
-    }
-    family_counts = {name: 0 for name in family_targets}
+    execution_graph_counts: dict[str, int] = {}
     anchor_ids = {"matmul_rank_000", "matmul_rank_001", "matmul_rank_002"}
     catalog_ids = {row["workload_id"] for row in catalog_rows}
     required_anchors = (
@@ -457,11 +447,9 @@ def main() -> int:
     for catalog_index, metadata in enumerate(catalog_rows, 1):
         if len(selected_workloads) >= args.selected_workloads:
             break
-        search_family = metadata.get("search_family", "base")
-        if family_counts.get(search_family, 0) >= family_targets.get(
-            search_family, 0
-        ):
-            continue
+        metadata = dict(metadata)
+        search_family = "hardware_ideal_region"
+        metadata["search_family"] = search_family
         callback_workload = old.Workload(
             metadata["workload_id"], int(metadata["m"]), int(metadata["n"]),
             int(metadata["k"]), metadata["dtype"], truthy(metadata["trans_a"]),
@@ -476,8 +464,8 @@ def main() -> int:
         official_callback_ns = time.perf_counter_ns() - started
 
         started = time.perf_counter_ns()
-        proposals = proposal_space_for(
-            search_workload, None, platform, core_cap, search_family
+        proposals, ideal_region = derive_proposals(
+            search_workload, platform, core_cap
         )
         candidate_generation_ns = time.perf_counter_ns() - started
         generated_count = len(proposals)
@@ -612,6 +600,12 @@ def main() -> int:
             "generated_candidate_count": str(generated_count),
             "legal_candidate_count": str(len(legal)),
             "simulator_valid_candidate_count": str(len(ranked)),
+            "ideal_anchor_count": str(len(ideal_region.anchors)),
+            "ideal_region_count": str(len(ideal_region.plans)),
+            "ideal_discovery_evaluations": str(ideal_region.evaluated),
+            "execution_graphs_represented": ";".join(sorted({
+                old.template_name(item) for item in proposals
+            })),
             "tiling_official_callback_ms": f"{official_callback_ns / 1e6:.9g}",
             "tiling_runtime_kb_seed_ms": "0",
             "tiling_solver_select_ms": f"{new_score_ns / 1e6:.9g}",
@@ -628,7 +622,10 @@ def main() -> int:
         selected_rows.append(dict(row))
         all_rows.append(dict(row))
         selected_workloads.append(metadata)
-        family_counts[search_family] += 1
+        selected_graph = old.template_name(selected["knowledge"])
+        execution_graph_counts[selected_graph] = (
+            execution_graph_counts.get(selected_graph, 0) + 1
+        )
         stage_totals["official_callback_ns"] += official_callback_ns
         stage_totals["candidate_generation_ns"] += candidate_generation_ns
         stage_totals["static_legality_ns"] += static_legality_ns
@@ -637,12 +634,18 @@ def main() -> int:
         timing_log.write(
             f"selection:{metadata['workload_id']}",
             {
-                "schema": "matmul_hardware_simulator_selection_v2",
+                "schema": "matmul_hardware_simulator_selection_v3",
                 "record_type": "tiling_selection_timing",
                 "workload": metadata,
                 "generated_candidates": generated_count,
                 "legal_candidates": len(legal),
                 "simulator_valid_candidates": len(ranked),
+                "ideal_anchors": len(ideal_region.anchors),
+                "ideal_region_plans": len(ideal_region.plans),
+                "ideal_discovery_evaluations": ideal_region.evaluated,
+                "execution_graphs_represented": sorted({
+                    old.template_name(item) for item in proposals
+                }),
                 "selected_new_model_rank": selected["new_rank_all"],
                 "selected_used_core_num": selected["knowledge"]["usedCoreNum"],
                 "callback_attempts": callback_count,
@@ -659,7 +662,8 @@ def main() -> int:
             f"{metadata['workload_id']} shape={metadata['m']}x{metadata['n']}x{metadata['k']} "
             f"dtype={metadata['dtype']} trans={metadata['trans_a']}{metadata['trans_b']} "
             f"core_cap={core_cap} pool={generated_count} legal={len(legal)} "
-            f"family={search_family} selected_core={selected['knowledge']['usedCoreNum']} "
+            f"graph={selected_graph} selected_core={selected['knowledge']['usedCoreNum']} "
+            f"anchors={len(ideal_region.anchors)} region={len(ideal_region.plans)} "
             f"generation_ms={timing_values['candidate_generation_ms']:.3f} "
             f"legality_ms={timing_values['static_legality_ms']:.3f} "
             f"model_ms={new_score_ns / 1e6:.3f} "
@@ -676,11 +680,6 @@ def main() -> int:
         )
     if not required_anchors <= {row["workload_id"] for row in selected_workloads}:
         raise old.SearchError("one or more colleague anchor shapes were not admitted")
-    if family_counts != family_targets:
-        raise old.SearchError(
-            f"selected family counts {family_counts}, required {family_targets}"
-        )
-
     args.workloads.parent.mkdir(parents=True, exist_ok=True)
     with args.workloads.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=catalog_fields)
@@ -696,7 +695,7 @@ def main() -> int:
         f"MATMUL_MODEL_VALIDATION_CANDIDATES shapes={len(selected_workloads)} "
         "tilings_per_shape=1 "
         f"measured_per_shape={MEASURED_TILINGS} "
-        f"families={family_counts} "
+        f"selected_execution_graphs={execution_graph_counts} "
         f"wall_ms={(time.perf_counter_ns() - campaign_started) / 1e6:.3f} "
         + " ".join(
             f"{name[:-3]}_ms={value / 1e6:.3f}"
@@ -707,10 +706,11 @@ def main() -> int:
     timing_log.write(
         "selection:campaign_complete",
         {
-            "schema": "matmul_hardware_simulator_selection_v2",
+            "schema": "matmul_hardware_simulator_selection_v3",
             "record_type": "tiling_selection_timing_summary",
             "status": "complete",
             "shape_count": len(selected_workloads),
+            "selected_execution_graphs": execution_graph_counts,
             "timing_ms": {
                 name[:-3]: value / 1e6
                 for name, value in stage_totals.items()

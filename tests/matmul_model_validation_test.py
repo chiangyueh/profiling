@@ -32,10 +32,9 @@ def test_catalog_has_200_plus_unique_shapes_and_colleague_anchors() -> None:
         ("4096", "512", "7168"),
     ]
     assert len({row["search_core_cap"] for row in rows}) == 7
-    assert sum(row["search_family"] == "base" for row in rows) == 180
-    assert sum(
-        row["search_family"] == "deterministic_split_k" for row in rows
-    ) == 60
+    assert {row["search_family"] for row in rows} == {
+        "hardware_ideal_region"
+    }
 
 
 def test_hardware_simulator_ranks_the_full_legal_pool(monkeypatch) -> None:
@@ -50,10 +49,10 @@ def test_hardware_simulator_ranks_the_full_legal_pool(monkeypatch) -> None:
     ranked, new_ns = candidates.ranked_pool(
         workload, proposals, HARDWARE
     )
-    assert len(proposals) >= 31
+    assert 1 < len(proposals) < 100
     assert len(ranked) == len(proposals)
     assert new_ns > 0
-    assert len({row["knowledge"]["usedCoreNum"] for row in ranked}) >= 3
+    assert len({row["knowledge"]["usedCoreNum"] for row in ranked}) >= 2
     assert all(row["selection"] == "new_hardware_simulator" for row in ranked)
 
 
@@ -69,13 +68,16 @@ def test_deterministic_splitk_is_lowered_as_numeric_reduction_parts() -> None:
     workload = old.Workload(
         "split", 128, 128, 16384, "fp16", False, False, 20
     )
-    proposal = candidates.proposal_space_for(
+    proposals = candidates.proposal_space_for(
         workload,
         None,
         HARDWARE,
         20,
         "deterministic_split_k",
-    )[0]
+    )
+    proposal = next(
+        item for item in proposals if item["tilingEnable"] == 3
+    )
     plan = plan_from_cann(
         workload.m, workload.n, workload.k, proposal
     )
@@ -118,6 +120,20 @@ def test_old_model_does_not_cancel_splitk_parallelism_with_base_l2_penalty() -> 
         workload, dict(knowledge, usedCoreNum=20), HARDWARE
     )
     assert twenty_core.cycles < four_core.cycles
+
+
+def test_matmul_generation_has_no_fixed_base_or_splitk_quota() -> None:
+    source = Path(candidates.__file__).read_text(encoding="utf-8")
+    assert "GEOMETRY_LIMIT" not in source
+    assert "deterministic_splitk_candidates" not in source
+    assert "splitk-workloads" not in source
+    workload = old.Workload(
+        "deep", 128, 128, 16384, "fp16", False, False, 20
+    )
+    proposals, region = candidates.derive_proposals(workload, HARDWARE, 20)
+    assert region.evaluated < 1000
+    assert len(region.plans) < region.evaluated
+    assert {item["tilingEnable"] for item in proposals} == {0, 3}
 
 
 def test_incremental_log_resumes_without_duplicate_records(tmp_path: Path) -> None:

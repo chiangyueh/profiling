@@ -10,7 +10,8 @@ usage() {
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
 Paired MatMulV3 model validation: 200 unique shapes, one final simulator
-tiling and one official autotiling baseline per shape (400 latency records).
+tiling selected from a hardware-derived ideal neighbourhood and one official
+autotiling baseline per shape (400 latency records).
 USAGE
 }
 
@@ -64,7 +65,7 @@ CAMPAIGN_ID="$({
         runner/official_matmul_runner.cpp \
         npu_cost_model/*.py
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_model_validation_v2/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_model_validation_v3/${CAMPAIGN_ID}"
 CATALOG="${CAMPAIGN_DIR}/catalog.csv"
 WORKLOADS="${CAMPAIGN_DIR}/workloads.csv"
 CANDIDATES="${CAMPAIGN_DIR}/candidates.csv"
@@ -86,7 +87,7 @@ fi
 
 echo "CAMPAIGN_READY operator=matmul shapes=200 selected_tilings_per_shape=1 records=400 device=${PHYSICAL_DEVICE}"
 echo "comparison=official_matmul_v3,new_hardware_simulator"
-echo "families=base:160,deterministic_split_k:40"
+echo "search=all_declared_execution_graphs,hardware_ideal_region,adjacent_transitions"
 echo "logs=${LOG_DIR}"
 echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
@@ -121,7 +122,7 @@ build_wall_ms=$(( ($(date +%s%N) - build_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=runner_build wall_ms=${build_wall_ms} cached=${build_cached}"
 
 export DISABLE_MEASUREMENT_HISTORY=1
-export SEARCH_SCOPE=matmul_model_validation_v2
+export SEARCH_SCOPE=matmul_model_validation_v3
 export SEARCH_OUTPUT="${CANDIDATES}"
 export SEARCH_ALL_OUTPUT="${ALL_CANDIDATES}"
 export SEARCH_TILING_DIR="${TILING_DIR}"
@@ -139,7 +140,6 @@ if not all(Path(value).is_file() for value in sys.argv[1:]):
     raise SystemExit(1)
 workloads = list(csv.DictReader(open(sys.argv[1], newline="", encoding="utf-8")))
 candidates = list(csv.DictReader(open(sys.argv[2], newline="", encoding="utf-8")))
-families = Counter(row.get("search_family", "") for row in workloads)
 searched = Counter(
     row["workload_id"] for row in candidates
     if row.get("candidate_role") == "searched"
@@ -151,7 +151,7 @@ for row in candidates:
     )
 if (
     len(workloads) != 200
-    or families != {"base": 160, "deterministic_split_k": 40}
+    or {row.get("search_family") for row in workloads} != {"hardware_ideal_region"}
     or len(candidates) != 200
     or len(searched) != 200 or set(searched.values()) != {1}
     or len(hashes) != 200 or {len(value) for value in hashes.values()} != {1}

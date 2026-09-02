@@ -17,9 +17,22 @@ from .ir import (
     StageScope,
     Tensor,
 )
-from .schedule import RankedTiling, ScheduleSpace, SearchPolicy, SolveResult, TilingPlan
+from .schedule import (
+    IdealRegion,
+    RankedTiling,
+    ScheduleSpace,
+    SearchPolicy,
+    SolveResult,
+    TilingPlan,
+)
 from .simulator import SimulationResult, simulate
-from .solver import generate_plans, plan_space_size, solve
+from .solver import (
+    derive_ideal_region,
+    generate_plans,
+    plan_space_size,
+    solve,
+    solve_ideal_region,
+)
 
 __all__ = [
     "Access",
@@ -29,6 +42,7 @@ __all__ = [
     "Axis",
     "AxisKind",
     "Hardware",
+    "IdealRegion",
     "MemorySpace",
     "Operator",
     "Primitive",
@@ -45,10 +59,12 @@ __all__ = [
     "TilingPlan",
     "ascend_910b3",
     "base_plan_from_cann",
+    "derive_ideal_region",
     "plan_from_cann",
     "generate_plans",
     "plan_space_size",
     "simulate",
     "simulate_cann_base",
     "solve",
+    "solve_ideal_region",
 ]

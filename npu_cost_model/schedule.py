@@ -214,9 +214,31 @@ class SolveResult:
     rejected: int
     exhaustive: bool
     rejection_reasons: dict[str, int] = field(default_factory=dict)
+    search_metadata: dict[str, object] = field(default_factory=dict)
 
     @property
     def best(self) -> RankedTiling:
         if not self.ranked:
             raise RuntimeError("solver produced no legal tiling")
         return self.ranked[0]
+
+
+@dataclass(frozen=True)
+class IdealRegion:
+    """Finite schedule neighbourhood around hardware-model local optima.
+
+    ``anchors`` are local optima reached from hardware-derived starting
+    points. ``plans`` contains those anchors and exactly one declared
+    schedule transition around each anchor.  Neither collection is a random
+    sample or a fixed per-kernel quota.
+    """
+
+    plans: tuple[TilingPlan, ...]
+    anchors: tuple[TilingPlan, ...]
+    evaluated: int
+    legal: int
+    rejected: int
+    exhaustive: bool
+    rejection_reasons: tuple[tuple[str, int], ...] = ()
+    algorithm_anchor_counts: tuple[tuple[int, int], ...] = ()
+    algorithm_region_counts: tuple[tuple[int, int], ...] = ()

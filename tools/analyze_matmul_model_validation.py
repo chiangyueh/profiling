@@ -214,6 +214,16 @@ def main() -> int:
             ),
             "predicted_cycles": number(candidate, "new_model_cycles"),
             "model_bottleneck": candidate.get("new_model_bottleneck", ""),
+            "ideal_region": {
+                "anchor_count": int(candidate.get("ideal_anchor_count", "0") or 0),
+                "plan_count": int(candidate.get("ideal_region_count", "0") or 0),
+                "evaluations": int(
+                    candidate.get("ideal_discovery_evaluations", "0") or 0
+                ),
+                "execution_graphs_represented": candidate.get(
+                    "execution_graphs_represented", ""
+                ).split(";"),
+            },
             "comparison": paired_result(official, selected),
             "selection_timing_ms": timing_values(
                 candidate, SELECTION_TIMING_FIELDS
@@ -240,22 +250,25 @@ def main() -> int:
     aggregate["selected_execution_timing"] = aggregate_timing([
         row["selected_execution_timing_ms"] for row in per_shape
     ])
-    aggregate["by_search_family"] = {
+    aggregate["by_selected_execution_graph"] = {
         family: summarize([
             row for row in per_shape
-            if row["workload"].get("search_family") == family
+            if row["selected_tiling"].get("kernel_family") == family
         ])
         for family in sorted({
-            row["workload"].get("search_family", "unknown")
+            row["selected_tiling"].get("kernel_family", "unknown")
             for row in per_shape
         })
     }
 
     result = {
-        "schema": "matmul_hardware_simulator_validation_v2",
+        "schema": "matmul_hardware_simulator_validation_v3",
         "status": "complete",
         "method": {
-            "selection": "one final tiling chosen only by the new hardware simulator",
+            "selection": (
+                "one final tiling chosen from hardware-derived local optima "
+                "and adjacent schedule transitions"
+            ),
             "comparison": "selected tiling versus installed official MatMulV3 on the same NPU",
             "measurement": "device-event latency after every-C numeric validation",
             "noise_filter": "max(1% of official median, 2*hypot(stddevs))",

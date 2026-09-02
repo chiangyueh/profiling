@@ -11,8 +11,8 @@ from pathlib import Path
 
 CATALOG_SIZE = 240
 SELECTED_SIZE = 200
-BASE_CATALOG_SIZE = 180
-SPLITK_CATALOG_SIZE = 60
+GENERAL_CATALOG_SIZE = 180
+DEEP_REDUCTION_CATALOG_SIZE = 60
 MAX_INPUT_BYTES = 160 * 1024 * 1024
 MAX_OUTPUT_BYTES = 96 * 1024 * 1024
 
@@ -68,7 +68,7 @@ def _row(
     mode: Mode,
     core_cap: int,
     family: str,
-    search_family: str = "base",
+    search_family: str = "hardware_ideal_region",
 ) -> dict[str, str]:
     return {
         "workload_id": f"matmul_rank_{index:03d}",
@@ -103,7 +103,7 @@ def build_catalog() -> list[dict[str, str]]:
         seen.add((m, n, k))
         rows.append(_row(
             len(rows), m, n, k, Mode("fp16", 0, 0), 20,
-            "colleague_anchor", "base",
+            "colleague_anchor",
         ))
 
     # Coprime strides traverse only reviewed boundary values.  There is no
@@ -121,10 +121,10 @@ def build_catalog() -> list[dict[str, str]]:
         rows.append(
             _row(len(rows), m, n, k, mode, core_cap, "base_hardware_lattice")
         )
-        if len(rows) == BASE_CATALOG_SIZE:
+        if len(rows) == GENERAL_CATALOG_SIZE:
             break
-    if len(rows) != BASE_CATALOG_SIZE:
-        raise RuntimeError("could not fill the BASE validation catalog")
+    if len(rows) != GENERAL_CATALOG_SIZE:
+        raise RuntimeError("could not fill the general validation catalog")
 
     split_modes = (Mode("fp16", 0, 0), Mode("bf16", 0, 0))
     split_m = (128, 192, 256, 320, 384, 448, 512, 640, 768)
@@ -142,10 +142,10 @@ def build_catalog() -> list[dict[str, str]]:
         seen.add(signature)
         rows.append(_row(
             len(rows), m, n, k, mode, 20,
-            "deterministic_split_k_lattice", "deterministic_split_k",
+            "deep_reduction_lattice",
         ))
         split_count += 1
-        if split_count == SPLITK_CATALOG_SIZE:
+        if split_count == DEEP_REDUCTION_CATALOG_SIZE:
             break
     if len(rows) != CATALOG_SIZE:
         raise RuntimeError(f"generated {len(rows)} workloads, expected {CATALOG_SIZE}")

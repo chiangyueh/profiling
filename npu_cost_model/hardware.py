@@ -135,7 +135,7 @@ def ascend_910b3() -> Hardware:
             (MemorySpace.GM, MemorySpace.L1): 16.0,
             (MemorySpace.GM, MemorySpace.UB): 16.0,
             (MemorySpace.L1, MemorySpace.L0A): 256.0,
-            (MemorySpace.L1, MemorySpace.L0B): 128.0,
+            (MemorySpace.L1, MemorySpace.L0B): 256.0,
             (MemorySpace.L0C, MemorySpace.GM): 64.0,
             (MemorySpace.UB, MemorySpace.GM): 64.0,
         },

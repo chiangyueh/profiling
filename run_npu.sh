@@ -69,7 +69,7 @@ CAMPAIGN_DIR="${ROOT}/results/matmul_model_validation_v3/${CAMPAIGN_ID}"
 CATALOG="${CAMPAIGN_DIR}/catalog.csv"
 WORKLOADS="${CAMPAIGN_DIR}/workloads.csv"
 CANDIDATES="${CAMPAIGN_DIR}/candidates.csv"
-ALL_CANDIDATES="${CAMPAIGN_DIR}/all_callback_fixed.csv"
+ALL_CANDIDATES="${CAMPAIGN_DIR}/all_hardware_model.csv"
 TILING_DIR="${CAMPAIGN_DIR}/tilings"
 OUT_STEM="${CAMPAIGN_DIR}/measurement"
 DETAILS_DIR="${OUT_STEM}_details"
@@ -87,7 +87,7 @@ fi
 
 echo "CAMPAIGN_READY operator=matmul shapes=200 selected_tilings_per_shape=1 records=400 device=${PHYSICAL_DEVICE}"
 echo "comparison=official_matmul_v3,new_hardware_simulator"
-echo "search=all_declared_execution_graphs,hardware_ideal_region,adjacent_transitions"
+echo "search=all_ir_declared_execution_graphs,hardware_ideal_region,adjacent_transitions"
 echo "logs=${LOG_DIR}"
 echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
@@ -147,7 +147,7 @@ searched = Counter(
 hashes = {}
 for row in candidates:
     hashes.setdefault(row["workload_id"], set()).add(
-        row.get("callback_tiling_sha256", "")
+        row.get("model_schedule_sha256", "")
     )
 if (
     len(workloads) != 200

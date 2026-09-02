@@ -9,6 +9,7 @@ from npu_cost_model import (
     AccessMode,
     Algorithm,
     Axis,
+    AxisKind,
     MemorySpace,
     Operator,
     Resource,
@@ -202,6 +203,38 @@ def test_same_shape_different_semantics_take_different_hardware_paths() -> None:
     assert dict(indirect_cost.resource_cycles)[Resource.SCALAR] > 0.0
 
 
+def test_copy_latency_repeats_only_across_declared_dependency_tiles() -> None:
+    tensor = Tensor("X", (64, 256), "fp16")
+    axes = (
+        Axis("m", 64, tile_values=(64,)),
+        Axis("k", 256, AxisKind.REDUCTION, 16, (32, 64)),
+    )
+
+    def cost(dependency_axes: tuple[str, ...], k_tile: int) -> float:
+        algorithm = Algorithm(
+            stages=(Stage("load", accesses=(Access(
+                "X", ("m", "k"), AccessMode.READ,
+                (MemorySpace.GM, MemorySpace.UB),
+                dependency_axes=dependency_axes,
+            ),)),),
+            output_axes=("m",), reduction_axes=("k",),
+            buffered_spaces=(MemorySpace.UB,),
+        )
+        operator = Operator(axes, (tensor,), (algorithm,))
+        return simulate(operator, TilingPlan(
+            algorithm=0,
+            axis_tiles=(("m", 64), ("k", k_tile)),
+            used_cores=1,
+            traversal=("m",),
+        ), HARDWARE).total_cycles
+
+    independent_32 = cost((), 32)
+    independent_64 = cost((), 64)
+    dependent_32 = cost(("k",), 32)
+    dependent_64 = cost(("k",), 64)
+    assert dependent_32 - independent_32 > dependent_64 - independent_64
+
+
 def test_generated_matmul_plans_are_aligned_and_solver_returns_legal_top_k() -> None:
     operator = matmul(96, 160, 1024)
     space = ScheduleSpace(
@@ -370,7 +403,7 @@ def test_coupled_task_geometry_overrides_independent_task_options() -> None:
     )
 
 
-def test_l2_traversal_and_pipeline_boundaries_change_cycles() -> None:
+def test_l2_residency_traversal_and_pipeline_boundaries_change_cycles() -> None:
     operator = matmul(512, 128, 1024)
     common = dict(
         algorithm=0,
@@ -408,8 +441,35 @@ def test_l2_traversal_and_pipeline_boundaries_change_cycles() -> None:
         HARDWARE,
     )
     assert row_first.valid and column_first.valid and pipelined.valid
-    assert row_first.total_cycles != column_first.total_cycles
+    # The complete cache group fits in 910B3 L2, so either visit order can
+    # reuse the same resident tensors.
+    assert row_first.total_cycles == column_first.total_cycles
     assert pipelined.total_cycles < column_first.total_cycles
+
+    constrained_l2 = replace(
+        HARDWARE,
+        capacities={**HARDWARE.capacities, MemorySpace.L2: 512 * 1024},
+    )
+    row_nonresident = simulate(
+        operator,
+        TilingPlan(
+            **common,
+            buffers=((MemorySpace.L0A, 1), (MemorySpace.L0B, 1), (MemorySpace.L0C, 1)),
+            traversal=("m", "n"),
+        ),
+        constrained_l2,
+    )
+    column_nonresident = simulate(
+        operator,
+        TilingPlan(
+            **common,
+            buffers=((MemorySpace.L0A, 1), (MemorySpace.L0B, 1), (MemorySpace.L0C, 1)),
+            traversal=("n", "m"),
+        ),
+        constrained_l2,
+    )
+    assert row_nonresident.valid and column_nonresident.valid
+    assert row_nonresident.total_cycles != column_nonresident.total_cycles
 
 
 def test_fused_attention_uses_the_same_generic_solver() -> None:

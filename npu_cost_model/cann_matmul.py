@@ -53,11 +53,11 @@ def plan_from_cann(
     l2_n = _integer(knowledge, "l2NTileBlock") * single_n
     l2_order = int(knowledge["l2IterateOrder"])
     cube_order = int(knowledge["iterateOrder"])
-    traversal = (
-        ("m", "n")
-        if l2_order == 1 or (l2_order == 0 and cube_order == 0)
-        else ("n", "m")
-    )
+    # tileL2cacheTiling.calOrder drives the BASE block scheduler.  Value zero
+    # selects its default staggered schedule; it does not delegate L2 order to
+    # TCubeTiling.iterateOrder.  Falling back to the Cube field made identical
+    # L2 schedules receive different cache traffic in the simulator.
+    traversal = ("n", "m") if l2_order == 2 else ("m", "n")
     a_packets = _integer(knowledge, "depthA1") // (
         _integer(knowledge, "stepM") * _integer(knowledge, "stepKa")
     )

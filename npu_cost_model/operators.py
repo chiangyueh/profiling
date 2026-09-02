@@ -45,21 +45,25 @@ def matmul(
     """Matrix contraction whose K reduction may be partitioned numerically."""
 
     in_bytes = dtype_bytes(dtype)
-    k0 = 8 if dtype == "fp32" else 16
+    # TCube's FP32 K0=8 format is available only for ND x transposed-ND.
+    # Every other input-layout combination is lowered with K0=16.  Keeping
+    # this in the operator-to-hardware lowering prevents the generic solver
+    # from projecting an ideal region that the backend ABI later rejects.
+    k0 = 8 if dtype == "fp32" and not trans_a and trans_b else 16
     a_shape = (k, m) if trans_a else (m, k)
     b_shape = (n, k) if trans_b else (k, n)
     axes = (
         Axis(
-            "m", m, AxisKind.PARALLEL, 16, tuple(range(16, 257, 16)),
+            "m", m, AxisKind.PARALLEL, 16,
             independent_task_tiling=True, independent_cache_tiling=True,
         ),
         Axis(
-            "n", n, AxisKind.PARALLEL, 16, tuple(range(16, 257, 16)),
+            "n", n, AxisKind.PARALLEL, 16,
             independent_task_tiling=True, independent_cache_tiling=True,
         ),
         Axis(
             "k", k, AxisKind.REDUCTION, k0,
-            tuple(range(k0, 257, k0)), False,
+            independent_task_tiling=False,
         ),
     )
     tensors = (
@@ -79,6 +83,7 @@ def matmul(
                         if trans_a else AccessPattern.CONTIGUOUS
                     ),
                     contiguous_axes=(("m",) if trans_a else ("k",)),
+                    dependency_axes=("k",),
                 ),
                 Access(
                     "B", ("k", "n"), AccessMode.READ,
@@ -88,6 +93,7 @@ def matmul(
                         if trans_b else AccessPattern.CONTIGUOUS
                     ),
                     contiguous_axes=(("k",) if trans_b else ("n",)),
+                    dependency_axes=("k",),
                 ),
             ),
             concurrent=True,
@@ -137,7 +143,6 @@ def matmul(
         ),
         pipeline_boundaries=(
             (MemorySpace.L0A, MemorySpace.L0B),
-            (MemorySpace.L0C,),
         ),
         name="cube_contraction",
     )

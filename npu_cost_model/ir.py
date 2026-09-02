@@ -144,6 +144,10 @@ class Access:
     contiguous_axes: tuple[str, ...] = ()
     transaction_bytes: int = 32
     coalesced_elements: int = 1
+    # Axes whose successive tiles are separated by a producer/consumer
+    # dependency.  Their transfer latency cannot be collapsed into one
+    # pipeline fill even when the copy engine accepts queued requests.
+    dependency_axes: tuple[str, ...] = ()
     contention_factor: float = 1.0
     local_dtype: str | None = None
     # Some engines consume more internal-port bytes than reach GM. FixPipe,
@@ -158,6 +162,10 @@ class Access:
             raise ValueError("transaction_bytes must be positive")
         if self.coalesced_elements <= 0:
             raise ValueError("coalesced_elements must be positive")
+        if len(self.dependency_axes) != len(set(self.dependency_axes)):
+            raise ValueError("dependency_axes must be unique")
+        if not set(self.dependency_axes) <= set(self.axes):
+            raise ValueError("dependency_axes must be accessed tensor axes")
         if self.contention_factor < 1.0:
             raise ValueError("contention_factor must be at least one")
         if self.local_dtype is not None:

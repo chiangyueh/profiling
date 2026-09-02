@@ -31,7 +31,7 @@ MODES = tuple(
     for trans_b in (0, 1)
 )
 
-CORE_CAPS = (1, 2, 4, 8, 12, 16, 20)
+PHYSICAL_AIC_CORES = 20
 M_VALUES = (
     96, 112, 128, 144, 160, 176, 192, 224, 256, 320, 384, 448,
     512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072,
@@ -66,7 +66,6 @@ def _row(
     n: int,
     k: int,
     mode: Mode,
-    core_cap: int,
     family: str,
     search_family: str = "hardware_ideal_region",
 ) -> dict[str, str]:
@@ -78,14 +77,14 @@ def _row(
         "dtype": mode.dtype,
         "trans_a": str(mode.trans_a),
         "trans_b": str(mode.trans_b),
-        # The physical operator always sees all 20 AICs.  search_core_cap is
-        # the explicit solver constraint and candidate usedCoreNum varies.
-        "max_cores": "20",
-        "search_core_cap": str(core_cap),
+        # Every workload exposes the complete physical AIC pool.  The solver
+        # chooses usedCoreNum from the schedule, rather than changing the
+        # hardware capacity from one shape to the next.
+        "max_cores": str(PHYSICAL_AIC_CORES),
         "search_family": search_family,
         "coverage": (
             f"{family};{mode.dtype};t{mode.trans_a}{mode.trans_b};"
-            f"core_cap_{core_cap};m{m};n{n};k{k}"
+            f"full_aic_{PHYSICAL_AIC_CORES};m{m};n{n};k{k}"
         ),
     }
 
@@ -102,7 +101,7 @@ def build_catalog() -> list[dict[str, str]]:
     for m, n, k in anchors:
         seen.add((m, n, k))
         rows.append(_row(
-            len(rows), m, n, k, Mode("fp16", 0, 0), 20,
+            len(rows), m, n, k, Mode("fp16", 0, 0),
             "colleague_anchor",
         ))
 
@@ -113,13 +112,12 @@ def build_catalog() -> list[dict[str, str]]:
         n = N_VALUES[(sequence * 11 + sequence // 17) % len(N_VALUES)]
         k = K_VALUES[(sequence * 13 + sequence // 19) % len(K_VALUES)]
         mode = MODES[(sequence * 5 + sequence // 23) % len(MODES)]
-        core_cap = CORE_CAPS[(sequence * 3 + sequence // 29) % len(CORE_CAPS)]
         signature = (m, n, k)
         if signature in seen or not within_budget(m, n, k, mode.dtype):
             continue
         seen.add(signature)
         rows.append(
-            _row(len(rows), m, n, k, mode, core_cap, "base_hardware_lattice")
+            _row(len(rows), m, n, k, mode, "base_hardware_lattice")
         )
         if len(rows) == GENERAL_CATALOG_SIZE:
             break
@@ -141,7 +139,7 @@ def build_catalog() -> list[dict[str, str]]:
             continue
         seen.add(signature)
         rows.append(_row(
-            len(rows), m, n, k, mode, 20,
+            len(rows), m, n, k, mode,
             "deep_reduction_lattice",
         ))
         split_count += 1

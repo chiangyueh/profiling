@@ -218,10 +218,11 @@ TilePlan LowerTileToHardwarePath(const Workload &w, const TCubeTiling &t,
         Resource::MTE1, MemorySpace::L1, MemorySpace::L0A, aMte1Bytes, out.mmads);
     ResourceWork mte1BWork = Transfer(
         Resource::MTE1, MemorySpace::L1, MemorySpace::L0B, bMte1Bytes, out.mmads);
-    // V220 has asymmetric L1->L0A/L0B service. This is an intrinsic route
-    // property, not a MatMul- or shape-specific correction.
+    // Both L1-to-matrix-buffer routes use the measured MTE1 service rate.
+    // The available matched CA/CB CCE observations do not establish a
+    // route-specific throughput difference.
     mte1AWork.bytesPerCycle = 256.0;
-    mte1BWork.bytesPerCycle = 128.0;
+    mte1BWork.bytesPerCycle = 256.0;
     const PathNode mte1A = PathNode::Work(mte1AWork);
     const PathNode mte1B = PathNode::Work(mte1BWork);
 

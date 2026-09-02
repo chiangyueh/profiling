@@ -38,6 +38,7 @@ PROFILE_COLUMNS = [
     "search_model_raw_ratio_vs_bank_seed",
     "search_model_ratio_vs_bank_seed", "search_model_calibration",
     "search_model_confidence", "search_history_match",
+    "model_schedule_sha256",
     "callback_tiling_sha256", "callback_derived_diff_vs_default",
     "callback_derived_diff_vs_bank_seed",
     "tiling_official_callback_ms", "tiling_runtime_kb_seed_ms",
@@ -640,7 +641,10 @@ def exact_profile_fingerprint(
 ) -> tuple[str, ...] | None:
     role = row.get("candidate_role", "")
     signature = row.get("tiling_signature", "")
-    callback_sha = row.get("callback_tiling_sha256", "").lower()
+    schedule_sha = (
+        row.get("model_schedule_sha256", "")
+        or row.get("callback_tiling_sha256", "")
+    ).lower()
     template = (
         row.get("kernel_template", "")
         or row.get("search_template", "")
@@ -655,8 +659,8 @@ def exact_profile_fingerprint(
     if (
         role not in TUNING_BANK_ROLES
         or len(signature_words) != len(matmul_contract.KNOWLEDGE_FIELDS)
-        or len(callback_sha) != 64
-        or any(character not in "0123456789abcdef" for character in callback_sha)
+        or len(schedule_sha) != 64
+        or any(character not in "0123456789abcdef" for character in schedule_sha)
     ):
         return None
     required = (
@@ -675,7 +679,7 @@ def exact_profile_fingerprint(
         row["trans_b"],
         template,
         signature,
-        callback_sha,
+        schedule_sha,
     )
 
 
@@ -1161,7 +1165,12 @@ def validate_candidate(row: dict[str, str], spec: BankSpec) -> None:
             f"execution_mode={mode!r} does not match MatMulV3 family={family}"
         )
 
-    suffix = require_int(row, "callback_kernel_suffix", 0)
+    suffix_column = (
+        "model_kernel_suffix"
+        if row.get("model_kernel_suffix", "") != ""
+        else "callback_kernel_suffix"
+    )
+    suffix = require_int(row, suffix_column, 0)
     try:
         callback_family = matmul_contract.CANN81_KERNEL_VARIANTS[suffix][1]
     except KeyError as exception:
@@ -1450,6 +1459,7 @@ def candidate_profile(
         "search_model_calibration": "search_model_calibration",
         "search_model_confidence": "search_model_confidence",
         "search_history_match": "search_history_match",
+        "model_schedule_sha256": "model_schedule_sha256",
         "callback_tiling_sha256": "callback_tiling_sha256",
         "callback_derived_diff_vs_default": "callback_derived_diff_vs_default",
         "callback_derived_diff_vs_bank_seed": "callback_derived_diff_vs_bank_seed",

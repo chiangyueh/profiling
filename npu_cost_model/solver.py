@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass
 from heapq import heappush, heapreplace
-from itertools import product
+from itertools import combinations, product
 from math import floor, gcd, prod
 
 from .hardware import Hardware
@@ -34,7 +35,13 @@ def _spread(values: list[int], limit: int) -> tuple[int, ...]:
     return tuple(sorted(selected))
 
 
-def automatic_tile_values(axis: Axis, core_count: int, limit: int) -> tuple[int, ...]:
+def _bounded_breakpoints(values: list[int], limit: int | None) -> tuple[int, ...]:
+    return tuple(sorted(set(values))) if limit is None else _spread(values, limit)
+
+
+def automatic_tile_values(
+    axis: Axis, core_count: int, limit: int | None
+) -> tuple[int, ...]:
     """Derive alignment and parallelism breakpoints without latency data."""
 
     if axis.tile_values:
@@ -43,7 +50,7 @@ def automatic_tile_values(axis: Axis, core_count: int, limit: int) -> tuple[int,
             for value in axis.tile_values
             if value % axis.alignment == 0
         ]
-        return _spread(values, limit)
+        return _bounded_breakpoints(values, limit)
 
     alignment = axis.alignment
     values = {alignment, align_up(axis.extent, alignment)}
@@ -51,16 +58,18 @@ def automatic_tile_values(axis: Axis, core_count: int, limit: int) -> tuple[int,
     while value < axis.extent:
         values.add(value)
         value *= 2
-    for divisor in (2, 3, 4, 5, 8, 16, core_count):
+    # Each possible wave count of the declared core resource is a hardware
+    # breakpoint.  A hand-picked divisor list silently omitted legal regions.
+    for divisor in range(1, core_count + 1):
         values.add(align_up(ceil_div(axis.extent, divisor), alignment))
-    return _spread([value for value in values if value > 0], limit)
+    return _bounded_breakpoints([value for value in values if value > 0], limit)
 
 
 def automatic_task_tile_values(
     axis: Axis,
     inner_tile: int,
     core_count: int,
-    limit: int,
+    limit: int | None,
 ) -> tuple[int, ...]:
     """Derive core-task breakpoints independently from local-memory tiles."""
 
@@ -70,13 +79,11 @@ def automatic_task_tile_values(
     while value < axis.extent:
         values.add(value)
         value *= 2
-    for divisor in (2, 3, 4, 5, 8, 10, 16, core_count):
+    for divisor in range(1, core_count + 1):
         values.add(align_up(ceil_div(axis.extent, divisor), alignment))
-    for multiplier in (2, 3, 4, 8):
-        values.add(align_up(inner_tile * multiplier, alignment))
     minimum = min(inner_tile, axis.extent)
     maximum = max(inner_tile, align_up(axis.extent, alignment))
-    return _spread(
+    return _bounded_breakpoints(
         [value for value in values if minimum <= value <= maximum], limit
     )
 
@@ -85,19 +92,17 @@ def automatic_cache_tile_values(
     axis: Axis,
     task_tile: int,
     core_count: int,
-    limit: int,
+    limit: int | None,
 ) -> tuple[int, ...]:
     """Derive L2 scheduling-group breakpoints from task geometry."""
 
     alignment = axis.alignment
     values = {task_tile, align_up(axis.extent, alignment)}
-    for divisor in (2, 3, 4, 5, 8, 10, 16, core_count):
+    for divisor in range(1, core_count + 1):
         values.add(align_up(ceil_div(axis.extent, divisor), alignment))
-    for multiplier in (2, 3, 4, 8):
-        values.add(align_up(task_tile * multiplier, alignment))
     minimum = min(task_tile, axis.extent)
     maximum = max(task_tile, align_up(axis.extent, alignment))
-    return _spread(
+    return _bounded_breakpoints(
         [value for value in values if minimum <= value <= maximum], limit
     )
 
@@ -128,7 +133,9 @@ def _algorithm_tile_options(
                 )
             else:
                 values = automatic_tile_values(
-                    axis, core_count, space.max_axis_values
+                    axis,
+                    core_count,
+                    None if preserve_declared else space.max_axis_values,
                 )
         legal = tuple(sorted(set(
             value for value in values
@@ -160,6 +167,10 @@ def _algorithm_tile_levels(
     inner_options = _algorithm_tile_options(
         operator, algorithm_index, hardware, space, preserve_declared
     )
+    # Ideal-region search consumes the complete finite set of hardware
+    # breakpoints. ``max_axis_values`` remains only an explicit bound for the
+    # Cartesian/exhaustive API; it must not silently remove an ideal anchor.
+    breakpoint_limit = None if preserve_declared else space.max_axis_values
     explicit_tasks = space.task_tiles
     explicit_caches = space.cache_tiles
     all_levels: list[tuple[tuple[int, int, int], ...]] = []
@@ -179,7 +190,7 @@ def _algorithm_tile_levels(
                 )))
             elif axis.independent_task_tiling and axis.name in algorithm.output_axes:
                 tasks = automatic_task_tile_values(
-                    axis, inner, core_count, space.max_axis_values
+                    axis, inner, core_count, breakpoint_limit
                 )
             else:
                 tasks = (inner,)
@@ -195,7 +206,7 @@ def _algorithm_tile_levels(
                     and axis.name in algorithm.output_axes
                 ):
                     caches = automatic_cache_tile_values(
-                        axis, task, core_count, space.max_axis_values
+                        axis, task, core_count, breakpoint_limit
                     )
                 else:
                     caches = (task,)
@@ -213,15 +224,9 @@ def _core_options(operator: Operator, algorithm_index: int, hardware: Hardware,
     maximum = hardware.core_count(operator.algorithms[algorithm_index].core_resource)
     if space.core_options:
         return tuple(sorted(set(value for value in space.core_options if value <= maximum)))
-    values = {1, maximum}
-    power = 1
-    while power <= maximum:
-        values.add(power)
-        power *= 2
-    for divisor in (2, 3, 4):
-        values.add(max(1, maximum // divisor))
-        values.add(max(1, ceil_div(maximum, divisor)))
-    return tuple(sorted(value for value in values if value <= maximum))
+    # Core count is a small discrete hardware dimension (20 on 910B3), so it
+    # is cheap and safer to preserve every legal value.
+    return tuple(range(1, maximum + 1))
 
 
 def _reduction_options(
@@ -603,6 +608,8 @@ def _nearest_level(
     levels: tuple[tuple[int, int, int], ...],
     target: tuple[int, int, int],
 ) -> tuple[int, int, int]:
+    if target in levels:
+        return target
     return min(levels, key=lambda value: (_level_distance(value, target), value))
 
 
@@ -691,8 +698,25 @@ def _reduction_transition_values(
     if not allowed:
         return (1,)
     output_tasks = _output_task_count(operator, algorithm, plan)
+    core_count = hardware.core_count(algorithm.core_resource)
+    if output_tasks >= core_count:
+        # A reduction partition is useful here only if it reduces the longest
+        # arithmetic wave.  When ceil(O*P/C)/P == ceil(O/C), it performs the
+        # same critical-core arithmetic and additionally writes/reads partial
+        # results.  This dominance test follows from task counts; it is not a
+        # core-count cutoff or an operator-specific rule.
+        serial_waves = ceil_div(output_tasks, core_count)
+        improving = tuple(
+            value for value in allowed
+            if value == 1
+            or ceil_div(output_tasks * value, core_count)
+            < serial_waves * value
+        )
+        if len(improving) == 1:
+            return (1,)
+        allowed = improving
     required = min(maximum, max(1, ceil_div(
-        hardware.core_count(algorithm.core_resource), output_tasks
+        core_count, output_tasks
     )))
     position = min(
         range(len(allowed)), key=lambda index: abs(allowed[index] - required)
@@ -725,40 +749,10 @@ def _reduction_fill_profile(
         options = _reduction_transition_values(
             operator, algorithm_index, current, hardware, space, axis_name
         )
-        value = min(options, key=lambda item: (abs(item - remaining), item))
+        filling = tuple(item for item in options if item >= remaining)
+        value = filling[0] if filling else options[-1]
         profile.append((axis_name, value))
         remaining = max(1, ceil_div(remaining, value))
-        current = _replace_plan(current, reduction_parts=tuple(profile))
-    return tuple(profile)
-
-
-def _reduction_chunk_profile(
-    operator: Operator,
-    algorithm_index: int,
-    plan: TilingPlan,
-    hardware: Hardware,
-    space: ScheduleSpace,
-) -> tuple[tuple[str, int], ...]:
-    """Expose one full core wave of legal reduction chunks.
-
-    This second hardware anchor is required even when output tiles already
-    fill the cores: shortening a very deep reduction changes the live cache
-    footprint and pipeline length.  The partition product is bounded by the
-    physical core wave rather than by an operator-specific Split-K count.
-    """
-
-    algorithm = operator.algorithms[algorithm_index]
-    remaining = hardware.core_count(algorithm.core_resource)
-    profile: list[tuple[str, int]] = []
-    current = plan
-    for axis_name in algorithm.reduction_axes:
-        options = _reduction_transition_values(
-            operator, algorithm_index, current, hardware, space, axis_name
-        )
-        eligible = tuple(value for value in options if value <= remaining)
-        value = eligible[-1] if eligible else 1
-        profile.append((axis_name, value))
-        remaining = max(1, remaining // value)
         current = _replace_plan(current, reduction_parts=tuple(profile))
     return tuple(profile)
 
@@ -813,8 +807,56 @@ def _level_for_targets(
 ) -> tuple[int, int, int]:
     """Select the declared legal level nearest three physical targets."""
 
+    target = (inner, task, cache)
+    if target in levels:
+        return target
     same_inner = tuple(level for level in levels if level[0] == inner)
-    return _nearest_level(same_inner or levels, (inner, task, cache))
+    return _nearest_level(same_inner or levels, target)
+
+
+def _scratchpad_terms(
+    operator: Operator,
+    algorithm,
+) -> tuple[
+    tuple[
+        tuple[
+            MemorySpace,
+            tuple[tuple[tuple[tuple[int, int], ...], int], ...],
+        ],
+        ...,
+    ],
+    tuple[int, ...],
+]:
+    """Compile static tensor-access metadata for capacity projections."""
+
+    axis_positions = {
+        axis.name: (index, axis.extent)
+        for index, axis in enumerate(operator.axes)
+    }
+    allocations: dict[
+        tuple[str, MemorySpace],
+        list[tuple[tuple[tuple[int, int], ...], int]],
+    ] = {}
+    for stage in algorithm.stages:
+        for access in stage.accesses:
+            tensor = operator.tensor(access.tensor)
+            element_bytes = dtype_bytes(access.local_dtype or tensor.dtype)
+            for memory in access.path:
+                if memory in (MemorySpace.GM, MemorySpace.L2):
+                    continue
+                allocations.setdefault((tensor.name, memory), []).append(
+                    (
+                        tuple(axis_positions[axis] for axis in access.axes),
+                        element_bytes,
+                    )
+                )
+    return (
+        tuple(
+            (memory, tuple(options))
+            for (_, memory), options in allocations.items()
+        ),
+        tuple(axis_positions[axis][0] for axis in algorithm.output_axes),
+    )
 
 
 def _local_memory_pressure(
@@ -825,36 +867,31 @@ def _local_memory_pressure(
     buffers: tuple[tuple[MemorySpace, int], ...],
     reductions: tuple[tuple[str, int], ...],
     hardware: Hardware,
+    scratchpad_terms=None,
 ) -> float:
     """Return the largest scratchpad-capacity ratio for an inner tile."""
 
-    tiles = {
-        name: level[0] for name, level in zip(axis_names, levels)
-    }
+    del axis_names
     buffer_counts = dict(buffers)
-    allocations: dict[tuple[str, MemorySpace], int] = {}
-    for stage in algorithm.stages:
-        for access in stage.accesses:
-            tensor = operator.tensor(access.tensor)
-            element_bytes = dtype_bytes(access.local_dtype or tensor.dtype)
-            elements = prod(
-                min(operator.axis(axis).extent, tiles[axis])
-                for axis in access.axes
-            ) if access.axes else 1
-            for memory in access.path:
-                if memory in (MemorySpace.GM, MemorySpace.L2):
-                    continue
-                key = (tensor.name, memory)
-                allocations[key] = max(
-                    allocations.get(key, 0), elements * element_bytes
-                )
     usage: dict[MemorySpace, int] = {}
-    for (_, memory), byte_count in allocations.items():
+    allocation_terms, output_indexes = (
+        scratchpad_terms or _scratchpad_terms(operator, algorithm)
+    )
+    for memory, alternatives in allocation_terms:
+        byte_count = max(
+            (
+                prod(
+                    min(extent, levels[index][0])
+                    for index, extent in axes
+                ) if axes else 1
+            ) * element_bytes
+            for axes, element_bytes in alternatives
+        )
         usage[memory] = usage.get(memory, 0) + (
             byte_count * buffer_counts.get(memory, 1)
         )
     if prod(value for _, value in reductions) > 1:
-        output_elements = prod(tiles[axis] for axis in algorithm.output_axes)
+        output_elements = prod(levels[index][0] for index in output_indexes)
         usage[MemorySpace.UB] = usage.get(MemorySpace.UB, 0) + (
             2 * output_elements * dtype_bytes(algorithm.partial_dtype)
         )
@@ -877,23 +914,37 @@ def _fit_inner_capacity(
     buffers: tuple[tuple[MemorySpace, int], ...],
     reductions: tuple[tuple[str, int], ...],
     hardware: Hardware,
+    scratchpad_terms=None,
 ) -> tuple[tuple[int, int, int], ...]:
     """Project a target geometry onto all declared scratchpad constraints."""
 
     current = levels
+    inner_values_by_axis = tuple(
+        tuple(sorted(set(level[0] for level in options)))
+        for options in levels_by_axis
+    )
     pressure = _local_memory_pressure(
-        operator, algorithm, axis_names, current, buffers, reductions, hardware
+        operator, algorithm, axis_names, current, buffers, reductions,
+        hardware, scratchpad_terms,
     )
     while pressure > 1.0:
         alternatives: list[
             tuple[float, int, tuple[tuple[int, int, int], ...]]
         ] = []
-        for axis_index, options in enumerate(levels_by_axis):
-            inner_values = sorted(set(level[0] for level in options))
+        for axis_index, (options, inner_values) in enumerate(zip(
+            levels_by_axis, inner_values_by_axis
+        )):
             position = inner_values.index(current[axis_index][0])
             if position == 0:
                 continue
-            inner = inner_values[position - 1]
+            # Capacity usage is monotone in every tiled extent.  Project the
+            # current value to the measured pressure boundary instead of
+            # walking through every intermediate hardware breakpoint.
+            target = max(inner_values[0], int(
+                current[axis_index][0] / pressure
+            ))
+            projected = bisect_right(inner_values, target) - 1
+            inner = inner_values[min(position - 1, max(0, projected))]
             changed = list(current)
             changed[axis_index] = _level_for_targets(
                 options,
@@ -904,7 +955,7 @@ def _fit_inner_capacity(
             changed_tuple = tuple(changed)
             next_pressure = _local_memory_pressure(
                 operator, algorithm, axis_names, changed_tuple,
-                buffers, reductions, hardware,
+                buffers, reductions, hardware, scratchpad_terms,
             )
             retained_volume = prod(level[0] for level in changed_tuple)
             alternatives.append(
@@ -912,7 +963,13 @@ def _fit_inner_capacity(
             )
         if not alternatives:
             break
-        next_pressure, _, current = min(alternatives)
+        feasible = tuple(item for item in alternatives if item[0] <= 1.0)
+        if feasible:
+            next_pressure, _, current = min(
+                feasible, key=lambda item: (item[1], item[0], item[2])
+            )
+        else:
+            next_pressure, _, current = min(alternatives)
         if next_pressure >= pressure and current == levels:
             break
         pressure = next_pressure
@@ -1037,44 +1094,56 @@ def _l2_footprint(
     axis_names: tuple[str, ...],
     levels: tuple[tuple[int, int, int], ...],
     reductions: tuple[tuple[str, int], ...],
+    l2_terms: tuple[
+        tuple[str, tuple[str, ...], str, bool], ...
+    ] | None = None,
 ) -> int:
     caches = {
         name: level[2] for name, level in zip(axis_names, levels)
     }
     reduction_values = dict(reductions)
     reduction_count = prod(reduction_values.values()) if reductions else 1
+    if l2_terms is None:
+        l2_terms = tuple(
+            (
+                access.tensor,
+                access.axes,
+                operator.tensor(access.tensor).dtype,
+                access.is_result,
+            )
+            for stage in algorithm.stages
+            for access in stage.accesses
+            if MemorySpace.GM in access.path
+        )
     allocations: dict[str, int] = {}
-    for stage in algorithm.stages:
-        for access in stage.accesses:
-            if MemorySpace.GM not in access.path:
-                continue
-            tensor = operator.tensor(access.tensor)
-            value_dtype = (
-                algorithm.partial_dtype
-                if access.is_result and reduction_count > 1 else tensor.dtype
-            )
-            elements = 1
-            for axis_name in access.axes:
-                axis = operator.axis(axis_name)
-                if axis_name in algorithm.output_axes:
-                    extent = min(axis.extent, caches[axis_name])
-                elif axis_name in algorithm.reduction_axes:
-                    extent = ceil_div(
-                        axis.extent, reduction_values.get(axis_name, 1)
-                    )
-                else:
-                    extent = axis.extent
-                elements *= extent
-            allocations[tensor.name] = max(
-                allocations.get(tensor.name, 0),
-                elements * dtype_bytes(value_dtype),
-            )
+    for tensor_name, access_axes, tensor_dtype, is_result in l2_terms:
+        value_dtype = (
+            algorithm.partial_dtype
+            if is_result and reduction_count > 1 else tensor_dtype
+        )
+        elements = 1
+        for axis_name in access_axes:
+            axis = operator.axis(axis_name)
+            if axis_name in algorithm.output_axes:
+                extent = min(axis.extent, caches[axis_name])
+            elif axis_name in algorithm.reduction_axes:
+                extent = ceil_div(
+                    axis.extent, reduction_values.get(axis_name, 1)
+                )
+            else:
+                extent = axis.extent
+            elements *= extent
+        allocations[tensor_name] = max(
+            allocations.get(tensor_name, 0),
+            elements * dtype_bytes(value_dtype),
+        )
     return sum(allocations.values())
 
 
 def _reuse_axis_weights(operator: Operator, algorithm, traversal) -> dict[str, int]:
-    """Count source bytes that one larger cache axis can reuse."""
+    """Count source bytes that one larger cache axis can keep resident."""
 
+    del traversal
     weights = {axis: 0 for axis in algorithm.output_axes}
     for stage in algorithm.stages:
         for access in stage.accesses:
@@ -1088,10 +1157,11 @@ def _reuse_axis_weights(operator: Operator, algorithm, traversal) -> dict[str, i
             ):
                 continue
             tensor = operator.tensor(access.tensor)
-            for axis_name in reversed(traversal):
-                if axis_name in access.axes:
-                    break
-                weights[axis_name] += tensor.elements * dtype_bytes(tensor.dtype)
+            for axis_name in algorithm.output_axes:
+                if axis_name not in access.axes:
+                    weights[axis_name] += (
+                        tensor.elements * dtype_bytes(tensor.dtype)
+                    )
     return weights
 
 
@@ -1104,30 +1174,40 @@ def _expand_cache_for_reuse(
     reductions: tuple[tuple[str, int], ...],
     traversal: tuple[str, ...],
     hardware: Hardware,
+    l2_terms=None,
+    reuse_weights=None,
 ) -> tuple[tuple[int, int, int], ...]:
     """Grow only reuse-bearing cache axes up to the physical L2 boundary."""
 
     capacity = hardware.capacities.get(MemorySpace.L2, 0)
     if capacity <= 0:
         return levels
-    weights = _reuse_axis_weights(operator, algorithm, traversal)
+    weights = (
+        reuse_weights
+        if reuse_weights is not None
+        else _reuse_axis_weights(operator, algorithm, traversal)
+    )
     current = levels
+    # Inner/task values stay fixed while a cache group grows.  Resolve each
+    # legal cache transition once rather than rescanning the full level table
+    # on every step.
+    cache_values_by_axis = tuple(
+        sorted(set(
+            level[2] for level in options
+            if level[0] == current[axis_index][0]
+            and level[1] == current[axis_index][1]
+        ))
+        for axis_index, options in enumerate(levels_by_axis)
+    )
     while True:
         alternatives: list[
             tuple[float, int, tuple[tuple[int, int, int], ...]]
         ] = []
-        for axis_index, (axis, options) in enumerate(
-            zip(operator.axes, levels_by_axis)
-        ):
+        for axis_index, axis in enumerate(operator.axes):
             weight = weights.get(axis.name, 0)
             if weight <= 0:
                 continue
-            compatible = tuple(
-                level for level in options
-                if level[0] == current[axis_index][0]
-                and level[1] == current[axis_index][1]
-            )
-            cache_values = sorted(set(level[2] for level in compatible))
+            cache_values = cache_values_by_axis[axis_index]
             position = cache_values.index(current[axis_index][2])
             if position + 1 == len(cache_values):
                 continue
@@ -1138,7 +1218,8 @@ def _expand_cache_for_reuse(
             )
             changed_tuple = tuple(changed)
             footprint = _l2_footprint(
-                operator, algorithm, axis_names, changed_tuple, reductions
+                operator, algorithm, axis_names, changed_tuple, reductions,
+                l2_terms,
             )
             if footprint <= capacity:
                 gain = weight * (
@@ -1158,6 +1239,7 @@ def _best_feasible_buffer(
     reductions: tuple[tuple[str, int], ...],
     profiles: tuple[tuple[tuple[MemorySpace, int], ...], ...],
     hardware: Hardware,
+    scratchpad_terms=None,
 ) -> tuple[tuple[MemorySpace, int], ...]:
     """Maximize declared pipeline overlap without overflowing scratchpads."""
 
@@ -1168,7 +1250,7 @@ def _best_feasible_buffer(
         profile for profile in profiles
         if _local_memory_pressure(
             operator, algorithm, axis_names, levels, profile,
-            reductions, hardware,
+            reductions, hardware, scratchpad_terms,
         ) <= 1.0
     )
     if not feasible:
@@ -1198,23 +1280,82 @@ def _direct_hardware_anchors(
 
     algorithm = operator.algorithms[algorithm_index]
     axis_names = tuple(axis.name for axis in operator.axes)
+    scratchpad_terms = _scratchpad_terms(operator, algorithm)
+    l2_terms = tuple(
+        (
+            access.tensor,
+            access.axes,
+            operator.tensor(access.tensor).dtype,
+            access.is_result,
+        )
+        for stage in algorithm.stages
+        for access in stage.accesses
+        if MemorySpace.GM in access.path
+    )
+    reuse_weights = _reuse_axis_weights(operator, algorithm, traversals[0])
     core_allowed = _core_options(operator, algorithm_index, hardware, space)
     core_count = core_allowed[-1]
     single_buffers = min(buffers, key=lambda profile: sum(dict(profile).values()))
     boundaries = algorithm.pipeline_boundaries or tuple(
         (memory,) for memory in algorithm.buffered_spaces
     )
-    overlap_buffers = max(
-        buffers,
-        key=lambda profile: (
-            sum(
-                all(dict(profile).get(memory, 1) == 2 for memory in boundary)
-                for boundary in boundaries
-            ),
-            -sum(dict(profile).values()),
-        ),
-    )
     serial = tuple((axis, 1) for axis in algorithm.reduction_axes)
+    fitted_cache: dict[
+        tuple[
+            tuple[tuple[int, int, int], ...],
+            tuple[tuple[MemorySpace, int], ...],
+            tuple[tuple[str, int], ...],
+        ],
+        tuple[tuple[int, int, int], ...],
+    ] = {}
+
+    def fitted(
+        levels: tuple[tuple[int, int, int], ...],
+        profile: tuple[tuple[MemorySpace, int], ...],
+        reductions: tuple[tuple[str, int], ...],
+    ) -> tuple[tuple[int, int, int], ...]:
+        key = (levels, profile, reductions)
+        if key not in fitted_cache:
+            fitted_cache[key] = _fit_inner_capacity(
+                operator,
+                algorithm,
+                axis_names,
+                levels_by_axis,
+                levels,
+                profile,
+                reductions,
+                hardware,
+                scratchpad_terms,
+            )
+        return fitted_cache[key]
+
+    expanded_cache: dict[
+        tuple[
+            tuple[tuple[int, int, int], ...],
+            tuple[tuple[str, int], ...],
+        ],
+        tuple[tuple[int, int, int], ...],
+    ] = {}
+
+    def expanded(
+        levels: tuple[tuple[int, int, int], ...],
+        reductions: tuple[tuple[str, int], ...],
+    ) -> tuple[tuple[int, int, int], ...]:
+        key = (levels, reductions)
+        if key not in expanded_cache:
+            expanded_cache[key] = _expand_cache_for_reuse(
+                operator,
+                algorithm,
+                axis_names,
+                levels_by_axis,
+                levels,
+                reductions,
+                traversals[0],
+                hardware,
+                l2_terms,
+                reuse_weights,
+            )
+        return expanded_cache[key]
 
     output_rank = max(1, len(algorithm.output_axes))
     parallel: list[tuple[int, int, int]] = []
@@ -1229,9 +1370,13 @@ def _direct_hardware_anchors(
         parallel.append(_nearest_level(
             levels, (inner_target, task_target, task_target)
         ))
-    scheduled_axes = set(algorithm.output_axes) | set(algorithm.reduction_axes)
+    output_axes = set(algorithm.output_axes)
     issue_geometry = tuple(
-        min(levels) if axis.name in scheduled_axes else max(levels)
+        # More output tiles expose parallel tasks.  A larger reduction tile,
+        # however, performs the same arithmetic with fewer DMA/instruction
+        # latency waves.  Treating reduction axes like output axes forced the
+        # K anchor to the smallest legal value and was not a hardware optimum.
+        min(levels) if axis.name in output_axes else max(levels)
         for axis, levels in zip(operator.axes, levels_by_axis)
     )
     target_geometries = (
@@ -1239,15 +1384,36 @@ def _direct_hardware_anchors(
         tuple(parallel),
         tuple(max(levels) for levels in levels_by_axis),
     )
-    inner_geometries = tuple(dict.fromkeys(
-        _fit_inner_capacity(
-            operator, algorithm, axis_names, levels_by_axis, geometry,
-            fit_buffers, serial, hardware,
+    # A fully double-buffered profile is not automatically the capacity
+    # optimum: doubling an output buffer can halve a Cube tile.  Select the
+    # non-serial boundary profile that retains the largest legal inner volume,
+    # then expose every other buffer profile as a one-transition neighbour.
+    # This keeps the direct search finite without privileging "all DB=2".
+    maximum_geometry = target_geometries[-1]
+    non_serial_fits = tuple(
+        (
+            profile,
+            fitted(maximum_geometry, profile, serial),
         )
+        for profile in buffers
+        if profile != single_buffers
+    )
+    capacity_buffers = (
+        max(
+            non_serial_fits,
+            key=lambda item: (
+                prod(level[0] for level in item[1]),
+                -sum(dict(item[0]).values()),
+            ),
+        )[0]
+        if non_serial_fits else single_buffers
+    )
+    anchor_buffers = tuple(dict.fromkeys((single_buffers, capacity_buffers)))
+    inner_geometries = tuple(dict.fromkeys(
+        fitted(geometry, fit_buffers, serial)
         for geometry in target_geometries
-        for fit_buffers in dict.fromkeys((single_buffers, overlap_buffers))
+        for fit_buffers in anchor_buffers
     ))
-
     result: list[TilingPlan] = []
     coupled_task_axes = frozenset(space.coupled_task_axes)
     for geometry in inner_geometries:
@@ -1269,24 +1435,25 @@ def _direct_hardware_anchors(
             )
             reduction_profiles = [serial]
             if algorithm.parallel_reduction:
-                reduction_profiles.extend((
-                    _reduction_fill_profile(
-                        operator, algorithm_index, prototype, hardware, space
-                    ),
-                    _reduction_chunk_profile(
-                        operator, algorithm_index, prototype, hardware, space
-                    ),
+                reduction_profiles.append(_reduction_fill_profile(
+                    operator, algorithm_index, prototype, hardware, space
                 ))
             for reductions in tuple(dict.fromkeys(reduction_profiles)):
+                # Core-wave retargeting can enlarge a coupled inner/task tile.
+                # Re-project that geometry before L2 expansion so an output
+                # balance target cannot silently exceed L1/L0 capacity.
+                fitted_task_levels = fitted(
+                    task_levels, single_buffers, reductions
+                )
+                # L2 residency is a property of the complete declared cache
+                # group.  It no longer depends on output traversal, so solve
+                # it once and then expose both traversal orders.
+                cache_levels = expanded(fitted_task_levels, reductions)
+                buffer_profile = _best_feasible_buffer(
+                    operator, algorithm, axis_names, cache_levels,
+                    reductions, buffers, hardware, scratchpad_terms,
+                )
                 for traversal in traversals:
-                    cache_levels = _expand_cache_for_reuse(
-                        operator, algorithm, axis_names, levels_by_axis,
-                        task_levels, reductions, traversal, hardware,
-                    )
-                    buffer_profile = _best_feasible_buffer(
-                        operator, algorithm, axis_names, cache_levels,
-                        reductions, buffers, hardware,
-                    )
                     candidate = _plan_from_levels(
                         algorithm_index, axis_names, cache_levels, reductions,
                         core_count, buffer_profile, traversal,
@@ -1362,12 +1529,6 @@ def _ideal_neighbours(
                     ),
                 ))
 
-    core_allowed = _core_options(operator, plan.algorithm, hardware, space)
-    for value in _useful_core_values(
-        _total_task_count(operator, algorithm, plan), core_allowed
-    ):
-        if value != plan.used_cores:
-            result.append(_replace_plan(plan, used_cores=value))
     result.extend(
         _replace_plan(plan, buffers=value)
         for value in buffers if value != plan.buffers
@@ -1376,6 +1537,204 @@ def _ideal_neighbours(
         _replace_plan(plan, traversal=value)
         for value in traversals if value != plan.traversal
     )
+    return tuple(dict.fromkeys(result))
+
+
+def _plan_hardware_metrics(
+    operator: Operator,
+    algorithm,
+    plan: TilingPlan,
+) -> tuple[int, ...]:
+    """Rate-independent objectives used to prove schedule dominance."""
+
+    total_tasks = _total_task_count(operator, algorithm, plan)
+    active_cores = min(plan.used_cores, total_tasks)
+    wave = ceil_div(total_tasks, active_cores)
+    transfer_bytes = 0
+    output_axes = set(algorithm.output_axes)
+    reduction_axes = set(algorithm.reduction_axes)
+    for stage in algorithm.stages:
+        for access in stage.accesses:
+            tensor = operator.tensor(access.tensor)
+            points = 1
+            for axis in operator.axes:
+                if axis.name in output_axes:
+                    factor = (
+                        axis.extent if axis.name in access.axes
+                        else ceil_div(axis.extent, plan.tasks[axis.name])
+                    )
+                elif axis.name in reduction_axes:
+                    factor = (
+                        axis.extent if axis.name in access.axes
+                        else plan.reductions.get(axis.name, 1)
+                    )
+                else:
+                    factor = axis.extent if axis.name in access.axes else 1
+                points *= factor
+            element_bytes = dtype_bytes(access.local_dtype or tensor.dtype)
+            transfer_bytes += (
+                points * element_bytes * max(1, len(access.path) - 1)
+            )
+    reduction_tile_waves = prod(
+        ceil_div(operator.axis(axis).extent, plan.tiles[axis])
+        for axis in algorithm.reduction_axes
+    )
+    boundaries = algorithm.pipeline_boundaries or tuple(
+        (memory,) for memory in algorithm.buffered_spaces
+    )
+    overlap_boundaries = sum(
+        all(plan.buffer_counts.get(memory, 1) == 2 for memory in boundary)
+        for boundary in boundaries
+    )
+
+    return (
+        wave,
+        -active_cores,
+        transfer_bytes,
+        reduction_tile_waves,
+        -overlap_boundaries,
+    )
+
+
+def _pareto_hardware_plans(
+    operator: Operator,
+    algorithm,
+    plans: tuple[TilingPlan, ...],
+) -> tuple[TilingPlan, ...]:
+    """Retain the Pareto frontier of rate-independent hardware objectives.
+
+    This is an objective-derived ideal-region projection, not a fixed
+    candidate count: the retained cardinality changes with the geometry.
+    """
+
+    metrics = {
+        plan: _plan_hardware_metrics(operator, algorithm, plan)
+        for plan in plans
+    }
+    grouped: dict[tuple[bool, ...], set[tuple[int, ...]]] = {}
+    for plan, value in metrics.items():
+        topology = tuple(
+            plan.reductions.get(axis, 1) > 1
+            for axis in algorithm.reduction_axes
+        )
+        grouped.setdefault(topology, set()).add(value)
+
+    # Dominance depends only on the numeric metric vector, not on the tiling
+    # identity.  Compare each distinct vector once per reduction topology.
+    # This is exactly equivalent to the pairwise definition above while
+    # avoiding repeated topology construction and thousands of duplicate
+    # comparisons for schedules with identical hardware work.
+    nondominated: dict[tuple[bool, ...], set[tuple[int, ...]]] = {}
+    for topology, values in grouped.items():
+        frontier = {
+            value
+            for value in values
+            if not any(
+                other != value
+                and all(left <= right for left, right in zip(other, value))
+                for other in values
+            )
+        }
+        nondominated[topology] = frontier
+
+    return tuple(
+        plan
+        for plan in plans
+        if metrics[plan] in nondominated[tuple(
+            plan.reductions.get(axis, 1) > 1
+            for axis in algorithm.reduction_axes
+        )]
+    )
+
+
+def _capacity_frontier_plans(
+    operator: Operator,
+    hardware: Hardware,
+    space: ScheduleSpace,
+    levels_by_axis: tuple[tuple[tuple[int, int, int], ...], ...],
+    plan: TilingPlan,
+) -> tuple[TilingPlan, ...]:
+    """Enumerate pairwise scratchpad-capacity boundaries around an anchor.
+
+    A one-axis neighbour cannot represent the common tradeoff where one
+    output tile shrinks while another grows to keep L0C full.  For every pair
+    of output axes, sweep the declared levels of one axis and select the
+    largest feasible level of the other.  Scratchpad pressure is monotone, so
+    a binary search finds the complete boundary without a Cartesian search or
+    a hand-picked distance/percentage limit.
+    """
+
+    algorithm = operator.algorithms[plan.algorithm]
+    output_indexes = tuple(
+        index for index, axis in enumerate(operator.axes)
+        if axis.name in algorithm.output_axes
+    )
+    if len(output_indexes) < 2:
+        return ()
+    axis_names = tuple(axis.name for axis in operator.axes)
+    scratchpad_terms = _scratchpad_terms(operator, algorithm)
+    core_allowed = _core_options(
+        operator, plan.algorithm, hardware, space
+    )
+    current = tuple(
+        (plan.tiles[name], plan.tasks[name], plan.caches[name])
+        for name in axis_names
+    )
+    coupled = frozenset(space.coupled_task_axes)
+
+    def representatives(axis_index: int) -> tuple[tuple[int, int, int], ...]:
+        axis = operator.axes[axis_index]
+        options = levels_by_axis[axis_index]
+        inners = sorted(set(level[0] for level in options))
+        result = []
+        for inner in inners:
+            task = (
+                inner if axis.name in coupled
+                else max(inner, current[axis_index][1])
+            )
+            cache = max(task, current[axis_index][2])
+            result.append(_level_for_targets(options, inner, task, cache))
+        return tuple(dict.fromkeys(result))
+
+    result: list[TilingPlan] = []
+    for left_index, right_index in combinations(output_indexes, 2):
+        left_levels = representatives(left_index)
+        right_levels = representatives(right_index)
+        for left in left_levels:
+            low = 0
+            high = len(right_levels) - 1
+            best: tuple[int, int, int] | None = None
+            while low <= high:
+                middle = (low + high) // 2
+                levels = list(current)
+                levels[left_index] = left
+                levels[right_index] = right_levels[middle]
+                if _local_memory_pressure(
+                    operator, algorithm, axis_names, tuple(levels),
+                    plan.buffers, plan.reduction_parts, hardware,
+                    scratchpad_terms,
+                ) <= 1.0:
+                    best = right_levels[middle]
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best is None:
+                continue
+            levels = list(current)
+            levels[left_index] = left
+            levels[right_index] = best
+            candidate = _plan_from_levels(
+                plan.algorithm, axis_names, tuple(levels),
+                plan.reduction_parts, plan.used_cores, plan.buffers,
+                plan.traversal,
+            )
+            result.append(_replace_plan(
+                candidate,
+                used_cores=_useful_core_values(
+                    _total_task_count(operator, algorithm, candidate),
+                    core_allowed,
+                )[-1],
+            ))
     return tuple(dict.fromkeys(result))
 
 
@@ -1395,29 +1754,76 @@ def derive_ideal_region(
     space = space or ScheduleSpace()
     policy = policy or SearchPolicy()
     axis_names = tuple(axis.name for axis in operator.axes)
-    cache: dict[TilingPlan, object] = {}
+    cache: dict[object, object] = {}
+    l2_terms_by_algorithm = tuple(
+        tuple(
+            (
+                access.tensor,
+                access.axes,
+                operator.tensor(access.tensor).dtype,
+                access.is_result,
+            )
+            for stage in algorithm.stages
+            for access in stage.accesses
+            if MemorySpace.GM in access.path
+        )
+        for algorithm in operator.algorithms
+    )
     reasons: Counter[str] = Counter()
     stopped = False
 
     def evaluate(plan: TilingPlan):
         nonlocal stopped
-        if plan in cache:
-            return cache[plan]
+        algorithm = operator.algorithms[plan.algorithm]
+        l2_capacity = hardware.capacities.get(MemorySpace.L2, 0)
+        cache_key: object = plan
+        if l2_capacity > 0 and _l2_footprint(
+            operator,
+            algorithm,
+            axis_names,
+            tuple(
+                (
+                    plan.tiles[name],
+                    plan.tasks[name],
+                    plan.caches[name],
+                )
+                for name in axis_names
+            ),
+            plan.reduction_parts,
+            l2_terms_by_algorithm[plan.algorithm],
+        ) <= l2_capacity:
+            # Traversal is cost-equivalent while the complete declared cache
+            # group is resident; the simulator intentionally ignores order
+            # in this case.  Cache that proven equivalence without deleting
+            # either legal schedule from the returned region.
+            cache_key = (
+                plan.algorithm,
+                plan.axis_tiles,
+                plan.task_tiles,
+                plan.cache_tiles,
+                plan.used_cores,
+                plan.reduction_parts,
+                plan.buffers,
+            )
+        if cache_key in cache:
+            return cache[cache_key]
         if len(cache) >= policy.max_evaluations:
             stopped = True
             return None
         value = simulate(operator, plan, hardware)
-        cache[plan] = value
+        cache[cache_key] = value
         if not value.valid:
             reasons[value.error] += 1
         return value
 
     anchors: list[TilingPlan] = []
+    primary_anchors: set[TilingPlan] = set()
     algorithm_anchor_counts: Counter[int] = Counter()
     algorithm_region_counts: Counter[int] = Counter()
     algorithm_contexts: dict[int, tuple] = {}
 
     for algorithm_index, algorithm in enumerate(operator.algorithms):
+        scratchpad_terms = _scratchpad_terms(operator, algorithm)
         levels_by_axis = _algorithm_tile_levels(
             operator, algorithm_index, hardware, space, True
         )
@@ -1430,16 +1836,46 @@ def derive_ideal_region(
             operator, hardware, space, algorithm_index,
             levels_by_axis, buffers, traversals,
         )
+        # Declared finite spaces are already intentional and may be solved
+        # exactly by callers/tests.  Dominance reduction is needed only for
+        # the automatically derived hardware region.
+        if not (
+            space.tile_options
+            or space.task_tile_options
+            or space.cache_tile_options
+        ):
+            direct = _pareto_hardware_plans(operator, algorithm, direct)
         # Keep the best feasible direct solution in every numeric reduction
         # topology.  This retains serial and each independently partitioned
         # reduction graph without assigning names or fixed quotas to them.
         best_by_topology: dict[tuple[object, ...], tuple[float, TilingPlan]] = {}
+        feasible_direct: list[TilingPlan] = []
         for candidate in direct:
+            if _local_memory_pressure(
+                operator,
+                algorithm,
+                axis_names,
+                tuple(
+                    (
+                        candidate.tiles[name],
+                        candidate.tasks[name],
+                        candidate.caches[name],
+                    )
+                    for name in axis_names
+                ),
+                candidate.buffers,
+                candidate.reduction_parts,
+                hardware,
+                scratchpad_terms,
+            ) > 1.0:
+                reasons["projected scratchpad capacity"] += 1
+                continue
             result = evaluate(candidate)
             if result is None:
                 break
             if not result.valid:
                 continue
+            feasible_direct.append(candidate)
             topology = tuple(
                 candidate.reductions.get(axis, 1) > 1
                 for axis in algorithm.reduction_axes
@@ -1452,30 +1888,59 @@ def derive_ideal_region(
                 best_by_topology[topology] = (
                     result.total_cycles, candidate
                 )
-        unique_algorithm_anchors = tuple(
+        unique_primary_anchors = tuple(
             value[1]
             for _, value in sorted(best_by_topology.items())
         )
+        # Every feasible direct projection is a hardware-derived anchor.  Do
+        # not discard capacity/issue/reuse projections merely because the
+        # approximate model currently ranks another projection first.  For an
+        # identical geometry, fewer active cores are weakly dominated; the
+        # anchor already uses min(physical cores, executable tasks), so lower
+        # core-count copies do not need to be enumerated.
+        unique_algorithm_anchors = tuple(dict.fromkeys(
+            feasible_direct
+        ))
         anchors.extend(unique_algorithm_anchors)
+        primary_anchors.update(unique_primary_anchors)
         algorithm_anchor_counts[algorithm_index] = len(unique_algorithm_anchors)
         if stopped:
             break
 
     anchors = list(dict.fromkeys(anchors))
     region: list[TilingPlan] = []
+    frontier_cache: dict[TilingPlan, tuple[TilingPlan, ...]] = {}
     for anchor in anchors:
         levels_by_axis, buffers, traversals = algorithm_contexts[anchor.algorithm]
-        for plan in (anchor, *_ideal_neighbours(
-            operator, hardware, space, policy,
-            levels_by_axis, buffers, traversals, anchor,
-        )):
+        neighbourhood = (
+            _ideal_neighbours(
+                operator, hardware, space, policy,
+                levels_by_axis, buffers, traversals, anchor,
+            )
+            if anchor in primary_anchors else ()
+        )
+        canonical = _replace_plan(anchor, traversal=traversals[0])
+        if canonical not in frontier_cache:
+            frontier_cache[canonical] = _capacity_frontier_plans(
+                operator, hardware, space, levels_by_axis, canonical
+            )
+        capacity_frontier = tuple(
+            _replace_plan(plan, traversal=anchor.traversal)
+            for plan in frontier_cache[canonical]
+        )
+        for plan in (anchor, *neighbourhood):
             result = evaluate(plan)
             if result is not None and result.valid:
                 region.append(plan)
+        # Capacity-frontier construction already proves local-memory
+        # feasibility and changes only declared output-axis levels.  Defer its
+        # detailed cycle simulation to ranking instead of evaluating the same
+        # plan once here and again at the execution-ABI boundary.
+        region.extend(capacity_frontier)
     region = list(dict.fromkeys(region))
     for plan in region:
         algorithm_region_counts[plan.algorithm] += 1
-    legal = sum(value.valid for value in cache.values())
+    legal = len(region)
     return IdealRegion(
         plans=tuple(region),
         anchors=tuple(anchors),

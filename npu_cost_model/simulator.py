@@ -213,6 +213,7 @@ def _access_cost(
     hardware: Hardware,
     reduction_partitions: int,
     partial_dtype: str,
+    cache_group_resident: bool,
 ) -> WorkCost:
     tensor = operator.tensor(access.tensor)
     # A result write becomes a partial-result write when the schedule
@@ -238,12 +239,26 @@ def _access_cost(
         and access.pattern != AccessPattern.INDIRECT
         and any(space in access.path for space in (MemorySpace.L1, MemorySpace.UB))
     ):
-        traversal = plan.traversal or algorithm.output_axes
         task_tiles = plan.tasks
         cache_tiles = plan.caches
-        for axis_name in reversed(traversal):
-            if axis_name in access.axes:
-                break
+        if cache_group_resident:
+            # Every task in this declared cache group can reuse a resident
+            # tensor irrespective of which output axis is visited first.
+            # Traversal matters only once the complete live group no longer
+            # fits and reuse must come from adjacent tasks.
+            reusable_axes = tuple(
+                axis_name for axis_name in algorithm.output_axes
+                if axis_name not in access.axes
+            )
+        else:
+            reusable: list[str] = []
+            traversal = plan.traversal or algorithm.output_axes
+            for axis_name in reversed(traversal):
+                if axis_name in access.axes:
+                    break
+                reusable.append(axis_name)
+            reusable_axes = tuple(reusable)
+        for axis_name in reusable_axes:
             reuse_factor *= max(
                 1, ceil_div(cache_tiles[axis_name], task_tiles[axis_name])
             )
@@ -262,11 +277,14 @@ def _access_cost(
         if source == MemorySpace.GM and reuse_factor > 1:
             service /= reuse_factor
             hop_transactions /= reuse_factor
-        waves = 1.0
+        waves = float(prod(
+            ceil_div(extents[axis], plan.tiles[axis])
+            for axis in access.dependency_axes
+        ))
         if access.pattern == AccessPattern.INDIRECT and MemorySpace.GM in (
             source, destination
         ):
-            waves = float(ceil(hop_transactions / 16.0))
+            waves *= float(ceil(hop_transactions / 16.0))
         if access.mode == AccessMode.ATOMIC_ADD:
             waves *= access.contention_factor
         work = _work_item(
@@ -321,6 +339,7 @@ def _stage_cost(
     hardware: Hardware,
     reduction_partitions: int,
     partial_dtype: str,
+    cache_group_resident: bool,
 ) -> WorkCost:
     children = [
         *(
@@ -333,6 +352,7 @@ def _stage_cost(
                 hardware,
                 reduction_partitions,
                 partial_dtype,
+                cache_group_resident,
             )
             for access in stage.accesses
         ),
@@ -485,6 +505,7 @@ def _kernel_stage_cost(
     hardware: Hardware,
     active_cores: int,
     reduction_partitions: int,
+    cache_group_resident: bool,
 ) -> WorkCost:
     extents = {axis.name: axis.extent for axis in operator.axes}
     total = WorkCost()
@@ -501,6 +522,7 @@ def _kernel_stage_cost(
                 hardware,
                 reduction_partitions,
                 algorithm.partial_dtype,
+                cache_group_resident,
             )
         )
     if active_cores <= 1:
@@ -514,6 +536,82 @@ def _kernel_stage_cost(
         for resource, cycles in total.resource_cycles.items()
     }
     return total
+
+
+def _task_pipeline_cost(
+    algorithm: Algorithm,
+    plan: TilingPlan,
+    stage_costs: list[tuple[int, WorkCost]],
+) -> tuple[WorkCost, float]:
+    """Return the steady-state task period and one-time pipeline fill.
+
+    Pipeline overlap is a dependency-graph property: a double-buffered local
+    memory boundary connects the task stage that fills/consumes that memory
+    to its adjacent compute stage.  Unconnected stages remain serial.  This
+    avoids assigning an arbitrary fractional overlap merely from the number
+    of buffers that happen to be doubled.
+    """
+
+    aggregate = WorkCost()
+    for _, cost in stage_costs:
+        aggregate.add(cost)
+    if (
+        not aggregate.valid
+        or not algorithm.pipeline_capable
+        or len(stage_costs) < 2
+    ):
+        return aggregate, 0.0
+
+    task_positions = {
+        stage_index: position
+        for position, (stage_index, _) in enumerate(stage_costs)
+    }
+    active_edges: set[tuple[int, int]] = set()
+    boundaries = algorithm.pipeline_boundaries or tuple(
+        (space,) for space in algorithm.buffered_spaces
+    )
+    for boundary in boundaries:
+        if not all(
+            plan.buffer_counts.get(space, 1) == 2 for space in boundary
+        ):
+            continue
+        boundary_spaces = set(boundary)
+        for stage_index, _ in stage_costs:
+            stage = algorithm.stages[stage_index]
+            position = task_positions[stage_index]
+            loads_boundary = any(
+                access.mode == AccessMode.READ
+                and bool(boundary_spaces.intersection(access.path[1:]))
+                for access in stage.accesses
+            )
+            stores_boundary = any(
+                access.mode in (AccessMode.WRITE, AccessMode.ATOMIC_ADD)
+                and bool(boundary_spaces.intersection(access.path[:-1]))
+                for access in stage.accesses
+            )
+            if loads_boundary and position + 1 < len(stage_costs):
+                active_edges.add((position, position + 1))
+            if stores_boundary and position > 0:
+                active_edges.add((position - 1, position))
+
+    if not active_edges:
+        return aggregate, 0.0
+
+    # Connected adjacent stages form a producer/consumer pipeline.  Its
+    # steady-state period is the slowest stage; disconnected components are
+    # serialized.  Filling/draining each component is paid once per core.
+    elapsed = [cost.elapsed_cycles for _, cost in stage_costs]
+    period = 0.0
+    component_start = 0
+    for position in range(len(elapsed) - 1):
+        if (position, position + 1) in active_edges:
+            continue
+        period += max(elapsed[component_start:position + 1])
+        component_start = position + 1
+    period += max(elapsed[component_start:])
+    fill = max(0.0, sum(elapsed) - period)
+    aggregate.elapsed_cycles = period
+    return aggregate, fill
 
 
 def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> SimulationResult:
@@ -570,9 +668,12 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
     peak = _local_memory(
         operator, algorithm, plan, total_reduction_partitions
     )
-    peak[MemorySpace.L2] = _cache_memory(
+    cache_memory = _cache_memory(
         operator, algorithm, plan, total_reduction_partitions
     )
+    peak[MemorySpace.L2] = cache_memory
+    l2_capacity = hardware.capacities.get(MemorySpace.L2, 0)
+    cache_group_resident = l2_capacity > 0 and cache_memory <= l2_capacity
     for space, byte_count in peak.items():
         # L2 is a cache, not a statically allocated scratchpad.  A working
         # set larger than L2 is executable and causes refetch traffic; local
@@ -598,15 +699,16 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
     core_gm_write = [0.0] * active_cores
     core_l2 = [0.0] * active_cores
     offset = 0
-    task_cache: dict[tuple[tuple[str, int], ...], WorkCost] = {}
+    task_cache: dict[tuple[tuple[str, int], ...], tuple[WorkCost, float]] = {}
     for extents, multiplicity in classes:
         signature = tuple(sorted(extents.items()))
-        task = task_cache.get(signature)
-        if task is None:
-            task = WorkCost()
-            for stage in algorithm.stages:
+        cached_task = task_cache.get(signature)
+        if cached_task is None:
+            stage_costs: list[tuple[int, WorkCost]] = []
+            for stage_index, stage in enumerate(algorithm.stages):
                 if stage.scope == StageScope.TASK:
-                    task.add(
+                    stage_costs.append((
+                        stage_index,
                         _stage_cost(
                             operator,
                             algorithm,
@@ -616,9 +718,14 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
                             hardware,
                             total_reduction_partitions,
                             algorithm.partial_dtype,
-                        )
-                    )
-            task_cache[signature] = task
+                            cache_group_resident,
+                        ),
+                    ))
+            cached_task = _task_pipeline_cost(
+                algorithm, plan, stage_costs
+            )
+            task_cache[signature] = cached_task
+        task, task_fill = cached_task
         if not task.valid:
             return _invalid(task.error)
         base = multiplicity // active_cores
@@ -631,8 +738,7 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
             core_gm_read[core] += task.gm_read_bytes * count
             core_gm_write[core] += task.gm_write_bytes * count
             core_l2[core] += task.l2_bytes * count
-            task_roof = max(task.resource_cycles.values(), default=0.0)
-            core_fill[core] = max(core_fill[core], task.elapsed_cycles - task_roof)
+            core_fill[core] = max(core_fill[core], task_fill)
             for resource, cycles in task.resource_cycles.items():
                 core_resources[core][resource] = (
                     core_resources[core].get(resource, 0.0) + cycles * count
@@ -646,22 +752,11 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         hardware,
         active_cores,
         total_reduction_partitions,
+        cache_group_resident,
     )
     if not kernel_stage.valid:
         return _invalid(kernel_stage.error)
 
-    boundaries = algorithm.pipeline_boundaries or tuple(
-        (space,) for space in algorithm.buffered_spaces
-    )
-    satisfied_boundaries = sum(
-        all(plan.buffer_counts.get(space, 1) == 2 for space in boundary)
-        for boundary in boundaries
-    )
-    overlap_fraction = (
-        satisfied_boundaries / len(boundaries)
-        if algorithm.pipeline_capable and boundaries
-        else 0.0
-    )
     core_cycles: list[float] = []
     aggregate_resources: dict[Resource, float] = {}
     gm_read = gm_write = l2_bytes = 0.0
@@ -674,14 +769,7 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         core_gm_read[core] += kernel_stage.gm_read_bytes
         core_gm_write[core] += kernel_stage.gm_write_bytes
         core_l2[core] += kernel_stage.l2_bytes
-        if overlap_fraction > 0.0:
-            resource_roof = max(core_resources[core].values(), default=0.0)
-            fully_pipelined = resource_roof + core_fill[core]
-            cycles = core_serial[core] - overlap_fraction * (
-                core_serial[core] - fully_pipelined
-            )
-        else:
-            cycles = core_serial[core]
+        cycles = core_serial[core] + core_fill[core]
         core_cycles.append(cycles)
         gm_read += core_gm_read[core]
         gm_write += core_gm_write[core]

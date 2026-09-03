@@ -122,22 +122,25 @@ def matmul(
         *,
         resident_a: bool = False,
         resident_b: bool = False,
-        l1_only: bool = False,
+        route: str = "complete",
     ) -> tuple[Access, ...]:
+        if route not in ("complete", "gm_to_l1", "l1_to_l0"):
+            raise ValueError("unsupported MatMul input route")
         result: list[Access] = []
         if not resident_a:
-            result.append(Access(
-                "A", ("m", "k"), AccessMode.READ,
-                (
-                    (MemorySpace.L1, MemorySpace.L0A)
-                    if l1_only
-                    else (MemorySpace.GM, MemorySpace.L1, MemorySpace.L0A)
-                ),
-                pattern=a_pattern,
-                contiguous_axes=a_contiguous,
-                dependency_axes=("k",),
-            ))
-        else:
+            if route in ("complete", "gm_to_l1"):
+                result.append(Access(
+                    "A", ("m", "k"), AccessMode.READ,
+                    (
+                        (MemorySpace.GM, MemorySpace.L1)
+                        if route == "gm_to_l1"
+                        else (MemorySpace.GM, MemorySpace.L1, MemorySpace.L0A)
+                    ),
+                    pattern=a_pattern,
+                    contiguous_axes=a_contiguous,
+                    dependency_axes=("k",),
+                ))
+        if resident_a or route == "l1_to_l0":
             result.append(Access(
                 "A", ("m", "k"), AccessMode.READ,
                 (MemorySpace.L1, MemorySpace.L0A),
@@ -146,18 +149,19 @@ def matmul(
                 dependency_axes=("k",),
             ))
         if not resident_b:
-            result.append(Access(
-                "B", ("k", "n"), AccessMode.READ,
-                (
-                    (MemorySpace.L1, MemorySpace.L0B)
-                    if l1_only
-                    else (MemorySpace.GM, MemorySpace.L1, MemorySpace.L0B)
-                ),
-                pattern=b_pattern,
-                contiguous_axes=b_contiguous,
-                dependency_axes=("k",),
-            ))
-        else:
+            if route in ("complete", "gm_to_l1"):
+                result.append(Access(
+                    "B", ("k", "n"), AccessMode.READ,
+                    (
+                        (MemorySpace.GM, MemorySpace.L1)
+                        if route == "gm_to_l1"
+                        else (MemorySpace.GM, MemorySpace.L1, MemorySpace.L0B)
+                    ),
+                    pattern=b_pattern,
+                    contiguous_axes=b_contiguous,
+                    dependency_axes=("k",),
+                ))
+        if resident_b or route == "l1_to_l0":
             result.append(Access(
                 "B", ("k", "n"), AccessMode.READ,
                 (MemorySpace.L1, MemorySpace.L0B),
@@ -165,7 +169,7 @@ def matmul(
                 contiguous_axes=b_contiguous,
                 dependency_axes=("k",),
             ))
-        if has_bias:
+        if has_bias and route in ("complete", "gm_to_l1"):
             result.append(Access(
                 "Bias", ("n",), AccessMode.READ,
                 (MemorySpace.GM, MemorySpace.L1),
@@ -275,7 +279,6 @@ def matmul(
         *,
         resident_a: bool = False,
         resident_b: bool = False,
-        staged_gm_to_l1: bool = False,
         vector_output: bool = False,
         workspace_alignment: int = 1,
         atomic: bool = False,
@@ -322,40 +325,26 @@ def matmul(
                 ),),
                 scope=StageScope.CORE,
             ))
-        if staged_gm_to_l1:
-            stages.extend((
-                Stage(
-                    "stage_inputs_to_l1",
-                    accesses=(
-                        Access("A", ("m", "k"), AccessMode.READ,
-                               (MemorySpace.GM, MemorySpace.L1),
-                               pattern=a_pattern, contiguous_axes=a_contiguous,
-                               dependency_axes=("k",)),
-                        Access("B", ("k", "n"), AccessMode.READ,
-                               (MemorySpace.GM, MemorySpace.L1),
-                               pattern=b_pattern, contiguous_axes=b_contiguous,
-                               dependency_axes=("k",)),
-                    ),
-                    concurrent=True,
-                    invocation_axes=invocation_axes,
-                ),
-                Stage(
-                    "stage_l1_to_l0",
-                    accesses=input_accesses(l1_only=True),
-                    concurrent=True,
-                    invocation_axes=invocation_axes,
-                ),
-            ))
-        else:
+        gm_to_l1 = input_accesses(
+            resident_a=resident_a,
+            resident_b=resident_b,
+            route="gm_to_l1",
+        )
+        if gm_to_l1:
             stages.append(Stage(
-                "load_inputs",
-                accesses=input_accesses(
-                    resident_a=resident_a,
-                    resident_b=resident_b,
-                ),
-                concurrent=True,
+                "stage_inputs_to_l1",
+                accesses=gm_to_l1,
                 invocation_axes=invocation_axes,
             ))
+        stages.append(Stage(
+            "stage_l1_to_l0",
+            accesses=input_accesses(
+                resident_a=resident_a,
+                resident_b=resident_b,
+                route="l1_to_l0",
+            ),
+            invocation_axes=invocation_axes,
+        ))
         stages.append(Stage(
             "matrix_multiply_accumulate",
             primitives=(Primitive(
@@ -398,7 +387,10 @@ def matmul(
             reduction_operations_per_element=1.0,
             pipeline_capable=True,
             buffered_spaces=tuple(buffered),
-            pipeline_boundaries=((MemorySpace.L0A, MemorySpace.L0B),),
+            pipeline_boundaries=(
+                (MemorySpace.L1,),
+                (MemorySpace.L0A, MemorySpace.L0B),
+            ),
             workspace_buffers=workspace_buffers,
             coupled_task_axes=coupled_task_axes,
             name=name,

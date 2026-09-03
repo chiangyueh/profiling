@@ -605,6 +605,42 @@ def test_l2_reuse_uses_l2_ingress_instead_of_free_local_service() -> None:
     assert resident.critical_core_cycles * 4 > no_cross_task_reuse.critical_core_cycles
 
 
+def test_matmul_l1_double_buffer_overlaps_mte2_with_downstream_pipeline() -> None:
+    """L1 buffering is a real GM->L1 / L1->L0 stage boundary."""
+
+    operator = matmul(1024, 512, 4096)
+    common = dict(
+        algorithm=0,
+        axis_tiles=(("m", 128), ("n", 128), ("k", 128)),
+        task_tiles=(("m", 128), ("n", 128), ("k", 4096)),
+        cache_tiles=(("m", 1024), ("n", 512), ("k", 4096)),
+        used_cores=16,
+        reduction_parts=(("k", 1),),
+        traversal=("m", "n"),
+    )
+    single = simulate(
+        operator,
+        TilingPlan(
+            **common,
+            buffers=((MemorySpace.L1, 1), (MemorySpace.L0A, 1),
+                     (MemorySpace.L0B, 1), (MemorySpace.L0C, 1)),
+        ),
+        HARDWARE,
+    )
+    double = simulate(
+        operator,
+        TilingPlan(
+            **common,
+            buffers=((MemorySpace.L1, 2), (MemorySpace.L0A, 1),
+                     (MemorySpace.L0B, 1), (MemorySpace.L0C, 1)),
+        ),
+        HARDWARE,
+    )
+    assert single.valid and double.valid
+    assert dict(single.resource_cycles) == dict(double.resource_cycles)
+    assert double.critical_core_cycles < single.critical_core_cycles
+
+
 def test_fused_attention_uses_the_same_generic_solver() -> None:
     operator = flash_attention_forward(1, 8, 128, 256, 64)
     space = ScheduleSpace(

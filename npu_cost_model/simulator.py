@@ -186,9 +186,12 @@ def _work_item(
     fixed_cycles: float = 0.0,
     latency_waves: float = 0.0,
     route: tuple[MemorySpace, MemorySpace] | None = None,
+    byte_rate_override: float = 0.0,
 ) -> WorkCost:
     rate = hardware.rate(resource, dtype)
-    byte_rate = hardware.route_rate(*route) if route is not None else 0.0
+    byte_rate = byte_rate_override
+    if byte_rate <= 0.0 and route is not None:
+        byte_rate = hardware.route_rate(*route)
     if byte_rate <= 0.0:
         byte_rate = rate.bytes_per_cycle
     if byte_count > 0.0 and byte_rate <= 0.0:
@@ -277,9 +280,23 @@ def _access_cost(
         )
         port_bytes = traffic
         if access.service_bytes_per_element is not None:
+            service_bytes_per_element = access.service_bytes_per_element
+            if (
+                access.is_result
+                and reduction_partitions > 1
+                and protocol != ReductionProtocol.DIRECT
+                and access.local_dtype is not None
+            ):
+                # A workspace partial keeps the accumulator dtype.  For a
+                # direct result the declared service covers L0C input plus
+                # the final output dtype; replace only that destination side
+                # when the schedule writes a wider reduction partial.
+                service_bytes_per_element = (
+                    dtype_bytes(access.local_dtype) + element_bytes
+                )
             port_bytes = align_up(
                 _points(extents, access.axes)
-                * access.service_bytes_per_element,
+                * service_bytes_per_element,
                 access.transaction_bytes,
             )
         resource = _transfer_resource(source, destination, access.mode)
@@ -291,9 +308,20 @@ def _access_cost(
             else useful
         )
         hop_transactions = float(transactions)
+        # A cache hit removes an HBM fill, not the transfer consumed by the
+        # requesting core.  Split the service into a miss fraction crossing
+        # GM -> local memory and a hit fraction crossing L2 -> local memory.
+        # Express the latter as equivalent GM-route bytes so _work_item can
+        # retain one MTE occupancy roof.  This prevents cache reuse from
+        # making repeated small tiles free, without charging every L2 hit at
+        # the much slower HBM rate.
         if source == MemorySpace.GM and reuse_factor > 1:
-            service /= reuse_factor
-            hop_transactions /= reuse_factor
+            miss_rate = hardware.route_rate(source, destination)
+            hit_rate = hardware.route_rate(MemorySpace.L2, destination)
+            if miss_rate > 0.0 and hit_rate > 0.0:
+                misses = service / reuse_factor
+                hits = service - misses
+                service = misses + hits * miss_rate / hit_rate
         waves = float(prod(
             ceil_div(extents[axis], hop_tiles[axis])
             for axis in access.dependency_axes
@@ -304,17 +332,46 @@ def _access_cost(
             waves *= float(ceil(hop_transactions / 16.0))
         if access.mode == AccessMode.ATOMIC_ADD:
             waves *= access.contention_factor
+        atomic_byte_rate = 0.0
+        if access.mode == AccessMode.ATOMIC_ADD and cache_group_resident:
+            # After the first producer store, repeated reductions target a
+            # resident L2 line.  Compose its read and write services instead
+            # of charging the cold-HBM atomic rate.  The payload rate for a
+            # read-modify-write is the harmonic composition of both paths.
+            read_destination = (
+                MemorySpace.UB
+                if source == MemorySpace.UB
+                else MemorySpace.L1
+            )
+            read_rate = hardware.route_rate(
+                MemorySpace.L2, read_destination
+            )
+            write_rate = hardware.route_rate(source, destination)
+            if read_rate > 0.0 and write_rate > 0.0:
+                atomic_byte_rate = 1.0 / (
+                    1.0 / read_rate + 1.0 / write_rate
+                )
         work = _work_item(
             hardware,
             resource,
             byte_count=service,
             issue_count=hop_transactions,
             latency_waves=waves,
-            route=(source, destination),
+            # Atomic throughput is the complete read-modify-write service.
+            # Reusing the plain store route here would silently replace the
+            # atomic rate with the faster one-way MTE3/FixPipe bandwidth.
+            route=(
+                None
+                if access.mode == AccessMode.ATOMIC_ADD
+                else (source, destination)
+            ),
+            byte_rate_override=atomic_byte_rate,
         )
         if source == MemorySpace.GM:
             work.gm_read_bytes += traffic / reuse_factor
-            work.l2_bytes += 2.0 * traffic / reuse_factor
+            # One L2 egress is required for every consumer.  Only the L2
+            # ingress from HBM is shared by the resident cache group.
+            work.l2_bytes += traffic + traffic / reuse_factor
         if destination == MemorySpace.GM:
             work.gm_write_bytes += traffic
             work.l2_bytes += 2.0 * traffic
@@ -1042,6 +1099,108 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
                 aggregate_resources.get(resource, 0.0) + cycles_value
             )
 
+    protocol = algorithm.effective_reduction_protocol
+    if (
+        total_reduction_partitions > active_cores
+        and protocol == ReductionProtocol.PARALLEL_WORKSPACE
+    ):
+        # Each producer core owns one workspace partial.  If there are more
+        # logical reduction chunks than producers, the later chunks are
+        # accumulated atomically into that same partial before the final
+        # cross-core reduction.  They are not independent plain stores.
+        # Evaluate the exact result access for every output-tail class so the
+        # correction remains an IR rule, independent of the operator name.
+        repeated_chunks_per_output = total_reduction_partitions - active_cores
+        direct_resource_delta: dict[Resource, float] = {}
+        atomic_resource_delta: dict[Resource, float] = {}
+        elapsed_delta = 0.0
+        read_delta = write_delta = l2_delta = 0.0
+        output_dimensions = [
+            (
+                axis_name,
+                _axis_classes(
+                    operator.axis(axis_name).extent,
+                    plan.tasks[axis_name],
+                ),
+            )
+            for axis_name in algorithm.output_axes
+        ]
+        result_accesses = tuple(
+            access
+            for stage in algorithm.stages
+            if stage.scope == StageScope.TASK
+            for access in stage.accesses
+            if access.is_result
+        )
+        for combination in product(
+            *(classes for _, classes in output_dimensions)
+        ):
+            extents = {
+                name: value[0]
+                for (name, _), value in zip(output_dimensions, combination)
+            }
+            for axis in operator.axes:
+                extents.setdefault(
+                    axis.name,
+                    min(axis.extent, plan.tasks[axis.name]),
+                )
+            multiplicity = (
+                prod(value[1] for value in combination)
+                * repeated_chunks_per_output
+            )
+            for access in result_accesses:
+                direct = _access_cost(
+                    operator, algorithm, plan, access, extents, hardware,
+                    total_reduction_partitions, algorithm.partial_dtype,
+                    cache_group_resident,
+                )
+                atomic = _access_cost(
+                    operator, algorithm, plan,
+                    replace(access, mode=AccessMode.ATOMIC_ADD),
+                    extents, hardware, total_reduction_partitions,
+                    algorithm.partial_dtype, cache_group_resident,
+                )
+                if not direct.valid or not atomic.valid:
+                    return _invalid(direct.error or atomic.error)
+                elapsed_delta += (
+                    atomic.elapsed_cycles - direct.elapsed_cycles
+                ) * multiplicity
+                read_delta += (
+                    atomic.gm_read_bytes - direct.gm_read_bytes
+                ) * multiplicity
+                write_delta += (
+                    atomic.gm_write_bytes - direct.gm_write_bytes
+                ) * multiplicity
+                l2_delta += (
+                    atomic.l2_bytes - direct.l2_bytes
+                ) * multiplicity
+                for resource, cycles in direct.resource_cycles.items():
+                    direct_resource_delta[resource] = (
+                        direct_resource_delta.get(resource, 0.0)
+                        + cycles * multiplicity
+                    )
+                for resource, cycles in atomic.resource_cycles.items():
+                    atomic_resource_delta[resource] = (
+                        atomic_resource_delta.get(resource, 0.0)
+                        + cycles * multiplicity
+                    )
+        if elapsed_delta > 0.0:
+            critical_index = max(
+                range(active_cores), key=core_cycles.__getitem__
+            )
+            core_cycles[critical_index] += elapsed_delta / active_cores
+        gm_read += read_delta
+        gm_write += write_delta
+        l2_bytes += l2_delta
+        for resource, cycles in direct_resource_delta.items():
+            aggregate_resources[resource] = max(
+                0.0, aggregate_resources.get(resource, 0.0) - cycles
+            )
+        for resource, cycles in atomic_resource_delta.items():
+            aggregate_resources[resource] = (
+                aggregate_resources.get(resource, 0.0) + cycles
+            )
+
     workspace_bytes, workspace_traffic = _workspace_metrics(
         operator,
         algorithm,
@@ -1065,7 +1224,6 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
                 aggregate_resources.get(resource, 0.0) + cycles
             )
     reduction_cycles = 0.0
-    protocol = algorithm.effective_reduction_protocol
     if (
         total_reduction_partitions > 1
         and protocol in (
@@ -1078,11 +1236,18 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         result_tensor = operator.tensor(algorithm.result_tensor)
         output_elements = prod(operator.axis(axis).extent for axis in algorithm.output_axes)
         partial_bytes = output_elements * dtype_bytes(algorithm.partial_dtype)
-        workspace_multiplicity = (
-            total_reduction_partitions
+        # Logical K partitions are accumulated by the finite set of producer
+        # cores before vector finalization.  The reduction reads one partial
+        # per producer, not one full output for every logical K chunk.  This
+        # distinction matters whenever a core processes multiple K chunks.
+        # It is a general parallel-reduction rule and follows directly from
+        # the per-active-core WorkspaceBuffer allocation.
+        reduction_producers = (
+            min(total_reduction_partitions, active_cores)
             if protocol == ReductionProtocol.PARALLEL_WORKSPACE
             else 1
         )
+        workspace_multiplicity = reduction_producers
         implicit_workspace_bytes = partial_bytes * workspace_multiplicity
         if not algorithm.workspace_buffers:
             workspace_bytes = implicit_workspace_bytes
@@ -1091,7 +1256,7 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         reduction_operations = (
             output_elements
             * (
-                total_reduction_partitions - 1
+                reduction_producers - 1
                 if protocol == ReductionProtocol.PARALLEL_WORKSPACE
                 else 1
             )

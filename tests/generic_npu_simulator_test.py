@@ -238,6 +238,41 @@ def test_parallel_reduction_is_a_numeric_schedule_choice() -> None:
     assert partitioned.total_cycles < serial.total_cycles
 
 
+def test_parallel_reduction_fan_in_is_bounded_by_producer_cores() -> None:
+    """Several logical K chunks on one core form one final partial."""
+
+    operator = matmul(16, 16, 16384)
+    common = dict(
+        algorithm=2,
+        axis_tiles=(("m", 128), ("n", 128), ("k", 128)),
+        task_tiles=(("m", 384), ("n", 384), ("k", 384)),
+        used_cores=20,
+        buffers=(),
+        traversal=("m", "n"),
+    )
+    twenty_chunks = simulate(
+        operator,
+        TilingPlan(**common, reduction_parts=(("k", 20),)),
+        HARDWARE,
+    )
+    forty_chunks = simulate(
+        operator,
+        TilingPlan(**common, reduction_parts=(("k", 40),)),
+        HARDWARE,
+    )
+    assert twenty_chunks.valid and forty_chunks.valid
+    assert twenty_chunks.active_cores == forty_chunks.active_cores == 20
+    # Both schedules leave 20 producer partials for the AIV reduction.  More
+    # logical chunks increase AIC work, not allocation or final fan-in.
+    assert twenty_chunks.workspace_bytes == forty_chunks.workspace_bytes
+    assert twenty_chunks.reduction_cycles == forty_chunks.reduction_cycles
+    # Chunks beyond the producer count use atomic read-modify-write on the
+    # resident per-core partial instead of masquerading as plain stores.
+    assert Resource.ATOMIC not in dict(twenty_chunks.resource_cycles)
+    assert dict(forty_chunks.resource_cycles)[Resource.ATOMIC] > 0.0
+    assert forty_chunks.gm_read_bytes > twenty_chunks.gm_read_bytes
+
+
 def test_same_shape_different_semantics_take_different_hardware_paths() -> None:
     shape = (64, 64)
     direct = elementwise_add(shape)
@@ -526,7 +561,48 @@ def test_l2_residency_traversal_and_pipeline_boundaries_change_cycles() -> None:
         constrained_l2,
     )
     assert row_nonresident.valid and column_nonresident.valid
-    assert row_nonresident.total_cycles != column_nonresident.total_cycles
+    # Visit order changes which input must be refetched from HBM, but both
+    # orders still perform the same L2 -> L1 service.  The critical MTE path
+    # can therefore remain the runtime roof even when HBM traffic differs.
+    assert row_nonresident.gm_read_bytes != column_nonresident.gm_read_bytes
+
+
+def test_l2_reuse_uses_l2_ingress_instead_of_free_local_service() -> None:
+    """A resident line uses the L2 ingress rate for every core consumer."""
+
+    operator = matmul(512, 512, 4096)
+    common = dict(
+        algorithm=0,
+        axis_tiles=(("m", 128), ("n", 128), ("k", 128)),
+        task_tiles=(("m", 128), ("n", 128), ("k", 4096)),
+        used_cores=16,
+        reduction_parts=(("k", 1),),
+        buffers=((MemorySpace.L0A, 1), (MemorySpace.L0B, 1), (MemorySpace.L0C, 1)),
+        traversal=("m", "n"),
+    )
+    resident = simulate(
+        operator,
+        TilingPlan(
+            **common,
+            cache_tiles=(("m", 512), ("n", 512), ("k", 4096)),
+        ),
+        HARDWARE,
+    )
+    no_cross_task_reuse = simulate(
+        operator,
+        TilingPlan(
+            **common,
+            cache_tiles=(("m", 128), ("n", 128), ("k", 4096)),
+        ),
+        HARDWARE,
+    )
+    assert resident.valid and no_cross_task_reuse.valid
+    assert resident.gm_read_bytes < no_cross_task_reuse.gm_read_bytes
+    assert resident.critical_core_cycles < no_cross_task_reuse.critical_core_cycles
+    # Four-fold logical reuse cannot divide MTE service by four: three of
+    # those four consumers still transfer their line over the finite-rate
+    # L2 ingress path.
+    assert resident.critical_core_cycles * 4 > no_cross_task_reuse.critical_core_cycles
 
 
 def test_fused_attention_uses_the_same_generic_solver() -> None:

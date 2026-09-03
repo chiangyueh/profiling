@@ -139,6 +139,12 @@ def ascend_910b3() -> Hardware:
         route_byte_rates={
             (MemorySpace.GM, MemorySpace.L1): 16.0,
             (MemorySpace.GM, MemorySpace.UB): 16.0,
+            # A resident L2 line still crosses the per-core ingress port.
+            # The isolated C220 profile sustains about 110 B/cycle per AIC;
+            # this is distinct from both a 16 B/cycle HBM miss and a free
+            # local-memory reuse.
+            (MemorySpace.L2, MemorySpace.L1): 110.0,
+            (MemorySpace.L2, MemorySpace.UB): 110.0,
             (MemorySpace.L1, MemorySpace.L0A): 256.0,
             (MemorySpace.L1, MemorySpace.L0B): 256.0,
             (MemorySpace.L0C, MemorySpace.GM): 64.0,

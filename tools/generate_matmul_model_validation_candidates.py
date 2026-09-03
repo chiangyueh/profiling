@@ -200,6 +200,12 @@ def new_breakdown(result) -> str:
             "gm_read_bytes": result.gm_read_bytes,
             "gm_write_bytes": result.gm_write_bytes,
             "l2_bytes": result.l2_bytes,
+            "workspace_bytes": result.workspace_bytes,
+            "reduction_cycles": result.reduction_cycles,
+            "resources": {
+                resource.value: cycles
+                for resource, cycles in result.resource_cycles
+            },
         },
         separators=(",", ":"),
         sort_keys=True,

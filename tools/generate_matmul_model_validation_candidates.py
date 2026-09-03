@@ -28,6 +28,7 @@ from npu_cost_model import (
     ScheduleSpace,
     SearchPolicy,
     ascend_910b3,
+    cann81_matmul_effective_l1_bytes,
     derive_ideal_region,
     execution_mode_name,
     lower_plan_to_cann,
@@ -171,11 +172,7 @@ def generic_hardware(platform: old.Hardware):
         MemorySpace.L0A: platform.l0a_bytes,
         MemorySpace.L0B: platform.l0b_bytes,
         MemorySpace.L0C: platform.l0c_bytes,
-        # GetCoreMemSize reports the C220 L1 value after reserving one
-        # 256-byte RPC block.  A standalone device kernel may use that block;
-        # CANN 8.1's CalL1Tiling restores it before checking packet capacity.
-        # This restores physical memory, not a fitted score allowance.
-        MemorySpace.L1: platform.l1_bytes + 256,
+        MemorySpace.L1: cann81_matmul_effective_l1_bytes(platform.l1_bytes),
         MemorySpace.L2: platform.l2_bytes,
     })
     return replace(

@@ -25,6 +25,7 @@ from npu_cost_model import (
     MemorySpace,
     Resource,
     ascend_910b3,
+    cann81_matmul_effective_l1_bytes,
     execution_mode_name,
     source_kernel_suffix as model_source_kernel_suffix,
     validate_cann_tiling,
@@ -1147,21 +1148,7 @@ def validate_candidate(row: dict[str, str], spec: BankSpec) -> None:
         trans_b=truthy(row.get("trans_b")),
         max_cores=int(row.get("max_cores") or spec.aic_cores),
     )
-    generic_base = ascend_910b3()
-    generic_cores = dict(generic_base.core_counts)
-    generic_cores[Resource.CUBE] = spec.aic_cores
-    generic_capacities = dict(generic_base.capacities)
-    generic_capacities.update({
-        MemorySpace.L0A: spec.l0a_bytes,
-        MemorySpace.L0B: spec.l0b_bytes,
-        MemorySpace.L0C: spec.l0c_bytes,
-        MemorySpace.L1: spec.l1_bytes,
-    })
-    hardware = replace(
-        generic_base,
-        core_counts=generic_cores,
-        capacities=generic_capacities,
-    )
+    hardware = candidate_contract_hardware(spec)
     violations = validate_cann_tiling(
         workload.m, workload.n, workload.k, workload.dtype,
         workload.trans_a, workload.trans_b, knowledge, hardware,
@@ -1195,6 +1182,26 @@ def validate_candidate(row: dict[str, str], spec: BankSpec) -> None:
             f"kernel suffix={suffix} does not match graph={family} "
             f"expected_suffix={expected_suffix}"
         )
+
+
+def candidate_contract_hardware(spec: BankSpec):
+    """Construct the exact hardware view shared by selection and admission."""
+
+    generic_base = ascend_910b3()
+    generic_cores = dict(generic_base.core_counts)
+    generic_cores[Resource.CUBE] = spec.aic_cores
+    generic_capacities = dict(generic_base.capacities)
+    generic_capacities.update({
+        MemorySpace.L0A: spec.l0a_bytes,
+        MemorySpace.L0B: spec.l0b_bytes,
+        MemorySpace.L0C: spec.l0c_bytes,
+        MemorySpace.L1: cann81_matmul_effective_l1_bytes(spec.l1_bytes),
+    })
+    return replace(
+        generic_base,
+        core_counts=generic_cores,
+        capacities=generic_capacities,
+    )
 
 
 def create_candidate_bank(
@@ -1893,6 +1900,31 @@ def main() -> int:
         )
         and row.get("dtype", "").lower() in {"fp16", "bf16", "fp32"}
     ]
+    contract_spec = BankSpec(
+        soc=args.soc,
+        aic_cores=args.aic_cores,
+        l0a_bytes=args.l0a_bytes,
+        l0b_bytes=args.l0b_bytes,
+        l0c_bytes=args.l0c_bytes,
+        l1_bytes=args.l1_bytes,
+        filename="",
+        version=0,
+        template={},
+    )
+    for candidate in supported_candidates:
+        try:
+            validate_candidate(candidate, contract_spec)
+        except ProfileError as error:
+            raise ProfileError(
+                f"static candidate-contract preflight failed for "
+                f"{candidate.get('workload_id', '?')} "
+                f"role={candidate.get('candidate_role', '?')} "
+                f"rank={candidate.get('rank', '?')}: {error}"
+            ) from error
+    print(
+        f"candidate_contract_preflight: passed={len(supported_candidates)}",
+        flush=True,
+    )
     current_history_groups: dict[
         tuple[str, ...], list[tuple[dict[str, str], dict]]
     ] = {}

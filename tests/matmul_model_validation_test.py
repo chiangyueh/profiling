@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import analyze_matmul_model_validation as analysis
 import generate_matmul_model_validation_candidates as candidates
 import generate_matmul_model_validation_workloads as workloads
+import profile_official_tilings as profiler
 import refine_matmul_v3_candidates as old
 from npu_cost_model import (
     CANN81_MATMUL_FAMILIES,
@@ -60,6 +61,27 @@ def test_cann81_dispatch_suffixes_and_families_are_complete() -> None:
         observed_families.add(family)
     assert tuple(observed_suffixes) == CANN81_MATMUL_KERNEL_SUFFIXES
     assert observed_families == set(CANN81_MATMUL_FAMILIES)
+
+
+def test_selection_and_execution_gate_share_effective_l1_capacity() -> None:
+    selector = candidates.generic_hardware(HARDWARE)
+    spec = profiler.BankSpec(
+        soc="Ascend910B3",
+        aic_cores=HARDWARE.aic_cores,
+        l0a_bytes=HARDWARE.l0a_bytes,
+        l0b_bytes=HARDWARE.l0b_bytes,
+        l0c_bytes=HARDWARE.l0c_bytes,
+        l1_bytes=int(HARDWARE.l1_bytes),
+        filename="",
+        version=0,
+        template={},
+    )
+    execution_gate = profiler.candidate_contract_hardware(spec)
+    assert selector.capacities[MemorySpace.L1] == 512 * 1024
+    assert (
+        execution_gate.capacities[MemorySpace.L1]
+        == selector.capacities[MemorySpace.L1]
+    )
 
 
 def test_all_cann81_kernel_suffixes_are_generated_from_source_rules() -> None:

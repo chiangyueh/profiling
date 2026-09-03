@@ -39,6 +39,18 @@ _ND2NZ_ON_THE_WAY_BYTES = frozenset(
 )
 
 
+def cann81_matmul_effective_l1_bytes(reported_bytes: int) -> int:
+    """Return the C220 single-op L1 capacity used by MatMulV3.
+
+    Ascend910B3 reports 512 KiB minus the 256-byte RPC reservation.  The
+    CANN 8.1 MatMulV3 ``CalL1Tiling`` path restores that reservation for a
+    standalone operator.  Rounding to the allocator's KiB boundary also
+    leaves an already-normalized capacity unchanged.
+    """
+
+    return align_up(int(reported_bytes), 1024)
+
+
 @lru_cache(maxsize=256)
 def _matmul_operator(
     m: int,

@@ -79,7 +79,8 @@ if [[ "${PLATFORM_AIC_CORES}" -le 0 ]]; then
     exit 1
 fi
 
-if [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v3" ]]; then
+if [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v3" || \
+      "${SEARCH_SCOPE}" == "matmul_regression_diagnostic_v1" ]]; then
     MODEL_VALIDATION_LOG_ARGS=()
     if [[ -n "${MEASUREMENT_JSONL_LOG_DIRECTORY:-}" ]]; then
         MODEL_VALIDATION_LOG_ARGS=(
@@ -91,6 +92,14 @@ if [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v3" ]]; then
           -s "${MODEL_VALIDATION_WORKLOADS_OUTPUT:?}" ]]; then
         echo "MATMUL_MODEL_VALIDATION_CANDIDATES cached=${SEARCH_OUTPUT}"
     else
+        MODEL_VALIDATION_EXTRA_ARGS=(
+            --selected-workloads "${MODEL_VALIDATION_SELECTED_WORKLOADS:-200}"
+            --searched-candidates "${MODEL_VALIDATION_SEARCHED_CANDIDATES:-1}"
+            --candidate-selection "${MODEL_VALIDATION_CANDIDATE_SELECTION:-model_top}"
+        )
+        if [[ "${MODEL_VALIDATION_ALLOW_SUBSET_FAMILY_COVERAGE:-0}" == "1" ]]; then
+            MODEL_VALIDATION_EXTRA_ARGS+=(--allow-subset-family-coverage)
+        fi
         python3 tools/generate_matmul_model_validation_candidates.py \
             --raw-candidates "${RAW_ALL_OUTPUT}" \
             --catalog "${WORKLOADS}" \
@@ -106,6 +115,7 @@ if [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v3" ]]; then
             --l2-bytes "${PLATFORM_L2_BYTES}" \
             --l2-bytes-per-cycle-per-core "${PLATFORM_L2_BPC}" \
             --hbm-bytes-per-cycle-per-core "${PLATFORM_HBM_BPC}" \
+            "${MODEL_VALIDATION_EXTRA_ARGS[@]}" \
             "${MODEL_VALIDATION_LOG_ARGS[@]}"
     fi
 elif [[ "${SEARCH_SCOPE}" == "controlled_frontier_v1" ]]; then

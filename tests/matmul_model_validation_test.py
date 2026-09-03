@@ -12,8 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import analyze_matmul_model_validation as analysis
+import analyze_matmul_regression_diagnostic as diagnostic_analysis
 import generate_matmul_model_validation_candidates as candidates
 import generate_matmul_model_validation_workloads as workloads
+import generate_matmul_regression_diagnostic_workloads as diagnostic_workloads
 import profile_official_tilings as profiler
 import refine_matmul_v3_candidates as old
 from npu_cost_model import (
@@ -204,6 +206,65 @@ def test_catalog_has_200_plus_unique_shapes_and_colleague_anchors() -> None:
         "cann81_fixpipe_mixed_nd2nz",
     ):
         assert name in coverage
+
+
+def test_regression_diagnostic_freezes_all_35_significant_regressions() -> None:
+    rows = diagnostic_workloads.build_diagnostic_workloads()
+    assert len(rows) == 35
+    assert len({row["workload_id"] for row in rows}) == 35
+    assert {row["diagnostic_partition"] for row in rows} == {
+        "analysis", "holdout",
+    }
+    assert sum(row["diagnostic_partition"] == "analysis" for row in rows) == 24
+    assert sum(row["diagnostic_partition"] == "holdout" for row in rows) == 11
+    assert {int(row["workload_id"].rsplit("_", 1)[1]) for row in rows} == set(
+        diagnostic_workloads.REGRESSED_RANKS
+    )
+
+
+def test_diagnostic_selection_spans_available_families_and_core_occupancy() -> None:
+    workload = old.Workload(
+        "deep", 128, 128, 16384, "fp16", False, False, 20
+    )
+    proposals = candidates.proposal_space(workload, HARDWARE)
+    ranked, _ = candidates.ranked_pool(workload, proposals, HARDWARE)
+    selected = candidates.select_measurement_candidates(
+        ranked, 20, HARDWARE.aic_cores, "diagnostic_diverse"
+    )
+    selected_rows = [item for item, _ in selected]
+    assert len(selected_rows) == 20
+    assert len({id(item) for item in selected_rows}) == 20
+    assert selected_rows[0]["new_rank_all"] == 1
+    assert {
+        candidates.execution_mode_name(item["knowledge"])
+        for item in selected_rows
+    } == {
+        candidates.execution_mode_name(item["knowledge"])
+        for item in ranked
+    }
+    available_buckets = {
+        candidates._core_bucket(
+            item["knowledge"]["usedCoreNum"], HARDWARE.aic_cores
+        )
+        for item in ranked
+    }
+    selected_buckets = {
+        candidates._core_bucket(
+            item["knowledge"]["usedCoreNum"], HARDWARE.aic_cores
+        )
+        for item in selected_rows
+    }
+    assert selected_buckets == available_buckets
+
+
+def test_regression_ranking_statistics_are_within_shape() -> None:
+    predicted = [1.0, 2.0, 3.0, 4.0]
+    measured = [1.0, 3.0, 2.0, 4.0]
+    assert diagnostic_analysis.spearman(predicted, predicted) == pytest.approx(1.0)
+    assert diagnostic_analysis.spearman(predicted, measured) == pytest.approx(0.8)
+    assert diagnostic_analysis.pairwise_order_accuracy(
+        predicted, measured
+    ) == pytest.approx(5 / 6)
 
 
 def test_hardware_simulator_ranks_the_full_legal_pool(monkeypatch) -> None:

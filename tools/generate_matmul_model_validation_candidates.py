@@ -42,7 +42,6 @@ from npu_cost_model.operators import matmul
 
 SELECTED_WORKLOADS = 200
 SEARCHED_CANDIDATES = 1
-MEASURED_TILINGS = 1
 CUSTOM_COLUMNS = (
     "hardware_aic_cores",
     "pool_sequence",
@@ -69,6 +68,8 @@ CUSTOM_COLUMNS = (
     "ideal_discovery_evaluations",
     "execution_graphs_represented",
     "model_input_source",
+    "global_model_rank",
+    "diagnostic_selection_reason",
 )
 
 
@@ -271,6 +272,103 @@ def ranked_pool(
     return new_order, new_ns
 
 
+def _core_bucket(used_cores: int, hardware_cores: int) -> int:
+    """Group core counts by hardware occupancy, without shape thresholds."""
+
+    return min(3, (4 * max(1, used_cores) - 1) // max(1, hardware_cores))
+
+
+def select_measurement_candidates(
+    ranked: list[dict],
+    count: int,
+    hardware_cores: int,
+    policy: str,
+) -> list[tuple[dict, str]]:
+    """Choose deterministic measurement rows from an already legal pool.
+
+    ``diagnostic_diverse`` does not change simulator ranking.  It preserves
+    model rank 1, then obtains observability across execution graphs, core
+    occupancy, and graph/core combinations before filling from global model
+    order.  This prevents a BASE-heavy top-N list from masquerading as a
+    cross-family ranking experiment.
+    """
+
+    if count <= 0:
+        raise old.SearchError("searched candidate count must be positive")
+    if len(ranked) < count:
+        raise old.SearchError(
+            f"only {len(ranked)} legal simulator candidates; required {count}"
+        )
+    if policy == "model_top":
+        return [
+            (item, "model_rank") for item in ranked[:count]
+        ]
+    if policy != "diagnostic_diverse":
+        raise old.SearchError(f"unknown candidate selection policy: {policy}")
+
+    selected: list[tuple[dict, str]] = []
+    seen: set[int] = set()
+
+    def add(item: dict, reason: str) -> None:
+        identity = id(item)
+        if identity not in seen and len(selected) < count:
+            seen.add(identity)
+            selected.append((item, reason))
+
+    add(ranked[0], "global_model_top1")
+
+    # The order is source ABI order, not an observed-latency preference.
+    for family in CANN81_MATMUL_FAMILIES:
+        item = next(
+            (
+                row for row in ranked
+                if execution_mode_name(row["knowledge"]) == family
+            ),
+            None,
+        )
+        if item is not None:
+            add(item, f"best_legal_family:{family}")
+
+    # Retain the best legal schedule in each occupancy band represented by
+    # this shape.  Buckets are fractions of physical AIC capacity.
+    for bucket in range(4):
+        item = next(
+            (
+                row for row in ranked
+                if _core_bucket(
+                    row["knowledge"]["usedCoreNum"], hardware_cores
+                ) == bucket
+            ),
+            None,
+        )
+        if item is not None:
+            add(item, f"best_core_occupancy_quartile:{bucket + 1}")
+
+    # Family/core intersections expose whether a cycle error belongs to a
+    # dataflow graph or to parallel occupancy.  Groups are visited by their
+    # best predicted member, with deterministic ties from ranked order.
+    intersections: dict[tuple[str, int], dict] = {}
+    for item in ranked:
+        key = (
+            execution_mode_name(item["knowledge"]),
+            item["knowledge"]["usedCoreNum"],
+        )
+        intersections.setdefault(key, item)
+    for (family, cores), item in sorted(
+        intersections.items(),
+        key=lambda pair: pair[1]["new_rank_all"],
+    ):
+        add(item, f"best_family_core:{family}:{cores}")
+
+    for item in ranked:
+        add(item, "model_rank_fill")
+    if len(selected) != count:
+        raise old.SearchError(
+            f"selected {len(selected)} diagnostic candidates; required {count}"
+        )
+    return selected
+
+
 def attach_models(
     row: dict[str, str],
     new_result,
@@ -354,13 +452,25 @@ def main() -> int:
     parser.add_argument(
         "--searched-candidates", type=int, default=SEARCHED_CANDIDATES
     )
+    parser.add_argument(
+        "--candidate-selection",
+        choices=("model_top", "diagnostic_diverse"),
+        default="model_top",
+    )
+    parser.add_argument(
+        "--allow-subset-family-coverage",
+        action="store_true",
+        help=(
+            "permit a frozen workload subset that cannot legally instantiate "
+            "every CANN family; every family available to each shape is still "
+            "included by diagnostic_diverse selection"
+        ),
+    )
     parser.add_argument("--jsonl-log-directory", type=Path)
     args = parser.parse_args()
 
-    if args.selected_workloads <= 0 or args.searched_candidates != 1:
-        raise old.SearchError(
-            "model validation selects exactly one simulator tiling per shape"
-        )
+    if args.selected_workloads <= 0 or args.searched_candidates <= 0:
+        raise old.SearchError("workload and candidate counts must be positive")
 
     platform = old.Hardware(
         args.aic_cores, args.l0a_bytes, args.l0b_bytes, args.l0c_bytes,
@@ -455,12 +565,23 @@ def main() -> int:
                 search_workload, item["knowledge"]
             ))
 
+        measurement_candidates = select_measurement_candidates(
+            ranked,
+            args.searched_candidates,
+            args.aic_cores,
+            args.candidate_selection,
+        )
         selected = ranked[0]
         started = time.perf_counter_ns()
 
-        def materialize_model_row(item: dict, model_rank: int) -> dict[str, str]:
+        def materialize_model_row(
+            item: dict,
+            output_rank: int,
+            selection_reason: str,
+        ) -> dict[str, str]:
             knowledge = item["knowledge"]
             result = item["new"]
+            model_rank = item["new_rank_all"]
             suffix = kernel_suffix_for(callback_workload, knowledge)
             model_row = old.row_from_state(
                 fields, None, callback_workload, knowledge,
@@ -482,13 +603,15 @@ def main() -> int:
             model_row["execution_mode"] = execution_mode_name(knowledge)
             attach_execution_identity(model_row, callback_workload, knowledge)
             model_row.update({
-                "rank": str(model_rank),
+                "rank": str(output_rank),
                 "search_model_score": f"{result.total_cycles:.12g}",
                 "search_model_cycles": f"{result.total_cycles:.12g}",
                 "search_model_raw_ratio_vs_bank_seed": "",
                 "search_model_ratio_vs_bank_seed": "",
                 "new_model_ratio_vs_official": "",
                 "search_model_breakdown": new_breakdown(result),
+                "global_model_rank": str(model_rank),
+                "diagnostic_selection_reason": selection_reason,
             })
             attach_models(
                 model_row,
@@ -502,7 +625,12 @@ def main() -> int:
             )
             return model_row
 
-        row = materialize_model_row(selected, 1)
+        selected_model_rows = [
+            materialize_model_row(item, output_rank, reason)
+            for output_rank, (item, reason) in enumerate(
+                measurement_candidates, 1
+            )
+        ]
         execution_abi_ns = time.perf_counter_ns() - started
         total_ns = time.perf_counter_ns() - shape_started
         timing_values = {
@@ -528,29 +656,25 @@ def main() -> int:
             "tiling_solver_callback_count": "0",
             "tiling_solver_extra_ms": f"{(candidate_generation_ns + static_legality_ns) / 1e6:.9g}",
             "tiling_solver_total_ms": f"{total_ns / 1e6:.9g}",
-            "search_model_cycles": f"{selected['new'].total_cycles:.12g}",
-            "search_model_raw_ratio_vs_bank_seed": "",
-            "search_model_ratio_vs_bank_seed": "",
-            "new_model_ratio_vs_official": "",
-            "search_model_breakdown": new_breakdown(selected["new"]),
         }
-        row.update(common_row_values)
-        selected_rows.append(dict(row))
-        all_rows.write(dict(row))
-        for model_rank, item in enumerate(ranked[1:], 2):
-            alternative = materialize_model_row(item, model_rank)
-            alternative.update(common_row_values)
-            alternative["search_model_cycles"] = (
-                f"{item['new'].total_cycles:.12g}"
+        for row in selected_model_rows:
+            row.update(common_row_values)
+            selected_rows.append(dict(row))
+        for item in ranked:
+            model_rank = item["new_rank_all"]
+            alternative = materialize_model_row(
+                item, model_rank, "complete_model_ranked_pool"
             )
-            alternative["search_model_breakdown"] = new_breakdown(item["new"])
+            alternative.update(common_row_values)
             all_rows.write(alternative)
         all_rows.flush()
         selected_workloads.append(metadata)
         selected_graph = execution_mode_name(selected["knowledge"])
-        execution_graph_counts[selected_graph] = (
-            execution_graph_counts.get(selected_graph, 0) + 1
-        )
+        for item, _ in measurement_candidates:
+            graph = execution_mode_name(item["knowledge"])
+            execution_graph_counts[graph] = (
+                execution_graph_counts.get(graph, 0) + 1
+            )
         stage_totals["candidate_generation_ns"] += candidate_generation_ns
         stage_totals["static_legality_ns"] += static_legality_ns
         stage_totals["simulator_scoring_ns"] += new_score_ns
@@ -572,6 +696,15 @@ def main() -> int:
                 }),
                 "selected_new_model_rank": selected["new_rank_all"],
                 "selected_used_core_num": selected["knowledge"]["usedCoreNum"],
+                "measurement_candidate_count": len(measurement_candidates),
+                "measurement_execution_graphs": sorted({
+                    execution_mode_name(item["knowledge"])
+                    for item, _ in measurement_candidates
+                }),
+                "measurement_used_core_counts": sorted({
+                    item["knowledge"]["usedCoreNum"]
+                    for item, _ in measurement_candidates
+                }),
                 "official_tiler_calls": 0,
                 "timing_ms": {
                     **timing_values,
@@ -585,7 +718,8 @@ def main() -> int:
             f"{metadata['workload_id']} shape={metadata['m']}x{metadata['n']}x{metadata['k']} "
             f"dtype={metadata['dtype']} trans={metadata['trans_a']}{metadata['trans_b']} "
             f"hardware_cores={args.aic_cores} pool={generated_count} legal={len(legal)} "
-            f"graph={selected_graph} selected_core={selected['knowledge']['usedCoreNum']} "
+            f"measure={len(measurement_candidates)} top_graph={selected_graph} "
+            f"top_core={selected['knowledge']['usedCoreNum']} "
             f"anchors={len(ideal_region.anchors)} region={len(ideal_region.plans)} "
             f"generation_ms={timing_values['candidate_generation_ms']:.3f} "
             f"legality_ms={timing_values['static_legality_ms']:.3f} "
@@ -604,7 +738,7 @@ def main() -> int:
     missing_suffixes = (
         set(CANN81_MATMUL_KERNEL_SUFFIXES) - legal_kernel_suffixes
     )
-    if missing_graphs or missing_suffixes:
+    if (missing_graphs or missing_suffixes) and not args.allow_subset_family_coverage:
         raise old.SearchError(
             "CANN 8.1 family coverage is incomplete: "
             f"missing_graphs={sorted(missing_graphs)} "
@@ -625,8 +759,9 @@ def main() -> int:
     all_rows.publish()
     print(
         f"MATMUL_MODEL_VALIDATION_CANDIDATES shapes={len(selected_workloads)} "
-        "tilings_per_shape=1 "
-        f"measured_per_shape={MEASURED_TILINGS} "
+        f"tilings_per_shape={args.searched_candidates} "
+        f"candidate_selection={args.candidate_selection} "
+        f"measured_per_shape={args.searched_candidates} "
         f"selected_execution_graphs={execution_graph_counts} "
         f"generated_execution_graphs={dict(generated_graph_counts)} "
         f"generated_kernel_suffixes={sorted(generated_kernel_suffixes)} "

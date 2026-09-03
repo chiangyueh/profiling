@@ -9,9 +9,9 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-Paired MatMulV3 model validation: 200 unique shapes, one final simulator
-tiling selected from a hardware-derived ideal neighbourhood and one official
-autotiling baseline per shape (400 latency records).
+MatMulV3 regression ranking diagnostic: the 35 shapes that regressed beyond
+measured noise in validation v3.  Each shape requires 20 distinct successful
+model tilings plus one official MatMulV3 baseline (735 latency records).
 USAGE
 }
 
@@ -44,28 +44,31 @@ unset ASCEND_CUSTOM_OPP_PATH || true
 source "${ROOT}/scripts/env.sh" >/dev/null
 
 catalog_started_ns="$(date +%s%N)"
-CATALOG_TMP="$(mktemp "${TMPDIR:-/tmp}/matmul-model-validation.XXXXXX.csv")"
+CATALOG_TMP="$(mktemp "${TMPDIR:-/tmp}/matmul-regression-diagnostic.XXXXXX.csv")"
 cleanup() {
     [[ -f "${CATALOG_TMP:-}" ]] && rm -f -- "${CATALOG_TMP}"
 }
 trap cleanup EXIT
 
-python3 tools/generate_matmul_model_validation_workloads.py \
+python3 tools/generate_matmul_regression_diagnostic_workloads.py \
     --output "${CATALOG_TMP}" >/dev/null
 catalog_wall_ms=$(( ($(date +%s%N) - catalog_started_ns) / 1000000 ))
 CAMPAIGN_ID="$({
     sha256sum \
         "${CATALOG_TMP}" \
         tools/generate_matmul_model_validation_workloads.py \
+        tools/generate_matmul_regression_diagnostic_workloads.py \
         tools/generate_matmul_model_validation_candidates.py \
-        tools/analyze_matmul_model_validation.py \
+        tools/analyze_matmul_regression_diagnostic.py \
         tools/refine_matmul_v3_candidates.py \
         tools/profile_official_tilings.py \
+        run_npu.sh \
+        scripts/run_search.sh \
         scripts/profile_npu.sh \
         runner/official_matmul_runner.cpp \
         npu_cost_model/*.py
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_model_validation_v3/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_regression_ranking_v1/${CAMPAIGN_ID}"
 CATALOG="${CAMPAIGN_DIR}/catalog.csv"
 WORKLOADS="${CAMPAIGN_DIR}/workloads.csv"
 CANDIDATES="${CAMPAIGN_DIR}/candidates.csv"
@@ -80,14 +83,15 @@ cp "${CATALOG_TMP}" "${CATALOG}"
 
 if [[ -s "${ANALYSIS}" ]] && \
    grep -q '"status": "complete"' "${ANALYSIS}"; then
-    echo "MATMUL_MODEL_VALIDATION_COMPLETE shapes=200 records=400"
+    echo "MATMUL_REGRESSION_RANKING_COMPLETE shapes=35 records=735"
     echo "analysis=${ANALYSIS} logs=${LOG_DIR}"
     exit 0
 fi
 
-echo "CAMPAIGN_READY operator=matmul shapes=200 selected_tilings_per_shape=1 records=400 device=${PHYSICAL_DEVICE}"
+echo "CAMPAIGN_READY operator=matmul shapes=35 model_tilings_per_shape=20 official_per_shape=1 records=735 device=${PHYSICAL_DEVICE}"
 echo "comparison=official_matmul_v3,new_hardware_simulator"
-echo "search=cann81_all_7_kernel_families,all_12_suffixes,hardware_ideal_region,adjacent_transitions"
+echo "search=legal_family,core_occupancy,family_core_intersections,model_rank_fill"
+echo "partition=analysis_24,preregistered_holdout_11"
 echo "logs=${LOG_DIR}"
 echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
@@ -122,20 +126,23 @@ build_wall_ms=$(( ($(date +%s%N) - build_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=runner_build wall_ms=${build_wall_ms} cached=${build_cached}"
 
 export DISABLE_MEASUREMENT_HISTORY=1
-export SEARCH_SCOPE=matmul_model_validation_v3
+export SEARCH_SCOPE=matmul_regression_diagnostic_v1
 export SEARCH_OUTPUT="${CANDIDATES}"
 export SEARCH_ALL_OUTPUT="${ALL_CANDIDATES}"
 export SEARCH_TILING_DIR="${TILING_DIR}"
 export MODEL_VALIDATION_WORKLOADS_OUTPUT="${WORKLOADS}"
 export MEASUREMENT_JSONL_LOG_DIRECTORY="${LOG_DIR}"
 export MEASUREMENT_JSONL_LOG_MAX_BYTES=52428800
+export MODEL_VALIDATION_SELECTED_WORKLOADS=35
+export MODEL_VALIDATION_SEARCHED_CANDIDATES=20
+export MODEL_VALIDATION_CANDIDATE_SELECTION=diagnostic_diverse
+export MODEL_VALIDATION_ALLOW_SUBSET_FAMILY_COVERAGE=1
 
 if python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" <<'PY' >/dev/null 2>&1
 import csv
 import sys
 from collections import Counter
 from pathlib import Path
-from npu_cost_model import CANN81_MATMUL_FAMILIES, CANN81_MATMUL_KERNEL_SUFFIXES
 
 if not all(Path(value).is_file() for value in sys.argv[1:]):
     raise SystemExit(1)
@@ -157,23 +164,16 @@ for row in candidates:
         row.get("model_schedule_sha256", "")
     )
 if (
-    len(workloads) != 200
-    or len(set(workload_ids)) != 200
+    len(workloads) != 35
+    or len(set(workload_ids)) != 35
     or {row.get("search_family") for row in workloads} != {"hardware_ideal_region"}
-    or len(candidates) != 200
+    or len(candidates) != 700
     or set(candidate_ids) != set(workload_ids)
-    or len(searched) != 200 or set(searched.values()) != {1}
-    or len(hashes) != 200 or {len(value) for value in hashes.values()} != {1}
+    or len(searched) != 35 or set(searched.values()) != {20}
+    or len(hashes) != 35 or {len(value) for value in hashes.values()} != {20}
     or not all_candidates
-    or {
-        row.get("model_kernel_family", "").lower()
-        for row in all_candidates
-    } != set(CANN81_MATMUL_FAMILIES)
-    or {
-        int(row["model_kernel_suffix"])
-        for row in all_candidates
-        if row.get("model_kernel_suffix", "").isdigit()
-    } != set(CANN81_MATMUL_KERNEL_SUFFIXES)
+    or not all(row.get("global_model_rank", "").isdigit() for row in candidates)
+    or not all(row.get("diagnostic_selection_reason", "") for row in candidates)
 ):
     raise SystemExit(1)
 PY
@@ -183,6 +183,7 @@ fi
 
 SEARCH_LOG="${CAMPAIGN_DIR}/candidate_generation.log"
 search_started_ns="$(date +%s%N)"
+PROFILE_WORKLOADS="${WORKLOADS}"
 set +e
 source "${ROOT}/scripts/run_search.sh" "${CATALOG}" \
     > >(tee "${SEARCH_LOG}" | awk '
@@ -194,6 +195,7 @@ source "${ROOT}/scripts/run_search.sh" "${CATALOG}" \
     ') 2>&1
 search_rc=$?
 set -e
+WORKLOADS="${PROFILE_WORKLOADS}"
 search_wall_ms=$(( ($(date +%s%N) - search_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=tiling_selection wall_ms=${search_wall_ms}" | tee -a "${SEARCH_LOG}"
 if [[ "${search_rc}" -ne 0 ]]; then
@@ -204,18 +206,18 @@ export PLATFORM_AIC_CORES PLATFORM_L0A_BYTES PLATFORM_L0B_BYTES
 export PLATFORM_L0C_BYTES PLATFORM_L1_BYTES PLATFORM_L2_BYTES
 export PLATFORM_L2_BPC PLATFORM_HBM_BPC
 
-echo "NPU_MEASUREMENT_BEGIN shapes=200 simulator_tilings=200 official_baselines=200"
+echo "NPU_MEASUREMENT_BEGIN shapes=35 simulator_tilings=700 official_baselines=35"
 export KEEP_DETAILS=1
 export WARMUP=2
 export REPEAT=20
 export SAMPLES=7
-export RANK_LIMIT=1
-export SUCCESSFUL_TILINGS_PER_WORKLOAD=1
+export RANK_LIMIT=20
+export SUCCESSFUL_TILINGS_PER_WORKLOAD=20
 export SKIP_BANK_SEED_CONTROL=1
 export STRUCTURED_FULL_PREFLIGHT=1
 export NUMERIC_PREFLIGHT_MAX_MIB=256
 export PROFILE_STALL_TIMEOUT_SEC=0
-export PROFILE_PROGRESS_EVERY=50
+export PROFILE_PROGRESS_EVERY=20
 
 PROFILE_LOG="${CAMPAIGN_DIR}/measurement_progress.log"
 profile_started_ns="$(date +%s%N)"
@@ -244,13 +246,15 @@ for required in \
 done
 
 analysis_started_ns="$(date +%s%N)"
-python3 tools/analyze_matmul_model_validation.py \
+python3 tools/analyze_matmul_regression_diagnostic.py \
     --workloads "${WORKLOADS}" \
     --candidates "${CANDIDATES}" \
     --profile "${DETAILS_DIR}/profile.csv" \
     --official-profile "${DETAILS_DIR}/official_profile.csv" \
     --output "${ANALYSIS}" \
-    --log-directory "${LOG_DIR}"
+    --log-directory "${LOG_DIR}" \
+    --expected-shapes 35 \
+    --minimum-model-tilings 20
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 echo "analysis=${ANALYSIS}"

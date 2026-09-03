@@ -1657,17 +1657,21 @@ def _plan_hardware_metrics(
         for stage in algorithm.stages
         for primitive in stage.primitives
     )
-    padded_primitive_points = sum(
-        prod(
-            ceil_div(operator.axis(axis).extent, plan.tiles[axis])
-            * plan.tiles[axis]
-            if axis in primitive.padded_axes
-            else operator.axis(axis).extent
-            for axis in primitive.axes
-        )
-        for stage in algorithm.stages
-        for primitive in stage.primitives
-    )
+    padded_primitive_points = 0
+    for stage in algorithm.stages:
+        for primitive in stage.primitives:
+            points = 1
+            for axis_name in primitive.axes:
+                axis = operator.axis(axis_name)
+                if axis_name not in primitive.padded_axes:
+                    points *= axis.extent
+                    continue
+                tile = plan.tiles[axis_name]
+                full, tail = divmod(axis.extent, tile)
+                points *= full * tile + (
+                    align_up(tail, axis.alignment) if tail else 0
+                )
+            padded_primitive_points += points
     boundaries = algorithm.pipeline_boundaries or tuple(
         (memory,) for memory in algorithm.buffered_spaces
     )

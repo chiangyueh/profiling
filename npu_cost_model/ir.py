@@ -283,6 +283,10 @@ class Primitive:
     operations_per_point: float = 1.0
     issue_elements: int = 1
     dtype: str | None = None
+    # Axes whose tail is padded to the axis' architectural alignment before
+    # the primitive executes.  This is deliberately independent of the
+    # selected tile size: a 96-row tail in a 112-row Cube tile still executes
+    # 96 rows because Cube's M fractal is 16, not 112.
     padded_axes: tuple[str, ...] = ()
     fixed_cycles: float = 0.0
     # Axes covered by one submitted hardware command.  For example one Cube

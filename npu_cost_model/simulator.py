@@ -326,6 +326,14 @@ def _access_cost(
             ceil_div(extents[axis], hop_tiles[axis])
             for axis in access.dependency_axes
         ))
+        # A ping-pong destination turns a stream of otherwise dependent DMA
+        # packets into one steady-state producer/consumer pipeline.  Every
+        # packet still consumes issue and byte service above, but completion
+        # latency is paid only while filling/draining the pipeline.  Charging
+        # the full route latency once per K packet double-counts that same
+        # dependency and systematically favors tiny tasks with more cores.
+        if waves > 1.0 and plan.buffer_counts.get(destination, 1) == 2:
+            waves = 1.0
         if access.pattern == AccessPattern.INDIRECT and MemorySpace.GM in (
             source, destination
         ):
@@ -383,6 +391,7 @@ def _access_cost(
 
 
 def _primitive_cost(
+    operator: Operator,
     primitive: Primitive,
     extents: dict[str, int],
     tiles: dict[str, int],
@@ -390,7 +399,9 @@ def _primitive_cost(
 ) -> WorkCost:
     work_extents = dict(extents)
     for axis in primitive.padded_axes:
-        work_extents[axis] = align_up(extents[axis], tiles[axis])
+        work_extents[axis] = align_up(
+            extents[axis], operator.axis(axis).alignment
+        )
     points = _points(work_extents, primitive.axes)
     operations = points * primitive.operations_per_point
     issues = ceil_div(points, primitive.issue_elements)
@@ -458,7 +469,7 @@ def _stage_cost(
             ),
             *(
                 _primitive_cost(
-                    primitive, invocation_extents, plan.tiles, hardware
+                    operator, primitive, invocation_extents, plan.tiles, hardware
                 )
                 for primitive in stage.primitives
             ),

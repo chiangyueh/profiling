@@ -173,6 +173,41 @@ def test_primitive_command_geometry_charges_architectural_startup() -> None:
     assert narrow.total_cycles - wide.total_cycles == 42.0
 
 
+def test_primitive_tail_padding_uses_architectural_alignment_not_tile() -> None:
+    """A partial tile executes complete hardware fractals, not a full tile."""
+
+    algorithm = Algorithm(
+        stages=(Stage(
+            "vector",
+            primitives=(Primitive(
+                Resource.VECTOR,
+                ("x",),
+                issue_elements=16,
+                dtype="fp16",
+                padded_axes=("x",),
+            ),),
+        ),),
+        output_axes=("x",),
+        core_resource=Resource.VECTOR,
+    )
+    operator = Operator(
+        axes=(Axis("x", 97, alignment=16),),
+        tensors=(Tensor("Y", (97,), "fp16"),),
+        algorithms=(algorithm,),
+    )
+    result = simulate(operator, TilingPlan(
+        algorithm=0,
+        axis_tiles=(("x", 128),),
+        used_cores=1,
+        traversal=("x",),
+    ), HARDWARE)
+    assert result.valid
+    # 97 useful points occupy seven 16-element hardware vectors (112
+    # points).  The result would be 128 points if padding incorrectly used
+    # the selected 128-point tile as its alignment quantum.
+    assert dict(result.resource_cycles)[Resource.VECTOR] == 7.0
+
+
 def test_generic_legality_rejects_bad_alignment_capacity_and_traversal() -> None:
     operator = matmul(128, 128, 512)
     base = dict(
@@ -321,6 +356,49 @@ def test_copy_latency_repeats_only_across_declared_dependency_tiles() -> None:
     dependent_32 = cost(("k",), 32)
     dependent_64 = cost(("k",), 64)
     assert dependent_32 - independent_32 > dependent_64 - independent_64
+
+
+def test_ping_pong_dma_stream_pays_one_completion_fill_latency() -> None:
+    """Buffered packets retain service cost but overlap completion latency."""
+
+    axes = (
+        Axis("x", 1, tile_values=(1,)),
+        Axis("k", 64, AxisKind.REDUCTION, 16, (16,)),
+    )
+    algorithm = Algorithm(
+        stages=(Stage("load", accesses=(Access(
+            "A", ("k",), AccessMode.READ,
+            (MemorySpace.GM, MemorySpace.UB),
+            dependency_axes=("k",),
+        ),)),),
+        output_axes=("x",),
+        reduction_axes=("k",),
+        buffered_spaces=(MemorySpace.UB,),
+    )
+    operator = Operator(
+        axes,
+        (Tensor("A", (64,), "fp16"), Tensor("C", (1,), "fp16")),
+        (algorithm,),
+    )
+    common = dict(
+        algorithm=0,
+        axis_tiles=(("x", 1), ("k", 16)),
+        task_tiles=(("x", 1), ("k", 64)),
+        transfer_tiles=((
+            "A", MemorySpace.GM, MemorySpace.UB, "k", 16,
+        ),),
+        used_cores=1,
+        traversal=("x",),
+    )
+    single = simulate(operator, TilingPlan(
+        **common, buffers=((MemorySpace.UB, 1),),
+    ), HARDWARE)
+    double = simulate(operator, TilingPlan(
+        **common, buffers=((MemorySpace.UB, 2),),
+    ), HARDWARE)
+    assert single.valid and double.valid
+    assert dict(single.resource_cycles) == dict(double.resource_cycles)
+    assert single.critical_core_cycles - double.critical_core_cycles == 3 * 337
 
 
 def test_generated_matmul_plans_are_aligned_and_solver_returns_legal_top_k() -> None:

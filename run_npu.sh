@@ -223,7 +223,7 @@ set +e
 "${ROOT}/scripts/profile_npu.sh" \
     "${CANDIDATES}" "${OUT_STEM}" "${WORKLOADS}" \
     > >(tee "${PROFILE_LOG}" | awk '
-        /profile_plan:|WORKLOAD_GROUP_RESULT|official_tiling_profile completed|fatal:|candidate_abort|profile_npu failed/ {print}
+        /candidate_contract_preflight:|profile_plan:|WORKLOAD_GROUP_RESULT|official_tiling_profile completed|fatal:|candidate_abort|profile_npu failed/ {print}
     ') 2>&1
 profile_rc=$?
 set -e

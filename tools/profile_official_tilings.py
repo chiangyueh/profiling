@@ -10,12 +10,25 @@ import re
 import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import refine_matmul_v3_candidates as matmul_contract
+from npu_cost_model import (
+    MemorySpace,
+    Resource,
+    ascend_910b3,
+    execution_mode_name,
+    source_kernel_suffix as model_source_kernel_suffix,
+    validate_cann_tiling,
+)
 
 
 PROFILE_COLUMNS = [
@@ -1134,33 +1147,35 @@ def validate_candidate(row: dict[str, str], spec: BankSpec) -> None:
         trans_b=truthy(row.get("trans_b")),
         max_cores=int(row.get("max_cores") or spec.aic_cores),
     )
-    hardware = matmul_contract.Hardware(
-        aic_cores=spec.aic_cores,
-        l0a_bytes=spec.l0a_bytes,
-        l0b_bytes=spec.l0b_bytes,
-        l0c_bytes=spec.l0c_bytes,
-        l1_bytes=spec.l1_bytes,
-        l2_bytes=192 * 1024 * 1024,
-        l2_bytes_per_cycle_per_core=1.0,
-        hbm_bytes_per_cycle_per_core=1.0,
+    generic_base = ascend_910b3()
+    generic_cores = dict(generic_base.core_counts)
+    generic_cores[Resource.CUBE] = spec.aic_cores
+    generic_capacities = dict(generic_base.capacities)
+    generic_capacities.update({
+        MemorySpace.L0A: spec.l0a_bytes,
+        MemorySpace.L0B: spec.l0b_bytes,
+        MemorySpace.L0C: spec.l0c_bytes,
+        MemorySpace.L1: spec.l1_bytes,
+    })
+    hardware = replace(
+        generic_base,
+        core_counts=generic_cores,
+        capacities=generic_capacities,
     )
-    if not matmul_contract.hard_legal(workload, knowledge, hardware):
+    violations = validate_cann_tiling(
+        workload.m, workload.n, workload.k, workload.dtype,
+        workload.trans_a, workload.trans_b, knowledge, hardware,
+        aoe_injection=True,
+    )
+    if violations:
         raise ProfileError(
-            "candidate violates the exact CANN 8.1 MatMulV3 template contract"
+            "candidate violates the CANN 8.1 MatMulV3 contract: "
+            + ",".join(violations)
         )
 
-    family = matmul_contract.template_name(knowledge)
-    expected_modes = {
-        "BASE": "base_iterate_all",
-        "SINGLE_CORE_SPLIT_K": "single_core_split_k",
-        "DETERMINISTIC_SPLIT_K": "deterministic_split_k",
-        "AL1_FULL_LOAD": "al1_full_load",
-        "BL1_FULL_LOAD": "bl1_full_load",
-        "BL1_FULL_LOAD_FIXPIPE": "bl1_full_load_fixpipe",
-        "BL1_FULL_LOAD_VEC_NZ2ND": "bl1_full_load_vec_nz2nd",
-    }
+    family = execution_mode_name(knowledge)
     mode = row.get("execution_mode", "")
-    if mode != expected_modes[family]:
+    if mode != family:
         raise ProfileError(
             f"execution_mode={mode!r} does not match MatMulV3 family={family}"
         )
@@ -1171,16 +1186,14 @@ def validate_candidate(row: dict[str, str], spec: BankSpec) -> None:
         else "callback_kernel_suffix"
     )
     suffix = require_int(row, suffix_column, 0)
-    try:
-        callback_family = matmul_contract.CANN81_KERNEL_VARIANTS[suffix][1]
-    except KeyError as exception:
+    expected_suffix = model_source_kernel_suffix(
+        workload.m, workload.n, workload.k, workload.dtype,
+        workload.trans_a, workload.trans_b, knowledge,
+    )
+    if suffix != expected_suffix:
         raise ProfileError(
-            f"installed CANN 8.1 MatMulV3 has no kernel suffix={suffix}"
-        ) from exception
-    if callback_family != family:
-        raise ProfileError(
-            f"callback kernel suffix={suffix} selects {callback_family}, "
-            f"not requested family={family}"
+            f"kernel suffix={suffix} does not match graph={family} "
+            f"expected_suffix={expected_suffix}"
         )
 
 

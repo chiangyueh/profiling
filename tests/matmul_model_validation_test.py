@@ -15,7 +15,18 @@ import analyze_matmul_model_validation as analysis
 import generate_matmul_model_validation_candidates as candidates
 import generate_matmul_model_validation_workloads as workloads
 import refine_matmul_v3_candidates as old
-from npu_cost_model import MemorySpace, TilingPlan, plan_from_cann
+from npu_cost_model import (
+    CANN81_MATMUL_FAMILIES,
+    CANN81_MATMUL_KERNEL_SUFFIXES,
+    MemorySpace,
+    TilingPlan,
+    kernel_suffix,
+    lower_plan_to_cann,
+    plan_from_cann,
+    simulate,
+    source_kernel_suffix,
+    validate_cann_tiling,
+)
 from profile_official_tilings import IncrementalJsonl
 
 
@@ -23,6 +34,126 @@ HARDWARE = old.Hardware(
     20, 64 * 1024, 64 * 1024, 128 * 1024, 511.75 * 1024,
     192 * 1024 * 1024, 110.0, 32.0,
 )
+
+
+def test_cann81_dispatch_suffixes_and_families_are_complete() -> None:
+    keys = (
+        (0, 0, "base"),
+        (0, 1, "base"),
+        (2, 0, "single_core_split_k"),
+        (2, 1, "single_core_split_k"),
+        (3, 0, "deterministic_split_k"),
+        (3, 1, "deterministic_split_k"),
+        (10, 1, "al1_full_load"),
+        (20, 0, "bl1_full_load"),
+        (20, 1, "bl1_full_load"),
+        (1020, 0, "bl1_full_load_fixpipe"),
+        (1020, 1, "bl1_full_load_fixpipe"),
+        (2020, 1, "bl1_full_load_vec_nz2nd"),
+    )
+    observed_suffixes = []
+    observed_families = set()
+    for enabled, mix, family in keys:
+        knowledge = {"tilingEnable": enabled, "mixNd2Nz": mix}
+        observed_suffixes.append(kernel_suffix(knowledge, aligned=bool(mix)))
+        assert candidates.execution_mode_name(knowledge) == family
+        observed_families.add(family)
+    assert tuple(observed_suffixes) == CANN81_MATMUL_KERNEL_SUFFIXES
+    assert observed_families == set(CANN81_MATMUL_FAMILIES)
+
+
+def test_all_cann81_kernel_suffixes_are_generated_from_source_rules() -> None:
+    cases = (
+        (512, 512, 512, "fp16", False, False),
+        (257, 1009, 4097, "fp16", False, False),
+        (128, 17, 16384, "fp16", False, False),
+        (16, 320, 4096, "fp32", False, True),
+        (8192, 64, 32, "fp16", False, False),
+        (28672, 64, 17, "fp16", False, False),
+        (16384, 17, 32, "fp16", False, False),
+        (24576, 17, 7, "fp32", False, False),
+        (16384, 17, 8, "fp32", False, False),
+    )
+    suffixes: set[int] = set()
+    families: set[str] = set()
+    for sequence, (m, n, k, dtype, trans_a, trans_b) in enumerate(cases):
+        workload = old.Workload(
+            f"suffix_{sequence}", m, n, k, dtype,
+            trans_a, trans_b, HARDWARE.aic_cores,
+        )
+        for knowledge in candidates.proposal_space(workload, HARDWARE):
+            suffixes.add(source_kernel_suffix(
+                m, n, k, dtype, trans_a, trans_b, knowledge,
+            ))
+            families.add(candidates.execution_mode_name(knowledge))
+    assert suffixes == set(CANN81_MATMUL_KERNEL_SUFFIXES)
+    assert families == set(CANN81_MATMUL_FAMILIES)
+
+
+@pytest.mark.parametrize(
+    "family,shape,dtype,trans_a,trans_b",
+    (
+        ("base", (512, 512, 512), "fp16", False, False),
+        ("single_core_split_k", (128, 128, 16384), "fp16", False, False),
+        ("deterministic_split_k", (128, 128, 16384), "fp16", False, False),
+        ("al1_full_load", (16, 320, 4096), "fp32", False, True),
+        ("bl1_full_load", (65536, 128, 128), "fp16", False, False),
+        ("bl1_full_load_fixpipe", (65536, 7, 16), "fp16", False, False),
+        ("bl1_full_load_vec_nz2nd", (65536, 7, 8), "fp32", False, True),
+    ),
+)
+def test_each_cann81_family_is_generated_lowered_validated_and_simulated(
+    family: str,
+    shape: tuple[int, int, int],
+    dtype: str,
+    trans_a: bool,
+    trans_b: bool,
+) -> None:
+    workload = old.Workload(
+        family, *shape, dtype, trans_a, trans_b, HARDWARE.aic_cores
+    )
+    proposals = candidates.proposal_space(workload, HARDWARE)
+    family_rows = [
+        row for row in proposals
+        if candidates.execution_mode_name(row) == family
+    ]
+    assert family_rows, f"no generated CANN row for {family}"
+    generic = candidates.generic_hardware(HARDWARE)
+    operator = candidates.matmul(
+        *shape, dtype, trans_a=trans_a, trans_b=trans_b
+    )
+    for knowledge in family_rows:
+        assert not validate_cann_tiling(
+            *shape, dtype, trans_a, trans_b, knowledge, generic
+        )
+        plan = plan_from_cann(
+            *shape, knowledge, dtype=dtype,
+            trans_a=trans_a, trans_b=trans_b,
+        )
+        assert simulate(operator, plan, generic).valid
+
+
+def test_workspace_equations_come_from_schedule_dimensions() -> None:
+    workload = old.Workload(
+        "det", 128, 128, 16384, "fp16", False, False, 20
+    )
+    proposal = next(
+        row for row in candidates.proposal_space(workload, HARDWARE)
+        if candidates.execution_mode_name(row) == "deterministic_split_k"
+    )
+    generic = candidates.generic_hardware(HARDWARE)
+    operator = candidates.matmul(128, 128, 16384, "fp16")
+    plan = plan_from_cann(128, 128, 16384, proposal)
+    result = simulate(operator, plan, generic)
+    expected = (
+        20 * 1024 * 1024
+        + result.active_cores
+        * proposal["singleCoreM"]
+        * proposal["singleCoreN"]
+        * 2
+        * 4
+    )
+    assert result.workspace_bytes == expected
 
 
 def test_catalog_has_200_plus_unique_shapes_and_colleague_anchors() -> None:
@@ -39,6 +170,18 @@ def test_catalog_has_200_plus_unique_shapes_and_colleague_anchors() -> None:
     assert {row["search_family"] for row in rows} == {
         "hardware_ideal_region"
     }
+    coverage = ";".join(row["coverage"] for row in rows[:200])
+    for name in (
+        "cann81_al1_full_load",
+        "cann81_bl1_full_load",
+        "cann81_bl1_fixpipe",
+        "cann81_bl1_vec_nz2nd",
+        "cann81_mixed_nd2nz",
+        "cann81_splitk_mixed_nd2nz",
+        "cann81_bl1_mixed_nd2nz",
+        "cann81_fixpipe_mixed_nd2nz",
+    ):
+        assert name in coverage
 
 
 def test_hardware_simulator_ranks_the_full_legal_pool(monkeypatch) -> None:
@@ -61,7 +204,7 @@ def test_hardware_simulator_ranks_the_full_legal_pool(monkeypatch) -> None:
     # the full physical core count instead of manufacturing core caps.
     core_counts = {row["knowledge"]["usedCoreNum"] for row in ranked}
     assert max(core_counts) == HARDWARE.aic_cores
-    assert min(core_counts) >= 19
+    assert min(core_counts) >= 1
     assert all(row["selection"] == "new_hardware_simulator" for row in ranked)
 
 
@@ -84,10 +227,13 @@ def test_base_abi_materialization_preserves_task_geometry_and_k_extent() -> None
         ),
         traversal=("m", "n"),
     )
-    knowledge = candidates.make_base_from_plan(workload, HARDWARE, plan)
-    assert knowledge is not None
-    assert knowledge["singleCoreM"] == knowledge["baseM"] == 96
-    assert knowledge["singleCoreN"] == knowledge["baseN"] == 80
+    knowledge = lower_plan_to_cann(
+        workload.m, workload.n, workload.k, workload.dtype,
+        workload.trans_a, workload.trans_b, plan,
+        candidates.generic_hardware(HARDWARE),
+    )
+    assert knowledge["singleCoreM"] == knowledge["baseM"] == 16
+    assert knowledge["singleCoreN"] == knowledge["baseN"] == 16
     assert knowledge["baseK"] == 128
 
 
@@ -115,7 +261,7 @@ def test_deterministic_splitk_is_lowered_as_numeric_reduction_parts() -> None:
     plan = plan_from_cann(
         workload.m, workload.n, workload.k, proposal
     )
-    assert plan.algorithm == 0
+    assert plan.algorithm == 2
     assert plan.reductions["k"] > 1
     assert plan.used_cores == proposal["usedCoreNum"]
 
@@ -168,7 +314,7 @@ def test_matmul_generation_has_no_fixed_base_or_splitk_quota() -> None:
     assert region.exhaustive
     assert region.evaluated <= 10_000
     assert region.plans
-    assert {item["tilingEnable"] for item in proposals} == {0, 3}
+    assert {item["tilingEnable"] for item in proposals} == {0, 2, 3}
 
 
 def test_capacity_frontier_retargets_cores_to_changed_task_grid() -> None:
@@ -183,7 +329,8 @@ def test_capacity_frontier_retargets_cores_to_changed_task_grid() -> None:
         * old.ceil_div(workload.n, item["singleCoreN"]) == 3
     ]
     assert three_task
-    assert {item["usedCoreNum"] for item in three_task} == {3}
+    assert 3 in {item["usedCoreNum"] for item in three_task}
+    assert all(item["usedCoreNum"] <= 3 for item in three_task)
 
 
 def test_ideal_region_ignores_cartesian_axis_sampling_limit() -> None:

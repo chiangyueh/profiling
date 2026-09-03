@@ -16,12 +16,17 @@ from .ir import (
     MemorySpace,
     Operator,
     Primitive,
+    ReductionProtocol,
     Resource,
     Stage,
     StageScope,
     Tensor,
+    TileLevel,
+    WorkspaceBuffer,
+    WorkspaceDimension,
     dtype_bytes,
 )
+from .matmul_layout import LayoutConversion, source_layout_conversion
 
 
 def _power_tiles(alignment: int, maximum: int) -> tuple[int, ...]:
@@ -41,10 +46,21 @@ def matmul(
     *,
     trans_a: bool = False,
     trans_b: bool = False,
+    a_layout: str = "ND",
+    b_layout: str = "ND",
+    output_dtype: str | None = None,
+    has_bias: bool = False,
 ) -> Operator:
-    """Matrix contraction whose K reduction may be partitioned numerically."""
+    """C220 matrix contraction expressed as its complete dataflow set.
+
+    Kernel-family names below are diagnostic metadata.  The simulator sees
+    only memory paths, residency levels, primitives and reduction protocols.
+    Frontends may therefore describe another contraction implementation with
+    the same building blocks without adding a cost-model branch.
+    """
 
     in_bytes = dtype_bytes(dtype)
+    out_dtype = output_dtype or dtype
     # TCube's FP32 K0=8 format is available only for ND x transposed-ND.
     # Every other input-layout combination is lowered with K0=16.  Keeping
     # this in the operator-to-hardware lowering prevents the generic solver
@@ -66,92 +82,451 @@ def matmul(
             independent_task_tiling=False,
         ),
     )
-    tensors = (
+    tensors = [
         Tensor("A", a_shape, dtype),
         Tensor("B", b_shape, dtype),
-        Tensor("C", (m, n), dtype),
-    )
-    stages = (
-        Stage(
-            "load_inputs",
-            accesses=(
-                Access(
-                    "A", ("m", "k"), AccessMode.READ,
-                    (MemorySpace.GM, MemorySpace.L1, MemorySpace.L0A),
-                    pattern=(
-                        AccessPattern.STRIDED
-                        if trans_a else AccessPattern.CONTIGUOUS
-                    ),
-                    contiguous_axes=(("m",) if trans_a else ("k",)),
-                    dependency_axes=("k",),
+        Tensor("C", (m, n), out_dtype),
+        # Logical GM temporary used only by the FixPipe/NZ2ND graphs.  Its
+        # allocated padding is declared separately by WorkspaceBuffer; its
+        # accesses let the generic simulator count actual route traffic and
+        # copy requests rather than mistaking reserved ping-pong capacity for
+        # bytes transferred.
+        Tensor("OutputWorkspace", (m, n), out_dtype),
+    ]
+    if has_bias:
+        tensors.append(Tensor("Bias", (n,), out_dtype))
+
+    a_pattern = AccessPattern.STRIDED if trans_a else AccessPattern.CONTIGUOUS
+    b_pattern = AccessPattern.STRIDED if trans_b else AccessPattern.CONTIGUOUS
+    a_contiguous = ("m",) if trans_a else ("k",)
+    b_contiguous = ("k",) if trans_b else ("n",)
+    conversions = {
+        name: source_layout_conversion(
+            m, n, k, dtype, trans_a, trans_b,
+            a_layout=a_layout,
+            b_layout=b_layout,
+            graph_name=name,
+        )
+        for name in (
+            "base",
+            "single_core_split_k",
+            "deterministic_split_k",
+            "al1_full_load",
+            "bl1_full_load",
+            "bl1_full_load_fixpipe",
+            "bl1_full_load_vec_nz2nd",
+        )
+    }
+
+    def input_accesses(
+        *,
+        resident_a: bool = False,
+        resident_b: bool = False,
+        l1_only: bool = False,
+    ) -> tuple[Access, ...]:
+        result: list[Access] = []
+        if not resident_a:
+            result.append(Access(
+                "A", ("m", "k"), AccessMode.READ,
+                (
+                    (MemorySpace.L1, MemorySpace.L0A)
+                    if l1_only
+                    else (MemorySpace.GM, MemorySpace.L1, MemorySpace.L0A)
                 ),
-                Access(
-                    "B", ("k", "n"), AccessMode.READ,
-                    (MemorySpace.GM, MemorySpace.L1, MemorySpace.L0B),
-                    pattern=(
-                        AccessPattern.STRIDED
-                        if trans_b else AccessPattern.CONTIGUOUS
-                    ),
-                    contiguous_axes=(("k",) if trans_b else ("n",)),
-                    dependency_axes=("k",),
+                pattern=a_pattern,
+                contiguous_axes=a_contiguous,
+                dependency_axes=("k",),
+            ))
+        else:
+            result.append(Access(
+                "A", ("m", "k"), AccessMode.READ,
+                (MemorySpace.L1, MemorySpace.L0A),
+                pattern=a_pattern,
+                contiguous_axes=a_contiguous,
+                dependency_axes=("k",),
+            ))
+        if not resident_b:
+            result.append(Access(
+                "B", ("k", "n"), AccessMode.READ,
+                (
+                    (MemorySpace.L1, MemorySpace.L0B)
+                    if l1_only
+                    else (MemorySpace.GM, MemorySpace.L1, MemorySpace.L0B)
                 ),
-            ),
-            concurrent=True,
-        ),
-        Stage(
-            "matrix_multiply_accumulate",
-            primitives=(
-                Primitive(
-                    Resource.CUBE,
-                    ("m", "n", "k"),
+                pattern=b_pattern,
+                contiguous_axes=b_contiguous,
+                dependency_axes=("k",),
+            ))
+        else:
+            result.append(Access(
+                "B", ("k", "n"), AccessMode.READ,
+                (MemorySpace.L1, MemorySpace.L0B),
+                pattern=b_pattern,
+                contiguous_axes=b_contiguous,
+                dependency_axes=("k",),
+            ))
+        if has_bias:
+            result.append(Access(
+                "Bias", ("n",), AccessMode.READ,
+                (MemorySpace.GM, MemorySpace.L1),
+            ))
+        return tuple(result)
+
+    def conversion_stages(conversion: LayoutConversion) -> tuple[Stage, ...]:
+        lanes = max(1, 256 // (8 * in_bytes))
+        stages: list[Stage] = []
+        for tensor, access_axes, enabled in (
+            ("A", ("m", "k"), conversion.a),
+            ("B", ("k", "n"), conversion.b),
+        ):
+            if not enabled:
+                continue
+            stages.append(Stage(
+                f"stream_{tensor.lower()}_nd_to_nz",
+                accesses=(
+                    Access(tensor, access_axes, AccessMode.READ,
+                           (MemorySpace.GM, MemorySpace.UB)),
+                    Access(tensor, access_axes, AccessMode.WRITE,
+                           (MemorySpace.UB, MemorySpace.GM)),
+                ),
+                primitives=(Primitive(
+                    Resource.VECTOR, access_axes,
                     operations_per_point=1.0,
-                    issue_elements=16 * 16 * k0,
+                    issue_elements=lanes,
                     dtype=dtype,
-                    padded_axes=("m", "n", "k"),
+                ),),
+                scope=StageScope.KERNEL,
+                concurrent=True,
+            ))
+        return tuple(stages)
+
+    def output_stages(
+        *,
+        atomic: bool = False,
+        vector_output: bool = False,
+        workspace_alignment: int = 1,
+    ) -> tuple[Stage, ...]:
+        if vector_output:
+            return (
+                Stage(
+                    "write_output_workspace",
+                    accesses=(Access(
+                        "OutputWorkspace", ("m", "n"), AccessMode.WRITE,
+                        (MemorySpace.L0C, MemorySpace.GM),
+                        transaction_bytes=(
+                            workspace_alignment * dtype_bytes(out_dtype)
+                        ),
+                        local_dtype="fp32",
+                        service_bytes_per_element=4 + dtype_bytes(out_dtype),
+                    ),),
                 ),
-            ),
-        ),
-        Stage(
+                Stage(
+                    "vector_layout_and_cast",
+                    accesses=(
+                        Access(
+                            "OutputWorkspace", ("m", "n"), AccessMode.READ,
+                            (MemorySpace.GM, MemorySpace.UB),
+                            transaction_bytes=(
+                                workspace_alignment * dtype_bytes(out_dtype)
+                            ),
+                        ),
+                        Access(
+                            "C", ("m", "n"), AccessMode.WRITE,
+                            (MemorySpace.UB, MemorySpace.GM),
+                            is_result=True,
+                        ),
+                    ),
+                    primitives=(Primitive(
+                        Resource.VECTOR,
+                        ("m", "n"),
+                        operations_per_point=1.0,
+                        issue_elements=max(1, 256 // (8 * dtype_bytes(out_dtype))),
+                        dtype=out_dtype,
+                    ),),
+                ),
+            )
+        return (Stage(
             "write_result",
-            accesses=(
-                Access(
+            accesses=(Access(
+                "C", ("m", "n"),
+                AccessMode.ATOMIC_ADD if atomic else AccessMode.WRITE,
+                (MemorySpace.L0C, MemorySpace.GM),
+                local_dtype="fp32",
+                service_bytes_per_element=4 + dtype_bytes(out_dtype),
+                is_result=True,
+            ),),
+        ),)
+
+    def graph(
+        name: str,
+        protocol: ReductionProtocol,
+        *,
+        resident_a: bool = False,
+        resident_b: bool = False,
+        staged_gm_to_l1: bool = False,
+        vector_output: bool = False,
+        workspace_alignment: int = 1,
+        atomic: bool = False,
+        workspace_buffers: tuple[WorkspaceBuffer, ...] = (),
+    ) -> Algorithm:
+        conversion = conversions[name]
+        stages: list[Stage] = list(conversion_stages(conversion))
+        if atomic:
+            stages.append(Stage(
+                "clear_atomic_destination",
+                accesses=(Access(
                     "C", ("m", "n"), AccessMode.WRITE,
-                    (MemorySpace.L0C, MemorySpace.GM),
-                    local_dtype="fp32",
-                    service_bytes_per_element=4 + in_bytes,
-                    is_result=True,
+                    (MemorySpace.UB, MemorySpace.GM),
+                ),),
+                scope=StageScope.KERNEL,
+            ))
+        if resident_a:
+            stages.append(Stage(
+                "load_resident_a",
+                accesses=(Access(
+                    "A", ("m", "k"), AccessMode.READ,
+                    (MemorySpace.GM, MemorySpace.L1),
+                    pattern=a_pattern,
+                    contiguous_axes=a_contiguous,
+                    residency=((MemorySpace.L1, TileLevel.TASK),),
+                ),),
+                scope=StageScope.CORE,
+            ))
+        if resident_b:
+            stages.append(Stage(
+                "load_resident_b",
+                accesses=(Access(
+                    "B", ("k", "n"), AccessMode.READ,
+                    (MemorySpace.GM, MemorySpace.L1),
+                    pattern=b_pattern,
+                    contiguous_axes=b_contiguous,
+                    residency=((MemorySpace.L1, TileLevel.TASK),),
+                ),),
+                scope=StageScope.CORE,
+            ))
+        if staged_gm_to_l1:
+            stages.extend((
+                Stage(
+                    "stage_inputs_to_l1",
+                    accesses=(
+                        Access("A", ("m", "k"), AccessMode.READ,
+                               (MemorySpace.GM, MemorySpace.L1),
+                               pattern=a_pattern, contiguous_axes=a_contiguous,
+                               dependency_axes=("k",)),
+                        Access("B", ("k", "n"), AccessMode.READ,
+                               (MemorySpace.GM, MemorySpace.L1),
+                               pattern=b_pattern, contiguous_axes=b_contiguous,
+                               dependency_axes=("k",)),
+                    ),
+                    concurrent=True,
                 ),
+                Stage(
+                    "stage_l1_to_l0",
+                    accesses=input_accesses(l1_only=True),
+                    concurrent=True,
+                ),
+            ))
+        else:
+            stages.append(Stage(
+                "load_inputs",
+                accesses=input_accesses(
+                    resident_a=resident_a,
+                    resident_b=resident_b,
+                ),
+                concurrent=True,
+            ))
+        stages.append(Stage(
+            "matrix_multiply_accumulate",
+            primitives=(Primitive(
+                Resource.CUBE,
+                ("m", "n", "k"),
+                operations_per_point=1.0,
+                issue_elements=16 * 16 * k0,
+                dtype=dtype,
+                padded_axes=("m", "n", "k"),
+            ),),
+        ))
+        stages.extend(output_stages(
+            atomic=atomic,
+            vector_output=vector_output,
+            workspace_alignment=workspace_alignment,
+        ))
+        buffered = [MemorySpace.L1, MemorySpace.L0A,
+                    MemorySpace.L0B, MemorySpace.L0C]
+        if conversion.a or conversion.b or vector_output:
+            buffered.append(MemorySpace.UB)
+        return Algorithm(
+            stages=tuple(stages),
+            output_axes=("m", "n"),
+            reduction_axes=("k",),
+            core_resource=Resource.CUBE,
+            parallel_reduction=(
+                protocol in (
+                    ReductionProtocol.PARALLEL_WORKSPACE,
+                    ReductionProtocol.PARALLEL_ATOMIC,
+                )
             ),
+            reduction_protocol=protocol,
+            result_tensor="C",
+            partial_dtype="fp32",
+            reduction_resource=Resource.VECTOR,
+            reduction_operations_per_element=1.0,
+            pipeline_capable=True,
+            buffered_spaces=tuple(buffered),
+            pipeline_boundaries=((MemorySpace.L0A, MemorySpace.L0B),),
+            workspace_buffers=workspace_buffers,
+            name=name,
+        )
+
+    system_workspace = WorkspaceBuffer(fixed_bytes=20 * 1024 * 1024)
+    def conversion_workspace(
+        conversion: LayoutConversion,
+    ) -> tuple[WorkspaceBuffer, ...]:
+        result: list[WorkspaceBuffer] = []
+        if conversion.a:
+            result.append(WorkspaceBuffer(
+            dimensions=(
+                WorkspaceDimension("m", alignment=(32 // in_bytes if trans_a else 16)),
+                WorkspaceDimension("k", alignment=(16 if trans_a else 32 // in_bytes)),
+            ),
+            dtype=dtype,
+            ))
+        if conversion.b:
+            result.append(WorkspaceBuffer(
+            dimensions=(
+                WorkspaceDimension("k", alignment=(32 // in_bytes if trans_b else 16)),
+                WorkspaceDimension("n", alignment=(16 if trans_b else 32 // in_bytes)),
+            ),
+            dtype=dtype,
+            ))
+        return tuple(result)
+
+    common_workspace = (
+        system_workspace, *conversion_workspace(conversions["base"])
+    )
+    serial_workspace = (
+        system_workspace,
+        *conversion_workspace(conversions["single_core_split_k"]),
+        WorkspaceBuffer(
+        dimensions=(
+            WorkspaceDimension("m"),
+            WorkspaceDimension("n", alignment=256 // in_bytes),
+        ),
+        dtype="fp32",
         ),
     )
-    algorithm = Algorithm(
-        stages=stages,
-        output_axes=("m", "n"),
-        reduction_axes=("k",),
-        core_resource=Resource.CUBE,
-        parallel_reduction=True,
-        result_tensor="C",
-        partial_dtype="fp32",
-        reduction_resource=Resource.VECTOR,
-        reduction_operations_per_element=1.0,
-        pipeline_capable=True,
-        buffered_spaces=(
-            MemorySpace.L1,
-            MemorySpace.L0A,
-            MemorySpace.L0B,
-            MemorySpace.L0C,
+    deterministic_workspace = (
+        system_workspace,
+        *conversion_workspace(conversions["deterministic_split_k"]),
+        WorkspaceBuffer(
+        dimensions=(
+            WorkspaceDimension("m", TileLevel.TASK, clamp_to_axis=False),
+            WorkspaceDimension("n", TileLevel.TASK, clamp_to_axis=False),
         ),
-        pipeline_boundaries=(
-            (MemorySpace.L0A, MemorySpace.L0B),
+        dtype="fp32",
+        copies=2,
+        per_active_core=True,
         ),
-        name="cube_contraction",
     )
+    fixpipe_prefix = (
+        system_workspace,
+        *conversion_workspace(conversions["bl1_full_load_fixpipe"]),
+    )
+    fixpipe_workspace = (*fixpipe_prefix, WorkspaceBuffer(
+        dimensions=(
+            WorkspaceDimension("m", TileLevel.INNER),
+            WorkspaceDimension("n", TileLevel.KERNEL, 512 // dtype_bytes(out_dtype)),
+        ),
+        dtype=out_dtype,
+        copies=2,
+        per_active_core=True,
+    ))
+    nz2nd_workspace = (
+        system_workspace,
+        *conversion_workspace(conversions["bl1_full_load_vec_nz2nd"]),
+        WorkspaceBuffer(
+        dimensions=(
+            WorkspaceDimension("m", TileLevel.INNER),
+            WorkspaceDimension("n", TileLevel.KERNEL, 16),
+        ),
+        dtype=out_dtype,
+        copies=2,
+        per_active_core=True,
+        ),
+    )
+
+    # These are exactly the seven execution families dispatched by the
+    # pinned CANN 8.1 Ascend910B3 mat_mul_v3.cpp.  Aligned/unaligned suffixes
+    # are layout-conversion variants of the same dataflow and are selected at
+    # the ABI boundary, not separate cost functions.
+    algorithms: list[Algorithm] = [
+        graph("base", ReductionProtocol.DIRECT,
+              workspace_buffers=common_workspace),
+        graph(
+              "single_core_split_k",
+              ReductionProtocol.SERIAL_DIRECT if out_dtype == "fp32" else ReductionProtocol.SERIAL_WORKSPACE,
+              workspace_buffers=serial_workspace),
+        graph("deterministic_split_k", ReductionProtocol.PARALLEL_WORKSPACE,
+              workspace_buffers=deterministic_workspace),
+        graph("bl1_full_load", ReductionProtocol.DIRECT, resident_b=True,
+              workspace_buffers=(
+                  system_workspace,
+                  *conversion_workspace(conversions["bl1_full_load"]),
+              )),
+        graph(
+            "bl1_full_load_fixpipe",
+            ReductionProtocol.DIRECT,
+            resident_b=True,
+            vector_output=True,
+            workspace_alignment=512 // dtype_bytes(out_dtype),
+            workspace_buffers=fixpipe_workspace,
+        ),
+    ]
+    # AL1 full load is the sole FP32-NT-only family in the CANN 8.1 source.
+    if dtype == "fp32" and not trans_a and trans_b:
+        algorithms.append(
+            graph(
+                "al1_full_load", ReductionProtocol.DIRECT, resident_a=True,
+                workspace_buffers=(
+                    system_workspace,
+                    *conversion_workspace(conversions["al1_full_load"]),
+                ),
+            )
+        )
+    # The vector NZ2ND variant is selected from FixPipe by actual conversion
+    # state, K alignment, and N extent; transpose is not part of its source
+    # predicate.
+    vector_conversion = conversions["bl1_full_load_vec_nz2nd"]
+    if (
+        dtype == "fp32"
+        and not vector_conversion.a
+        and k % 8 == 0
+        and n <= 192
+    ):
+        algorithms.append(
+            graph(
+                "bl1_full_load_vec_nz2nd",
+                ReductionProtocol.DIRECT,
+                resident_b=True,
+                vector_output=True,
+                workspace_alignment=16,
+                workspace_buffers=nz2nd_workspace,
+            )
+        )
+
     return Operator(
         axes=axes,
-        tensors=tensors,
-        algorithms=(algorithm,),
+        tensors=tuple(tensors),
+        algorithms=tuple(algorithms),
         name="matmul",
-        attributes=(("trans_a", str(int(trans_a))), ("trans_b", str(int(trans_b)))),
+        attributes=(
+            ("trans_a", str(int(trans_a))),
+            ("trans_b", str(int(trans_b))),
+            ("a_layout", a_layout),
+            ("b_layout", b_layout),
+            ("output_dtype", out_dtype),
+            ("has_bias", str(int(has_bias))),
+        ),
     )
 
 

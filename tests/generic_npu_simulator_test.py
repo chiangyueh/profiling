@@ -161,8 +161,9 @@ def test_generic_legality_rejects_bad_alignment_capacity_and_traversal() -> None
 def test_parallel_reduction_is_a_numeric_schedule_choice() -> None:
     operator = matmul(16, 16, 16384)
     common = dict(
-        algorithm=0,
-        axis_tiles=(("m", 16), ("n", 16), ("k", 128)),
+        algorithm=2,
+        axis_tiles=(("m", 128), ("n", 128), ("k", 128)),
+        task_tiles=(("m", 384), ("n", 384), ("k", 384)),
         used_cores=20,
         buffers=(),
         traversal=("m", "n"),
@@ -180,8 +181,8 @@ def test_parallel_reduction_is_a_numeric_schedule_choice() -> None:
     assert serial.valid and partitioned.valid
     assert serial.active_cores == 1
     assert partitioned.active_cores == 20
-    assert serial.workspace_bytes == 0
-    assert partitioned.workspace_bytes == 20 * 16 * 16 * 4
+    assert serial.workspace_bytes >= 20 * 1024 * 1024
+    assert partitioned.workspace_bytes > serial.workspace_bytes
     assert partitioned.total_cycles < serial.total_cycles
 
 
@@ -317,7 +318,10 @@ def test_reduction_schedule_is_discovered_without_a_named_splitk_path() -> None:
     assert max(partitions) > 1
     renamed = replace(
         operator,
-        algorithms=(replace(operator.algorithms[0], name="renamed"),),
+        algorithms=tuple(
+            replace(algorithm, name=f"renamed_{index}")
+            for index, algorithm in enumerate(operator.algorithms)
+        ),
         name="renamed_operator",
     )
     renamed_region = derive_ideal_region(renamed, HARDWARE)
@@ -349,7 +353,8 @@ def test_hardware_projection_matches_exhaustive_optimum_on_a_finite_space() -> N
 
 
 def test_core_factor_projection_matches_coupled_exhaustive_optimum() -> None:
-    operator = matmul(160, 80, 192, "fp16")
+    full = matmul(160, 80, 192, "fp16")
+    operator = replace(full, algorithms=(full.algorithms[0],))
     space = ScheduleSpace(
         tile_options=(
             ("m", (16, 32, 48, 64)),

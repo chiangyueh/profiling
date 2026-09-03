@@ -7,9 +7,9 @@ import argparse
 import csv
 import hashlib
 import json
-import math
 import sys
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,14 +20,20 @@ if str(ROOT) not in sys.path:
 import refine_matmul_v3_candidates as old
 from profile_official_tilings import IncrementalJsonl
 from npu_cost_model import (
+    CANN81_MATMUL_FAMILIES,
+    CANN81_MATMUL_KERNEL_SUFFIXES,
     MemorySpace,
     Resource,
     ScheduleSpace,
     SearchPolicy,
     ascend_910b3,
     derive_ideal_region,
+    execution_mode_name,
+    lower_plan_to_cann,
     plan_from_cann,
     simulate,
+    source_kernel_suffix,
+    validate_cann_tiling,
 )
 from npu_cost_model.operators import matmul
 
@@ -74,160 +80,6 @@ def truthy(value: object) -> bool:
     return str(value or "").lower() in {"1", "true", "yes", "on"}
 
 
-def make_base_from_plan(
-    workload: old.Workload,
-    hardware: old.Hardware,
-    plan,
-) -> dict[str, int] | None:
-    # CANN 8.1 BASE has no independent task tile below singleCoreM/N:
-    # its legal contract requires baseM/N to cover that complete core task.
-    # Preserve the generic task geometry at the ABI boundary rather than
-    # silently replacing it with the smaller scratchpad inner tile.
-    single_m = min(workload.m, plan.tasks["m"])
-    single_n = min(workload.n, plan.tasks["n"])
-    base_m = old.align_up(single_m, 16)
-    base_n = old.align_up(single_n, 16)
-    base_k = min(
-        plan.tiles["k"],
-        old.align_up(workload.k, old.base_k_alignment(workload)),
-    )
-    m_parts = old.ceil_div(workload.m, single_m)
-    n_parts = old.ceil_div(workload.n, single_n)
-    l2_m = max(1, min(m_parts, old.ceil_div(plan.caches["m"], single_m)))
-    l2_n = max(1, min(n_parts, old.ceil_div(plan.caches["n"], single_n)))
-    traversal = plan.traversal or ("m", "n")
-    l2_order = 1 if traversal[-1] == "n" else 2
-    iterate_order = 0 if traversal[-1] == "n" else 1
-    buffers = plan.buffer_counts
-    cores = min(plan.used_cores, m_parts * n_parts, workload.max_cores)
-    knowledge = {
-        "usedCoreNum": cores,
-        "singleCoreM": single_m,
-        "singleCoreN": single_n,
-        "singleCoreK": workload.k,
-        "baseM": base_m,
-        "baseN": base_n,
-        "baseK": base_k,
-        "depthA1": 1,
-        "depthB1": 1,
-        "stepM": 1,
-        "stepN": 1,
-        "iterateOrder": iterate_order,
-        "stepKa": 1,
-        "stepKb": 1,
-        "dbL0A": buffers.get(MemorySpace.L0A, 1),
-        "dbL0B": buffers.get(MemorySpace.L0B, 1),
-        "dbL0C": buffers.get(MemorySpace.L0C, 1),
-        "l2MTileCnt": old.ceil_div(old.ceil_div(workload.m, base_m), l2_m),
-        "l2NTileCnt": old.ceil_div(old.ceil_div(workload.n, base_n), l2_n),
-        "l2MTileBlock": l2_m,
-        "l2NTileBlock": l2_n,
-        "l2IterateOrder": l2_order,
-        "tilingEnable": 0,
-    }
-    depth_a, depth_b, step_a, step_b = old.official_l1_for_base(
-        workload, knowledge, hardware
-    )
-    knowledge.update(
-        depthA1=depth_a,
-        depthB1=depth_b,
-        stepKa=step_a,
-        stepKb=step_b,
-    )
-    return knowledge if old.hard_legal(workload, knowledge, hardware) else None
-
-
-def make_parallel_reduction_from_plan(
-    workload: old.Workload,
-    hardware: old.Hardware,
-    plan,
-) -> dict[str, int] | None:
-    """Encode a numeric parallel-reduction plan in the CANN 8.1 ABI.
-
-    The fixed values are the public deterministic-reduction execution-graph
-    contract. They do not decide whether reduction parallelism is searched or
-    how it is ranked; the generic IR solver has already made that decision.
-    """
-
-    in_bytes = old.INPUT_BYTES[workload.dtype]
-    base_k = 256 // in_bytes
-    single_k = 3 * base_k
-    k_chunks = old.ceil_div(workload.k, single_k)
-    if k_chunks < 2:
-        return None
-    traversal = plan.traversal or ("m", "n")
-    if traversal[-1] == "n":
-        step_m, step_n, depth_a, depth_b = 3, 1, 9, 6
-        iterate_order, l2_order = 1, 0
-        single_m, single_n = 384, max(128, workload.n)
-    else:
-        step_m, step_n, depth_a, depth_b = 1, 3, 6, 9
-        iterate_order, l2_order = 0, 1
-        single_m, single_n = max(128, workload.m), 384
-    per_core_l2 = hardware.l2_bytes * 7 // 10 // hardware.aic_cores
-    if traversal[-1] == "n":
-        fixed_m = min(single_m, workload.m)
-        fixed_bytes = single_k * fixed_m * in_bytes
-        bytes_per_n = single_k * in_bytes + fixed_m * 4
-        if per_core_l2 <= fixed_bytes:
-            return None
-        n_l2_split = (per_core_l2 - fixed_bytes) // bytes_per_n
-        if n_l2_split <= 0:
-            return None
-        if workload.n > n_l2_split:
-            n_l2_split = old.align_up(n_l2_split, 16)
-            n_count = old.ceil_div(workload.n, n_l2_split)
-            single_n = old.align_up(old.ceil_div(workload.n, n_count), 16)
-    else:
-        fixed_n = min(single_n, workload.n)
-        fixed_bytes = single_k * fixed_n * in_bytes
-        bytes_per_m = single_k * in_bytes + fixed_n * 4
-        if per_core_l2 <= fixed_bytes:
-            return None
-        m_l2_split = (per_core_l2 - fixed_bytes) // bytes_per_m
-        if m_l2_split <= 0:
-            return None
-        if workload.m > m_l2_split:
-            m_l2_split = old.align_up(m_l2_split, 16)
-            m_count = old.ceil_div(workload.m, m_l2_split)
-            single_m = old.align_up(old.ceil_div(workload.m, m_count), 16)
-    m_chunks = old.ceil_div(workload.m, single_m)
-    n_chunks = old.ceil_div(workload.n, single_n)
-    used_cores = min(
-        plan.used_cores, k_chunks, workload.max_cores, hardware.aic_cores
-    )
-    # This execution graph is a parallel reduction.  One active core cannot
-    # shorten the reduction and is dominated by the serial BASE graph.
-    if used_cores < 2:
-        return None
-    knowledge = {
-        "usedCoreNum": used_cores,
-        "singleCoreM": single_m,
-        "singleCoreN": single_n,
-        "singleCoreK": single_k,
-        "baseM": 128,
-        "baseN": 128,
-        "baseK": base_k,
-        "depthA1": depth_a,
-        "depthB1": depth_b,
-        "stepM": step_m,
-        "stepN": step_n,
-        "iterateOrder": iterate_order,
-        "stepKa": 3,
-        "stepKb": 3,
-        "dbL0A": 2,
-        "dbL0B": 2,
-        "dbL0C": 2,
-        "l2MTileCnt": 1,
-        "l2NTileCnt": 1,
-        "l2MTileBlock": max(1, m_chunks),
-        "l2NTileBlock": max(1, n_chunks),
-        "l2IterateOrder": l2_order,
-        "tilingEnable": 3,
-    }
-    return knowledge if old.hard_legal(workload, knowledge, hardware) else None
-
-
 def derive_proposals(
     workload: old.Workload,
     hardware: old.Hardware,
@@ -240,14 +92,8 @@ def derive_proposals(
     region = derive_ideal_region(
         operator,
         generic,
-        ScheduleSpace(
-            core_options=tuple(range(1, hardware.aic_cores + 1)),
-            # CANN 8.1 BASE exposes one M/N geometry for both the Cube tile
-            # and the per-core task. Declare that backend contract so the
-            # solver does not score an unrepresentable schedule.
-            coupled_task_axes=("m", "n"),
-        ),
-        SearchPolicy(top_k=1, max_evaluations=10000),
+        ScheduleSpace(core_options=tuple(range(1, hardware.aic_cores + 1))),
+        SearchPolicy(top_k=1, max_evaluations=100000),
     )
     if not region.exhaustive:
         raise old.SearchError(
@@ -257,13 +103,12 @@ def derive_proposals(
     result: list[dict[str, int]] = []
     seen: set[tuple[int, ...]] = set()
     for plan in region.plans:
-        reduction_parts = math.prod(plan.reductions.values()) if plan.reductions else 1
-        knowledge = (
-            make_base_from_plan(workload, hardware, plan)
-            if reduction_parts == 1
-            else make_parallel_reduction_from_plan(workload, hardware, plan)
-        )
-        if knowledge is None:
+        try:
+            knowledge = lower_plan_to_cann(
+                workload.m, workload.n, workload.k, workload.dtype,
+                workload.trans_a, workload.trans_b, plan, generic,
+            )
+        except ValueError:
             continue
         signature = old.knowledge_signature(knowledge)
         if signature not in seen:
@@ -349,7 +194,12 @@ def ranked_pool(
     new_ns = 0
     equivalent_scores: dict[tuple[object, ...], object] = {}
     for sequence, knowledge in enumerate(proposals, 1):
-        plan = plan_from_cann(workload.m, workload.n, workload.k, knowledge)
+        plan = plan_from_cann(
+            workload.m, workload.n, workload.k, knowledge,
+            dtype=workload.dtype,
+            trans_a=workload.trans_a,
+            trans_b=workload.trans_b,
+        )
         equivalence_key = (
             plan.algorithm,
             plan.axis_tiles,
@@ -420,29 +270,10 @@ def attach_models(
 def kernel_suffix_for(workload: old.Workload, knowledge: dict[str, int]) -> int:
     """Return the CANN 8.1 kernel-family suffix without running its tiler."""
 
-    aligned = (
-        workload.m % 16 == 0
-        and workload.n % 16 == 0
-        and workload.k % old.base_k_alignment(workload) == 0
+    return source_kernel_suffix(
+        workload.m, workload.n, workload.k, workload.dtype,
+        workload.trans_a, workload.trans_b, knowledge,
     )
-    low_digit = int(aligned)
-    family = old.template_name(knowledge)
-    bases = {
-        "BASE": 0,
-        "SINGLE_CORE_SPLIT_K": 20,
-        "DETERMINISTIC_SPLIT_K": 30,
-        "AL1_FULL_LOAD": 100,
-        "BL1_FULL_LOAD": 200,
-        "BL1_FULL_LOAD_FIXPIPE": 10200,
-        "BL1_FULL_LOAD_VEC_NZ2ND": 20200,
-    }
-    suffix = bases[family] + low_digit
-    if suffix not in old.CANN81_KERNEL_VARIANTS:
-        # AL1 and VEC_NZ2ND have no unaligned CANN 8.1 kernel.
-        raise old.SearchError(
-            f"CANN 8.1 has no {family} kernel for this alignment"
-        )
-    return suffix
 
 
 def attach_execution_identity(
@@ -465,8 +296,8 @@ def attach_execution_identity(
     row.update({
         "model_schedule_sha256": schedule_sha,
         "model_kernel_suffix": str(suffix),
-        "model_kernel_variant": old.CANN81_KERNEL_VARIANTS[suffix][0],
-        "model_kernel_family": old.CANN81_KERNEL_VARIANTS[suffix][1],
+        "model_kernel_variant": execution_mode_name(knowledge).upper(),
+        "model_kernel_family": execution_mode_name(knowledge).upper(),
     })
 
 
@@ -515,6 +346,10 @@ def main() -> int:
     selected_rows: list[dict[str, str]] = []
     all_rows: list[dict[str, str]] = []
     execution_graph_counts: dict[str, int] = {}
+    generated_graph_counts: Counter[str] = Counter()
+    generated_kernel_suffixes: set[int] = set()
+    legal_graph_counts: Counter[str] = Counter()
+    legal_kernel_suffixes: set[int] = set()
     anchor_ids = {"matmul_rank_000", "matmul_rank_001", "matmul_rank_002"}
     catalog_ids = {row["workload_id"] for row in catalog_rows}
     required_anchors = (
@@ -553,6 +388,11 @@ def main() -> int:
         proposals, ideal_region = derive_proposals(
             search_workload, platform
         )
+        for proposal in proposals:
+            generated_graph_counts[execution_mode_name(proposal)] += 1
+            generated_kernel_suffixes.add(kernel_suffix_for(
+                search_workload, proposal
+            ))
         candidate_generation_ns = time.perf_counter_ns() - started
         generated_count = len(proposals)
 
@@ -563,7 +403,12 @@ def main() -> int:
             signature = old.knowledge_signature(knowledge)
             if (
                 signature in legal_signatures
-                or not old.hard_legal(search_workload, knowledge, platform)
+                or validate_cann_tiling(
+                    search_workload.m, search_workload.n, search_workload.k,
+                    search_workload.dtype, search_workload.trans_a,
+                    search_workload.trans_b, knowledge,
+                    generic_hardware(platform),
+                )
             ):
                 continue
             legal_signatures.add(signature)
@@ -573,54 +418,68 @@ def main() -> int:
         ranked, new_score_ns = ranked_pool(search_workload, legal, platform)
         if not ranked:
             continue
+        for item in ranked:
+            legal_graph_counts[execution_mode_name(item["knowledge"])] += 1
+            legal_kernel_suffixes.add(kernel_suffix_for(
+                search_workload, item["knowledge"]
+            ))
 
         selected = ranked[0]
         started = time.perf_counter_ns()
-        suffix = kernel_suffix_for(callback_workload, selected["knowledge"])
-        row = old.row_from_state(
-            fields, None, callback_workload, selected["knowledge"],
-            "generic_hardware_simulator_v1",
-            old.template_name(selected["knowledge"]),
-            selected["new"].total_cycles,
-            selected["new"].gm_read_bytes + selected["new"].gm_write_bytes,
-            selected["new"].l2_bytes,
-            10_000_000_000_000_000_000 + suffix,
-            guidance=selected["selection"], estimate=None,
-            bottleneck=selected["new"].bottleneck,
-            rationale="lowest predicted cycles from the hardware simulator",
-            resume_policy="allow_new",
-        )
-        attach_execution_identity(
-            row, callback_workload, selected["knowledge"]
-        )
+
+        def materialize_model_row(item: dict, model_rank: int) -> dict[str, str]:
+            knowledge = item["knowledge"]
+            result = item["new"]
+            suffix = kernel_suffix_for(callback_workload, knowledge)
+            model_row = old.row_from_state(
+                fields, None, callback_workload, knowledge,
+                "generic_hardware_simulator_v1",
+                execution_mode_name(knowledge).upper(),
+                result.total_cycles,
+                result.gm_read_bytes + result.gm_write_bytes,
+                result.l2_bytes,
+                10_000_000_000_000_000_000 + suffix,
+                guidance=item["selection"], estimate=None,
+                bottleneck=result.bottleneck,
+                rationale=(
+                    "lowest predicted cycles from the hardware simulator"
+                    if model_rank == 1 else
+                    "hardware-simulator ranked legal alternative"
+                ),
+                resume_policy="allow_new",
+            )
+            model_row["execution_mode"] = execution_mode_name(knowledge)
+            attach_execution_identity(model_row, callback_workload, knowledge)
+            model_row.update({
+                "rank": str(model_rank),
+                "search_model_score": f"{result.total_cycles:.12g}",
+                "search_model_cycles": f"{result.total_cycles:.12g}",
+                "search_model_raw_ratio_vs_bank_seed": "",
+                "search_model_ratio_vs_bank_seed": "",
+                "new_model_ratio_vs_official": "",
+                "search_model_breakdown": new_breakdown(result),
+            })
+            attach_models(
+                model_row,
+                result,
+                new_rank=model_rank,
+                new_ns=new_score_ns,
+                hardware_aic_cores=args.aic_cores,
+                pool_sequence=item["pool_sequence"],
+                pool_size=len(legal),
+                selection=item["selection"],
+            )
+            return model_row
+
+        row = materialize_model_row(selected, 1)
         execution_abi_ns = time.perf_counter_ns() - started
-        # These fields are ratios only in the historical callback-seeded
-        # search.  A standalone hardware model has no official denominator.
-        row.update({
-            "search_model_score": f"{selected['new'].total_cycles:.12g}",
-            "search_model_cycles": f"{selected['new'].total_cycles:.12g}",
-            "search_model_raw_ratio_vs_bank_seed": "",
-            "search_model_ratio_vs_bank_seed": "",
-            "new_model_ratio_vs_official": "",
-        })
-        row["rank"] = "1"
-        attach_models(
-            row,
-            selected["new"],
-            new_rank=selected["new_rank_all"],
-            new_ns=new_score_ns,
-            hardware_aic_cores=args.aic_cores,
-            pool_sequence=selected["pool_sequence"],
-            pool_size=len(legal),
-            selection=selected["selection"],
-        )
         total_ns = time.perf_counter_ns() - shape_started
         timing_values = {
             "candidate_generation_ms": candidate_generation_ns / 1e6,
             "static_legality_ms": static_legality_ns / 1e6,
             "execution_abi_ms": execution_abi_ns / 1e6,
         }
-        row.update({
+        common_row_values = {
             **{name: f"{value:.9g}" for name, value in timing_values.items()},
             "generated_candidate_count": str(generated_count),
             "legal_candidate_count": str(len(legal)),
@@ -629,7 +488,7 @@ def main() -> int:
             "ideal_region_count": str(len(ideal_region.plans)),
             "ideal_discovery_evaluations": str(ideal_region.evaluated),
             "execution_graphs_represented": ";".join(sorted({
-                old.template_name(item) for item in proposals
+                execution_mode_name(item) for item in proposals
             })),
             "tiling_official_callback_ms": "0",
             "tiling_runtime_kb_seed_ms": "0",
@@ -643,11 +502,20 @@ def main() -> int:
             "search_model_ratio_vs_bank_seed": "",
             "new_model_ratio_vs_official": "",
             "search_model_breakdown": new_breakdown(selected["new"]),
-        })
+        }
+        row.update(common_row_values)
         selected_rows.append(dict(row))
         all_rows.append(dict(row))
+        for model_rank, item in enumerate(ranked[1:], 2):
+            alternative = materialize_model_row(item, model_rank)
+            alternative.update(common_row_values)
+            alternative["search_model_cycles"] = (
+                f"{item['new'].total_cycles:.12g}"
+            )
+            alternative["search_model_breakdown"] = new_breakdown(item["new"])
+            all_rows.append(alternative)
         selected_workloads.append(metadata)
-        selected_graph = old.template_name(selected["knowledge"])
+        selected_graph = execution_mode_name(selected["knowledge"])
         execution_graph_counts[selected_graph] = (
             execution_graph_counts.get(selected_graph, 0) + 1
         )
@@ -668,7 +536,7 @@ def main() -> int:
                 "ideal_region_plans": len(ideal_region.plans),
                 "ideal_discovery_evaluations": ideal_region.evaluated,
                 "execution_graphs_represented": sorted({
-                    old.template_name(item) for item in proposals
+                    execution_mode_name(item) for item in proposals
                 }),
                 "selected_new_model_rank": selected["new_rank_all"],
                 "selected_used_core_num": selected["knowledge"]["usedCoreNum"],
@@ -700,6 +568,16 @@ def main() -> int:
             f"only {len(selected_workloads)} workloads produced a legal "
             f"simulator selection; required {args.selected_workloads}"
         )
+    missing_graphs = set(CANN81_MATMUL_FAMILIES) - set(legal_graph_counts)
+    missing_suffixes = (
+        set(CANN81_MATMUL_KERNEL_SUFFIXES) - legal_kernel_suffixes
+    )
+    if missing_graphs or missing_suffixes:
+        raise old.SearchError(
+            "CANN 8.1 family coverage is incomplete: "
+            f"missing_graphs={sorted(missing_graphs)} "
+            f"missing_suffixes={sorted(missing_suffixes)}"
+        )
     if not required_anchors <= {row["workload_id"] for row in selected_workloads}:
         raise old.SearchError("one or more colleague anchor shapes were not admitted")
     args.workloads.parent.mkdir(parents=True, exist_ok=True)
@@ -718,6 +596,11 @@ def main() -> int:
         "tilings_per_shape=1 "
         f"measured_per_shape={MEASURED_TILINGS} "
         f"selected_execution_graphs={execution_graph_counts} "
+        f"generated_execution_graphs={dict(generated_graph_counts)} "
+        f"generated_kernel_suffixes={sorted(generated_kernel_suffixes)} "
+        f"legal_execution_graphs={dict(legal_graph_counts)} "
+        f"legal_kernel_suffixes={sorted(legal_kernel_suffixes)} "
+        f"full_ranked_rows={len(all_rows)} "
         f"wall_ms={(time.perf_counter_ns() - campaign_started) / 1e6:.3f} "
         + " ".join(
             f"{name[:-3]}_ms={value / 1e6:.3f}"
@@ -733,6 +616,11 @@ def main() -> int:
             "status": "complete",
             "shape_count": len(selected_workloads),
             "selected_execution_graphs": execution_graph_counts,
+            "generated_execution_graphs": dict(generated_graph_counts),
+            "generated_kernel_suffixes": sorted(generated_kernel_suffixes),
+            "legal_execution_graphs": dict(legal_graph_counts),
+            "legal_kernel_suffixes": sorted(legal_kernel_suffixes),
+            "full_ranked_rows": len(all_rows),
             "timing_ms": {
                 name[:-3]: value / 1e6
                 for name, value in stage_totals.items()

@@ -21,9 +21,12 @@ from .ir import (
     MemorySpace,
     Operator,
     Primitive,
+    ReductionProtocol,
     Resource,
     Stage,
     StageScope,
+    TileLevel,
+    WorkspaceBuffer,
     dtype_bytes,
 )
 from .schedule import TilingPlan
@@ -129,7 +132,7 @@ def _transfer_resource(
         return Resource.ATOMIC
     if source == MemorySpace.L1 and destination in (MemorySpace.L0A, MemorySpace.L0B):
         return Resource.MTE1
-    if source == MemorySpace.L0C and destination == MemorySpace.GM:
+    if source == MemorySpace.L0C:
         return Resource.FIXPIPE
     if source == MemorySpace.UB and destination == MemorySpace.GM:
         return Resource.MTE3
@@ -218,9 +221,12 @@ def _access_cost(
     tensor = operator.tensor(access.tensor)
     # A result write becomes a partial-result write when the schedule
     # parallelizes a reduction.
+    protocol = algorithm.effective_reduction_protocol
     value_dtype = (
         partial_dtype
-        if access.is_result and reduction_partitions > 1
+        if access.is_result
+        and reduction_partitions > 1
+        and protocol != ReductionProtocol.DIRECT
         else tensor.dtype
     )
     element_bytes = dtype_bytes(value_dtype)
@@ -379,30 +385,48 @@ def _local_memory(
     plan: TilingPlan,
     reduction_partitions: int,
 ) -> dict[MemorySpace, int]:
-    tiles = plan.tiles
     buffers = plan.buffer_counts
     allocations: dict[tuple[str, MemorySpace], int] = {}
     for stage in algorithm.stages:
         for access in stage.accesses:
             tensor = operator.tensor(access.tensor)
             local_dtype = access.local_dtype or tensor.dtype
-            elements = prod(
-                min(operator.axis(axis).extent, tiles[axis])
-                for axis in access.axes
-            ) if access.axes else 1
-            byte_count = elements * dtype_bytes(local_dtype)
+            residency = dict(access.residency)
             for space in access.path:
                 if space in (MemorySpace.GM, MemorySpace.L2):
                     continue
+                level = residency.get(space, TileLevel.INNER)
+                level_tiles = {
+                    TileLevel.INNER: plan.tiles,
+                    TileLevel.TASK: plan.tasks,
+                    TileLevel.CACHE: plan.caches,
+                    TileLevel.KERNEL: {
+                        axis.name: axis.extent for axis in operator.axes
+                    },
+                }[level]
+                elements = prod(
+                    min(operator.axis(axis).extent, level_tiles[axis])
+                    for axis in access.axes
+                ) if access.axes else 1
+                byte_count = elements * dtype_bytes(local_dtype)
                 key = (tensor.name, space)
                 allocations[key] = max(allocations.get(key, 0), byte_count)
     peak: dict[MemorySpace, int] = {}
     for (_, space), byte_count in allocations.items():
         peak[space] = peak.get(space, 0) + byte_count * buffers.get(space, 1)
 
-    if reduction_partitions > 1:
-        output_tile_elements = prod(tiles[axis] for axis in algorithm.output_axes)
-        partial_live = 2 * output_tile_elements * dtype_bytes(algorithm.partial_dtype)
+    if (
+        reduction_partitions > 1
+        and algorithm.effective_reduction_protocol
+        == ReductionProtocol.PARALLEL_WORKSPACE
+    ):
+        output_tile_elements = prod(
+            plan.tiles[axis] for axis in algorithm.output_axes
+        )
+        # One partial tile is already represented by a declared C->UB access
+        # in vector-output graphs.  This is the second ping-pong/reduction
+        # operand, not two additional allocations.
+        partial_live = output_tile_elements * dtype_bytes(algorithm.partial_dtype)
         peak[MemorySpace.UB] = peak.get(MemorySpace.UB, 0) + partial_live
     return peak
 
@@ -424,7 +448,10 @@ def _cache_memory(
             tensor = operator.tensor(access.tensor)
             value_dtype = (
                 algorithm.partial_dtype
-                if access.is_result and reduction_partitions > 1
+                if access.is_result
+                and reduction_partitions > 1
+                and algorithm.effective_reduction_protocol
+                != ReductionProtocol.DIRECT
                 else tensor.dtype
             )
             elements = 1
@@ -442,6 +469,66 @@ def _cache_memory(
                 elements * dtype_bytes(value_dtype),
             )
     return sum(allocations.values())
+
+
+def _workspace_metrics(
+    operator: Operator,
+    algorithm: Algorithm,
+    plan: TilingPlan,
+    hardware: Hardware,
+    active_cores: int,
+    reduction_partitions: int,
+) -> tuple[int, WorkCost]:
+    """Evaluate declared temporary GM allocations and their memory routes."""
+
+    allocated = 0
+    traffic = WorkCost()
+    levels = {
+        TileLevel.INNER: plan.tiles,
+        TileLevel.TASK: plan.tasks,
+        TileLevel.CACHE: plan.caches,
+        TileLevel.KERNEL: {
+            axis.name: axis.extent for axis in operator.axes
+        },
+    }
+    for buffer in algorithm.workspace_buffers:
+        elements = 1 if buffer.dimensions else 0
+        for dimension in buffer.dimensions:
+            scheduled_extent = levels[dimension.level][dimension.axis]
+            extent = (
+                min(operator.axis(dimension.axis).extent, scheduled_extent)
+                if dimension.clamp_to_axis
+                else scheduled_extent
+            )
+            elements *= align_up(extent, dimension.alignment)
+        multiplicity = buffer.copies
+        if buffer.per_active_core:
+            multiplicity *= active_cores
+        if buffer.per_reduction_partition:
+            multiplicity *= reduction_partitions
+        payload = elements * dtype_bytes(buffer.dtype) * multiplicity
+        allocated += buffer.fixed_bytes + payload
+        for path, mode in (
+            (buffer.producer_path, AccessMode.WRITE),
+            (buffer.consumer_path, AccessMode.READ),
+        ):
+            for source, destination in zip(path, path[1:]):
+                resource = _transfer_resource(source, destination, mode)
+                work = _work_item(
+                    hardware,
+                    resource,
+                    byte_count=float(payload),
+                    issue_count=float(ceil_div(payload, hardware.transaction_bytes)),
+                    route=(source, destination),
+                )
+                if source == MemorySpace.GM:
+                    work.gm_read_bytes += payload
+                    work.l2_bytes += 2.0 * payload
+                if destination == MemorySpace.GM:
+                    work.gm_write_bytes += payload
+                    work.l2_bytes += 2.0 * payload
+                traffic.add(work)
+    return allocated, traffic
 
 
 def _axis_classes(extent: int, tile: int) -> list[tuple[int, int]]:
@@ -480,9 +567,12 @@ def _task_classes(
         dimensions.append((axis_name, _axis_classes(axis.extent, tiles[axis_name])))
     for axis_name in algorithm.reduction_axes:
         axis = operator.axis(axis_name)
-        dimensions.append(
-            (axis_name, _partition_classes(axis.extent, reductions.get(axis_name, 1)))
+        values = (
+            _partition_classes(axis.extent, reductions.get(axis_name, 1))
+            if algorithm.distributes_reduction_partitions
+            else [(axis.extent, 1)]
         )
+        dimensions.append((axis_name, values))
 
     classes: list[tuple[dict[str, int], int]] = []
     for combination in product(*(values for _, values in dimensions)):
@@ -535,6 +625,40 @@ def _kernel_stage_cost(
         resource: cycles / active_cores
         for resource, cycles in total.resource_cycles.items()
     }
+    return total
+
+
+def _core_stage_cost(
+    operator: Operator,
+    algorithm: Algorithm,
+    plan: TilingPlan,
+    hardware: Hardware,
+    reduction_partitions: int,
+    cache_group_resident: bool,
+) -> WorkCost:
+    """Cost of setup/resident loads performed once by every active core."""
+
+    extents = {
+        axis.name: min(axis.extent, plan.tasks[axis.name])
+        for axis in operator.axes
+    }
+    total = WorkCost()
+    for stage in algorithm.stages:
+        if stage.scope != StageScope.CORE:
+            continue
+        total.add(
+            _stage_cost(
+                operator,
+                algorithm,
+                plan,
+                stage,
+                extents,
+                hardware,
+                reduction_partitions,
+                algorithm.partial_dtype,
+                cache_group_resident,
+            )
+        )
     return total
 
 
@@ -658,8 +782,8 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
     total_reduction_partitions = 1
     for axis_name in algorithm.reduction_axes:
         parts = reductions.get(axis_name, 1)
-        if parts > 1 and not algorithm.parallel_reduction:
-            return _invalid("algorithm does not permit a parallel reduction")
+        if parts > 1 and not algorithm.permits_reduction_partitioning:
+            return _invalid("algorithm does not permit a partitioned reduction")
         available_chunks = ceil_div(operator.axis(axis_name).extent, tiles[axis_name])
         if parts > available_chunks:
             return _invalid(f"reduction partitions exceed {axis_name} tile chunks")
@@ -756,16 +880,33 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
     )
     if not kernel_stage.valid:
         return _invalid(kernel_stage.error)
+    core_stage = _core_stage_cost(
+        operator,
+        algorithm,
+        plan,
+        hardware,
+        total_reduction_partitions,
+        cache_group_resident,
+    )
+    if not core_stage.valid:
+        return _invalid(core_stage.error)
 
     core_cycles: list[float] = []
     aggregate_resources: dict[Resource, float] = {}
     gm_read = gm_write = l2_bytes = 0.0
     for core in range(active_cores):
+        for resource, cycles in core_stage.resource_cycles.items():
+            core_resources[core][resource] = (
+                core_resources[core].get(resource, 0.0) + cycles
+            )
         for resource, cycles in kernel_stage.resource_cycles.items():
             core_resources[core][resource] = (
                 core_resources[core].get(resource, 0.0) + cycles
             )
-        core_serial[core] += kernel_stage.elapsed_cycles
+        core_serial[core] += core_stage.elapsed_cycles + kernel_stage.elapsed_cycles
+        core_gm_read[core] += core_stage.gm_read_bytes
+        core_gm_write[core] += core_stage.gm_write_bytes
+        core_l2[core] += core_stage.l2_bytes
         core_gm_read[core] += kernel_stage.gm_read_bytes
         core_gm_write[core] += kernel_stage.gm_write_bytes
         core_l2[core] += kernel_stage.l2_bytes
@@ -779,20 +920,59 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
                 aggregate_resources.get(resource, 0.0) + cycles_value
             )
 
-    workspace_bytes = 0
+    workspace_bytes, workspace_traffic = _workspace_metrics(
+        operator,
+        algorithm,
+        plan,
+        hardware,
+        active_cores,
+        total_reduction_partitions,
+    )
+    if workspace_traffic.elapsed_cycles:
+        # Declared per-core payload already includes every core.  Convert its
+        # aggregate service to the critical per-core path while retaining the
+        # aggregate resource and bandwidth totals for shared roofs.
+        core_cycles[max(range(active_cores), key=core_cycles.__getitem__)] += (
+            workspace_traffic.elapsed_cycles / active_cores
+        )
+        gm_read += workspace_traffic.gm_read_bytes
+        gm_write += workspace_traffic.gm_write_bytes
+        l2_bytes += workspace_traffic.l2_bytes
+        for resource, cycles in workspace_traffic.resource_cycles.items():
+            aggregate_resources[resource] = (
+                aggregate_resources.get(resource, 0.0) + cycles
+            )
     reduction_cycles = 0.0
-    if total_reduction_partitions > 1:
+    protocol = algorithm.effective_reduction_protocol
+    if (
+        total_reduction_partitions > 1
+        and protocol in (
+            ReductionProtocol.SERIAL_WORKSPACE,
+            ReductionProtocol.PARALLEL_WORKSPACE,
+        )
+    ):
         if algorithm.result_tensor is None:
-            return _invalid("parallel reduction has no result tensor")
+            return _invalid("workspace reduction has no result tensor")
         result_tensor = operator.tensor(algorithm.result_tensor)
         output_elements = prod(operator.axis(axis).extent for axis in algorithm.output_axes)
         partial_bytes = output_elements * dtype_bytes(algorithm.partial_dtype)
-        workspace_bytes = partial_bytes * total_reduction_partitions
-        reduction_read = float(workspace_bytes)
+        workspace_multiplicity = (
+            total_reduction_partitions
+            if protocol == ReductionProtocol.PARALLEL_WORKSPACE
+            else 1
+        )
+        implicit_workspace_bytes = partial_bytes * workspace_multiplicity
+        if not algorithm.workspace_buffers:
+            workspace_bytes = implicit_workspace_bytes
+        reduction_read = float(implicit_workspace_bytes)
         reduction_write = float(result_tensor.elements * dtype_bytes(result_tensor.dtype))
         reduction_operations = (
             output_elements
-            * (total_reduction_partitions - 1)
+            * (
+                total_reduction_partitions - 1
+                if protocol == ReductionProtocol.PARALLEL_WORKSPACE
+                else 1
+            )
             * algorithm.reduction_operations_per_element
         )
         reduction_cores = min(
@@ -809,9 +989,10 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         )
         sync_rate = hardware.rate(Resource.SYNC).operations_per_cycle
         sync_cycles = (active_cores + reduction_cores) / max(1.0e-12, sync_rate)
-        reduction_cycles = (
-            hardware.kernel_launch_cycles + vector_cycles + sync_cycles
-        )
+        # CANN's mixed AIC/AIV kernels finalize the workspace inside the same
+        # launch.  Charge the synchronization and vector work, not a second
+        # host kernel launch.
+        reduction_cycles = vector_cycles + sync_cycles
         critical_index = max(range(active_cores), key=core_cycles.__getitem__)
         core_cycles[critical_index] += reduction_cycles
         gm_read += reduction_read

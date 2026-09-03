@@ -87,7 +87,7 @@ fi
 
 echo "CAMPAIGN_READY operator=matmul shapes=200 selected_tilings_per_shape=1 records=400 device=${PHYSICAL_DEVICE}"
 echo "comparison=official_matmul_v3,new_hardware_simulator"
-echo "search=all_ir_declared_execution_graphs,hardware_ideal_region,adjacent_transitions"
+echo "search=cann81_all_7_kernel_families,all_12_suffixes,hardware_ideal_region,adjacent_transitions"
 echo "logs=${LOG_DIR}"
 echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
@@ -135,11 +135,13 @@ import csv
 import sys
 from collections import Counter
 from pathlib import Path
+from npu_cost_model import CANN81_MATMUL_FAMILIES, CANN81_MATMUL_KERNEL_SUFFIXES
 
 if not all(Path(value).is_file() for value in sys.argv[1:]):
     raise SystemExit(1)
 workloads = list(csv.DictReader(open(sys.argv[1], newline="", encoding="utf-8")))
 candidates = list(csv.DictReader(open(sys.argv[2], newline="", encoding="utf-8")))
+all_candidates = list(csv.DictReader(open(sys.argv[3], newline="", encoding="utf-8")))
 searched = Counter(
     row["workload_id"] for row in candidates
     if row.get("candidate_role") == "searched"
@@ -155,6 +157,16 @@ if (
     or len(candidates) != 200
     or len(searched) != 200 or set(searched.values()) != {1}
     or len(hashes) != 200 or {len(value) for value in hashes.values()} != {1}
+    or not all_candidates
+    or {
+        row.get("model_kernel_family", "").lower()
+        for row in all_candidates
+    } != set(CANN81_MATMUL_FAMILIES)
+    or {
+        int(row["model_kernel_suffix"])
+        for row in all_candidates
+        if row.get("model_kernel_suffix", "").isdigit()
+    } != set(CANN81_MATMUL_KERNEL_SUFFIXES)
 ):
     raise SystemExit(1)
 PY

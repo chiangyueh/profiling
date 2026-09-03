@@ -10,7 +10,15 @@ from itertools import combinations, product
 from math import floor, gcd, prod
 
 from .hardware import Hardware
-from .ir import AccessMode, Axis, MemorySpace, Operator, dtype_bytes
+from .ir import (
+    AccessMode,
+    Axis,
+    MemorySpace,
+    Operator,
+    ReductionProtocol,
+    TileLevel,
+    dtype_bytes,
+)
 from .schedule import (
     RankedTiling,
     IdealRegion,
@@ -240,7 +248,7 @@ def _reduction_options(
     maximum = hardware.core_count(algorithm.core_resource)
     result: dict[str, tuple[int, ...]] = {}
     for axis_name in algorithm.reduction_axes:
-        if not algorithm.parallel_reduction:
+        if not algorithm.permits_reduction_partitioning:
             result[axis_name] = (1,)
             continue
         values = explicit.get(axis_name)
@@ -264,6 +272,12 @@ def _buffer_profiles(algorithm_spaces: tuple[MemorySpace, ...],
     for values in configured:
         if len(values) == 1:
             values = values * len(algorithm_spaces)
+        if len(values) < len(algorithm_spaces):
+            # A backend may add a non-pipelined scratch space (for example
+            # UB output conversion) to an otherwise identical graph.  Older
+            # callers that explicitly configure the common L1/L0 buffers do
+            # not need to repeat trailing single-buffer entries.
+            values = (*values, *((1,) * (len(algorithm_spaces) - len(values))))
         if len(values) != len(algorithm_spaces):
             raise ValueError("buffer option width must match algorithm buffered_spaces")
         if not policy.include_single_buffer and all(value == 1 for value in values):
@@ -644,9 +658,12 @@ def _output_task_count(operator: Operator, algorithm, plan: TilingPlan) -> int:
 
 
 def _total_task_count(operator: Operator, algorithm, plan: TilingPlan) -> int:
-    return _output_task_count(operator, algorithm, plan) * prod(
-        plan.reductions.get(axis, 1) for axis in algorithm.reduction_axes
+    reduction_tasks = (
+        prod(plan.reductions.get(axis, 1) for axis in algorithm.reduction_axes)
+        if algorithm.distributes_reduction_partitions
+        else 1
     )
+    return _output_task_count(operator, algorithm, plan) * reduction_tasks
 
 
 def _useful_core_values(
@@ -683,7 +700,7 @@ def _reduction_transition_values(
     """Reduction partitions around the core-fill transition."""
 
     algorithm = operator.algorithms[algorithm_index]
-    if not algorithm.parallel_reduction:
+    if not algorithm.permits_reduction_partitioning:
         return (1,)
     chunks = ceil_div(operator.axis(axis_name).extent, plan.tiles[axis_name])
     maximum = min(hardware.core_count(algorithm.core_resource), chunks)
@@ -739,6 +756,20 @@ def _reduction_fill_profile(
     """Distribute only the missing core parallelism over reduction axes."""
 
     algorithm = operator.algorithms[algorithm_index]
+    if (
+        algorithm.permits_reduction_partitioning
+        and not algorithm.distributes_reduction_partitions
+    ):
+        return tuple(
+            (
+                axis_name,
+                _reduction_transition_values(
+                    operator, algorithm_index, plan, hardware, space,
+                    axis_name,
+                )[-1],
+            )
+            for axis_name in algorithm.reduction_axes
+        )
     remaining = max(1, ceil_div(
         hardware.core_count(algorithm.core_resource),
         _output_task_count(operator, algorithm, plan),
@@ -833,20 +864,22 @@ def _scratchpad_terms(
         axis.name: (index, axis.extent)
         for index, axis in enumerate(operator.axes)
     }
-    allocations: dict[
-        tuple[str, MemorySpace],
-        list[tuple[tuple[tuple[int, int], ...], int]],
-    ] = {}
+    allocations: dict[tuple[str, MemorySpace], list[tuple[object, int]]] = {}
     for stage in algorithm.stages:
         for access in stage.accesses:
             tensor = operator.tensor(access.tensor)
             element_bytes = dtype_bytes(access.local_dtype or tensor.dtype)
+            residency = dict(access.residency)
             for memory in access.path:
                 if memory in (MemorySpace.GM, MemorySpace.L2):
                     continue
+                level = residency.get(memory, TileLevel.INNER)
                 allocations.setdefault((tensor.name, memory), []).append(
                     (
-                        tuple(axis_positions[axis] for axis in access.axes),
+                        tuple(
+                            (*axis_positions[axis], level)
+                            for axis in access.axes
+                        ),
                         element_bytes,
                     )
                 )
@@ -881,8 +914,17 @@ def _local_memory_pressure(
         byte_count = max(
             (
                 prod(
-                    min(extent, levels[index][0])
-                    for index, extent in axes
+                    min(
+                        extent,
+                        extent
+                        if level == TileLevel.KERNEL
+                        else levels[index][{
+                            TileLevel.INNER: 0,
+                            TileLevel.TASK: 1,
+                            TileLevel.CACHE: 2,
+                        }[level]],
+                    )
+                    for index, extent, level in axes
                 ) if axes else 1
             ) * element_bytes
             for axes, element_bytes in alternatives
@@ -890,7 +932,11 @@ def _local_memory_pressure(
         usage[memory] = usage.get(memory, 0) + (
             byte_count * buffer_counts.get(memory, 1)
         )
-    if prod(value for _, value in reductions) > 1:
+    if (
+        prod(value for _, value in reductions) > 1
+        and algorithm.effective_reduction_protocol
+        == ReductionProtocol.PARALLEL_WORKSPACE
+    ):
         output_elements = prod(levels[index][0] for index in output_indexes)
         usage[MemorySpace.UB] = usage.get(MemorySpace.UB, 0) + (
             2 * output_elements * dtype_bytes(algorithm.partial_dtype)
@@ -1434,7 +1480,7 @@ def _direct_hardware_anchors(
                 core_count, single_buffers, traversals[0],
             )
             reduction_profiles = [serial]
-            if algorithm.parallel_reduction:
+            if algorithm.permits_reduction_partitioning:
                 reduction_profiles.append(_reduction_fill_profile(
                     operator, algorithm_index, prototype, hardware, space
                 ))
@@ -1941,12 +1987,18 @@ def derive_ideal_region(
     for plan in region:
         algorithm_region_counts[plan.algorithm] += 1
     legal = len(region)
+    # ``region`` contains capacity-frontier plans that are admitted by the
+    # same closed-form capacity proof but intentionally are not simulated in
+    # ``evaluate`` until ranking.  They therefore need not be members of the
+    # evaluation cache.  Rejections are the invalid evaluations we actually
+    # observed, not ``len(cache) - len(region)`` (which can be negative).
+    rejected = sum(reasons.values())
     return IdealRegion(
         plans=tuple(region),
         anchors=tuple(anchors),
         evaluated=len(cache),
         legal=legal,
-        rejected=len(cache) - legal,
+        rejected=rejected,
         exhaustive=not stopped,
         rejection_reasons=tuple(sorted(reasons.items())),
         algorithm_anchor_counts=tuple(sorted(algorithm_anchor_counts.items())),

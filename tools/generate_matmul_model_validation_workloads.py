@@ -31,6 +31,39 @@ MODES = tuple(
     for trans_b in (0, 1)
 )
 
+# These are not single expected-answer shapes.  Each row marks a distinct
+# legal workload region whose CANN 8.1 dispatch has a different resident-set,
+# output, reduction, or ND2NZ route.  The solver still receives every graph
+# and chooses from parameters; the labels are coverage metadata only.
+FAMILY_STRESS_CASES = (
+    # AL1 full load: FP32 NT, skinny M, large resident K.
+    (4, 48, 4096, Mode("fp32", 0, 1), "cann81_al1_full_load"),
+    (8, 96, 6144, Mode("fp32", 0, 1), "cann81_al1_full_load"),
+    (12, 160, 7168, Mode("fp32", 0, 1), "cann81_al1_full_load"),
+    (16, 304, 7168, Mode("fp32", 0, 1), "cann81_al1_full_load"),
+    # BL1 full load: tall M and a complete small B resident set.
+    (8192, 64, 32, Mode("fp16", 0, 0), "cann81_bl1_full_load"),
+    (16384, 96, 64, Mode("bf16", 0, 0), "cann81_bl1_full_load"),
+    (32768, 128, 128, Mode("fp16", 0, 0), "cann81_bl1_full_load"),
+    (65536, 192, 256, Mode("fp16", 0, 0), "cann81_bl1_full_load"),
+    # BL1 + FixPipe: unaligned narrow output with FP16/BF16 conversion off.
+    (10240, 7, 16, Mode("fp16", 0, 0), "cann81_bl1_fixpipe"),
+    (12288, 17, 32, Mode("bf16", 0, 0), "cann81_bl1_fixpipe"),
+    (16384, 31, 64, Mode("fp16", 0, 0), "cann81_bl1_fixpipe"),
+    (20480, 47, 128, Mode("fp16", 0, 0), "cann81_bl1_fixpipe"),
+    # BL1 + vector NZ2ND: FP32 route selected from conversion state, not a
+    # transpose-name special case.
+    (10240, 9, 8, Mode("fp32", 0, 0), "cann81_bl1_vec_nz2nd"),
+    (12288, 17, 16, Mode("fp32", 0, 0), "cann81_bl1_vec_nz2nd"),
+    (16384, 31, 24, Mode("fp32", 0, 0), "cann81_bl1_vec_nz2nd"),
+    (20480, 47, 32, Mode("fp32", 0, 0), "cann81_bl1_vec_nz2nd"),
+    # Explicit mixed-ND2NZ routes cover suffixes 0/20/30/200/10200.
+    (257, 1009, 4097, Mode("fp16", 0, 0), "cann81_mixed_nd2nz"),
+    (128, 17, 16384, Mode("fp16", 0, 0), "cann81_splitk_mixed_nd2nz"),
+    (28672, 64, 17, Mode("fp16", 0, 0), "cann81_bl1_mixed_nd2nz"),
+    (24576, 17, 7, Mode("fp32", 0, 0), "cann81_fixpipe_mixed_nd2nz"),
+)
+
 PHYSICAL_AIC_CORES = 20
 M_VALUES = (
     96, 112, 128, 144, 160, 176, 192, 224, 256, 320, 384, 448,
@@ -104,6 +137,15 @@ def build_catalog() -> list[dict[str, str]]:
             len(rows), m, n, k, Mode("fp16", 0, 0),
             "colleague_anchor",
         ))
+
+    for m, n, k, mode, family in FAMILY_STRESS_CASES:
+        if not within_budget(m, n, k, mode.dtype):
+            raise RuntimeError(f"family stress shape exceeds budget: {m}x{n}x{k}")
+        signature = (m, n, k)
+        if signature in seen:
+            raise RuntimeError(f"duplicate family stress shape: {signature}")
+        seen.add(signature)
+        rows.append(_row(len(rows), m, n, k, mode, family))
 
     # Coprime strides traverse only reviewed boundary values.  There is no
     # random generation and no duplicate M,N,K triple hidden behind a dtype.

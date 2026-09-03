@@ -54,7 +54,81 @@ class AccessPattern(str, Enum):
 
 class StageScope(str, Enum):
     TASK = "task"
+    CORE = "core"
     KERNEL = "kernel"
+
+
+class TileLevel(str, Enum):
+    """Schedule level that determines a core-local allocation's extent."""
+
+    INNER = "inner"
+    TASK = "task"
+    CACHE = "cache"
+    KERNEL = "kernel"
+
+
+class ReductionProtocol(str, Enum):
+    """How independently tiled reduction chunks produce one result.
+
+    These are hardware dataflow semantics, not MatMul template names.  The
+    same protocols describe reductions in any operator IR.
+    """
+
+    DIRECT = "direct"
+    SERIAL_DIRECT = "serial_direct"
+    SERIAL_WORKSPACE = "serial_workspace"
+    PARALLEL_WORKSPACE = "parallel_workspace"
+    PARALLEL_ATOMIC = "parallel_atomic"
+
+
+@dataclass(frozen=True)
+class WorkspaceDimension:
+    """One schedule-derived dimension of a temporary GM allocation."""
+
+    axis: str
+    level: TileLevel = TileLevel.KERNEL
+    alignment: int = 1
+    # Some device ABIs reserve a complete padded task slot even when the
+    # logical tensor tail is smaller.  Keep clamping as the default for
+    # ordinary tensor-shaped scratch, and let the frontend state the padded
+    # allocation contract explicitly when the kernel requires it.
+    clamp_to_axis: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.axis:
+            raise ValueError("workspace axis must not be empty")
+        if self.alignment <= 0:
+            raise ValueError("workspace alignment must be positive")
+
+
+@dataclass(frozen=True)
+class WorkspaceBuffer:
+    """Generic temporary-storage and traffic contract.
+
+    It is deliberately expressed in schedule levels and memory routes.  A
+    frontend can describe reduction partials, layout-conversion scratch, or
+    vector post-processing without teaching the simulator an operator name.
+    """
+
+    dimensions: tuple[WorkspaceDimension, ...] = ()
+    dtype: str = "uint8"
+    copies: int = 1
+    per_active_core: bool = False
+    per_reduction_partition: bool = False
+    fixed_bytes: int = 0
+    producer_path: tuple[MemorySpace, ...] = ()
+    consumer_path: tuple[MemorySpace, ...] = ()
+
+    def __post_init__(self) -> None:
+        names = [dimension.axis for dimension in self.dimensions]
+        if len(names) != len(set(names)):
+            raise ValueError("workspace dimensions must be unique")
+        if self.copies <= 0 or self.fixed_bytes < 0:
+            raise ValueError("workspace copies/fixed bytes are invalid")
+        dtype_bytes(self.dtype)
+        for path in (self.producer_path, self.consumer_path):
+            if path and len(path) < 2:
+                raise ValueError("workspace memory path needs at least two spaces")
 
 
 DTYPE_BYTES = {
@@ -154,6 +228,11 @@ class Access:
     # for example, reads an FP32 accumulator and writes an FP16 result.
     service_bytes_per_element: int | None = None
     is_result: bool = False
+    # By default every local allocation is sized from the inner tile.  A
+    # declaration may instead keep a tensor resident for one task, L2 cache
+    # group, or the complete kernel.  The simulator consumes only this
+    # memory-level declaration and never an operator/template label.
+    residency: tuple[tuple[MemorySpace, TileLevel], ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.path) < 2:
@@ -172,6 +251,13 @@ class Access:
             dtype_bytes(self.local_dtype)
         if self.service_bytes_per_element is not None and self.service_bytes_per_element <= 0:
             raise ValueError("service_bytes_per_element must be positive")
+        residency_spaces = [space for space, _ in self.residency]
+        if len(residency_spaces) != len(set(residency_spaces)):
+            raise ValueError("access residency contains duplicate memory spaces")
+        if any(space not in self.path for space in residency_spaces):
+            raise ValueError("access residency refers to a space outside its path")
+        if any(space in (MemorySpace.GM, MemorySpace.L2) for space in residency_spaces):
+            raise ValueError("access residency is only for core-local memory")
 
 
 @dataclass(frozen=True)
@@ -223,6 +309,11 @@ class Algorithm:
     reduction_axes: tuple[str, ...] = ()
     core_resource: Resource = Resource.VECTOR
     parallel_reduction: bool = False
+    # ``None`` preserves the original IR contract: parallel_reduction=True
+    # means a workspace/tree finalization, otherwise a direct result.  New
+    # graphs declare the protocol explicitly so serial Split-K and atomic
+    # Split-K are not mistaken for deterministic workspace reduction.
+    reduction_protocol: ReductionProtocol | None = None
     result_tensor: str | None = None
     partial_dtype: str = "fp32"
     reduction_resource: Resource = Resource.VECTOR
@@ -233,6 +324,7 @@ class Algorithm:
     # adjacent task iterations only when all of its storage spaces are
     # double-buffered.  This is schedule dependency metadata, not a cost fit.
     pipeline_boundaries: tuple[tuple[MemorySpace, ...], ...] = ()
+    workspace_buffers: tuple[WorkspaceBuffer, ...] = ()
     # Metadata only.  The simulator never branches on this value.
     name: str = "algorithm"
 
@@ -263,6 +355,27 @@ class Algorithm:
             raise ValueError("reduction_operations_per_element must be non-negative")
         dtype_bytes(self.partial_dtype)
 
+    @property
+    def effective_reduction_protocol(self) -> ReductionProtocol:
+        if self.reduction_protocol is not None:
+            return self.reduction_protocol
+        return (
+            ReductionProtocol.PARALLEL_WORKSPACE
+            if self.parallel_reduction
+            else ReductionProtocol.DIRECT
+        )
+
+    @property
+    def permits_reduction_partitioning(self) -> bool:
+        return self.effective_reduction_protocol != ReductionProtocol.DIRECT
+
+    @property
+    def distributes_reduction_partitions(self) -> bool:
+        return self.effective_reduction_protocol in (
+            ReductionProtocol.PARALLEL_WORKSPACE,
+            ReductionProtocol.PARALLEL_ATOMIC,
+        )
+
 
 @dataclass(frozen=True)
 class Operator:
@@ -290,6 +403,9 @@ class Operator:
                 raise ValueError("algorithm references an unknown output/reduction axis")
             if algorithm.result_tensor is not None and algorithm.result_tensor not in tensors:
                 raise ValueError("algorithm result_tensor is unknown")
+            for workspace in algorithm.workspace_buffers:
+                if not {item.axis for item in workspace.dimensions} <= axes:
+                    raise ValueError("workspace references an unknown iteration axis")
             for stage in algorithm.stages:
                 for access in stage.accesses:
                     if access.tensor not in tensors:

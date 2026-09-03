@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum
+from functools import lru_cache
 
 from .hardware import Hardware
 from .ir import MemorySpace, Resource, dtype_bytes
@@ -36,6 +37,32 @@ CANN81_MATMUL_KERNEL_SUFFIXES = (
 _ND2NZ_ON_THE_WAY_BYTES = frozenset(
     (32, 64, 96, 128, 160, 192, 224, 256, 384)
 )
+
+
+@lru_cache(maxsize=256)
+def _matmul_operator(
+    m: int,
+    n: int,
+    k: int,
+    dtype: str,
+    trans_a: bool,
+    trans_b: bool,
+    a_layout: str,
+    b_layout: str,
+    output_dtype: str | None,
+    has_bias: bool,
+):
+    """Reuse the immutable IR graph across ABI lowering and validation."""
+
+    return matmul(
+        m, n, k, dtype,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        a_layout=a_layout,
+        b_layout=b_layout,
+        output_dtype=output_dtype,
+        has_bias=has_bias,
+    )
 
 
 class SplitCoreMode(IntEnum):
@@ -286,14 +313,9 @@ def validate_cann_tiling(
 
     available_graphs = {
         algorithm.name
-        for algorithm in matmul(
+        for algorithm in _matmul_operator(
             m, n, k, dtype,
-            trans_a=trans_a,
-            trans_b=trans_b,
-            a_layout=a_layout,
-            b_layout=b_layout,
-            output_dtype=output_dtype,
-            has_bias=has_bias,
+            trans_a, trans_b, a_layout, b_layout, output_dtype, has_bias,
         ).algorithms
     }
     if graph.name not in available_graphs:
@@ -439,6 +461,16 @@ def validate_cann_tiling(
             or used > k_chunks
         ):
             reasons.append("DETERMINISTIC_SPLIT_K_3X3_CONTRACT")
+        # Every deterministic partial is allocated with a
+        # singleCoreM*singleCoreN stride.  The C220 reducer and MatMul API
+        # round the final N block to 256 bytes in FP32 workspace.  If that
+        # rounded tail is wider than the allocated N stride, one ping-pong
+        # slot overwrites the next (the 512x160x49152 BF16 device failure
+        # starts exactly at the first affected row).  This is a workspace
+        # address bound, not a profitability threshold.
+        n_tail = n - (ceil_div(n, single_n) - 1) * single_n
+        if align_up(n_tail, 256 // dtype_bytes("fp32")) > single_n:
+            reasons.append("DETERMINISTIC_SPLIT_K_N_TAIL_WORKSPACE_OVERFLOW")
 
     if full == FullLoadMode.AL1_FULL_LOAD:
         if not (
@@ -609,6 +641,84 @@ def _packet_depths(
     return None
 
 
+def _update_l1_step_k(
+    step_k: int,
+    base_k: int,
+    k: int,
+    input_bytes: int,
+) -> int:
+    """Apply the C220 DMA packet alignment rule to one K step."""
+
+    if step_k <= 0 or step_k * base_k >= k:
+        return step_k
+    packet_bytes = step_k * base_k * input_bytes
+    quantum = 512 if packet_bytes > 512 else 256 if packet_bytes > 256 else 0
+    base_bytes = base_k * input_bytes
+    if (
+        quantum
+        and packet_bytes % quantum
+        and quantum % base_bytes == 0
+    ):
+        while step_k > 1 and step_k * base_bytes % quantum:
+            step_k -= 1
+    return step_k
+
+
+def _base_l1_packet_depths(
+    base_m: int,
+    base_n: int,
+    base_k: int,
+    k: int,
+    input_bytes: int,
+    l1_capacity: int,
+    has_bias: bool,
+) -> tuple[int, int, int, int] | None:
+    """Reproduce CANN 8.1 ``CalL1Tiling`` from physical capacities.
+
+    The returned values are ``depthA1, depthB1, stepKa, stepKb``.  They are
+    derived from L1 size and transfer alignment only; no callback, latency
+    table, measured result, or shape-specific constant participates.
+    """
+
+    l1_capacity = int(l1_capacity)
+    half = 2
+    double_buffer = 2
+    bias_bytes = 256 * 4 if has_bias else 0
+    depth_a = l1_capacity // half // base_m // base_k // input_bytes
+    depth_b = l1_capacity // half // base_n // base_k // input_bytes
+    if depth_a <= 0 or depth_b <= 0:
+        return None
+    size_a = depth_a * base_m * base_k * input_bytes
+    size_b = depth_b * base_n * base_k * input_bytes
+    if size_a + size_b > l1_capacity - bias_bytes:
+        if base_m <= base_n:
+            depth_a //= half
+        else:
+            depth_b //= half
+    step_ka = _update_l1_step_k(
+        depth_a // double_buffer, base_k, k, input_bytes
+    )
+    step_kb = _update_l1_step_k(
+        depth_b // double_buffer, base_k, k, input_bytes
+    )
+    if step_ka <= 0 or step_kb <= 0:
+        return None
+    if step_ka >= step_kb:
+        step_ka = step_ka // step_kb * step_kb
+    else:
+        step_kb = step_kb // step_ka * step_ka
+    depth_a = step_ka * double_buffer
+    depth_b = step_kb * double_buffer
+    if (
+        depth_a * base_m * base_k * input_bytes
+        + depth_b * base_n * base_k * input_bytes
+        + bias_bytes
+        > l1_capacity
+    ):
+        return None
+    return depth_a, depth_b, step_ka, step_kb
+
+
 def lower_plan_to_cann(
     m: int,
     n: int,
@@ -632,14 +742,9 @@ def lower_plan_to_cann(
     shape-dependent sizes and core count come from ``plan``.
     """
 
-    operator = matmul(
+    operator = _matmul_operator(
         m, n, k, dtype,
-        trans_a=trans_a,
-        trans_b=trans_b,
-        a_layout=a_layout,
-        b_layout=b_layout,
-        output_dtype=output_dtype,
-        has_bias=has_bias,
+        trans_a, trans_b, a_layout, b_layout, output_dtype, has_bias,
     )
     if not 0 <= plan.algorithm < len(operator.algorithms):
         raise ValueError("plan algorithm is outside the MatMul execution graph set")
@@ -843,22 +948,13 @@ def lower_plan_to_cann(
         single_m = min(m, base_m)
         single_n = min(n, base_n)
         step_m = step_n = 1
-        depths = _packet_depths(
-            base_m, base_n, base_k, step_m, step_n, 1, 1,
-            input_bytes, l1_capacity, prefer_double,
+        depths = _base_l1_packet_depths(
+            base_m, base_n, base_k, k, input_bytes, l1_capacity,
+            has_bias,
         )
         if depths is None:
-            # Reduce the task region, preserving the inner Cube geometry.
-            single_m = min(m, base_m)
-            single_n = min(n, base_n)
-            step_m = step_n = 1
-            depths = _packet_depths(
-                base_m, base_n, base_k, 1, 1, 1, 1,
-                input_bytes, l1_capacity, False,
-            )
-        if depths is None:
             raise ValueError("direct graph L1 packet does not fit")
-        depth_a, depth_b = depths
+        depth_a, depth_b, step_ka, step_kb = depths
 
     output_tasks = ceil_div(m, single_m) * ceil_div(n, single_n)
     k_chunks = ceil_div(k, single_k)
@@ -944,14 +1040,9 @@ def plan_from_cann(
         knowledge,
         aligned=(m % 16 == 0 and n % 16 == 0 and k % base_k == 0),
     )
-    operator = matmul(
+    operator = _matmul_operator(
         m, n, k, dtype,
-        trans_a=trans_a,
-        trans_b=trans_b,
-        a_layout=a_layout,
-        b_layout=b_layout,
-        output_dtype=output_dtype,
-        has_bias=has_bias,
+        trans_a, trans_b, a_layout, b_layout, output_dtype, has_bias,
     )
     names = {algorithm.name: index for index, algorithm in enumerate(operator.algorithms)}
     if graph.name not in names:
@@ -975,10 +1066,41 @@ def plan_from_cann(
         _integer(knowledge, "stepN") * _integer(knowledge, "stepKb")
     )
     l1_buffers = 2 if min(a_packets, b_packets) >= 2 else 1
+    step_m = _integer(knowledge, "stepM")
+    step_n = _integer(knowledge, "stepN")
+    step_ka = _integer(knowledge, "stepKa")
+    step_kb = _integer(knowledge, "stepKb")
+    invocation_tiles = ()
+    if graph.split == SplitCoreMode.SINGLE_CORE_SPLIT_K:
+        invocation_tiles = (
+            ("m", _integer(knowledge, "stepM") * base_m),
+            ("n", _integer(knowledge, "stepN") * base_n),
+            ("k", single_k),
+        )
+    transfer_tiles = (
+        (
+            "A", MemorySpace.GM, MemorySpace.L1, "m",
+            min(single_m, step_m * base_m),
+        ),
+        (
+            "A", MemorySpace.GM, MemorySpace.L1, "k",
+            min(single_k, step_ka * base_k),
+        ),
+        (
+            "B", MemorySpace.GM, MemorySpace.L1, "n",
+            min(single_n, step_n * base_n),
+        ),
+        (
+            "B", MemorySpace.GM, MemorySpace.L1, "k",
+            min(single_k, step_kb * base_k),
+        ),
+    )
     return TilingPlan(
         algorithm=names[graph.name],
         axis_tiles=(("m", base_m), ("n", base_n), ("k", base_k)),
         task_tiles=(("m", single_m), ("n", single_n), ("k", single_k)),
+        invocation_tiles=invocation_tiles,
+        transfer_tiles=transfer_tiles,
         cache_tiles=(
             ("m", max(min(single_m, m), min(max(single_m, l2_m), m))),
             ("n", max(min(single_n, n), min(max(single_n, l2_n), n))),
@@ -1024,7 +1146,9 @@ def simulate_cann_base(
         dtype=dtype, trans_a=trans_a, trans_b=trans_b,
     )
     return simulate(
-        matmul(m, n, k, dtype, trans_a=trans_a, trans_b=trans_b),
+        _matmul_operator(
+            m, n, k, dtype, trans_a, trans_b, "ND", "ND", None, False
+        ),
         plan,
         hardware,
     )

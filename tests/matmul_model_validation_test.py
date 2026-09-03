@@ -302,6 +302,59 @@ def test_old_model_does_not_cancel_splitk_parallelism_with_base_l2_penalty() -> 
     assert twenty_core.cycles < four_core.cycles
 
 
+def test_single_core_splitk_replays_each_device_side_iterate_region() -> None:
+    knowledge = dict(zip(old.KNOWLEDGE_FIELDS, (
+        20, 1024, 720, 1024, 16, 16, 1024, 3, 3, 3, 3, 0,
+        1, 1, 1, 1, 1, 1, 2, 10, 1, 2, 2,
+    )))
+    operator = candidates.matmul(2048, 7168, 2048, "fp16")
+    hardware = candidates.generic_hardware(HARDWARE)
+    plan = plan_from_cann(2048, 7168, 2048, knowledge)
+    modeled = simulate(operator, plan, hardware)
+    collapsed = simulate(
+        operator, replace(plan, invocation_tiles=()), hardware
+    )
+    assert modeled.valid and collapsed.valid
+    assert plan.invocations == {"m": 48, "n": 48, "k": 1024}
+    # The source kernel performs 22*15*2 serial IterateAll calls for each
+    # full task.  Treating them as one call invents reuse that does not exist.
+    assert modeled.gm_read_bytes > collapsed.gm_read_bytes
+    assert modeled.total_cycles > collapsed.total_cycles
+
+
+def test_deterministic_splitk_rejects_fp32_workspace_tail_overflow() -> None:
+    knowledge = dict(zip(old.KNOWLEDGE_FIELDS, (
+        20, 384, 160, 384, 128, 128, 128, 9, 6, 3, 1, 0,
+        3, 3, 2, 2, 1, 1, 1, 2, 1, 1, 3,
+    )))
+    reasons = validate_cann_tiling(
+        512, 160, 49152, "bf16", False, False, knowledge,
+        candidates.generic_hardware(HARDWARE),
+    )
+    assert reasons == (
+        "DETERMINISTIC_SPLIT_K_N_TAIL_WORKSPACE_OVERFLOW",
+    )
+
+
+def test_base_l1_packets_follow_cann81_capacity_equations() -> None:
+    plan = TilingPlan(
+        algorithm=0,
+        axis_tiles=(("m", 128), ("n", 256), ("k", 64)),
+        task_tiles=(("m", 128), ("n", 256), ("k", 7168)),
+        cache_tiles=(("m", 2048), ("n", 1536), ("k", 7168)),
+        used_cores=20,
+        traversal=("m", "n"),
+    )
+    knowledge = lower_plan_to_cann(
+        2048, 1536, 7168, "fp16", False, False, plan,
+        candidates.generic_hardware(HARDWARE),
+    )
+    assert (
+        knowledge["depthA1"], knowledge["depthB1"],
+        knowledge["stepKa"], knowledge["stepKb"],
+    ) == (16, 8, 8, 4)
+
+
 def test_matmul_generation_has_no_fixed_base_or_splitk_quota() -> None:
     source = Path(candidates.__file__).read_text(encoding="utf-8")
     assert "GEOMETRY_LIMIT" not in source

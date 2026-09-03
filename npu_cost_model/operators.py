@@ -205,6 +205,8 @@ def matmul(
         atomic: bool = False,
         vector_output: bool = False,
         workspace_alignment: int = 1,
+        invocation_axes: tuple[str, ...] = (),
+        repeated_atomic_axis: str | None = None,
     ) -> tuple[Stage, ...]:
         if vector_output:
             return (
@@ -219,6 +221,7 @@ def matmul(
                         local_dtype="fp32",
                         service_bytes_per_element=4 + dtype_bytes(out_dtype),
                     ),),
+                    invocation_axes=invocation_axes,
                 ),
                 Stage(
                     "vector_layout_and_cast",
@@ -243,18 +246,27 @@ def matmul(
                         issue_elements=max(1, 256 // (8 * dtype_bytes(out_dtype))),
                         dtype=out_dtype,
                     ),),
+                    invocation_axes=invocation_axes,
                 ),
             )
         return (Stage(
             "write_result",
             accesses=(Access(
                 "C", ("m", "n"),
-                AccessMode.ATOMIC_ADD if atomic else AccessMode.WRITE,
+                AccessMode.ATOMIC_ADD
+                if atomic or repeated_atomic_axis is not None
+                else AccessMode.WRITE,
                 (MemorySpace.L0C, MemorySpace.GM),
                 local_dtype="fp32",
                 service_bytes_per_element=4 + dtype_bytes(out_dtype),
                 is_result=True,
+                first_iteration_mode=(
+                    AccessMode.WRITE
+                    if repeated_atomic_axis is not None else None
+                ),
+                mode_switch_axis=repeated_atomic_axis,
             ),),
+            invocation_axes=invocation_axes,
         ),)
 
     def graph(
@@ -268,8 +280,14 @@ def matmul(
         workspace_alignment: int = 1,
         atomic: bool = False,
         workspace_buffers: tuple[WorkspaceBuffer, ...] = (),
+        coupled_task_axes: tuple[str, ...] = (),
     ) -> Algorithm:
         conversion = conversions[name]
+        serial_reduction = protocol in (
+            ReductionProtocol.SERIAL_DIRECT,
+            ReductionProtocol.SERIAL_WORKSPACE,
+        )
+        invocation_axes = ("m", "n", "k") if serial_reduction else ()
         stages: list[Stage] = list(conversion_stages(conversion))
         if atomic:
             stages.append(Stage(
@@ -319,11 +337,13 @@ def matmul(
                                dependency_axes=("k",)),
                     ),
                     concurrent=True,
+                    invocation_axes=invocation_axes,
                 ),
                 Stage(
                     "stage_l1_to_l0",
                     accesses=input_accesses(l1_only=True),
                     concurrent=True,
+                    invocation_axes=invocation_axes,
                 ),
             ))
         else:
@@ -334,6 +354,7 @@ def matmul(
                     resident_b=resident_b,
                 ),
                 concurrent=True,
+                invocation_axes=invocation_axes,
             ))
         stages.append(Stage(
             "matrix_multiply_accumulate",
@@ -344,12 +365,16 @@ def matmul(
                 issue_elements=16 * 16 * k0,
                 dtype=dtype,
                 padded_axes=("m", "n", "k"),
+                command_axes=("m", "n", "k"),
             ),),
+            invocation_axes=invocation_axes,
         ))
         stages.extend(output_stages(
             atomic=atomic,
             vector_output=vector_output,
             workspace_alignment=workspace_alignment,
+            invocation_axes=invocation_axes,
+            repeated_atomic_axis="k" if serial_reduction else None,
         ))
         buffered = [MemorySpace.L1, MemorySpace.L0A,
                     MemorySpace.L0B, MemorySpace.L0C]
@@ -375,6 +400,7 @@ def matmul(
             buffered_spaces=tuple(buffered),
             pipeline_boundaries=((MemorySpace.L0A, MemorySpace.L0B),),
             workspace_buffers=workspace_buffers,
+            coupled_task_axes=coupled_task_axes,
             name=name,
         )
 
@@ -460,8 +486,11 @@ def matmul(
     # are layout-conversion variants of the same dataflow and are selected at
     # the ABI boundary, not separate cost functions.
     algorithms: list[Algorithm] = [
-        graph("base", ReductionProtocol.DIRECT,
-              workspace_buffers=common_workspace),
+        graph(
+            "base", ReductionProtocol.DIRECT,
+            workspace_buffers=common_workspace,
+            coupled_task_axes=("m", "n"),
+        ),
         graph(
               "single_core_split_k",
               ReductionProtocol.SERIAL_DIRECT if out_dtype == "fp32" else ReductionProtocol.SERIAL_WORKSPACE,

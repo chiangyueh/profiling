@@ -20,6 +20,20 @@ class TilingPlan:
     axis_tiles: tuple[tuple[str, int], ...]
     used_cores: int
     task_tiles: tuple[tuple[str, int], ...] = ()
+    # Region processed by one device-side primitive invocation.  This level
+    # sits between the resident inner tile and the schedulable per-core task:
+    # one task may call the same primitive repeatedly over several such
+    # regions.  It is needed for kernels that serialize a reduction inside a
+    # core instead of exposing every reduction chunk as an independent task.
+    invocation_tiles: tuple[tuple[str, int], ...] = ()
+    # Per-transfer packet geometry.  Inner tiles describe primitive
+    # residency, while a DMA can submit several adjacent inner tiles as one
+    # L1 packet.  Keys are (tensor, source, destination, axis); keeping the
+    # route in the key lets GM->L1 packetization differ from L1->L0 without
+    # any operator-specific simulator branch.
+    transfer_tiles: tuple[
+        tuple[str, MemorySpace, MemorySpace, str, int], ...
+    ] = ()
     cache_tiles: tuple[tuple[str, int], ...] = ()
     reduction_parts: tuple[tuple[str, int], ...] = ()
     buffers: tuple[tuple[MemorySpace, int], ...] = ()
@@ -28,6 +42,8 @@ class TilingPlan:
     def __post_init__(self) -> None:
         tile_names = [name for name, _ in self.axis_tiles]
         task_tile_names = [name for name, _ in self.task_tiles]
+        invocation_tile_names = [name for name, _ in self.invocation_tiles]
+        transfer_tile_keys = [item[:4] for item in self.transfer_tiles]
         cache_tile_names = [name for name, _ in self.cache_tiles]
         reduction_names = [name for name, _ in self.reduction_parts]
         buffer_names = [space for space, _ in self.buffers]
@@ -39,6 +55,10 @@ class TilingPlan:
             raise ValueError("axis_tiles contains duplicate axes")
         if len(task_tile_names) != len(set(task_tile_names)):
             raise ValueError("task_tiles contains duplicate axes")
+        if len(invocation_tile_names) != len(set(invocation_tile_names)):
+            raise ValueError("invocation_tiles contains duplicate axes")
+        if len(transfer_tile_keys) != len(set(transfer_tile_keys)):
+            raise ValueError("transfer_tiles contains duplicate route/axis keys")
         if len(cache_tile_names) != len(set(cache_tile_names)):
             raise ValueError("cache_tiles contains duplicate axes")
         if len(reduction_names) != len(set(reduction_names)):
@@ -49,6 +69,10 @@ class TilingPlan:
             raise ValueError("tile sizes must be positive")
         if any(value <= 0 for _, value in self.task_tiles):
             raise ValueError("task tile sizes must be positive")
+        if any(value <= 0 for _, value in self.invocation_tiles):
+            raise ValueError("invocation tile sizes must be positive")
+        if any(value <= 0 for *_, value in self.transfer_tiles):
+            raise ValueError("transfer tile sizes must be positive")
         if any(value <= 0 for _, value in self.cache_tiles):
             raise ValueError("cache tile sizes must be positive")
         if any(value <= 0 for _, value in self.reduction_parts):
@@ -69,6 +93,10 @@ class TilingPlan:
         return dict(self.task_tiles) or self.tiles
 
     @property
+    def invocations(self) -> dict[str, int]:
+        return dict(self.invocation_tiles) or self.tasks
+
+    @property
     def caches(self) -> dict[str, int]:
         return dict(self.cache_tiles) or self.tasks
 
@@ -76,11 +104,40 @@ class TilingPlan:
     def buffer_counts(self) -> dict[MemorySpace, int]:
         return dict(self.buffers)
 
+    def transfer_tile_map(
+        self,
+        tensor: str,
+        source: MemorySpace,
+        destination: MemorySpace,
+    ) -> dict[str, int]:
+        return {
+            axis: value
+            for item_tensor, item_source, item_destination, axis, value
+            in self.transfer_tiles
+            if (
+                item_tensor == tensor
+                and item_source == source
+                and item_destination == destination
+            )
+        }
+
     def as_dict(self) -> dict[str, object]:
         return {
             "algorithm": self.algorithm,
             "axis_tiles": dict(self.axis_tiles),
             "task_tiles": self.tasks,
+            "invocation_tiles": self.invocations,
+            "transfer_tiles": [
+                {
+                    "tensor": tensor,
+                    "source": source.value,
+                    "destination": destination.value,
+                    "axis": axis,
+                    "tile": value,
+                }
+                for tensor, source, destination, axis, value
+                in self.transfer_tiles
+            ],
             "cache_tiles": self.caches,
             "used_cores": self.used_cores,
             "reduction_parts": dict(self.reduction_parts),

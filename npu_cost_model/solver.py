@@ -163,7 +163,10 @@ def _algorithm_tile_levels(
     preserve_declared: bool = False,
 ) -> tuple[tuple[tuple[int, int, int], ...], ...]:
     algorithm = operator.algorithms[algorithm_index]
-    unknown_coupled = set(space.coupled_task_axes) - {
+    coupled_task_axes = (
+        set(space.coupled_task_axes) | set(algorithm.coupled_task_axes)
+    )
+    unknown_coupled = coupled_task_axes - {
         axis.name for axis in operator.axes
     }
     if unknown_coupled:
@@ -187,7 +190,7 @@ def _algorithm_tile_levels(
         explicit_cache = explicit_caches.get(axis.name)
         levels: list[tuple[int, int, int]] = []
         for inner in inner_options[axis.name]:
-            if axis.name in space.coupled_task_axes:
+            if axis.name in coupled_task_axes:
                 tasks = (inner,)
             elif explicit is not None:
                 tasks = tuple(sorted(set(
@@ -820,6 +823,8 @@ def _replace_plan(plan: TilingPlan, **changes) -> TilingPlan:
         "algorithm": plan.algorithm,
         "axis_tiles": plan.axis_tiles,
         "task_tiles": plan.task_tiles,
+        "invocation_tiles": plan.invocation_tiles,
+        "transfer_tiles": plan.transfer_tiles,
         "cache_tiles": plan.cache_tiles,
         "used_cores": plan.used_cores,
         "reduction_parts": plan.reduction_parts,
@@ -1425,11 +1430,27 @@ def _direct_hardware_anchors(
         min(levels) if axis.name in output_axes else max(levels)
         for axis, levels in zip(operator.axes, levels_by_axis)
     )
-    target_geometries = (
+    # A coupled scratchpad has several genuine capacity-frontier directions.
+    # For example, maximizing the reduction extent first can consume both
+    # input buffers and force the two output extents to their minima, whereas
+    # maximizing the output extents first reaches the L0C boundary with a
+    # streaming reduction tile.  Neither direction dominates the other from
+    # capacities alone.  Preserve every coordinate-extreme direction and let
+    # the simulator rank their finite adjacent neighbourhoods.  This is
+    # exponential only in IR rank (three for a contraction), not in the
+    # number of legal tile values.
+    coordinate_extremes = tuple(
+        tuple(
+            max(levels) if mask & (1 << axis_index) else min(levels)
+            for axis_index, levels in enumerate(levels_by_axis)
+        )
+        for mask in range(1, 1 << len(levels_by_axis))
+    )
+    target_geometries = tuple(dict.fromkeys((
         issue_geometry,
         tuple(parallel),
-        tuple(max(levels) for levels in levels_by_axis),
-    )
+        *coordinate_extremes,
+    )))
     # A fully double-buffered profile is not automatically the capacity
     # optimum: doubling an output buffer can halve a Cube tile.  Select the
     # non-serial boundary profile that retains the largest legal inner volume,
@@ -1461,7 +1482,9 @@ def _direct_hardware_anchors(
         for fit_buffers in anchor_buffers
     ))
     result: list[TilingPlan] = []
-    coupled_task_axes = frozenset(space.coupled_task_axes)
+    coupled_task_axes = frozenset(
+        set(space.coupled_task_axes) | set(algorithm.coupled_task_axes)
+    )
     for geometry in inner_geometries:
         part_profiles = (
             (),
@@ -1621,9 +1644,29 @@ def _plan_hardware_metrics(
             transfer_bytes += (
                 points * element_bytes * max(1, len(access.path) - 1)
             )
-    reduction_tile_waves = prod(
-        ceil_div(operator.axis(axis).extent, plan.tiles[axis])
-        for axis in algorithm.reduction_axes
+    # Primitive issue work depends on every tiled axis, not just reduction
+    # depth.  Counting K waves alone incorrectly declares a 16x16xK Cube
+    # tile superior to a much wider MxN tile that streams K, even when the
+    # latter submits fewer MMAD invocations overall.  The IR already states
+    # each primitive's axes, so this remains operator-independent.
+    primitive_issue_waves = sum(
+        prod(
+            ceil_div(operator.axis(axis).extent, plan.tiles[axis])
+            for axis in primitive.axes
+        )
+        for stage in algorithm.stages
+        for primitive in stage.primitives
+    )
+    padded_primitive_points = sum(
+        prod(
+            ceil_div(operator.axis(axis).extent, plan.tiles[axis])
+            * plan.tiles[axis]
+            if axis in primitive.padded_axes
+            else operator.axis(axis).extent
+            for axis in primitive.axes
+        )
+        for stage in algorithm.stages
+        for primitive in stage.primitives
     )
     boundaries = algorithm.pipeline_boundaries or tuple(
         (memory,) for memory in algorithm.buffered_spaces
@@ -1637,7 +1680,8 @@ def _plan_hardware_metrics(
         wave,
         -active_cores,
         transfer_bytes,
-        reduction_tile_waves,
+        primitive_issue_waves,
+        padded_primitive_points,
         -overlap_boundaries,
     )
 
@@ -1703,19 +1747,26 @@ def _capacity_frontier_plans(
     """Enumerate pairwise scratchpad-capacity boundaries around an anchor.
 
     A one-axis neighbour cannot represent the common tradeoff where one
-    output tile shrinks while another grows to keep L0C full.  For every pair
-    of output axes, sweep the declared levels of one axis and select the
-    largest feasible level of the other.  Scratchpad pressure is monotone, so
-    a binary search finds the complete boundary without a Cartesian search or
-    a hand-picked distance/percentage limit.
+    tile shrinks while another grows to keep a local memory full.  For every
+    pair of primitive axes, sweep the declared levels of one axis and select
+    the largest feasible level of the other.  This includes output/output
+    tradeoffs at L0C and output/reduction tradeoffs at L0A/L0B.  Scratchpad
+    pressure is monotone, so a binary search finds the complete boundary
+    without a Cartesian search or a hand-picked distance/percentage limit.
     """
 
     algorithm = operator.algorithms[plan.algorithm]
-    output_indexes = tuple(
+    primitive_axes = {
+        axis
+        for stage in algorithm.stages
+        for primitive in stage.primitives
+        for axis in primitive.axes
+    }
+    tiled_indexes = tuple(
         index for index, axis in enumerate(operator.axes)
-        if axis.name in algorithm.output_axes
+        if axis.name in primitive_axes
     )
-    if len(output_indexes) < 2:
+    if len(tiled_indexes) < 2:
         return ()
     axis_names = tuple(axis.name for axis in operator.axes)
     scratchpad_terms = _scratchpad_terms(operator, algorithm)
@@ -1726,9 +1777,23 @@ def _capacity_frontier_plans(
         (plan.tiles[name], plan.tasks[name], plan.caches[name])
         for name in axis_names
     )
-    coupled = frozenset(space.coupled_task_axes)
+    coupled = frozenset(
+        set(space.coupled_task_axes) | set(algorithm.coupled_task_axes)
+    )
+    representative_cache: dict[
+        tuple[int, tuple[tuple[int, int, int], ...]],
+        tuple[tuple[int, int, int], ...],
+    ] = {}
+    pressure_cache: dict[tuple[tuple[int, int, int], ...], bool] = {}
+    plan_cache: dict[tuple[tuple[int, int, int], ...], TilingPlan] = {}
 
-    def representatives(axis_index: int) -> tuple[tuple[int, int, int], ...]:
+    def representatives(
+        axis_index: int,
+        reference: tuple[tuple[int, int, int], ...] = current,
+    ) -> tuple[tuple[int, int, int], ...]:
+        cache_key = (axis_index, reference)
+        if cache_key in representative_cache:
+            return representative_cache[cache_key]
         axis = operator.axes[axis_index]
         options = levels_by_axis[axis_index]
         inners = sorted(set(level[0] for level in options))
@@ -1736,14 +1801,45 @@ def _capacity_frontier_plans(
         for inner in inners:
             task = (
                 inner if axis.name in coupled
-                else max(inner, current[axis_index][1])
+                else max(inner, reference[axis_index][1])
             )
-            cache = max(task, current[axis_index][2])
+            cache = max(task, reference[axis_index][2])
             result.append(_level_for_targets(options, inner, task, cache))
-        return tuple(dict.fromkeys(result))
+        value = tuple(dict.fromkeys(result))
+        representative_cache[cache_key] = value
+        return value
+
+    def fits(levels: tuple[tuple[int, int, int], ...]) -> bool:
+        if levels not in pressure_cache:
+            pressure_cache[levels] = _local_memory_pressure(
+                operator, algorithm, axis_names, levels,
+                plan.buffers, plan.reduction_parts, hardware,
+                scratchpad_terms,
+            ) <= 1.0
+        return pressure_cache[levels]
+
+    def make_plan(
+        levels: tuple[tuple[int, int, int], ...],
+    ) -> TilingPlan:
+        if levels in plan_cache:
+            return plan_cache[levels]
+        candidate = _plan_from_levels(
+            plan.algorithm, axis_names, levels,
+            plan.reduction_parts, plan.used_cores, plan.buffers,
+            plan.traversal,
+        )
+        value = _replace_plan(
+            candidate,
+            used_cores=_useful_core_values(
+                _total_task_count(operator, algorithm, candidate),
+                core_allowed,
+            )[-1],
+        )
+        plan_cache[levels] = value
+        return value
 
     result: list[TilingPlan] = []
-    for left_index, right_index in combinations(output_indexes, 2):
+    for left_index, right_index in combinations(tiled_indexes, 2):
         left_levels = representatives(left_index)
         right_levels = representatives(right_index)
         for left in left_levels:
@@ -1755,11 +1851,7 @@ def _capacity_frontier_plans(
                 levels = list(current)
                 levels[left_index] = left
                 levels[right_index] = right_levels[middle]
-                if _local_memory_pressure(
-                    operator, algorithm, axis_names, tuple(levels),
-                    plan.buffers, plan.reduction_parts, hardware,
-                    scratchpad_terms,
-                ) <= 1.0:
+                if fits(tuple(levels)):
                     best = right_levels[middle]
                     low = middle + 1
                 else:
@@ -1769,18 +1861,82 @@ def _capacity_frontier_plans(
             levels = list(current)
             levels[left_index] = left
             levels[right_index] = best
-            candidate = _plan_from_levels(
-                plan.algorithm, axis_names, tuple(levels),
-                plan.reduction_parts, plan.used_cores, plan.buffers,
-                plan.traversal,
+            result.append(make_plan(tuple(levels)))
+
+    # Capacity alone misses an important architectural tradeoff: a larger
+    # output tile can use fewer core waves while a smaller exact divisor can
+    # execute less padded work.  Enumerate only each output-axis pair (never
+    # the full rank-wide tile Cartesian product) and preserve its hardware
+    # Pareto frontier.  This is derived from core count, axis extents and
+    # primitive padding, with no measured or shape-specific threshold.
+    output_indexes = tuple(
+        index for index, axis in enumerate(operator.axes)
+        if (
+            axis.name in algorithm.output_axes
+            and axis.name in coupled
+        )
+    )
+    remaining_indexes = tuple(
+        index for index in tiled_indexes if index not in output_indexes
+    )
+    for left_index, right_index in combinations(output_indexes, 2):
+        grid_candidates: list[TilingPlan] = []
+        for left in representatives(left_index):
+            for right in representatives(right_index):
+                levels = list(current)
+                levels[left_index] = left
+                levels[right_index] = right
+                projected = [tuple(levels)]
+                # Once an output/core grid is chosen, project every remaining
+                # primitive axis to its largest scratchpad-feasible level and
+                # retain the adjacent lower level.  Those are the two sides
+                # of the capacity-versus-padding transition; no full
+                # rank-wide Cartesian enumeration is needed.
+                for axis_index in remaining_indexes:
+                    next_projected: list[
+                        tuple[tuple[int, int, int], ...]
+                    ] = []
+                    for seed in projected:
+                        options = representatives(axis_index, seed)
+                        low = 0
+                        high = len(options) - 1
+                        best_index: int | None = None
+                        while low <= high:
+                            middle = (low + high) // 2
+                            candidate_levels = list(seed)
+                            candidate_levels[axis_index] = options[middle]
+                            if fits(tuple(candidate_levels)):
+                                best_index = middle
+                                low = middle + 1
+                            else:
+                                high = middle - 1
+                        if best_index is None:
+                            continue
+                        for option_index in dict.fromkeys((
+                            best_index,
+                            max(0, best_index - 1),
+                        )):
+                            candidate_levels = list(seed)
+                            candidate_levels[axis_index] = options[option_index]
+                            next_projected.append(tuple(candidate_levels))
+                    projected = next_projected
+                for candidate_levels in projected:
+                    if fits(candidate_levels):
+                        grid_candidates.append(make_plan(candidate_levels))
+        by_reduction_geometry: dict[tuple[int, ...], list[TilingPlan]] = {}
+        for candidate in dict.fromkeys(grid_candidates):
+            reduction_geometry = tuple(
+                candidate.tiles[axis]
+                for axis in algorithm.reduction_axes
             )
-            result.append(_replace_plan(
-                candidate,
-                used_cores=_useful_core_values(
-                    _total_task_count(operator, algorithm, candidate),
-                    core_allowed,
-                )[-1],
+            by_reduction_geometry.setdefault(
+                reduction_geometry, []
+            ).append(candidate)
+        for candidates in by_reduction_geometry.values():
+            result.extend(_pareto_hardware_plans(
+                operator, algorithm, tuple(candidates)
             ))
+
     return tuple(dict.fromkeys(result))
 
 
@@ -1846,6 +2002,8 @@ def derive_ideal_region(
                 plan.algorithm,
                 plan.axis_tiles,
                 plan.task_tiles,
+                plan.invocation_tiles,
+                plan.transfer_tiles,
                 plan.cache_tiles,
                 plan.used_cores,
                 plan.reduction_parts,
@@ -1938,15 +2096,13 @@ def derive_ideal_region(
             value[1]
             for _, value in sorted(best_by_topology.items())
         )
-        # Every feasible direct projection is a hardware-derived anchor.  Do
-        # not discard capacity/issue/reuse projections merely because the
-        # approximate model currently ranks another projection first.  For an
-        # identical geometry, fewer active cores are weakly dominated; the
-        # anchor already uses min(physical cores, executable tasks), so lower
-        # core-count copies do not need to be enumerated.
-        unique_algorithm_anchors = tuple(dict.fromkeys(
-            feasible_direct
-        ))
+        # One scalar model optimum is retained for every numeric reduction
+        # topology.  All independent hardware tradeoffs around it are then
+        # reconstructed below by core-wave, capacity, padding, buffer and
+        # traversal frontiers.  Retaining every intermediate direct
+        # projection as another expansion seed is redundant and turns the
+        # finite ideal region into a large Cartesian-like audit pool.
+        unique_algorithm_anchors = unique_primary_anchors
         anchors.extend(unique_algorithm_anchors)
         primary_anchors.update(unique_primary_anchors)
         algorithm_anchor_counts[algorithm_index] = len(unique_algorithm_anchors)
@@ -1958,22 +2114,31 @@ def derive_ideal_region(
     frontier_cache: dict[TilingPlan, tuple[TilingPlan, ...]] = {}
     for anchor in anchors:
         levels_by_axis, buffers, traversals = algorithm_contexts[anchor.algorithm]
+        is_primary = anchor in primary_anchors
         neighbourhood = (
             _ideal_neighbours(
                 operator, hardware, space, policy,
                 levels_by_axis, buffers, traversals, anchor,
             )
-            if anchor in primary_anchors else ()
+            if is_primary else ()
         )
-        canonical = _replace_plan(anchor, traversal=traversals[0])
-        if canonical not in frontier_cache:
-            frontier_cache[canonical] = _capacity_frontier_plans(
-                operator, hardware, space, levels_by_axis, canonical
+        # Direct projections are all retained, but only the best feasible
+        # anchor in each numeric reduction topology is expanded.  A capacity
+        # frontier is a neighbourhood of an optimum, not a Cartesian
+        # multiplier for every alternate buffer/traversal projection.  This
+        # preserves every hardware-derived direction while bounding solve
+        # time and memory by the number of execution topologies.
+        capacity_frontier: tuple[TilingPlan, ...] = ()
+        if is_primary:
+            canonical = _replace_plan(anchor, traversal=traversals[0])
+            if canonical not in frontier_cache:
+                frontier_cache[canonical] = _capacity_frontier_plans(
+                    operator, hardware, space, levels_by_axis, canonical
+                )
+            capacity_frontier = tuple(
+                _replace_plan(plan, traversal=anchor.traversal)
+                for plan in frontier_cache[canonical]
             )
-        capacity_frontier = tuple(
-            _replace_plan(plan, traversal=anchor.traversal)
-            for plan in frontier_cache[canonical]
-        )
         for plan in (anchor, *neighbourhood):
             result = evaluate(plan)
             if result is not None and result.valid:

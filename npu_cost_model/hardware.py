@@ -93,7 +93,12 @@ def ascend_910b3() -> Hardware:
             Resource.MTE2: ResourceRate(16.0, 0.0, 10.0, 337.0),
             Resource.MTE1: ResourceRate(256.0, 0.0, 2.0, 0.0),
             Resource.MTE3: ResourceRate(64.0, 0.0, 10.0, 25.0),
-            Resource.CUBE: ResourceRate(0.0, 0.0, 1.0, 0.0),
+            # A C220 ``mad`` command has a 21-cycle architectural startup
+            # followed by M*N*K/4096 FP16/BF16 service.  The value is the
+            # frozen isolated-intrinsic intercept already established by the
+            # repository's CCE primitive campaign; no table is read while a
+            # tiling is scored.
+            Resource.CUBE: ResourceRate(0.0, 0.0, 1.0, 21.0),
             Resource.VECTOR: ResourceRate(0.0, 128.0, 1.0, 0.0),
             Resource.SCALAR: ResourceRate(0.0, 1.0, 1.0, 0.0),
             Resource.FIXPIPE: ResourceRate(64.0, 0.0, 31.0, 0.0),

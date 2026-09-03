@@ -142,6 +142,11 @@ if not all(Path(value).is_file() for value in sys.argv[1:]):
 workloads = list(csv.DictReader(open(sys.argv[1], newline="", encoding="utf-8")))
 candidates = list(csv.DictReader(open(sys.argv[2], newline="", encoding="utf-8")))
 all_candidates = list(csv.DictReader(open(sys.argv[3], newline="", encoding="utf-8")))
+workload_ids = [row["workload_id"] for row in workloads]
+candidate_ids = [
+    row["workload_id"] for row in candidates
+    if row.get("candidate_role") == "searched"
+]
 searched = Counter(
     row["workload_id"] for row in candidates
     if row.get("candidate_role") == "searched"
@@ -153,8 +158,10 @@ for row in candidates:
     )
 if (
     len(workloads) != 200
+    or len(set(workload_ids)) != 200
     or {row.get("search_family") for row in workloads} != {"hardware_ideal_region"}
     or len(candidates) != 200
+    or set(candidate_ids) != set(workload_ids)
     or len(searched) != 200 or set(searched.values()) != {1}
     or len(hashes) != 200 or {len(value) for value in hashes.values()} != {1}
     or not all_candidates

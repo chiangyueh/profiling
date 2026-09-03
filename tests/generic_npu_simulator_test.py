@@ -12,6 +12,7 @@ from npu_cost_model import (
     AxisKind,
     MemorySpace,
     Operator,
+    Primitive,
     Resource,
     ScheduleSpace,
     SearchPolicy,
@@ -119,6 +120,57 @@ def test_cost_is_invariant_to_operator_and_algorithm_names() -> None:
     second = simulate(renamed, plan, HARDWARE)
     assert first.valid and second.valid
     assert first == second
+
+
+def test_primitive_command_geometry_charges_architectural_startup() -> None:
+    axes = (
+        Axis("m", 256, alignment=16),
+        Axis("n", 256, alignment=16),
+        Axis("k", 64, AxisKind.REDUCTION, 16, core_mappable=False),
+    )
+    algorithm = Algorithm(
+        stages=(Stage(
+            "cube",
+            primitives=(Primitive(
+                Resource.CUBE,
+                ("m", "n", "k"),
+                issue_elements=16 * 16 * 16,
+                dtype="fp16",
+                command_axes=("m", "n", "k"),
+            ),),
+        ),),
+        output_axes=("m", "n"),
+        reduction_axes=("k",),
+        core_resource=Resource.CUBE,
+        name="generic_contraction",
+    )
+    operator = Operator(
+        axes=axes,
+        tensors=(Tensor("C", (256, 256), "fp16"),),
+        algorithms=(algorithm,),
+        name="not_matmul",
+    )
+    common = {
+        "algorithm": 0,
+        "used_cores": 1,
+        "traversal": ("m", "n"),
+    }
+    wide = simulate(operator, TilingPlan(
+        **common,
+        axis_tiles=(("m", 128), ("n", 256), ("k", 64)),
+    ), HARDWARE)
+    narrow = simulate(operator, TilingPlan(
+        **common,
+        axis_tiles=(("m", 256), ("n", 64), ("k", 64)),
+    ), HARDWARE)
+    assert wide.valid and narrow.valid
+    # Both schedules perform the same useful MACs.  The narrow-N schedule
+    # submits twice as many resident Cube commands, so only the architectural
+    # command-startup term distinguishes them.
+    assert dict(wide.resource_cycles)[Resource.CUBE] == dict(
+        narrow.resource_cycles
+    )[Resource.CUBE]
+    assert narrow.total_cycles - wide.total_cycles == 42.0
 
 
 def test_generic_legality_rejects_bad_alignment_capacity_and_traversal() -> None:

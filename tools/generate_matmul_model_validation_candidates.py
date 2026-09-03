@@ -11,6 +11,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +69,32 @@ CUSTOM_COLUMNS = (
     "execution_graphs_represented",
     "model_input_source",
 )
+
+
+class IncrementalCsv:
+    """Write a large audit table incrementally and publish it atomically."""
+
+    def __init__(self, destination: Path, fields: list[str]) -> None:
+        self.destination = destination
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self.partial = destination.with_name(f"{destination.name}.partial")
+        self.stream = self.partial.open("w", newline="", encoding="utf-8")
+        self.writer = csv.DictWriter(
+            self.stream, fieldnames=fields, extrasaction="ignore"
+        )
+        self.writer.writeheader()
+        self.count = 0
+
+    def write(self, row: dict[str, str]) -> None:
+        self.writer.writerow(row)
+        self.count += 1
+
+    def flush(self) -> None:
+        self.stream.flush()
+
+    def publish(self) -> None:
+        self.stream.close()
+        self.partial.replace(self.destination)
 
 
 def read_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
@@ -134,6 +161,7 @@ def proposal_space_for(
     return proposal_space(workload, hardware)
 
 
+@lru_cache(maxsize=8)
 def generic_hardware(platform: old.Hardware):
     base = ascend_910b3()
     core_counts = dict(base.core_counts)
@@ -143,7 +171,11 @@ def generic_hardware(platform: old.Hardware):
         MemorySpace.L0A: platform.l0a_bytes,
         MemorySpace.L0B: platform.l0b_bytes,
         MemorySpace.L0C: platform.l0c_bytes,
-        MemorySpace.L1: platform.l1_bytes,
+        # GetCoreMemSize reports the C220 L1 value after reserving one
+        # 256-byte RPC block.  A standalone device kernel may use that block;
+        # CANN 8.1's CalL1Tiling restores it before checking packet capacity.
+        # This restores physical memory, not a fitted score allowance.
+        MemorySpace.L1: platform.l1_bytes + 256,
         MemorySpace.L2: platform.l2_bytes,
     })
     return replace(
@@ -204,6 +236,8 @@ def ranked_pool(
             plan.algorithm,
             plan.axis_tiles,
             plan.task_tiles,
+            plan.invocation_tiles,
+            plan.transfer_tiles,
             plan.cache_tiles,
             plan.used_cores,
             plan.reduction_parts,
@@ -344,7 +378,7 @@ def main() -> int:
     catalog_fields, catalog_rows = read_rows(args.catalog)
     selected_workloads: list[dict[str, str]] = []
     selected_rows: list[dict[str, str]] = []
-    all_rows: list[dict[str, str]] = []
+    all_rows = IncrementalCsv(args.all_output, fields)
     execution_graph_counts: dict[str, int] = {}
     generated_graph_counts: Counter[str] = Counter()
     generated_kernel_suffixes: set[int] = set()
@@ -505,7 +539,7 @@ def main() -> int:
         }
         row.update(common_row_values)
         selected_rows.append(dict(row))
-        all_rows.append(dict(row))
+        all_rows.write(dict(row))
         for model_rank, item in enumerate(ranked[1:], 2):
             alternative = materialize_model_row(item, model_rank)
             alternative.update(common_row_values)
@@ -513,7 +547,8 @@ def main() -> int:
                 f"{item['new'].total_cycles:.12g}"
             )
             alternative["search_model_breakdown"] = new_breakdown(item["new"])
-            all_rows.append(alternative)
+            all_rows.write(alternative)
+        all_rows.flush()
         selected_workloads.append(metadata)
         selected_graph = execution_mode_name(selected["knowledge"])
         execution_graph_counts[selected_graph] = (
@@ -585,12 +620,12 @@ def main() -> int:
         writer = csv.DictWriter(stream, fieldnames=catalog_fields)
         writer.writeheader()
         writer.writerows(selected_workloads)
-    for destination, rows in ((args.output, selected_rows), (args.all_output, all_rows)):
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(selected_rows)
+    all_rows.publish()
     print(
         f"MATMUL_MODEL_VALIDATION_CANDIDATES shapes={len(selected_workloads)} "
         "tilings_per_shape=1 "
@@ -600,7 +635,7 @@ def main() -> int:
         f"generated_kernel_suffixes={sorted(generated_kernel_suffixes)} "
         f"legal_execution_graphs={dict(legal_graph_counts)} "
         f"legal_kernel_suffixes={sorted(legal_kernel_suffixes)} "
-        f"full_ranked_rows={len(all_rows)} "
+        f"full_ranked_rows={all_rows.count} "
         f"wall_ms={(time.perf_counter_ns() - campaign_started) / 1e6:.3f} "
         + " ".join(
             f"{name[:-3]}_ms={value / 1e6:.3f}"
@@ -620,7 +655,7 @@ def main() -> int:
             "generated_kernel_suffixes": sorted(generated_kernel_suffixes),
             "legal_execution_graphs": dict(legal_graph_counts),
             "legal_kernel_suffixes": sorted(legal_kernel_suffixes),
-            "full_ranked_rows": len(all_rows),
+            "full_ranked_rows": all_rows.count,
             "timing_ms": {
                 name[:-3]: value / 1e6
                 for name, value in stage_totals.items()

@@ -8,7 +8,7 @@ semantics such as indirect access, reduction partitions or memory routes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import product
 from math import ceil, inf, prod
 
@@ -195,11 +195,17 @@ def _work_item(
         return WorkCost(False, f"missing byte rate for {resource.value}")
     if operation_count > 0.0 and rate.operations_per_cycle <= 0.0:
         return WorkCost(False, f"missing operation rate for {resource.value}/{dtype}")
-    occupancy = fixed_cycles + issue_count * rate.issue_cycles
+    # Command submission and engine service form a pipeline: while one DMA
+    # or Cube instruction is executing, the next independent command can be
+    # issued.  Its steady-state occupancy is therefore the slowest declared
+    # throughput bound, not the sum of issue and service time.  Completion
+    # latency remains explicit below for dependency-separated waves.
+    throughput_bounds = [issue_count * rate.issue_cycles]
     if byte_count > 0.0:
-        occupancy += byte_count / byte_rate
+        throughput_bounds.append(byte_count / byte_rate)
     if operation_count > 0.0:
-        occupancy += operation_count / rate.operations_per_cycle
+        throughput_bounds.append(operation_count / rate.operations_per_cycle)
+    occupancy = fixed_cycles + max(throughput_bounds)
     elapsed = occupancy + latency_waves * rate.latency_cycles
     return WorkCost(
         elapsed_cycles=elapsed,
@@ -230,15 +236,6 @@ def _access_cost(
         else tensor.dtype
     )
     element_bytes = dtype_bytes(value_dtype)
-    traffic, useful, transactions = _traffic_bytes(
-        access, extents, plan.tiles, element_bytes
-    )
-    port_bytes = traffic
-    if access.service_bytes_per_element is not None:
-        port_bytes = align_up(
-            _points(extents, access.axes) * access.service_bytes_per_element,
-            access.transaction_bytes,
-        )
     reuse_factor = 1
     if (
         access.mode == AccessMode.READ
@@ -271,6 +268,20 @@ def _access_cost(
     result = WorkCost()
     path = access.path
     for source, destination in zip(path, path[1:]):
+        hop_tiles = dict(plan.tiles)
+        hop_tiles.update(
+            plan.transfer_tile_map(access.tensor, source, destination)
+        )
+        traffic, useful, transactions = _traffic_bytes(
+            access, extents, hop_tiles, element_bytes
+        )
+        port_bytes = traffic
+        if access.service_bytes_per_element is not None:
+            port_bytes = align_up(
+                _points(extents, access.axes)
+                * access.service_bytes_per_element,
+                access.transaction_bytes,
+            )
         resource = _transfer_resource(source, destination, access.mode)
         service = float(
             port_bytes
@@ -284,7 +295,7 @@ def _access_cost(
             service /= reuse_factor
             hop_transactions /= reuse_factor
         waves = float(prod(
-            ceil_div(extents[axis], plan.tiles[axis])
+            ceil_div(extents[axis], hop_tiles[axis])
             for axis in access.dependency_axes
         ))
         if access.pattern == AccessPattern.INDIRECT and MemorySpace.GM in (
@@ -326,6 +337,14 @@ def _primitive_cost(
     points = _points(work_extents, primitive.axes)
     operations = points * primitive.operations_per_point
     issues = ceil_div(points, primitive.issue_elements)
+    commands = (
+        prod(
+            ceil_div(work_extents[axis], tiles[axis])
+            for axis in primitive.command_axes
+        )
+        if primitive.command_axes
+        else 0
+    )
     return _work_item(
         hardware,
         primitive.resource,
@@ -333,6 +352,7 @@ def _primitive_cost(
         operation_count=operations,
         issue_count=float(issues),
         fixed_cycles=primitive.fixed_cycles,
+        latency_waves=float(commands),
     )
 
 
@@ -347,36 +367,103 @@ def _stage_cost(
     partial_dtype: str,
     cache_group_resident: bool,
 ) -> WorkCost:
-    children = [
-        *(
-            _access_cost(
-                operator,
-                algorithm,
-                plan,
-                access,
-                extents,
-                hardware,
-                reduction_partitions,
-                partial_dtype,
-                cache_group_resident,
+    switch_axes = {
+        access.mode_switch_axis
+        for access in stage.accesses
+        if access.mode_switch_axis is not None
+    }
+    if not switch_axes <= set(stage.invocation_axes):
+        return WorkCost(False, "access mode switch axis is not a stage invocation axis")
+
+    def one_invocation(
+        invocation_extents: dict[str, int],
+        first_iterations: frozenset[str],
+    ) -> WorkCost:
+        children = [
+            *(
+                _access_cost(
+                    operator,
+                    algorithm,
+                    plan,
+                    replace(
+                        access,
+                        mode=access.first_iteration_mode,
+                    )
+                    if access.mode_switch_axis in first_iterations
+                    else access,
+                    invocation_extents,
+                    hardware,
+                    reduction_partitions,
+                    partial_dtype,
+                    cache_group_resident,
+                )
+                for access in stage.accesses
+            ),
+            *(
+                _primitive_cost(
+                    primitive, invocation_extents, plan.tiles, hardware
+                )
+                for primitive in stage.primitives
+            ),
+        ]
+        item = WorkCost()
+        for child in children:
+            item.add(child)
+        if not item.valid:
+            return item
+        if stage.concurrent:
+            longest = max(
+                (child.elapsed_cycles for child in children), default=0.0
             )
-            for access in stage.accesses
-        ),
-        *(
-            _primitive_cost(primitive, extents, plan.tiles, hardware)
-            for primitive in stage.primitives
-        ),
-    ]
-    result = WorkCost()
-    for child in children:
-        result.add(child)
-    if not result.valid:
-        return result
-    if stage.concurrent:
-        longest = max((child.elapsed_cycles for child in children), default=0.0)
-        resource_roof = max(result.resource_cycles.values(), default=0.0)
-        result.elapsed_cycles = max(longest, resource_roof)
-    return result
+            resource_roof = max(item.resource_cycles.values(), default=0.0)
+            item.elapsed_cycles = max(longest, resource_roof)
+        return item
+
+    if not stage.invocation_axes:
+        return one_invocation(extents, frozenset())
+
+    invocation_tiles = plan.invocations
+    dimensions: list[tuple[str, list[tuple[int, int, bool]]]] = []
+    for axis_name in stage.invocation_axes:
+        if axis_name not in extents or axis_name not in invocation_tiles:
+            return WorkCost(False, f"missing invocation tile for axis {axis_name}")
+        extent = extents[axis_name]
+        tile = invocation_tiles[axis_name]
+        full = extent // tile
+        tail = extent % tile
+        classes: list[tuple[int, int, bool]] = []
+        if axis_name in switch_axes:
+            classes.append((min(tile, extent), 1, True))
+            if full > 1:
+                classes.append((tile, full - 1, False))
+            if tail:
+                classes.append((tail, 1, False))
+        else:
+            if full:
+                classes.append((tile, full, False))
+            if tail:
+                classes.append((tail, 1, False))
+        dimensions.append((axis_name, classes))
+
+    total = WorkCost()
+    for combination in product(*(classes for _, classes in dimensions)):
+        invocation_extents = dict(extents)
+        first_iterations: set[str] = set()
+        multiplicity = 1
+        for (axis_name, _), (size, count, first) in zip(
+            dimensions, combination
+        ):
+            invocation_extents[axis_name] = size
+            multiplicity *= count
+            if first:
+                first_iterations.add(axis_name)
+        item = one_invocation(
+            invocation_extents, frozenset(first_iterations)
+        )
+        if not item.valid:
+            return item
+        total.add(item.scaled(multiplicity))
+    return total
 
 
 def _local_memory(
@@ -756,6 +843,41 @@ def simulate(operator: Operator, plan: TilingPlan, hardware: Hardware) -> Simula
         task_tile = tasks[axis.name]
         if task_tile < min(tiles[axis.name], axis.extent):
             return _invalid(f"axis {axis.name} task tile is smaller than its inner tile")
+    invocations = plan.invocations
+    if set(invocations) != {axis.name for axis in operator.axes}:
+        return _invalid(
+            "invocation tiling must provide exactly one tile for every operator axis"
+        )
+    for axis in operator.axes:
+        invocation_tile = invocations[axis.name]
+        if invocation_tile < min(tiles[axis.name], axis.extent):
+            return _invalid(
+                f"axis {axis.name} invocation tile is smaller than its inner tile"
+            )
+        if invocation_tile > tasks[axis.name]:
+            return _invalid(
+                f"axis {axis.name} invocation tile exceeds its task tile"
+            )
+    for tensor, source, destination, axis_name, tile in plan.transfer_tiles:
+        if axis_name not in tiles:
+            return _invalid("transfer tiling references an unknown axis")
+        if tensor not in {item.name for item in operator.tensors}:
+            return _invalid("transfer tiling references an unknown tensor")
+        matching_accesses = (
+            access
+            for stage in algorithm.stages
+            for access in stage.accesses
+            if access.tensor == tensor and axis_name in access.axes
+        )
+        if not any(
+            (source, destination) in tuple(zip(access.path, access.path[1:]))
+            for access in matching_accesses
+        ):
+            return _invalid("transfer tiling references an undeclared memory hop")
+        if tile < min(tiles[axis_name], operator.axis(axis_name).extent):
+            return _invalid("transfer tile is smaller than its inner tile")
+        if tile > tasks[axis_name]:
+            return _invalid("transfer tile exceeds its task tile")
     caches = plan.caches
     if set(caches) != {axis.name for axis in operator.axes}:
         return _invalid("cache tiling must provide exactly one tile for every operator axis")

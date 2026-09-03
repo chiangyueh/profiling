@@ -233,6 +233,12 @@ class Access:
     # group, or the complete kernel.  The simulator consumes only this
     # memory-level declaration and never an operator/template label.
     residency: tuple[tuple[MemorySpace, TileLevel], ...] = ()
+    # Some serial reductions overwrite the destination on their first
+    # device-side invocation and atomically accumulate on subsequent
+    # invocations.  Declaring the switching axis keeps this behavior in the
+    # generic memory graph instead of an operator-specific cost hook.
+    first_iteration_mode: AccessMode | None = None
+    mode_switch_axis: str | None = None
 
     def __post_init__(self) -> None:
         if len(self.path) < 2:
@@ -258,6 +264,14 @@ class Access:
             raise ValueError("access residency refers to a space outside its path")
         if any(space in (MemorySpace.GM, MemorySpace.L2) for space in residency_spaces):
             raise ValueError("access residency is only for core-local memory")
+        if (self.first_iteration_mode is None) != (self.mode_switch_axis is None):
+            raise ValueError(
+                "first_iteration_mode and mode_switch_axis must be declared together"
+            )
+        if self.mode_switch_axis is not None and self.mode_switch_axis in self.axes:
+            raise ValueError(
+                "mode_switch_axis must be a repetition axis, not a tensor axis"
+            )
 
 
 @dataclass(frozen=True)
@@ -271,6 +285,12 @@ class Primitive:
     dtype: str | None = None
     padded_axes: tuple[str, ...] = ()
     fixed_cycles: float = 0.0
+    # Axes covered by one submitted hardware command.  For example one Cube
+    # ``mad`` command covers one resident M/N/K tile, while a vector command
+    # may cover ``issue_elements`` points.  Keeping command geometry in the
+    # primitive IR lets the simulator charge architectural command latency
+    # without recognizing an operator or kernel-family name.
+    command_axes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.operations_per_point < 0.0:
@@ -279,6 +299,10 @@ class Primitive:
             raise ValueError("issue_elements must be positive")
         if self.fixed_cycles < 0.0:
             raise ValueError("fixed_cycles must be non-negative")
+        if len(self.command_axes) != len(set(self.command_axes)):
+            raise ValueError("primitive command_axes must be unique")
+        if not set(self.command_axes) <= set(self.axes):
+            raise ValueError("primitive command_axes must be primitive axes")
         if self.dtype is not None:
             dtype_bytes(self.dtype)
 
@@ -292,12 +316,18 @@ class Stage:
     # Work items inside a stage may be submitted concurrently.  They still
     # compete for a shared resource, which the simulator accounts for.
     concurrent: bool = False
+    # Split a task into serial primitive invocations at the plan's declared
+    # invocation-tile level.  Accesses that do not contain one of these axes
+    # are repeated, naturally exposing lost reuse and repeated output work.
+    invocation_axes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("stage name must not be empty")
         if not self.accesses and not self.primitives:
             raise ValueError(f"stage {self.name} has no work")
+        if len(self.invocation_axes) != len(set(self.invocation_axes)):
+            raise ValueError("stage invocation_axes must be unique")
 
 
 @dataclass(frozen=True)
@@ -325,6 +355,11 @@ class Algorithm:
     # double-buffered.  This is schedule dependency metadata, not a cost fit.
     pipeline_boundaries: tuple[tuple[MemorySpace, ...], ...] = ()
     workspace_buffers: tuple[WorkspaceBuffer, ...] = ()
+    # Axes for which this device implementation assigns exactly one resident
+    # inner tile to each schedulable task.  This is an execution-graph
+    # property (for example a direct Cube kernel that calls Iterate once),
+    # not a search preference or an operator-name condition.
+    coupled_task_axes: tuple[str, ...] = ()
     # Metadata only.  The simulator never branches on this value.
     name: str = "algorithm"
 
@@ -335,6 +370,8 @@ class Algorithm:
             raise ValueError("algorithm output_axes must be unique")
         if len(self.reduction_axes) != len(set(self.reduction_axes)):
             raise ValueError("algorithm reduction_axes must be unique")
+        if len(self.coupled_task_axes) != len(set(self.coupled_task_axes)):
+            raise ValueError("algorithm coupled_task_axes must be unique")
         if set(self.output_axes) & set(self.reduction_axes):
             raise ValueError("output and reduction axes must be disjoint")
         if len(self.buffered_spaces) != len(set(self.buffered_spaces)):
@@ -403,6 +440,8 @@ class Operator:
                 raise ValueError("algorithm references an unknown output/reduction axis")
             if algorithm.result_tensor is not None and algorithm.result_tensor not in tensors:
                 raise ValueError("algorithm result_tensor is unknown")
+            if not set(algorithm.coupled_task_axes) <= axes:
+                raise ValueError("algorithm couples an unknown task axis")
             for workspace in algorithm.workspace_buffers:
                 if not {item.axis for item in workspace.dimensions} <= axes:
                     raise ValueError("workspace references an unknown iteration axis")

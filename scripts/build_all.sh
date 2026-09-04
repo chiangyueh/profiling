@@ -112,38 +112,82 @@ else
     echo "[1/2] Skipping tiling search host (runner-only build)"
 fi
 
-if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
-    echo "[2/2] Building official MatMulV3 runner and tuning-bank probe"
-else
-    echo "[2/2] Building official MatMulV3 runner"
-fi
+echo "[2/2] Building official baseline and direct MatMulV3 kernels (jobs=${BUILD_JOBS:-1})"
 SOC_BUILD_NAME="$(printf '%s' "$ASCENDC_SOC_VERSION" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' '_')"
 NPU_BUILD="$BUILD/npu_cmake_${SOC_BUILD_NAME}"
-if [[ -d "$NPU_BUILD" ]]; then
-    find "$NPU_BUILD" -mindepth 1 -delete
-fi
+mkdir -p "$NPU_BUILD"
 : >"$BUILD/kernel_build.log"
 run_logged "$BUILD/kernel_build.log" "configure official runner" \
     cmake -S "$ROOT/cmake_npu" -B "$NPU_BUILD" \
         -DASCEND_CANN_PACKAGE_PATH="$CANN_ROOT" \
         -DCMAKE_BUILD_TYPE=Release
 
-NPU_TARGETS=(official_matmul_runner)
-if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
-    NPU_TARGETS+=(tiling_bank_probe)
-fi
+DIRECT_KERNEL_TARGETS=(
+    direct_matmul_kernel_fp16_0 direct_matmul_kernel_fp16_1
+    direct_matmul_kernel_fp16_20 direct_matmul_kernel_fp16_21
+    direct_matmul_kernel_fp16_30 direct_matmul_kernel_fp16_31
+    direct_matmul_kernel_fp16_201
+    direct_matmul_kernel_fp16_10201
+    direct_matmul_kernel_bf16_1 direct_matmul_kernel_bf16_20
+    direct_matmul_kernel_bf16_21 direct_matmul_kernel_bf16_31
+    direct_matmul_kernel_bf16_201
+    direct_matmul_kernel_bf16_10201
+    direct_matmul_kernel_fp32_1 direct_matmul_kernel_fp32_21
+    direct_matmul_kernel_fp32_101 direct_matmul_kernel_fp32_201
+    direct_matmul_kernel_fp32_10201 direct_matmul_kernel_fp32_20201
+)
+MATMUL_V3_KERNEL_DIR="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/mat_mul_v3"
+DIRECT_KERNEL_BUILD_SIGNATURE="$({
+    printf '%s\0' \
+        "${ROOT}/direct_matmul/kernel_entry.cpp" \
+        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h" \
+        "${ROOT}/cmake_npu/CMakeLists.txt"
+    find "${MATMUL_V3_KERNEL_DIR}" -type f -print0
+} | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+kernel_count="${#DIRECT_KERNEL_TARGETS[@]}"
+kernel_index=0
+for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
+    kernel_index=$((kernel_index + 1))
+    target_stamp="${NPU_BUILD}/.${target}.sha256"
+    target_library="${NPU_BUILD}/lib/lib${target}.a"
+    target_include="${NPU_BUILD}/include/${target}"
+    if [[ -s "${target_library}" && -d "${target_include}" && \
+          -f "${target_stamp}" && \
+          "$(cat "${target_stamp}" 2>/dev/null || true)" == \
+              "${DIRECT_KERNEL_BUILD_SIGNATURE}" ]] && \
+       ar t "${target_library}" >/dev/null 2>&1; then
+        echo "DIRECT_KERNEL_BUILD ${kernel_index}/${kernel_count} ${target} cached"
+        continue
+    fi
+    # CANN 8.1's merge_obj_text.sh rewrites its input in place and cannot be
+    # invoked twice.  An interrupted ExternalProject therefore has to replay
+    # only this target's private preprocess directory from source.
+    target_preprocess="${NPU_BUILD}/${target}_preprocess-prefix"
+    if [[ -d "${target_preprocess}" ]]; then
+        cmake -E remove_directory "${target_preprocess}"
+    fi
+    echo "DIRECT_KERNEL_BUILD ${kernel_index}/${kernel_count} ${target} begin"
+    run_logged "$BUILD/kernel_build.log" "compile ${target}" \
+        cmake --build "$NPU_BUILD" --target "${target}" \
+        --parallel "${BUILD_JOBS:-1}"
+    printf '%s\n' "${DIRECT_KERNEL_BUILD_SIGNATURE}" >"${target_stamp}"
+    echo "DIRECT_KERNEL_BUILD ${kernel_index}/${kernel_count} ${target} passed"
+done
+echo "DIRECT_RUNNER_LINK begin"
 run_logged "$BUILD/kernel_build.log" "compile official runner" \
-    cmake --build "$NPU_BUILD" --target "${NPU_TARGETS[@]}" \
+    cmake --build "$NPU_BUILD" --target official_matmul_runner \
     --parallel "${BUILD_JOBS:-1}"
+run_logged "$BUILD/kernel_build.log" "link direct runner" \
+    cmake --build "$NPU_BUILD" --target direct_matmul_runner \
+    --parallel "${BUILD_JOBS:-1}"
+echo "DIRECT_RUNNER_LINK passed"
 cp "$NPU_BUILD/official_matmul_runner" "$BUILD/official_matmul_runner"
-if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
-    cp "$NPU_BUILD/tiling_bank_probe" "$BUILD/tiling_bank_probe"
-fi
+cp "$NPU_BUILD/direct_matmul_runner" "$BUILD/direct_matmul_runner"
 : >"$BUILD/runner_build.log"
 
 if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
-    file "$BUILD/matmul_tiling_search" "$BUILD/official_matmul_runner" "$BUILD/tiling_bank_probe"
+    file "$BUILD/matmul_tiling_search" "$BUILD/official_matmul_runner" "$BUILD/direct_matmul_runner"
 else
-    file "$BUILD/official_matmul_runner"
+    file "$BUILD/official_matmul_runner" "$BUILD/direct_matmul_runner"
 fi
 echo "Build completed: $BUILD"

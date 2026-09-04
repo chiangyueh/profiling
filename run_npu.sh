@@ -41,7 +41,27 @@ export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 unset ASCEND_CUSTOM_OPP_PATH || true
+while IFS='=' read -r name _; do
+    case "${name}" in
+        *RUNTIME_KB*|*TUNING_BANK*) unset "${name}" ;;
+    esac
+done < <(env)
 source "${ROOT}/scripts/env.sh" >/dev/null
+
+CANN_VERSION_FILE="${CANN_ROOT}/version.cfg"
+MATMUL_V3_SOURCE_DIR="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/mat_mul_v3"
+[[ -f "${CANN_VERSION_FILE}" ]] || {
+    echo "fatal: CANN version.cfg is missing: ${CANN_VERSION_FILE}" >&2
+    exit 2
+}
+grep -Eq '^toolkit_running_version=.*:8\.1' "${CANN_VERSION_FILE}" || {
+    echo "fatal: this direct campaign requires installed CANN 8.1" >&2
+    exit 2
+}
+[[ -f "${MATMUL_V3_SOURCE_DIR}/mat_mul_v3.cpp" ]] || {
+    echo "fatal: installed CANN 8.1 MatMulV3 source is missing" >&2
+    exit 2
+}
 
 catalog_started_ns="$(date +%s%N)"
 CATALOG_TMP="$(mktemp "${TMPDIR:-/tmp}/matmul-hardware-calibration.XXXXXX.csv")"
@@ -59,16 +79,21 @@ CAMPAIGN_ID="$({
         tools/generate_matmul_hardware_calibration_workloads.py \
         tools/generate_matmul_hardware_calibration_candidates.py \
         tools/analyze_matmul_hardware_calibration.py \
-        tools/restore_matmul_measurement_logs.py \
+        tools/direct_matmul_tiling.py \
+        tools/profile_direct_matmul.py \
         tools/refine_matmul_v3_candidates.py \
-        tools/profile_official_tilings.py \
         run_npu.sh \
         scripts/run_search.sh \
         scripts/profile_npu.sh \
         runner/official_matmul_runner.cpp \
-        npu_cost_model/*.py
+        direct_matmul/kernel_entry.cpp \
+        direct_matmul/mat_mul_v3_tiling_data.h \
+        direct_matmul/runner.cpp \
+        npu_cost_model/*.py \
+        "${CANN_VERSION_FILE}"
+    find "${MATMUL_V3_SOURCE_DIR}" -type f -print0 | sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_hardware_calibration_v1/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_hardware_calibration_direct_v2/${CAMPAIGN_ID}"
 CATALOG="${CAMPAIGN_DIR}/catalog.csv"
 WORKLOADS="${CAMPAIGN_DIR}/workloads.csv"
 CANDIDATES="${CAMPAIGN_DIR}/candidates.csv"
@@ -95,25 +120,27 @@ echo "logs=${LOG_DIR}"
 echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
 BUILD_INPUT_HASH="$({
-    find host runner cmake_npu -type f -print0
-    printf '%s\0' tools/tiling_bank_probe.cpp scripts/build_all.sh
+    find host runner direct_matmul cmake_npu -type f -print0
+    printf '%s\0' scripts/build_all.sh
+    find "${MATMUL_V3_SOURCE_DIR}" -type f -print0
+    printf '%s\0' "${CANN_VERSION_FILE}"
 } | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
 BUILD_STAMP="${ROOT}/build/.matmul_model_validation_build.sha256"
 LEGACY_BUILD_STAMP="${ROOT}/build/.matmul_controlled_build.sha256"
 if [[ ! -f "${BUILD_STAMP}" && -f "${LEGACY_BUILD_STAMP}" && \
       "$(cat "${LEGACY_BUILD_STAMP}" 2>/dev/null || true)" == "${BUILD_INPUT_HASH}" && \
       -x build/matmul_tiling_search && -x build/official_matmul_runner && \
-      -x build/tiling_bank_probe ]]; then
+      -x build/direct_matmul_runner ]]; then
     printf '%s\n' "${BUILD_INPUT_HASH}" >"${BUILD_STAMP}"
 fi
 build_started_ns="$(date +%s%N)"
 if [[ ! -x build/matmul_tiling_search || \
       ! -x build/official_matmul_runner || \
-      ! -x build/tiling_bank_probe || \
+      ! -x build/direct_matmul_runner || \
       ! -f "${BUILD_STAMP}" || \
       "$(cat "${BUILD_STAMP}" 2>/dev/null || true)" != "${BUILD_INPUT_HASH}" ]]; then
     echo "RUNNER_BUILD begin jobs=1"
-    BUILD_JOBS=1 scripts/build_all.sh >"${CAMPAIGN_DIR}/build.log" 2>&1
+    BUILD_JOBS=1 scripts/build_all.sh 2>&1 | tee "${CAMPAIGN_DIR}/build.log"
     printf '%s\n' "${BUILD_INPUT_HASH}" >"${BUILD_STAMP}"
     echo "RUNNER_BUILD passed"
     build_cached=0
@@ -212,15 +239,6 @@ export KEEP_DETAILS=1
 export WARMUP=1
 export REPEAT=1
 export SAMPLES=3
-export RANK_LIMIT=50
-export SUCCESSFUL_TILINGS_PER_WORKLOAD=0
-export SUCCESSFUL_TILINGS_COLUMN=required_successful_tilings
-export VALIDATE_AFTER_MEASUREMENT=1
-export REQUIRE_RUNTIME_KB_EXECUTION_ATTESTATION=1
-export SKIP_BANK_SEED_CONTROL=1
-export STRUCTURED_FULL_PREFLIGHT=1
-export NUMERIC_PREFLIGHT_MAX_MIB=256
-export PROFILE_STALL_TIMEOUT_SEC=0
 export PROFILE_PROGRESS_EVERY=20
 
 PROFILE_LOG="${CAMPAIGN_DIR}/measurement_progress.log"
@@ -229,13 +247,7 @@ set +e
 "${ROOT}/scripts/profile_npu.sh" \
     "${CANDIDATES}" "${OUT_STEM}" "${WORKLOADS}" \
     > >(awk '
-        /TILING_ERROR_BEGIN/ {in_error=1}
-        in_error {
-            print; fflush();
-            if (/TILING_ERROR_END/) in_error=0;
-            next;
-        }
-        /candidate_contract_preflight:|runtime_kb_execution_attestation:|profile_plan:|candidate_start|candidate_done|WORKLOAD_GROUP_RESULT|official_tiling_profile completed|fatal:|candidate_abort|candidate_rejected|profile_npu failed/ {
+        /OFFICIAL_BASELINE_|DIRECT_INPUT_|DIRECT_MEASUREMENT_|NPU_RESULTS_READY|fatal:|Traceback/ {
             print; fflush();
         }
     ' | tee "${PROFILE_LOG}") 2>&1
@@ -266,7 +278,7 @@ python3 tools/analyze_matmul_hardware_calibration.py \
     --output "${ANALYSIS}" \
     --log-directory "${LOG_DIR}" \
     --expected-shapes 70 \
-    --require-runtime-kb-attested
+    --require-direct-tiling-applied
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 echo "analysis=${ANALYSIS}"

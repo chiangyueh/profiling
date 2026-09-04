@@ -42,6 +42,29 @@ from npu_cost_model.operators import matmul
 
 
 RESERVE_CANDIDATES = 8
+OBSOLETE_EXECUTION_COLUMNS = {
+    "search_model_raw_ratio_vs_bank_seed",
+    "search_model_ratio_vs_bank_seed",
+    "callback_tiling_sha256",
+    "callback_tiling_bytes",
+    "callback_tiling_key",
+    "callback_block_dim",
+    "callback_workspace_bytes",
+    "callback_l2_cache_flag",
+    "callback_base_an",
+    "callback_base_ad",
+    "callback_base_bn",
+    "callback_base_bd",
+    "callback_kernel_suffix",
+    "callback_kernel_variant",
+    "callback_kernel_family",
+    "callback_derived_diff_vs_default",
+    "callback_derived_diff_vs_bank_seed",
+    "tiling_official_callback_ms",
+    "tiling_runtime_kb_seed_ms",
+    "tiling_solver_callback_ms",
+    "tiling_solver_callback_count",
+}
 FACTOR_FIELDS = {
     "core_parallelism": ("usedCoreNum",),
     "mn_geometry": (
@@ -420,7 +443,13 @@ def main() -> int:
     )
     hardware = generic_hardware(platform)
     raw_fields, _ = read_rows(args.raw_candidates)
-    fields = ["rank", *(field for field in raw_fields if field != "rank")]
+    fields = [
+        "rank",
+        *(
+            field for field in raw_fields
+            if field != "rank" and field not in OBSOLETE_EXECUTION_COLUMNS
+        ),
+    ]
     for field in (*old.EXTRA_COLUMNS, *CUSTOM_COLUMNS):
         if field not in fields:
             fields.append(field)
@@ -499,11 +528,7 @@ def main() -> int:
                 "simulator_scoring_ms": f"{scoring_ns / 1e6:.9g}",
                 "generated_candidate_count": str(len(proposed)),
                 "legal_candidate_count": str(len(pool)),
-                "tiling_official_callback_ms": "0",
-                "tiling_runtime_kb_seed_ms": "0",
                 "tiling_solver_select_ms": f"{scoring_ns / 1e6:.9g}",
-                "tiling_solver_callback_ms": "0",
-                "tiling_solver_callback_count": "0",
                 "tiling_solver_extra_ms": f"{(generation_ns + legality_ns) / 1e6:.9g}",
                 "tiling_solver_total_ms": f"{(time.perf_counter_ns() - shape_started) / 1e6:.9g}",
             })

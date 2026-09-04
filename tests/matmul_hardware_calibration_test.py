@@ -19,13 +19,18 @@ def test_frozen_campaign_contract() -> None:
     rows = workloads.build_workloads()
     assert len(rows) == 70
     assert len({row["workload_id"] for row in rows}) == 70
+    assert len({
+        (row["m"], row["n"], row["k"], row["dtype"],
+         row["trans_a"], row["trans_b"])
+        for row in rows
+    }) == 70
     assert Counter(row["calibration_partition"] for row in rows) == {
         "calibration": 49,
         "holdout": 21,
     }
     assert sum(int(row["required_successful_tilings"]) for row in rows) == 2185
     assert Counter(
-        row["target_kernel_family"] for row in rows
+        row["coverage_intent"] for row in rows
     ) == {
         "base": 19,
         "single_core_split_k": 13,

@@ -119,37 +119,30 @@ echo "partition=calibration_49,frozen_holdout_21 families=7"
 echo "logs=${LOG_DIR}"
 echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
-BUILD_INPUT_HASH="$({
-    find host runner direct_matmul cmake_npu -type f -print0
-    printf '%s\0' scripts/build_all.sh
-    find "${MATMUL_V3_SOURCE_DIR}" -type f -print0
-    printf '%s\0' "${CANN_VERSION_FILE}"
+HOST_BUILD_HASH="$({
+    find host compat -type f -print0
+    printf '%s\0' scripts/build_all.sh "${CANN_VERSION_FILE}"
 } | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
-BUILD_STAMP="${ROOT}/build/.matmul_model_validation_build.sha256"
-LEGACY_BUILD_STAMP="${ROOT}/build/.matmul_controlled_build.sha256"
-if [[ ! -f "${BUILD_STAMP}" && -f "${LEGACY_BUILD_STAMP}" && \
-      "$(cat "${LEGACY_BUILD_STAMP}" 2>/dev/null || true)" == "${BUILD_INPUT_HASH}" && \
-      -x build/matmul_tiling_search && -x build/official_matmul_runner && \
-      -x build/direct_matmul_runner ]]; then
-    printf '%s\n' "${BUILD_INPUT_HASH}" >"${BUILD_STAMP}"
-fi
-build_started_ns="$(date +%s%N)"
-if [[ ! -x build/matmul_tiling_search || \
-      ! -x build/official_matmul_runner || \
-      ! -x build/direct_matmul_runner || \
-      ! -f "${BUILD_STAMP}" || \
-      "$(cat "${BUILD_STAMP}" 2>/dev/null || true)" != "${BUILD_INPUT_HASH}" ]]; then
-    echo "RUNNER_BUILD begin jobs=1"
-    BUILD_JOBS=1 scripts/build_all.sh 2>&1 | tee "${CAMPAIGN_DIR}/build.log"
-    printf '%s\n' "${BUILD_INPUT_HASH}" >"${BUILD_STAMP}"
-    echo "RUNNER_BUILD passed"
-    build_cached=0
+HOST_BUILD_STAMP="${ROOT}/build/.matmul_platform_host.sha256"
+host_build_started_ns="$(date +%s%N)"
+if [[ ! -x build/matmul_tiling_search || ! -f "${HOST_BUILD_STAMP}" || \
+      "$(cat "${HOST_BUILD_STAMP}" 2>/dev/null || true)" != "${HOST_BUILD_HASH}" ]]; then
+    echo "PLATFORM_HOST_BUILD begin jobs=1"
+    if ! BUILD_COMPONENTS=host BUILD_JOBS=1 scripts/build_all.sh \
+        >"${CAMPAIGN_DIR}/platform_host_build.log" 2>&1; then
+        echo "PLATFORM_HOST_BUILD failed log=${CAMPAIGN_DIR}/platform_host_build.log"
+        tail -20 "${CAMPAIGN_DIR}/platform_host_build.log"
+        exit 1
+    fi
+    printf '%s\n' "${HOST_BUILD_HASH}" >"${HOST_BUILD_STAMP}"
+    echo "PLATFORM_HOST_BUILD passed"
+    host_build_cached=0
 else
-    echo "RUNNER_BUILD cached"
-    build_cached=1
+    echo "PLATFORM_HOST_BUILD cached"
+    host_build_cached=1
 fi
-build_wall_ms=$(( ($(date +%s%N) - build_started_ns) / 1000000 ))
-echo "CAMPAIGN_STAGE_TIMING stage=runner_build wall_ms=${build_wall_ms} cached=${build_cached}"
+host_build_wall_ms=$(( ($(date +%s%N) - host_build_started_ns) / 1000000 ))
+echo "CAMPAIGN_STAGE_TIMING stage=platform_host_build wall_ms=${host_build_wall_ms} cached=${host_build_cached}"
 
 export DISABLE_MEASUREMENT_HISTORY=1
 export SEARCH_SCOPE=matmul_hardware_calibration_v1
@@ -160,7 +153,8 @@ export MODEL_VALIDATION_WORKLOADS_OUTPUT="${WORKLOADS}"
 export MEASUREMENT_JSONL_LOG_DIRECTORY="${LOG_DIR}"
 export MEASUREMENT_JSONL_LOG_MAX_BYTES=52428800
 
-if python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" <<'PY' >/dev/null 2>&1
+candidate_contract() {
+python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" <<'PY'
 import csv
 import sys
 from collections import Counter
@@ -181,14 +175,25 @@ searched = Counter(
     if row.get("candidate_role") == "searched"
 )
 hashes = {}
+families = {}
 for row in candidates:
     hashes.setdefault(row["workload_id"], set()).add(
         row.get("model_schedule_sha256", "")
     )
+    if row.get("candidate_role") == "searched" and row.get("is_reserve") != "1":
+        families.setdefault(row["workload_id"], set()).add(
+            row.get("model_kernel_family", "")
+        )
 if (
     len(workloads) != 70
     or len(set(workload_ids)) != 70
+    or len({
+        (row["m"], row["n"], row["k"], row["dtype"],
+         row["trans_a"], row["trans_b"])
+        for row in workloads
+    }) != 70
     or {row.get("search_family") for row in workloads} != {"hardware_factor_region"}
+    or any("target_kernel_family" in row for row in workloads)
     or len(candidates) != 2745
     or set(candidate_ids) != set(workload_ids)
     or len(searched) != 70
@@ -199,12 +204,21 @@ if (
     )
     or len(hashes) != 70
     or any(len(hashes[row["workload_id"]]) != searched[row["workload_id"]] for row in workloads)
+    or len(families) != 70
+    or any(len(value) < 2 for value in families.values())
+    or set().union(*families.values()) != {
+        "BASE", "SINGLE_CORE_SPLIT_K", "DETERMINISTIC_SPLIT_K",
+        "AL1_FULL_LOAD", "BL1_FULL_LOAD", "BL1_FULL_LOAD_FIXPIPE",
+        "BL1_FULL_LOAD_VEC_NZ2ND",
+    }
     or not all_candidates
     or not all(row.get("global_model_rank", "").isdigit() for row in candidates)
     or not all(row.get("controlled_factor", "") for row in candidates)
 ):
     raise SystemExit(1)
 PY
+}
+if candidate_contract >/dev/null 2>&1
 then
     export REUSE_MODEL_VALIDATION_CANDIDATES=1
 fi
@@ -233,6 +247,51 @@ fi
 export PLATFORM_AIC_CORES PLATFORM_L0A_BYTES PLATFORM_L0B_BYTES
 export PLATFORM_L0C_BYTES PLATFORM_L1_BYTES PLATFORM_L2_BYTES
 export PLATFORM_L2_BPC PLATFORM_HBM_BPC
+
+if ! candidate_contract >/dev/null 2>&1; then
+    echo "CANDIDATE_CONTRACT_FAILED log=${SEARCH_LOG}"
+    exit 1
+fi
+
+direct_preflight_started_ns="$(date +%s%N)"
+python3 tools/direct_matmul_tiling.py \
+    --candidates "${CANDIDATES}" \
+    --output-dir "${DETAILS_DIR}/direct_tilings" \
+    --manifest "${DETAILS_DIR}/direct_manifest.csv" \
+    --l2-bytes "${PLATFORM_L2_BYTES}" \
+    --aic-cores "${PLATFORM_AIC_CORES}" \
+    --include-reserves >/dev/null
+direct_preflight_wall_ms=$(( ($(date +%s%N) - direct_preflight_started_ns) / 1000000 ))
+echo "DIRECT_TILING_PREFLIGHT passed candidates=2745 wall_ms=${direct_preflight_wall_ms}"
+
+RUNNER_BUILD_HASH="$({
+    find runner direct_matmul cmake_npu -type f -print0
+    printf '%s\0' scripts/build_all.sh "${CANN_VERSION_FILE}"
+    find "${MATMUL_V3_SOURCE_DIR}" -type f -print0
+} | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+RUNNER_BUILD_STAMP="${ROOT}/build/.matmul_direct_runner.sha256"
+runner_build_started_ns="$(date +%s%N)"
+if [[ ! -x build/official_matmul_runner || ! -x build/direct_matmul_runner || \
+      ! -f "${RUNNER_BUILD_STAMP}" || \
+      "$(cat "${RUNNER_BUILD_STAMP}" 2>/dev/null || true)" != "${RUNNER_BUILD_HASH}" ]]; then
+    echo "RUNNER_BUILD begin jobs=1"
+    if ! BUILD_COMPONENTS=runner BUILD_JOBS=1 scripts/build_all.sh \
+        > >(tee "${CAMPAIGN_DIR}/build.log" | awk '
+            /DIRECT_KERNEL_BUILD|DIRECT_RUNNER_LINK|fatal:/ {print; fflush()}
+        ') 2>&1; then
+        echo "RUNNER_BUILD failed log=${CAMPAIGN_DIR}/build.log"
+        tail -20 "${CAMPAIGN_DIR}/build.log"
+        exit 1
+    fi
+    printf '%s\n' "${RUNNER_BUILD_HASH}" >"${RUNNER_BUILD_STAMP}"
+    echo "RUNNER_BUILD passed"
+    runner_build_cached=0
+else
+    echo "RUNNER_BUILD cached"
+    runner_build_cached=1
+fi
+runner_build_wall_ms=$(( ($(date +%s%N) - runner_build_started_ns) / 1000000 ))
+echo "CAMPAIGN_STAGE_TIMING stage=runner_build wall_ms=${runner_build_wall_ms} cached=${runner_build_cached}"
 
 echo "NPU_MEASUREMENT_BEGIN shapes=70 candidate_records=2185 official_baselines=70 records=2255"
 export KEEP_DETAILS=1

@@ -36,19 +36,19 @@ CALIBRATION = {
         Spec(257, 1009, 4097),
     )),
     "single_core_split_k": (42, (
-        Spec(192, 512, 16384), Spec(448, 128, 16384),
-        Spec(192, 320, 24576), Spec(512, 320, 40960),
-        Spec(384, 448, 49152), Spec(256, 640, 32768),
-        Spec(320, 512, 2048, "fp32", 1, 1),
-        Spec(4096, 160, 1024, "fp32", 1, 0),
-        Spec(448, 3072, 1024, "fp32", 0, 1),
+        Spec(208, 544, 18432), Spec(464, 144, 18432),
+        Spec(224, 352, 28672), Spec(544, 352, 45056),
+        Spec(416, 480, 53248), Spec(256, 640, 32768),
+        Spec(352, 544, 3072, "fp32", 1, 1),
+        Spec(3072, 176, 2048, "fp32", 1, 0),
+        Spec(480, 2560, 1536, "fp32", 0, 1),
         Spec(160, 5120, 2048, "bf16", 1, 1),
     )),
     "deterministic_split_k": (31, (
         Spec(128, 128, 8192), Spec(128, 128, 16384),
         Spec(128, 128, 32768), Spec(128, 128, 49152, "bf16"),
-        Spec(192, 320, 24576), Spec(448, 128, 16384),
-        Spec(384, 448, 49152), Spec(512, 320, 40960, "bf16"),
+        Spec(208, 336, 20480), Spec(432, 144, 28672),
+        Spec(368, 464, 57344), Spec(512, 320, 40960, "bf16"),
     )),
     # AL1 must fit the complete A resident set in C220 L1.  Keeping K=4096
     # and varying M/N crosses core-wave and tail boundaries without violating
@@ -67,7 +67,7 @@ CALIBRATION = {
         Spec(8192, 31, 128, "bf16"), Spec(4096, 7, 8, "fp32"),
     )),
     "bl1_full_load_vec_nz2nd": (24, (
-        Spec(4096, 7, 8, "fp32"), Spec(4096, 17, 16, "fp32"),
+        Spec(6144, 15, 8, "fp32"), Spec(4096, 17, 16, "fp32"),
         Spec(8192, 31, 32, "fp32"), Spec(16384, 63, 64, "fp32"),
     )),
 }
@@ -131,7 +131,9 @@ def build_workloads() -> list[dict[str, str]]:
                     "dtype": spec.dtype, "trans_a": str(spec.trans_a),
                     "trans_b": str(spec.trans_b), "max_cores": "20",
                     "search_family": "hardware_factor_region",
-                    "target_kernel_family": family,
+                    # This labels the coverage stratum only.  Candidate
+                    # generation must consider every legal execution graph.
+                    "coverage_intent": family,
                     "calibration_partition": partition,
                     "required_successful_tilings": str(required),
                     "coverage": (

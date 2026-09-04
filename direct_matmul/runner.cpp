@@ -28,13 +28,16 @@
 #include "aclrtlaunch_direct_matmul_fp16_k201.h"
 #include "aclrtlaunch_direct_matmul_fp16_k10201.h"
 #include "aclrtlaunch_direct_matmul_bf16_k1.h"
+#include "aclrtlaunch_direct_matmul_bf16_k0.h"
 #include "aclrtlaunch_direct_matmul_bf16_k20.h"
 #include "aclrtlaunch_direct_matmul_bf16_k21.h"
+#include "aclrtlaunch_direct_matmul_bf16_k30.h"
 #include "aclrtlaunch_direct_matmul_bf16_k31.h"
 #include "aclrtlaunch_direct_matmul_bf16_k201.h"
 #include "aclrtlaunch_direct_matmul_bf16_k10201.h"
 #include "aclrtlaunch_direct_matmul_fp32_k1.h"
 #include "aclrtlaunch_direct_matmul_fp32_k21.h"
+#include "aclrtlaunch_direct_matmul_fp32_k31.h"
 #include "aclrtlaunch_direct_matmul_fp32_k101.h"
 #include "aclrtlaunch_direct_matmul_fp32_k201.h"
 #include "aclrtlaunch_direct_matmul_fp32_k10201.h"
@@ -364,6 +367,7 @@ void StructuredInputs(
     const auto mNegative = PatternVector(workload.m, 0, -1, 1.0F, workload.dtype);
     const auto nPositive = PatternVector(workload.n, 1, 1, 1.0F, workload.dtype);
     const auto nNegative = PatternVector(workload.n, 1, -1, 1.0F, workload.dtype);
+    const auto nSeven = PatternVector(workload.n, 1, 1, 7.0F, workload.dtype);
     if (workload.transA) {
         CopyRows(a, workload.k, mPositive, mPositive, 2);
     } else {
@@ -373,6 +377,9 @@ void StructuredInputs(
         CopyRows(b, workload.n, kPositive, kNegative, 1);
     } else {
         CopyRows(b, workload.k, nPositive, nNegative, 2);
+        // KChecksum assigns coefficient +7 to k=0.  Non-transposed B is
+        // stored as [K,N], so its first row must use that same coefficient.
+        std::memcpy(b.data(), nSeven.data(), nSeven.size());
     }
 }
 
@@ -445,9 +452,11 @@ aclError Launch(
         }
     } else if (candidate.dtype == "bf16") {
         switch (candidate.suffix) {
+            case 0: DIRECT_LAUNCH(bf16, 0);
             case 1: DIRECT_LAUNCH(bf16, 1);
             case 20: DIRECT_LAUNCH(bf16, 20);
             case 21: DIRECT_LAUNCH(bf16, 21);
+            case 30: DIRECT_LAUNCH(bf16, 30);
             case 31: DIRECT_LAUNCH(bf16, 31);
             case 201: DIRECT_LAUNCH(bf16, 201);
             case 10201: DIRECT_LAUNCH(bf16, 10201);
@@ -456,6 +465,7 @@ aclError Launch(
         switch (candidate.suffix) {
             case 1: DIRECT_LAUNCH(fp32, 1);
             case 21: DIRECT_LAUNCH(fp32, 21);
+            case 31: DIRECT_LAUNCH(fp32, 31);
             case 101: DIRECT_LAUNCH(fp32, 101);
             case 201: DIRECT_LAUNCH(fp32, 201);
             case 10201: DIRECT_LAUNCH(fp32, 10201);

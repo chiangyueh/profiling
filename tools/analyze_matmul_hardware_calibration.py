@@ -136,6 +136,16 @@ def aggregate(rows: list[dict]) -> dict:
         "model_top1_within_measured_noise_count": sum(
             row["model_top1_within_measured_best_noise"] for row in rows
         ),
+        "model_family_choice_correct_count": sum(
+            row["model_top1_kernel_family"]
+            == row["measured_best_kernel_family"]
+            for row in rows
+        ),
+        "model_family_choice_accuracy": sum(
+            row["model_top1_kernel_family"]
+            == row["measured_best_kernel_family"]
+            for row in rows
+        ) / len(rows),
         "measured_best_model_rank_capture": {
             f"top{limit}": sum(
                 row["measured_best_model_rank"] <= limit for row in rows
@@ -299,7 +309,7 @@ def main() -> int:
         per_shape.append({
             "workload": workload,
             "partition": workload["calibration_partition"],
-            "target_kernel_family": workload["target_kernel_family"],
+            "coverage_intent": workload["coverage_intent"],
             "successful_model_tilings": len(joined),
             "official": {
                 "median_ms": number(official, "median_ms"),
@@ -315,9 +325,11 @@ def main() -> int:
             ),
             "model_top1_output_rank": model_top["output_rank"],
             "model_top1_global_rank": model_top["global_model_rank"],
+            "model_top1_kernel_family": model_top["kernel_family"],
             "measured_best_output_rank": measured_best["output_rank"],
             "measured_best_model_rank": model_rank[measured_best["output_rank"]],
             "measured_best_global_model_rank": measured_best["global_model_rank"],
+            "measured_best_kernel_family": measured_best["kernel_family"],
             "model_top1_regret_pct": regret,
             "model_top1_within_measured_best_noise": regret <= noise_pct,
             "model_top1_vs_official": model_top["versus_official"],
@@ -326,7 +338,7 @@ def main() -> int:
         })
 
     partitions = ("calibration", "holdout")
-    families = sorted({row["target_kernel_family"] for row in per_shape})
+    coverage_intents = sorted({row["coverage_intent"] for row in per_shape})
     result = {
         "schema": "matmul_hardware_factor_calibration_v1",
         "status": "complete",
@@ -348,11 +360,11 @@ def main() -> int:
                 row for row in per_shape if row["partition"] == partition
             ]) for partition in partitions
         },
-        "by_family": {
-            family: aggregate([
+        "by_coverage_intent": {
+            intent: aggregate([
                 row for row in per_shape
-                if row["target_kernel_family"] == family
-            ]) for family in families
+                if row["coverage_intent"] == intent
+            ]) for intent in coverage_intents
         },
         "per_shape": per_shape,
     }
@@ -377,7 +389,7 @@ def main() -> int:
             "status": "complete",
             "aggregate": result["aggregate"],
             "by_partition": result["by_partition"],
-            "by_family": result["by_family"],
+            "by_coverage_intent": result["by_coverage_intent"],
         },
     )
     log.close()

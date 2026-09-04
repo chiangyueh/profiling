@@ -6,8 +6,9 @@ BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 BUILD_COMPONENTS="${BUILD_COMPONENTS:-all}"
 
-if [[ "${BUILD_COMPONENTS}" != "all" && "${BUILD_COMPONENTS}" != "runner" ]]; then
-    echo "fatal: BUILD_COMPONENTS must be 'all' or 'runner'" >&2
+if [[ "${BUILD_COMPONENTS}" != "all" && "${BUILD_COMPONENTS}" != "host" && \
+      "${BUILD_COMPONENTS}" != "runner" ]]; then
+    echo "fatal: BUILD_COMPONENTS must be 'all', 'host', or 'runner'" >&2
     exit 2
 fi
 
@@ -70,7 +71,7 @@ HOST_SOURCES=(
     "$ROOT/host/src/main.cpp"
 )
 
-if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
+if [[ "${BUILD_COMPONENTS}" == "all" || "${BUILD_COMPONENTS}" == "host" ]]; then
     echo "[1/2] Building official-CANN tiling search host"
     HOST_OBJ_DIR="$BUILD/host_obj"
     mkdir -p "$HOST_OBJ_DIR"
@@ -108,8 +109,14 @@ if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
         "$HOST_OBJ_DIR/hardware_path_builders.o" \
         "$HOST_OBJ_DIR/indexed_read_path.o" \
         -o "$BUILD/indexed_read_cost"
-else
+elif [[ "${BUILD_COMPONENTS}" == "runner" ]]; then
     echo "[1/2] Skipping tiling search host (runner-only build)"
+fi
+
+if [[ "${BUILD_COMPONENTS}" == "host" ]]; then
+    file "$BUILD/matmul_tiling_search"
+    echo "Build completed: $BUILD"
+    exit 0
 fi
 
 echo "[2/2] Building official baseline and direct MatMulV3 kernels (jobs=${BUILD_JOBS:-1})"
@@ -128,11 +135,13 @@ DIRECT_KERNEL_TARGETS=(
     direct_matmul_kernel_fp16_30 direct_matmul_kernel_fp16_31
     direct_matmul_kernel_fp16_201
     direct_matmul_kernel_fp16_10201
-    direct_matmul_kernel_bf16_1 direct_matmul_kernel_bf16_20
-    direct_matmul_kernel_bf16_21 direct_matmul_kernel_bf16_31
+    direct_matmul_kernel_bf16_0 direct_matmul_kernel_bf16_1
+    direct_matmul_kernel_bf16_20 direct_matmul_kernel_bf16_21
+    direct_matmul_kernel_bf16_30 direct_matmul_kernel_bf16_31
     direct_matmul_kernel_bf16_201
     direct_matmul_kernel_bf16_10201
     direct_matmul_kernel_fp32_1 direct_matmul_kernel_fp32_21
+    direct_matmul_kernel_fp32_31
     direct_matmul_kernel_fp32_101 direct_matmul_kernel_fp32_201
     direct_matmul_kernel_fp32_10201 direct_matmul_kernel_fp32_20201
 )

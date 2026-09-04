@@ -58,8 +58,8 @@ UB_BYTES = 196_352
 RPC_WORKSPACE_BYTES = 20 * 1024 * 1024
 SUPPORTED_KERNELS = {
     "fp16": {0, 1, 20, 21, 30, 31, 201, 10201},
-    "bf16": {1, 20, 21, 31, 201, 10201},
-    "fp32": {1, 21, 101, 201, 10201, 20201},
+    "bf16": {0, 1, 20, 21, 30, 31, 201, 10201},
+    "fp32": {1, 21, 31, 101, 201, 10201, 20201},
 }
 
 
@@ -343,7 +343,7 @@ def materialize(row: dict[str, str], *, l2_bytes: int, aic_cores: int) -> Materi
     if suffix not in SUPPORTED_KERNELS.get(dtype, set()):
         raise ValueError(f"direct kernel was not built for {dtype}/suffix={suffix}")
 
-    graph_name = row.get("target_kernel_family") or row.get("execution_mode") or "base"
+    graph_name = row.get("execution_mode") or "base"
     if graph_name == "base_iterate_all":
         graph_name = "base"
     conversion = source_layout_conversion(

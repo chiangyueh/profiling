@@ -66,6 +66,7 @@ OBSOLETE_EXECUTION_COLUMNS = {
     "tiling_solver_callback_count",
 }
 FACTOR_FIELDS = {
+    "execution_graph": ("tilingEnable",),
     "core_parallelism": ("usedCoreNum",),
     "mn_geometry": (
         "singleCoreM", "singleCoreN", "baseM", "baseN", "stepM", "stepN",
@@ -89,7 +90,7 @@ CUSTOM_COLUMNS = (
     "new_model_breakdown", "new_model_score_ns", "model_schedule_sha256",
     "model_kernel_suffix", "model_kernel_variant", "model_kernel_family",
     "model_input_source", "global_model_rank", "controlled_factor",
-    "factor_signature", "is_reserve", "target_kernel_family",
+    "factor_signature", "is_reserve", "coverage_intent",
     "calibration_partition", "required_successful_tilings",
     "candidate_generation_ms", "static_legality_ms", "simulator_scoring_ms",
     "generated_candidate_count", "legal_candidate_count",
@@ -142,9 +143,8 @@ def selected_partition_values(total: int, current: int) -> tuple[int, ...]:
     return tuple(sorted(values))
 
 
-def raw_family_region(
+def raw_hardware_region(
     workload: old.Workload,
-    family: str,
     hardware,
 ):
     operator = matmul(
@@ -167,8 +167,6 @@ def raw_family_region(
             )
         except ValueError:
             continue
-        if execution_mode_name(knowledge) != family:
-            continue
         key = signature(knowledge)
         if key not in seen:
             seen.add(key)
@@ -180,6 +178,7 @@ def expanded_knowledge(
     workload: old.Workload,
     seeds: list[dict[str, int]],
     hardware,
+    coverage_intent: str,
 ) -> list[dict[str, int]]:
     """Expand only declared hardware controls around source-lowered seeds."""
 
@@ -191,9 +190,14 @@ def expanded_knowledge(
     for seed in seeds:
         add(dict(seed))
 
-    # Twelve independent source-lowered geometries are enough to expose
-    # boundaries without turning this into a geometry Cartesian product.
-    for seed in seeds[:12]:
+    # Expand the declared calibration stratum while retaining unexpanded
+    # model optima from every other graph for cross-graph ranking.  This is
+    # experimental coverage, not a restriction on solver graph selection.
+    focused_seeds = [
+        seed for seed in seeds
+        if execution_mode_name(seed) == coverage_intent
+    ][:12]
+    for seed in focused_seeds:
         for cores in range(1, hardware.core_count(Resource.CUBE) + 1):
             candidate = dict(seed)
             candidate["usedCoreNum"] = cores
@@ -259,7 +263,6 @@ def breakdown(result) -> str:
 
 def legal_scored_pool(
     workload: old.Workload,
-    family: str,
     operator,
     proposed: list[dict[str, int]],
     hardware,
@@ -275,7 +278,7 @@ def legal_scored_pool(
             aoe_injection=True,
         )
         legality_ns += time.perf_counter_ns() - started
-        if violations or execution_mode_name(knowledge) != family:
+        if violations:
             continue
         try:
             plan = plan_from_cann(
@@ -293,6 +296,7 @@ def legal_scored_pool(
                 "knowledge": knowledge,
                 "simulation": simulation,
                 "pool_sequence": sequence,
+                "family": execution_mode_name(knowledge),
             })
     result.sort(key=lambda item: (
         item["simulation"].total_cycles, signature(item["knowledge"])
@@ -318,13 +322,22 @@ def factor_signature(factor: str, knowledge: dict[str, int]) -> str:
     return ":".join(f"{field}={knowledge[field]}" for field in fields)
 
 
-def select_controlled(pool: list[dict], count: int, reserves: int):
+def select_controlled(
+    pool: list[dict], count: int, reserves: int, coverage_intent: str,
+):
     if not pool:
         raise old.SearchError("empty legal model pool")
-    anchor = pool[0]["knowledge"]
+    coverage_items = [
+        item for item in pool if item["family"] == coverage_intent
+    ]
+    if not coverage_items:
+        raise old.SearchError(
+            f"coverage graph {coverage_intent} has no legal hardware schedule"
+        )
+    anchor = coverage_items[0]["knowledge"]
     by_factor: dict[str, list[dict]] = {factor: [] for factor in FACTOR_FIELDS}
     coupled: list[dict] = []
-    for item in pool:
+    for item in coverage_items:
         factors = difference_factors(anchor, item["knowledge"])
         item["factors"] = factors
         if len(factors) == 1:
@@ -346,6 +359,18 @@ def select_controlled(pool: list[dict], count: int, reserves: int):
 
     selected: list[tuple[dict, str]] = [(pool[0], "model_optimum_anchor")]
     seen = {signature(pool[0]["knowledge"])}
+    # Measure the model-best point from every legal execution graph before
+    # local factor sweeps.  No workload-provided family label participates
+    # in selection, so measured ranks test the graph choice itself.
+    best_by_family: dict[str, dict] = {}
+    for item in pool:
+        best_by_family.setdefault(item["family"], item)
+    for family in sorted(best_by_family):
+        item = best_by_family[family]
+        key = signature(item["knowledge"])
+        if key not in seen and len(selected) < count:
+            seen.add(key)
+            selected.append((item, "execution_graph"))
     factor_order = tuple(FACTOR_FIELDS)
     progress = True
     while len(selected) < count and progress:
@@ -363,7 +388,7 @@ def select_controlled(pool: list[dict], count: int, reserves: int):
     coupled.sort(key=lambda item: (
         -len(item["factors"]), item["model_rank"]
     ))
-    for item in (*coupled, *pool):
+    for item in (*coupled, *coverage_items, *pool):
         if len(selected) >= count:
             break
         key = signature(item["knowledge"])
@@ -467,17 +492,19 @@ def main() -> int:
             int(metadata["k"]), metadata["dtype"], truthy(metadata["trans_a"]),
             truthy(metadata["trans_b"]), args.aic_cores,
         )
-        family = metadata["target_kernel_family"]
+        coverage_intent = metadata["coverage_intent"]
         required = int(metadata["required_successful_tilings"])
         generation_started = time.perf_counter_ns()
-        operator, region, seeds = raw_family_region(workload, family, hardware)
-        proposed = expanded_knowledge(workload, seeds, hardware)
+        operator, region, seeds = raw_hardware_region(workload, hardware)
+        proposed = expanded_knowledge(
+            workload, seeds, hardware, coverage_intent
+        )
         generation_ns = time.perf_counter_ns() - generation_started
         pool, legality_ns, scoring_ns = legal_scored_pool(
-            workload, family, operator, proposed, hardware
+            workload, operator, proposed, hardware
         )
         selected, reserves = select_controlled(
-            pool, required, args.reserve_candidates
+            pool, required, args.reserve_candidates, coverage_intent
         )
         chosen = [
             *((item, factor, False) for item, factor in selected),
@@ -486,6 +513,7 @@ def main() -> int:
         for output_rank, (item, factor, reserve) in enumerate(chosen, 1):
             knowledge = item["knowledge"]
             simulation = item["simulation"]
+            family = item["family"]
             schedule_sha, suffix = execution_identity(workload, knowledge)
             row = old.row_from_state(
                 fields, None, workload, knowledge,
@@ -520,7 +548,7 @@ def main() -> int:
                     factor if factor in FACTOR_FIELDS else "", knowledge
                 ),
                 "is_reserve": str(int(reserve)),
-                "target_kernel_family": family,
+                "coverage_intent": coverage_intent,
                 "calibration_partition": metadata["calibration_partition"],
                 "required_successful_tilings": str(required),
                 "candidate_generation_ms": f"{generation_ns / 1e6:.9g}",
@@ -536,6 +564,7 @@ def main() -> int:
         for item in pool:
             knowledge = item["knowledge"]
             simulation = item["simulation"]
+            family = item["family"]
             schedule_sha, suffix = execution_identity(workload, knowledge)
             row = old.row_from_state(
                 fields, None, workload, knowledge,
@@ -555,17 +584,18 @@ def main() -> int:
                 "model_schedule_sha256": schedule_sha,
                 "model_kernel_suffix": str(suffix),
                 "model_kernel_family": family.upper(),
-                "target_kernel_family": family,
+                "coverage_intent": coverage_intent,
                 "calibration_partition": metadata["calibration_partition"],
                 "required_successful_tilings": str(required),
             })
             all_rows.append(row)
         selected_workloads.append(metadata)
-        family_counts[family] += required
+        family_counts.update(item[0]["family"] for item in selected)
         formal_count += required
         print(
             f"HARDWARE_FACTOR_CANDIDATES [{workload_index}/{len(catalog)}] "
-            f"{workload.workload_id} family={family} required={required} "
+            f"{workload.workload_id} coverage={coverage_intent} required={required} "
+            f"families={','.join(sorted({item[0]['family'] for item in selected}))} "
             f"reserve={len(reserves)} pool={len(pool)} "
             f"host_ms={(time.perf_counter_ns() - shape_started) / 1e6:.3f}",
             flush=True,

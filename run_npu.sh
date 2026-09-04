@@ -9,9 +9,9 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-MatMulV3 regression ranking diagnostic: the 35 shapes that regressed beyond
-measured noise in validation v3.  Each shape requires 20 distinct successful
-model tilings plus one official MatMulV3 baseline (735 latency records).
+MatMulV3 hardware-factor calibration: 49 calibration groups and 21 frozen
+holdout groups across all seven CANN 8.1 kernel families.  The formal output
+contains 2,185 validated candidate latencies plus 70 official baselines.
 USAGE
 }
 
@@ -44,22 +44,22 @@ unset ASCEND_CUSTOM_OPP_PATH || true
 source "${ROOT}/scripts/env.sh" >/dev/null
 
 catalog_started_ns="$(date +%s%N)"
-CATALOG_TMP="$(mktemp "${TMPDIR:-/tmp}/matmul-regression-diagnostic.XXXXXX.csv")"
+CATALOG_TMP="$(mktemp "${TMPDIR:-/tmp}/matmul-hardware-calibration.XXXXXX.csv")"
 cleanup() {
     [[ -f "${CATALOG_TMP:-}" ]] && rm -f -- "${CATALOG_TMP}"
 }
 trap cleanup EXIT
 
-python3 tools/generate_matmul_regression_diagnostic_workloads.py \
+python3 tools/generate_matmul_hardware_calibration_workloads.py \
     --output "${CATALOG_TMP}" >/dev/null
 catalog_wall_ms=$(( ($(date +%s%N) - catalog_started_ns) / 1000000 ))
 CAMPAIGN_ID="$({
     sha256sum \
         "${CATALOG_TMP}" \
-        tools/generate_matmul_model_validation_workloads.py \
-        tools/generate_matmul_regression_diagnostic_workloads.py \
-        tools/generate_matmul_model_validation_candidates.py \
-        tools/analyze_matmul_regression_diagnostic.py \
+        tools/generate_matmul_hardware_calibration_workloads.py \
+        tools/generate_matmul_hardware_calibration_candidates.py \
+        tools/analyze_matmul_hardware_calibration.py \
+        tools/restore_matmul_measurement_logs.py \
         tools/refine_matmul_v3_candidates.py \
         tools/profile_official_tilings.py \
         run_npu.sh \
@@ -68,7 +68,7 @@ CAMPAIGN_ID="$({
         runner/official_matmul_runner.cpp \
         npu_cost_model/*.py
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_regression_ranking_v1/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_hardware_calibration_v1/${CAMPAIGN_ID}"
 CATALOG="${CAMPAIGN_DIR}/catalog.csv"
 WORKLOADS="${CAMPAIGN_DIR}/workloads.csv"
 CANDIDATES="${CAMPAIGN_DIR}/candidates.csv"
@@ -83,15 +83,14 @@ cp "${CATALOG_TMP}" "${CATALOG}"
 
 if [[ -s "${ANALYSIS}" ]] && \
    grep -q '"status": "complete"' "${ANALYSIS}"; then
-    echo "MATMUL_REGRESSION_RANKING_COMPLETE shapes=35 records=735"
+    echo "MATMUL_HARDWARE_CALIBRATION_COMPLETE shapes=70 records=2255"
     echo "analysis=${ANALYSIS} logs=${LOG_DIR}"
     exit 0
 fi
 
-echo "CAMPAIGN_READY operator=matmul shapes=35 model_tilings_per_shape=20 official_per_shape=1 records=735 device=${PHYSICAL_DEVICE}"
-echo "comparison=official_matmul_v3,new_hardware_simulator"
-echo "search=legal_family,core_occupancy,family_core_intersections,model_rank_fill"
-echo "partition=analysis_24,preregistered_holdout_11"
+echo "CAMPAIGN_READY operator=matmul shapes=70 candidate_records=2185 official_baselines=70 records=2255 device=${PHYSICAL_DEVICE}"
+echo "measurement=1_warmup+3_device_event_samples+validate_last_timed_output"
+echo "partition=calibration_49,frozen_holdout_21 families=7"
 echo "logs=${LOG_DIR}"
 echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
@@ -126,17 +125,13 @@ build_wall_ms=$(( ($(date +%s%N) - build_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=runner_build wall_ms=${build_wall_ms} cached=${build_cached}"
 
 export DISABLE_MEASUREMENT_HISTORY=1
-export SEARCH_SCOPE=matmul_regression_diagnostic_v1
+export SEARCH_SCOPE=matmul_hardware_calibration_v1
 export SEARCH_OUTPUT="${CANDIDATES}"
 export SEARCH_ALL_OUTPUT="${ALL_CANDIDATES}"
 export SEARCH_TILING_DIR="${TILING_DIR}"
 export MODEL_VALIDATION_WORKLOADS_OUTPUT="${WORKLOADS}"
 export MEASUREMENT_JSONL_LOG_DIRECTORY="${LOG_DIR}"
 export MEASUREMENT_JSONL_LOG_MAX_BYTES=52428800
-export MODEL_VALIDATION_SELECTED_WORKLOADS=35
-export MODEL_VALIDATION_SEARCHED_CANDIDATES=20
-export MODEL_VALIDATION_CANDIDATE_SELECTION=diagnostic_diverse
-export MODEL_VALIDATION_ALLOW_SUBSET_FAMILY_COVERAGE=1
 
 if python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" <<'PY' >/dev/null 2>&1
 import csv
@@ -164,16 +159,22 @@ for row in candidates:
         row.get("model_schedule_sha256", "")
     )
 if (
-    len(workloads) != 35
-    or len(set(workload_ids)) != 35
-    or {row.get("search_family") for row in workloads} != {"hardware_ideal_region"}
-    or len(candidates) != 700
+    len(workloads) != 70
+    or len(set(workload_ids)) != 70
+    or {row.get("search_family") for row in workloads} != {"hardware_factor_region"}
+    or len(candidates) != 2745
     or set(candidate_ids) != set(workload_ids)
-    or len(searched) != 35 or set(searched.values()) != {20}
-    or len(hashes) != 35 or {len(value) for value in hashes.values()} != {20}
+    or len(searched) != 70
+    or any(
+        searched[row["workload_id"]]
+        != int(row["required_successful_tilings"]) + 8
+        for row in workloads
+    )
+    or len(hashes) != 70
+    or any(len(hashes[row["workload_id"]]) != searched[row["workload_id"]] for row in workloads)
     or not all_candidates
     or not all(row.get("global_model_rank", "").isdigit() for row in candidates)
-    or not all(row.get("diagnostic_selection_reason", "") for row in candidates)
+    or not all(row.get("controlled_factor", "") for row in candidates)
 ):
     raise SystemExit(1)
 PY
@@ -187,11 +188,11 @@ PROFILE_WORKLOADS="${WORKLOADS}"
 set +e
 source "${ROOT}/scripts/run_search.sh" "${CATALOG}" \
     > >(tee "${SEARCH_LOG}" | awk '
-        /MODEL_VALIDATION_CANDIDATES \[/ {
+        /HARDWARE_FACTOR_CANDIDATES \[/ {
             split(substr($2,2,length($2)-2), a, "/");
             if (a[1] == 1 || a[1] == a[2] || a[1] % 20 == 0) print;
         }
-        /MATMUL_MODEL_VALIDATION_CANDIDATES|fatal:/ {print}
+        /MATMUL_HARDWARE_CALIBRATION_CANDIDATES|fatal:/ {print}
     ') 2>&1
 search_rc=$?
 set -e
@@ -206,13 +207,15 @@ export PLATFORM_AIC_CORES PLATFORM_L0A_BYTES PLATFORM_L0B_BYTES
 export PLATFORM_L0C_BYTES PLATFORM_L1_BYTES PLATFORM_L2_BYTES
 export PLATFORM_L2_BPC PLATFORM_HBM_BPC
 
-echo "NPU_MEASUREMENT_BEGIN shapes=35 simulator_tilings=700 official_baselines=35"
+echo "NPU_MEASUREMENT_BEGIN shapes=70 candidate_records=2185 official_baselines=70 records=2255"
 export KEEP_DETAILS=1
-export WARMUP=2
-export REPEAT=20
-export SAMPLES=7
-export RANK_LIMIT=20
-export SUCCESSFUL_TILINGS_PER_WORKLOAD=20
+export WARMUP=1
+export REPEAT=1
+export SAMPLES=3
+export RANK_LIMIT=50
+export SUCCESSFUL_TILINGS_PER_WORKLOAD=0
+export SUCCESSFUL_TILINGS_COLUMN=required_successful_tilings
+export VALIDATE_AFTER_MEASUREMENT=1
 export SKIP_BANK_SEED_CONTROL=1
 export STRUCTURED_FULL_PREFLIGHT=1
 export NUMERIC_PREFLIGHT_MAX_MIB=256
@@ -224,9 +227,17 @@ profile_started_ns="$(date +%s%N)"
 set +e
 "${ROOT}/scripts/profile_npu.sh" \
     "${CANDIDATES}" "${OUT_STEM}" "${WORKLOADS}" \
-    > >(tee "${PROFILE_LOG}" | awk '
-        /candidate_contract_preflight:|profile_plan:|WORKLOAD_GROUP_RESULT|official_tiling_profile completed|fatal:|candidate_abort|profile_npu failed/ {print}
-    ') 2>&1
+    > >(awk '
+        /TILING_ERROR_BEGIN/ {in_error=1}
+        in_error {
+            print; fflush();
+            if (/TILING_ERROR_END/) in_error=0;
+            next;
+        }
+        /candidate_contract_preflight:|profile_plan:|candidate_start|candidate_done|WORKLOAD_GROUP_RESULT|official_tiling_profile completed|fatal:|candidate_abort|candidate_rejected|profile_npu failed/ {
+            print; fflush();
+        }
+    ' | tee "${PROFILE_LOG}") 2>&1
 profile_rc=$?
 set -e
 profile_wall_ms=$(( ($(date +%s%N) - profile_started_ns) / 1000000 ))
@@ -246,15 +257,14 @@ for required in \
 done
 
 analysis_started_ns="$(date +%s%N)"
-python3 tools/analyze_matmul_regression_diagnostic.py \
+python3 tools/analyze_matmul_hardware_calibration.py \
     --workloads "${WORKLOADS}" \
     --candidates "${CANDIDATES}" \
     --profile "${DETAILS_DIR}/profile.csv" \
     --official-profile "${DETAILS_DIR}/official_profile.csv" \
     --output "${ANALYSIS}" \
     --log-directory "${LOG_DIR}" \
-    --expected-shapes 35 \
-    --minimum-model-tilings 20
+    --expected-shapes 70
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 echo "analysis=${ANALYSIS}"

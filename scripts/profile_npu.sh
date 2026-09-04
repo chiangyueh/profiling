@@ -22,6 +22,8 @@ FINAL_CANDIDATES_CSV="${OUT_STEM}_candidates.csv"
 FINAL_SUMMARY_CSV="${OUT_STEM}_summary.csv"
 RESUME_CSV="${OUT_STEM}_resume.csv"
 RESUME_SAMPLES_CSV="${OUT_STEM}_resume_samples.csv"
+RECOVERED_CSV="${WORK_DIR}/jsonl_recovered.csv"
+RECOVERED_SAMPLES_CSV="${WORK_DIR}/jsonl_recovered_samples.csv"
 RESUME_RUN_ID="$(date +%Y%m%d_%H%M%S)"
 HISTORY_CSV="${MEASUREMENT_HISTORY:-results/npu_full_ocr_measurements.csv}"
 HISTORY_ARGS=()
@@ -48,7 +50,7 @@ merge_resume_history() {
     local source
     for source in \
         "${RESUME_CSV}" "${FINAL_CANDIDATES_CSV}" \
-        "${OFFICIAL_PROFILE_CSV}" "${PROFILE_CSV}"; do
+        "${RECOVERED_CSV}" "${OFFICIAL_PROFILE_CSV}" "${PROFILE_CSV}"; do
         if [[ -s "${source}" ]]; then
             sources+=("${source}")
         fi
@@ -85,7 +87,9 @@ PY
 merge_resume_samples() {
     local sources=()
     local source
-    for source in "${RESUME_SAMPLES_CSV}" "${OFFICIAL_SAMPLES_CSV}" "${SAMPLES_CSV}"; do
+    for source in \
+        "${RESUME_SAMPLES_CSV}" "${RECOVERED_SAMPLES_CSV}" \
+        "${OFFICIAL_SAMPLES_CSV}" "${SAMPLES_CSV}"; do
         if [[ -s "${source}" ]]; then
             sources+=("${source}")
         fi
@@ -187,6 +191,14 @@ for name in \
     fi
 done
 
+if [[ -n "${MEASUREMENT_JSONL_LOG_DIRECTORY:-}" && \
+      -d "${MEASUREMENT_JSONL_LOG_DIRECTORY}" ]]; then
+    python3 tools/restore_matmul_measurement_logs.py \
+        --log-directory "${MEASUREMENT_JSONL_LOG_DIRECTORY}" \
+        --profile-output "${RECOVERED_CSV}" \
+        --samples-output "${RECOVERED_SAMPLES_CSV}"
+fi
+
 merge_resume_history
 merge_resume_samples
 PROFILE_HISTORY_ARGS=()
@@ -219,6 +231,15 @@ if [[ "${SUCCESSFUL_TILINGS_PER_WORKLOAD:-0}" -gt 0 ]]; then
         --successful-tilings-per-workload
         "${SUCCESSFUL_TILINGS_PER_WORKLOAD}"
     )
+fi
+if [[ -n "${SUCCESSFUL_TILINGS_COLUMN:-}" ]]; then
+    PROFILE_MODE_ARGS+=(
+        --successful-tilings-column
+        "${SUCCESSFUL_TILINGS_COLUMN}"
+    )
+fi
+if [[ "${VALIDATE_AFTER_MEASUREMENT:-0}" == "1" ]]; then
+    PROFILE_MODE_ARGS+=(--validate-after-measurement)
 fi
 if [[ -n "${MEASUREMENT_JSONL_LOG_DIRECTORY:-}" ]]; then
     PROFILE_MODE_ARGS+=(

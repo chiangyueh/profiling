@@ -79,7 +79,29 @@ if [[ "${PLATFORM_AIC_CORES}" -le 0 ]]; then
     exit 1
 fi
 
-if [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v3" || \
+if [[ "${SEARCH_SCOPE}" == "matmul_hardware_calibration_v1" ]]; then
+    if [[ "${REUSE_MODEL_VALIDATION_CANDIDATES:-0}" == "1" && \
+          -s "${SEARCH_OUTPUT}" && -s "${SEARCH_ALL_OUTPUT}" && \
+          -s "${MODEL_VALIDATION_WORKLOADS_OUTPUT:?}" ]]; then
+        echo "MATMUL_HARDWARE_CALIBRATION_CANDIDATES cached=${SEARCH_OUTPUT}"
+    else
+        python3 tools/generate_matmul_hardware_calibration_candidates.py \
+            --raw-candidates "${RAW_ALL_OUTPUT}" \
+            --catalog "${WORKLOADS}" \
+            --workloads "${MODEL_VALIDATION_WORKLOADS_OUTPUT:?}" \
+            --output "${SEARCH_OUTPUT}" \
+            --all-output "${SEARCH_ALL_OUTPUT}" \
+            --soc "${ASCENDC_SOC_VERSION:-${SOC_VERSION:-Ascend910B}}" \
+            --aic-cores "${PLATFORM_AIC_CORES}" \
+            --l0a-bytes "${PLATFORM_L0A_BYTES}" \
+            --l0b-bytes "${PLATFORM_L0B_BYTES}" \
+            --l0c-bytes "${PLATFORM_L0C_BYTES}" \
+            --l1-bytes "${PLATFORM_L1_BYTES}" \
+            --l2-bytes "${PLATFORM_L2_BYTES}" \
+            --l2-bytes-per-cycle-per-core "${PLATFORM_L2_BPC}" \
+            --hbm-bytes-per-cycle-per-core "${PLATFORM_HBM_BPC}"
+    fi
+elif [[ "${SEARCH_SCOPE}" == "matmul_model_validation_v3" || \
       "${SEARCH_SCOPE}" == "matmul_regression_diagnostic_v1" ]]; then
     MODEL_VALIDATION_LOG_ARGS=()
     if [[ -n "${MEASUREMENT_JSONL_LOG_DIRECTORY:-}" ]]; then

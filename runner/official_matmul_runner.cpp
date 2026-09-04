@@ -38,6 +38,7 @@ struct Options {
     int32_t numericPreflightMaxMiB = 4;
     bool preflightOnly = false;
     bool structuredFullPreflight = false;
+    bool validateAfterMeasurement = false;
 };
 
 struct Workload {
@@ -699,98 +700,104 @@ ProfileSummary ProfileOfficial(
                 "aclnnMatmul");
         };
 
-        const auto preflightStarted = SteadyClock::now();
-        LogStage(workload, "preflight_launch_begin");
-        launch();
-        LogStage(workload, "preflight_launch_returned");
-        LogStage(workload, "preflight_sync_begin");
-        CheckAcl(aclrtSynchronizeStream(stream), "official preflight synchronize");
-        LogStage(workload, "preflight_sync_done");
         const size_t outputBytes = ElementBytes(workload.dtype);
-        if (numericPreflight && options.structuredFullPreflight) {
-            std::vector<uint8_t> observed(cBytes);
-            CheckAcl(aclrtMemcpy(
-                observed.data(), observed.size(), c.ptr, c.bytes,
-                ACL_MEMCPY_DEVICE_TO_HOST),
-                "aclrtMemcpy official full numeric output");
-            std::vector<uint8_t> expected(cBytes);
-            FillStructuredExpectedOutput(expected, workload);
-            if (std::memcmp(observed.data(), expected.data(), cBytes) != 0) {
-                const size_t elements = cBytes / outputBytes;
-                for (size_t index = 0; index < elements; ++index) {
-                    const size_t offset = index * outputBytes;
-                    if (std::memcmp(
-                            observed.data() + offset,
-                            expected.data() + offset,
-                            outputBytes) == 0) {
-                        continue;
-                    }
-                    uint32_t actualBits = 0;
-                    uint32_t expectedBits = 0;
-                    std::memcpy(
-                        &actualBits, observed.data() + offset, outputBytes);
-                    std::memcpy(
-                        &expectedBits, expected.data() + offset, outputBytes);
-                    throw std::runtime_error(
-                        "official structured numeric preflight failed at C index=" +
-                        std::to_string(index) + ", actual=" +
-                        std::to_string(DecodeOutput(actualBits, workload.dtype)) +
-                        ", expected=" +
-                        std::to_string(DecodeOutput(expectedBits, workload.dtype)));
-                }
-                throw std::runtime_error(
-                    "official structured numeric preflight output mismatch");
-            }
-        } else {
-            constexpr int64_t coverageGrid = 9;
-            std::set<int64_t> sampleIndices;
-            for (int64_t rowProbe = 0; rowProbe < coverageGrid; ++rowProbe) {
-                const int64_t row =
-                    (workload.m - 1) * rowProbe / (coverageGrid - 1);
-                for (int64_t columnProbe = 0; columnProbe < coverageGrid;
-                     ++columnProbe) {
-                    const int64_t column =
-                        (workload.n - 1) * columnProbe / (coverageGrid - 1);
-                    sampleIndices.insert(row * workload.n + column);
-                }
-            }
-            for (int64_t index : sampleIndices) {
-                uint32_t observed = 0;
-                auto *source = static_cast<uint8_t *>(c.ptr) +
-                    static_cast<size_t>(index) * outputBytes;
+        auto validateOutput = [&]() {
+            if (numericPreflight && options.structuredFullPreflight) {
+                std::vector<uint8_t> observed(cBytes);
                 CheckAcl(aclrtMemcpy(
-                    &observed, outputBytes, source, outputBytes,
+                    observed.data(), observed.size(), c.ptr, c.bytes,
                     ACL_MEMCPY_DEVICE_TO_HOST),
-                    "aclrtMemcpy official preflight sample");
-                if (numericPreflight) {
-                    const double actual = DecodeOutput(observed, workload.dtype);
-                    const double expected = ExpectedOnesOutput(workload.k, workload.dtype);
-                    const double tolerance = std::max(0.03, std::abs(expected) * 0.01);
-                    if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
+                    "aclrtMemcpy official full numeric output");
+                std::vector<uint8_t> expected(cBytes);
+                FillStructuredExpectedOutput(expected, workload);
+                if (std::memcmp(observed.data(), expected.data(), cBytes) != 0) {
+                    const size_t elements = cBytes / outputBytes;
+                    for (size_t index = 0; index < elements; ++index) {
+                        const size_t offset = index * outputBytes;
+                        if (std::memcmp(
+                                observed.data() + offset,
+                                expected.data() + offset,
+                                outputBytes) == 0) {
+                            continue;
+                        }
+                        uint32_t actualBits = 0;
+                        uint32_t expectedBits = 0;
+                        std::memcpy(
+                            &actualBits, observed.data() + offset, outputBytes);
+                        std::memcpy(
+                            &expectedBits, expected.data() + offset, outputBytes);
                         throw std::runtime_error(
-                            "official numeric preflight failed at C index=" +
+                            "official structured numeric validation failed at C index=" +
                             std::to_string(index) + ", actual=" +
-                            std::to_string(actual) + ", expected=" +
-                            std::to_string(expected));
+                            std::to_string(DecodeOutput(actualBits, workload.dtype)) +
+                            ", expected=" +
+                            std::to_string(DecodeOutput(expectedBits, workload.dtype)));
                     }
-                } else {
-                    const auto *bytes = reinterpret_cast<const uint8_t *>(&observed);
-                    for (size_t byte = 0; byte < outputBytes; ++byte) {
-                        if (bytes[byte] != 0) {
-                            std::ostringstream detail;
-                            detail << "official output coverage failed at C index="
-                                   << index << ", observed=0x"
-                                   << std::hex << std::setfill('0')
-                                   << std::setw(static_cast<int>(outputBytes * 2))
-                                   << observed;
-                            throw std::runtime_error(detail.str());
+                    throw std::runtime_error(
+                        "official structured numeric output mismatch");
+                }
+            } else {
+                constexpr int64_t coverageGrid = 9;
+                std::set<int64_t> sampleIndices;
+                for (int64_t rowProbe = 0; rowProbe < coverageGrid; ++rowProbe) {
+                    const int64_t row =
+                        (workload.m - 1) * rowProbe / (coverageGrid - 1);
+                    for (int64_t columnProbe = 0; columnProbe < coverageGrid;
+                         ++columnProbe) {
+                        const int64_t column =
+                            (workload.n - 1) * columnProbe / (coverageGrid - 1);
+                        sampleIndices.insert(row * workload.n + column);
+                    }
+                }
+                for (int64_t index : sampleIndices) {
+                    uint32_t observed = 0;
+                    auto *source = static_cast<uint8_t *>(c.ptr) +
+                        static_cast<size_t>(index) * outputBytes;
+                    CheckAcl(aclrtMemcpy(
+                        &observed, outputBytes, source, outputBytes,
+                        ACL_MEMCPY_DEVICE_TO_HOST),
+                        "aclrtMemcpy official validation sample");
+                    if (numericPreflight) {
+                        const double actual = DecodeOutput(observed, workload.dtype);
+                        const double expected = ExpectedOnesOutput(workload.k, workload.dtype);
+                        const double tolerance = std::max(0.03, std::abs(expected) * 0.01);
+                        if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
+                            throw std::runtime_error(
+                                "official numeric validation failed at C index=" +
+                                std::to_string(index) + ", actual=" +
+                                std::to_string(actual) + ", expected=" +
+                                std::to_string(expected));
+                        }
+                    } else {
+                        const auto *bytes = reinterpret_cast<const uint8_t *>(&observed);
+                        for (size_t byte = 0; byte < outputBytes; ++byte) {
+                            if (bytes[byte] != 0) {
+                                std::ostringstream detail;
+                                detail << "official output coverage failed at C index="
+                                       << index << ", observed=0x"
+                                       << std::hex << std::setfill('0')
+                                       << std::setw(static_cast<int>(outputBytes * 2))
+                                       << observed;
+                                throw std::runtime_error(detail.str());
+                            }
                         }
                     }
                 }
             }
+        };
+
+        if (!options.validateAfterMeasurement || options.preflightOnly) {
+            const auto preflightStarted = SteadyClock::now();
+            LogStage(workload, "preflight_launch_begin");
+            launch();
+            LogStage(workload, "preflight_launch_returned");
+            LogStage(workload, "preflight_sync_begin");
+            CheckAcl(aclrtSynchronizeStream(stream), "official preflight synchronize");
+            LogStage(workload, "preflight_sync_done");
+            validateOutput();
+            summary.numericPreflightMs = ElapsedMs(preflightStarted);
+            summary.preflightPassed = true;
         }
-        summary.numericPreflightMs = ElapsedMs(preflightStarted);
-        summary.preflightPassed = true;
         if (options.preflightOnly) {
             summary.success = true;
             summary.runnerTotalMs = ElapsedMs(runnerStarted);
@@ -836,6 +843,14 @@ ProfileSummary ProfileOfficial(
             throw;
         }
         summary.measurementWallMs = ElapsedMs(measurementStarted);
+        if (options.validateAfterMeasurement) {
+            const auto validationStarted = SteadyClock::now();
+            LogStage(workload, "measurement_output_validation_begin");
+            validateOutput();
+            summary.numericPreflightMs = ElapsedMs(validationStarted);
+            summary.preflightPassed = true;
+            LogStage(workload, "measurement_output_validation_done");
+        }
         ComputeStats(summary, workload);
     } catch (const std::exception &exception) {
         summary.error = exception.what();
@@ -922,7 +937,8 @@ std::unordered_map<std::string, std::string> ParseArgs(int argc, char **argv)
         const std::string key = argv[i];
         if (key == "--help" || key == "-h" || key == "--validate-input" ||
             key == "--acl-only" || key == "--preflight-only" ||
-            key == "--structured-full-preflight") {
+            key == "--structured-full-preflight" ||
+            key == "--validate-after-measurement") {
             args[key] = "1";
             continue;
         }
@@ -967,6 +983,7 @@ void PrintUsage()
         << "  --workload-limit N\n"
         << "  --numeric-preflight-max-mib N\n"
         << "  --structured-full-preflight  signed-axis inputs and full C comparison\n"
+        << "  --validate-after-measurement validate the final timed output; no extra launch\n"
         << "  --preflight-only     launch once, synchronize, and validate output; no timing\n"
         << "  --acl-only            initialize the linked ACL runtime without profiling\n"
         << "  --validate-input       validate input and CSV schema without ACL/NPU\n";
@@ -997,6 +1014,8 @@ int main(int argc, char **argv)
         options.preflightOnly = args.count("--preflight-only") != 0;
         options.structuredFullPreflight =
             args.count("--structured-full-preflight") != 0;
+        options.validateAfterMeasurement =
+            args.count("--validate-after-measurement") != 0;
         if (options.warmup < 0 || options.repeat <= 0 || options.samples <= 0) {
             throw std::runtime_error("warmup/repeat/samples values are invalid");
         }

@@ -181,6 +181,9 @@ class IncrementalJsonl:
         self.size += len(data)
         self.seen.add(key)
 
+    def contains(self, key: str) -> bool:
+        return key in self.seen
+
     def close(self) -> None:
         if self.stream is not None:
             self.stream.close()
@@ -1343,6 +1346,8 @@ def run_official(
     ]
     if args.structured_full_preflight:
         command.append("--structured-full-preflight")
+    if args.validate_after_measurement:
+        command.append("--validate-after-measurement")
     try:
         return_code, output, timed_out, host_runner_wall_ms = run_logged_process(
             command, env, output_dir / "runner.log", args.timeout_sec
@@ -1741,6 +1746,14 @@ def main() -> int:
         help="compare every C element against the signed-axis numeric oracle",
     )
     parser.add_argument(
+        "--validate-after-measurement",
+        action="store_true",
+        help=(
+            "validate the output left by the last timed launch instead of "
+            "performing a separate preflight launch"
+        ),
+    )
+    parser.add_argument(
         "--successful-tilings-per-workload",
         type=int,
         default=0,
@@ -1748,6 +1761,11 @@ def main() -> int:
             "stop after this many successful distinct bank-control/searched "
             "tilings and fail the campaign if a workload cannot reach it"
         ),
+    )
+    parser.add_argument(
+        "--successful-tilings-column",
+        default="",
+        help="workload CSV column containing the required successful count",
     )
     parser.add_argument(
         "--skip-bank-seed-control",
@@ -1831,6 +1849,7 @@ def main() -> int:
             "warmup": args.warmup,
             "repeat": args.repeat,
             "full_numeric_validation": args.structured_full_preflight,
+            "validation_after_last_timed_launch": args.validate_after_measurement,
         },
     )
     history_baselines, history_candidates = load_history(
@@ -1878,6 +1897,28 @@ def main() -> int:
         grouped.setdefault(row["workload_id"], []).append(row)
     for rows in grouped.values():
         rows.sort(key=lambda row: int(row.get("rank", "0")))
+
+    required_by_workload: dict[str, int] = {}
+    if args.successful_tilings_column:
+        for workload in workloads:
+            workload_id = workload["workload_id"]
+            try:
+                required = int(workload[args.successful_tilings_column])
+            except (KeyError, ValueError) as exception:
+                raise ProfileError(
+                    f"{workload_id}: invalid {args.successful_tilings_column}"
+                ) from exception
+            available = sum(
+                row.get("candidate_role") == "searched"
+                and 0 < int(row.get("rank", "0")) <= args.rank_limit
+                for row in grouped.get(workload_id, [])
+            )
+            if required <= 0 or required > available:
+                raise ProfileError(
+                    f"{workload_id}: required successful tilings={required}, "
+                    f"scheduled={available}"
+                )
+            required_by_workload[workload_id] = required
 
     write_header(args.custom_output, PROFILE_COLUMNS)
     write_header(args.custom_samples_output, SAMPLE_COLUMNS)
@@ -1976,7 +2017,7 @@ def main() -> int:
             if key in exact_sample_history
         }
 
-    if args.successful_tilings_per_workload:
+    if args.successful_tilings_per_workload or args.successful_tilings_column:
         # A gated calibration campaign deliberately stops after the first N
         # successful schedules.  Ranks beyond that point are not missing
         # paired data, so an interrupted rerun must retain its exact prefix.
@@ -2071,6 +2112,16 @@ def main() -> int:
             rank = candidate["rank"]
             role = candidate["candidate_role"]
             knowledge = make_knowledge(candidate)
+            failed_key = f"candidate:{workload_id}:{role}:{rank}:failed"
+            if incremental_log.contains(failed_key):
+                validate_candidate(candidate, spec)
+                prepared_candidates[(workload_id, role, rank)] = (
+                    None,
+                    knowledge,
+                )
+                bank_prepare_ms[(workload_id, role, rank)] = 0.0
+                history_prepared += 1
+                continue
             if (workload_id, role, rank) in history_assignments:
                 validate_candidate(candidate, spec)
                 prepared_candidates[(workload_id, role, rank)] = (
@@ -2309,6 +2360,9 @@ def main() -> int:
                 )
             bank_control_profile: dict[str, str] | None = None
             successful_tilings = 0
+            group_required = required_by_workload.get(
+                workload_id, args.successful_tilings_per_workload
+            )
             if controls:
                 control = controls[0]
                 control_rank = control["rank"]
@@ -2458,13 +2512,25 @@ def main() -> int:
             best_official_status = ""
             for candidate in searched:
                 if (
-                    args.successful_tilings_per_workload
+                    group_required
                     and successful_tilings
-                    >= args.successful_tilings_per_workload
+                    >= group_required
                 ):
                     break
                 candidate_index += 1
                 rank = candidate["rank"]
+                failed_key = (
+                    f"candidate:{workload_id}:searched:{rank}:failed"
+                )
+                if incremental_log.contains(failed_key):
+                    runtime_rejected += 1
+                    print(
+                        f"candidate_rejected [{candidate_index}/"
+                        f"{searched_count}] {workload_id} rank={rank} "
+                        "action=resume_known_rejection",
+                        flush=True,
+                    )
+                    continue
                 candidate_root = (
                     work_dir / "candidate" /
                     f"{safe_name(workload_id)}_searched_rank{rank}"
@@ -2637,7 +2703,6 @@ def main() -> int:
                         f"mark={marker}",
                         flush=True,
                     )
-            group_required = args.successful_tilings_per_workload
             group_admitted = not group_required or successful_tilings >= group_required
             if not group_admitted:
                 incomplete_groups += 1
@@ -2690,8 +2755,8 @@ def main() -> int:
         )
         if incomplete_groups:
             raise ProfileError(
-                f"{incomplete_groups} workload groups did not reach "
-                f"{args.successful_tilings_per_workload} successful tilings"
+                f"{incomplete_groups} workload groups did not reach their "
+                "required successful tiling count"
             )
         incremental_log.write(
             "campaign:measurement_complete",

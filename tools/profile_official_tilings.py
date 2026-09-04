@@ -61,7 +61,9 @@ PROFILE_COLUMNS = [
     "tiling_solver_total_ms",
     "bank_prepare_ms", "host_runner_wall_ms",
     "device_prepare_ms", "executor_setup_ms", "numeric_preflight_ms",
+    "workspace_bytes",
     "warmup_wall_ms", "measurement_wall_ms", "runner_total_ms",
+    "runtime_kb_attested",
     "measurement_source",
 ]
 SAMPLE_COLUMNS = ["workload_id", "rank", "candidate_role", "sample", "latency_ms"]
@@ -1239,6 +1241,10 @@ def create_candidate_bank(
     env = os.environ.copy()
     env["TUNE_BANK_PATH"] = str(root)
     env["ASCEND_CACHE_PATH"] = str(cache_root)
+    compiler_cache = cache_root / "op_compiler"
+    compiler_cache.mkdir(parents=True, exist_ok=True)
+    env["ACL_OP_COMPILER_CACHE_MODE"] = "enable"
+    env["ACL_OP_COMPILER_CACHE_DIR"] = str(compiler_cache)
     query = subprocess.run(
         [
             str(probe), "--query", str(key_path),
@@ -1329,6 +1335,8 @@ def run_official(
     output_dir: Path,
     env: dict[str, str],
     args: argparse.Namespace,
+    *,
+    preflight_only: bool = False,
 ) -> tuple[dict[str, str], list[dict[str, str]]]:
     profile_path = output_dir / "profile.csv"
     samples_path = output_dir / "samples.csv"
@@ -1348,6 +1356,8 @@ def run_official(
         command.append("--structured-full-preflight")
     if args.validate_after_measurement:
         command.append("--validate-after-measurement")
+    if preflight_only:
+        command.append("--preflight-only")
     try:
         return_code, output, timed_out, host_runner_wall_ms = run_logged_process(
             command, env, output_dir / "runner.log", args.timeout_sec
@@ -1436,12 +1446,14 @@ def candidate_profile(
     source: str,
     role: str,
     knowledge: dict | None = None,
+    runtime_kb_attested: bool = False,
 ) -> dict[str, str]:
     result = dict(measured)
     result.update({
         "rank": rank,
         "source": source,
         "candidate_role": role,
+        "runtime_kb_attested": "1" if runtime_kb_attested else "0",
     })
     if candidate is None:
         return result
@@ -1534,6 +1546,150 @@ def candidate_profile(
 
 def kernel_template_name(knowledge: dict) -> str:
     return f"MatMulV3_{matmul_contract.template_name(knowledge)}"
+
+
+def runtime_kb_attestation_pair(
+    candidates: list[dict[str, str]],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Pick a controlled CANN 8.1 workspace-visible core-count pair."""
+
+    groups: dict[tuple, list[dict[str, str]]] = {}
+    for candidate in candidates:
+        knowledge = make_knowledge(candidate)
+        if (
+            candidate.get("calibration_partition") != "calibration"
+            or candidate.get("trans_a") != "0"
+            or candidate.get("trans_b") != "0"
+            or knowledge["tilingEnable"] != 3
+        ):
+            continue
+        identity = (
+            candidate["workload_id"],
+            *(knowledge[name] for name in sorted(KNOWLEDGE_KEYS - {"usedCoreNum"})),
+        )
+        groups.setdefault(identity, []).append(candidate)
+
+    choices: list[
+        tuple[int, int, int, dict[str, str], dict[str, str]]
+    ] = []
+    for rows in groups.values():
+        by_core = {
+            make_knowledge(row)["usedCoreNum"]: row
+            for row in rows
+        }
+        if len(by_core) < 2:
+            continue
+        low_core = min(by_core)
+        high_core = max(by_core)
+        low = by_core[low_core]
+        high = by_core[high_core]
+        knowledge = make_knowledge(low)
+        expected_delta = (
+            (high_core - low_core)
+            * knowledge["singleCoreM"]
+            * knowledge["singleCoreN"]
+            * 2
+            * 4
+        )
+        workload_elements = (
+            int(low["m"]) * int(low["n"]) * int(low["k"])
+        )
+        choices.append((
+            high_core - low_core,
+            workload_elements,
+            expected_delta,
+            low,
+            high,
+        ))
+    if not choices:
+        raise ProfileError(
+            "RuntimeKb execution attestation requires an aligned calibration "
+            "deterministic Split-K pair differing only in usedCoreNum"
+        )
+    _, _, _, low, high = min(
+        choices,
+        key=lambda item: (-item[0], item[1], item[2]),
+    )
+    return low, high
+
+
+def deterministic_split_k_workspace_bytes(knowledge: dict) -> int:
+    """Exact CANN 8.1 BASE deterministic Split-K workspace formula."""
+
+    if knowledge["tilingEnable"] != 3:
+        raise ProfileError("workspace attestation requires tilingEnable=3")
+    return (
+        20 * 1024 * 1024
+        + knowledge["usedCoreNum"]
+        * knowledge["singleCoreM"]
+        * knowledge["singleCoreN"]
+        * 2
+        * 4
+    )
+
+
+def attest_runtime_kb_execution(
+    runner: Path,
+    workload_source: Path,
+    output_root: Path,
+    candidates: list[dict[str, str]],
+    prepared: dict[tuple[str, str, str], tuple[dict[str, str] | None, dict]],
+    args: argparse.Namespace,
+) -> dict:
+    """Prove that ACL execution consumed two distinct RuntimeKb records."""
+
+    low, high = runtime_kb_attestation_pair(candidates)
+    observations = []
+    for label, candidate in (("low", low), ("high", high)):
+        candidate_key = (
+            candidate["workload_id"],
+            candidate["candidate_role"],
+            candidate["rank"],
+        )
+        environment, knowledge = prepared[candidate_key]
+        assert environment is not None
+        measured, _ = run_official(
+            runner,
+            workload_source,
+            candidate["workload_id"],
+            output_root / label,
+            environment,
+            args,
+            preflight_only=True,
+        )
+        try:
+            observed_workspace = int(measured["workspace_bytes"])
+        except (KeyError, ValueError) as exception:
+            raise ProfileError(
+                "official runner did not report an integer workspace_bytes "
+                "during RuntimeKb execution attestation"
+            ) from exception
+        expected_workspace = deterministic_split_k_workspace_bytes(knowledge)
+        if observed_workspace != expected_workspace:
+            raise ProfileError(
+                "RuntimeKb execution attestation failed: "
+                f"usedCoreNum={knowledge['usedCoreNum']} "
+                f"workspace_bytes={observed_workspace} "
+                f"expected={expected_workspace}"
+            )
+        observations.append({
+            "rank": candidate["rank"],
+            "used_core_num": knowledge["usedCoreNum"],
+            "workspace_bytes": observed_workspace,
+        })
+    if observations[0]["workspace_bytes"] == observations[1]["workspace_bytes"]:
+        raise ProfileError(
+            "RuntimeKb execution attestation failed: controlled core-count "
+            "pair returned identical workspace"
+        )
+    return {
+        "schema": "matmul_runtime_kb_execution_attestation_v1",
+        "record_type": "runtime_kb_execution_attestation",
+        "status": "passed",
+        "workload_id": low["workload_id"],
+        "observations": observations,
+        "numeric_validation": "full_output_passed",
+    }
 
 
 def isolated_candidate_failure(error: RunnerProfileError) -> bool:
@@ -1784,6 +1940,14 @@ def main() -> int:
         help="validate every candidate against CANN RuntimeKb without using the NPU",
     )
     parser.add_argument(
+        "--require-runtime-kb-execution-attestation",
+        action="store_true",
+        help=(
+            "before formal timing, prove two controlled RuntimeKb records "
+            "reached CANN by their exact deterministic Split-K workspace"
+        ),
+    )
+    parser.add_argument(
         "--require-exact-resume-prefix",
         type=int,
         default=0,
@@ -2016,6 +2180,13 @@ def main() -> int:
             for key, value in history_assignments.items()
             if key in exact_sample_history
         }
+    if args.require_runtime_kb_execution_attestation:
+        history_assignments = {
+            key: value
+            for key, value in history_assignments.items()
+            if truthy(value.get("runtime_kb_attested"))
+            and value.get("workspace_bytes", "") != ""
+        }
 
     if args.successful_tilings_per_workload or args.successful_tilings_column:
         # A gated calibration campaign deliberately stops after the first N
@@ -2107,13 +2278,43 @@ def main() -> int:
         query_modes: set[str] = set()
         history_prepared = 0
         bank_prepared = 0
-        for validation_index, candidate in enumerate(supported_candidates, 1):
+        runtime_kb_attested = False
+        attestation_rows: list[dict[str, str]] = []
+        attestation_keys: set[tuple[str, str, str]] = set()
+        preparation_candidates = supported_candidates
+        if (
+            args.require_runtime_kb_execution_attestation
+            and not args.validate_only
+        ):
+            attestation_rows = list(
+                runtime_kb_attestation_pair(supported_candidates)
+            )
+            attestation_keys = {
+                (row["workload_id"], row["candidate_role"], row["rank"])
+                for row in attestation_rows
+            }
+            preparation_candidates = [
+                *attestation_rows,
+                *[
+                    row for row in supported_candidates
+                    if (
+                        row["workload_id"],
+                        row["candidate_role"],
+                        row["rank"],
+                    ) not in attestation_keys
+                ],
+            ]
+        for validation_index, candidate in enumerate(preparation_candidates, 1):
             workload_id = candidate["workload_id"]
             rank = candidate["rank"]
             role = candidate["candidate_role"]
+            candidate_key = (workload_id, role, rank)
             knowledge = make_knowledge(candidate)
             failed_key = f"candidate:{workload_id}:{role}:{rank}:failed"
-            if incremental_log.contains(failed_key):
+            if (
+                incremental_log.contains(failed_key)
+                and candidate_key not in attestation_keys
+            ):
                 validate_candidate(candidate, spec)
                 prepared_candidates[(workload_id, role, rank)] = (
                     None,
@@ -2122,7 +2323,10 @@ def main() -> int:
                 bank_prepare_ms[(workload_id, role, rank)] = 0.0
                 history_prepared += 1
                 continue
-            if (workload_id, role, rank) in history_assignments:
+            if (
+                candidate_key in history_assignments
+                and candidate_key not in attestation_keys
+            ):
                 validate_candidate(candidate, spec)
                 prepared_candidates[(workload_id, role, rank)] = (
                     None,
@@ -2162,12 +2366,40 @@ def main() -> int:
             bank_prepared += 1
             query_modes.add(query_mode)
             if (
+                attestation_keys
+                and not runtime_kb_attested
+                and attestation_keys.issubset(prepared_candidates)
+            ):
+                attestation = attest_runtime_kb_execution(
+                    args.runner,
+                    args.workloads,
+                    work_dir / "runtime_kb_execution_attestation",
+                    attestation_rows,
+                    prepared_candidates,
+                    args,
+                )
+                runtime_kb_attested = True
+                incremental_log.write(
+                    "campaign:runtime_kb_execution_attestation",
+                    attestation,
+                )
+                low, high = attestation["observations"]
+                print(
+                    "runtime_kb_execution_attestation: passed "
+                    f"workload={attestation['workload_id']} "
+                    f"cores={low['used_core_num']}->{high['used_core_num']} "
+                    f"workspace={low['workspace_bytes']}->"
+                    f"{high['workspace_bytes']} "
+                    "numeric_validation=full_output_passed",
+                    flush=True,
+                )
+            if (
                 validation_index == 1
-                or validation_index == len(supported_candidates)
+                or validation_index == len(preparation_candidates)
                 or validation_index % 50 == 0
             ):
                 print(
-                    f"bank_lookup: [{validation_index}/{len(supported_candidates)}] "
+                    f"bank_lookup: [{validation_index}/{len(preparation_candidates)}] "
                     f"{workload_id} role={role} rank={rank}",
                     flush=True,
                 )
@@ -2181,12 +2413,20 @@ def main() -> int:
         )
         if args.validate_only:
             return 0
+        if args.require_runtime_kb_execution_attestation and not runtime_kb_attested:
+            raise ProfileError("RuntimeKb execution attestation did not run")
 
         empty_bank = work_dir / "empty_bank"
         empty_bank.mkdir()
         baseline_env = os.environ.copy()
         baseline_env["TUNE_BANK_PATH"] = str(empty_bank)
         baseline_env["ASCEND_CACHE_PATH"] = str(cache_root)
+        baseline_compiler_cache = work_dir / "baseline_compiler_cache"
+        baseline_compiler_cache.mkdir()
+        baseline_env["ACL_OP_COMPILER_CACHE_MODE"] = "enable"
+        baseline_env["ACL_OP_COMPILER_CACHE_DIR"] = str(
+            baseline_compiler_cache
+        )
 
         candidate_index = 0
         runtime_rejected = 0
@@ -2464,6 +2704,7 @@ def main() -> int:
                     control.get("source", "official_seed_bank_roundtrip"),
                     control_role,
                     control_knowledge,
+                    runtime_kb_attested,
                 )
                 bank_control_profile["bank_prepare_ms"] = f"{bank_prepare_ms.get((workload_id, control_role, control_rank), 0.0):.9g}"
                 append_row(
@@ -2648,6 +2889,7 @@ def main() -> int:
                 profiled = candidate_profile(
                     candidate, measured, rank,
                     candidate.get("source", "searched"), "searched", knowledge,
+                    runtime_kb_attested,
                 )
                 profiled["bank_prepare_ms"] = f"{bank_prepare_ms.get((workload_id, 'searched', rank), 0.0):.9g}"
                 append_row(args.custom_output, PROFILE_COLUMNS, profiled)

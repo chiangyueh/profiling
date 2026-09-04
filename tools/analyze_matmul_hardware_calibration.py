@@ -34,12 +34,28 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--log-directory", type=Path, required=True)
     parser.add_argument("--expected-shapes", type=int, default=70)
+    parser.add_argument("--require-runtime-kb-attested", action="store_true")
     args = parser.parse_args()
 
     workloads = read_rows(args.workloads)
     candidates = read_rows(args.candidates)
     profiles = read_rows(args.profile)
     official_profiles = read_rows(args.official_profile)
+    if args.require_runtime_kb_attested:
+        unattested = [
+            row for row in profiles
+            if row.get("candidate_role") == "searched"
+            and valid_profile(row)
+            and (
+                row.get("runtime_kb_attested") != "1"
+                or row.get("workspace_bytes", "") == ""
+            )
+        ]
+        if unattested:
+            raise RuntimeError(
+                "successful candidate profiles lack RuntimeKb execution "
+                f"attestation: {len(unattested)} rows"
+            )
     if len(workloads) != args.expected_shapes:
         raise RuntimeError(
             f"workload count {len(workloads)}, expected {args.expected_shapes}"
@@ -180,6 +196,7 @@ def main() -> int:
             "latency_records": 2255,
             "latency_history_or_cce_table_used_by_model": False,
             "holdout_feedback_permitted_during_calibration": False,
+            "runtime_kb_execution_attested": args.require_runtime_kb_attested,
         },
         "aggregate": aggregate(per_shape),
         "by_partition": {

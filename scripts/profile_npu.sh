@@ -241,6 +241,9 @@ fi
 if [[ "${VALIDATE_AFTER_MEASUREMENT:-0}" == "1" ]]; then
     PROFILE_MODE_ARGS+=(--validate-after-measurement)
 fi
+if [[ "${REQUIRE_RUNTIME_KB_EXECUTION_ATTESTATION:-0}" == "1" ]]; then
+    PROFILE_MODE_ARGS+=(--require-runtime-kb-execution-attestation)
+fi
 if [[ -n "${MEASUREMENT_JSONL_LOG_DIRECTORY:-}" ]]; then
     PROFILE_MODE_ARGS+=(
         --jsonl-log-directory "${MEASUREMENT_JSONL_LOG_DIRECTORY}"

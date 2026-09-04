@@ -1,4 +1,5 @@
 #include <acl/acl.h>
+#include <acl/acl_op_compiler.h>
 #include <aclnn/acl_meta.h>
 #include <aclnnop/aclnn_matmul.h>
 
@@ -67,6 +68,7 @@ struct ProfileSummary {
     double tflops = 0.0;
     double devicePrepareMs = 0.0;
     double executorSetupMs = 0.0;
+    uint64_t workspaceBytes = 0;
     double numericPreflightMs = 0.0;
     double warmupWallMs = 0.0;
     double measurementWallMs = 0.0;
@@ -256,6 +258,7 @@ const std::vector<std::string> &ProfileColumns()
         "min_ms", "mean_ms", "median_ms", "stddev_ms", "p95_ms", "max_ms",
         "tflops", "warmup", "repeat", "samples", "tiling_signature", "tiling_bin",
         "device_prepare_ms", "executor_setup_ms", "numeric_preflight_ms",
+        "workspace_bytes",
         "warmup_wall_ms", "measurement_wall_ms", "runner_total_ms",
     };
     return columns;
@@ -685,6 +688,7 @@ ProfileSummary ProfileOfficial(
         CheckAclnn(aclnnMatmulGetWorkspaceSize(
             aTensor.ptr, bTensor.ptr, cTensor.ptr, 0, &workspaceBytes, &executor.ptr),
             "aclnnMatmulGetWorkspaceSize");
+        summary.workspaceBytes = workspaceBytes;
         if (executor.ptr == nullptr) {
             throw std::runtime_error("aclnnMatmulGetWorkspaceSize returned null executor");
         }
@@ -907,6 +911,7 @@ void WriteProfileRow(
         ToText(summary.devicePrepareMs),
         ToText(summary.executorSetupMs),
         ToText(summary.numericPreflightMs),
+        ToText(summary.workspaceBytes),
         ToText(summary.warmupWallMs),
         ToText(summary.measurementWallMs),
         ToText(summary.runnerTotalMs),
@@ -1050,6 +1055,16 @@ int main(int argc, char **argv)
         try {
             CheckAcl(aclInit(nullptr), "aclInit");
             aclInitialized = true;
+            if (const char *mode = std::getenv("ACL_OP_COMPILER_CACHE_MODE")) {
+                CheckAcl(
+                    aclSetCompileopt(ACL_OP_COMPILER_CACHE_MODE, mode),
+                    "aclSetCompileopt cache mode");
+            }
+            if (const char *directory = std::getenv("ACL_OP_COMPILER_CACHE_DIR")) {
+                CheckAcl(
+                    aclSetCompileopt(ACL_OP_COMPILER_CACHE_DIR, directory),
+                    "aclSetCompileopt cache directory");
+            }
             CheckAcl(aclrtSetDevice(options.deviceId), "aclrtSetDevice");
             deviceSet = true;
             CheckAcl(aclrtCreateContext(&context, options.deviceId), "aclrtCreateContext");

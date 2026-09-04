@@ -216,6 +216,7 @@ export RANK_LIMIT=50
 export SUCCESSFUL_TILINGS_PER_WORKLOAD=0
 export SUCCESSFUL_TILINGS_COLUMN=required_successful_tilings
 export VALIDATE_AFTER_MEASUREMENT=1
+export REQUIRE_RUNTIME_KB_EXECUTION_ATTESTATION=1
 export SKIP_BANK_SEED_CONTROL=1
 export STRUCTURED_FULL_PREFLIGHT=1
 export NUMERIC_PREFLIGHT_MAX_MIB=256
@@ -234,7 +235,7 @@ set +e
             if (/TILING_ERROR_END/) in_error=0;
             next;
         }
-        /candidate_contract_preflight:|profile_plan:|candidate_start|candidate_done|WORKLOAD_GROUP_RESULT|official_tiling_profile completed|fatal:|candidate_abort|candidate_rejected|profile_npu failed/ {
+        /candidate_contract_preflight:|runtime_kb_execution_attestation:|profile_plan:|candidate_start|candidate_done|WORKLOAD_GROUP_RESULT|official_tiling_profile completed|fatal:|candidate_abort|candidate_rejected|profile_npu failed/ {
             print; fflush();
         }
     ' | tee "${PROFILE_LOG}") 2>&1
@@ -264,7 +265,8 @@ python3 tools/analyze_matmul_hardware_calibration.py \
     --official-profile "${DETAILS_DIR}/official_profile.csv" \
     --output "${ANALYSIS}" \
     --log-directory "${LOG_DIR}" \
-    --expected-shapes 70
+    --expected-shapes 70 \
+    --require-runtime-kb-attested
 analysis_wall_ms=$(( ($(date +%s%N) - analysis_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=analysis wall_ms=${analysis_wall_ms}"
 echo "analysis=${ANALYSIS}"

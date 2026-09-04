@@ -71,6 +71,7 @@ target_link_directories(official_matmul_runner PRIVATE
 
 target_link_libraries(official_matmul_runner PRIVATE
     ascendcl
+    acl_op_compiler
     nnopbase
     opapi
     dl

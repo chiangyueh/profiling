@@ -22,4 +22,14 @@ __aicore__ inline void DirectReadMatmulTiling(
 #undef TILING_KEY_VAR
 #define TILING_KEY_VAR MATMUL_DIRECT_TILING_KEY
 #define mat_mul_v3 MATMUL_DIRECT_KERNEL
+
+// ascendc_library's generated static wrapper has already called
+// AscendC::GetUserWorkspace before entering MATMUL_DIRECT_KERNEL.  The
+// original dynamic MatMulV3 entry expects the untouched framework workspace
+// and performs that conversion itself.  Keeping both conversions skips the
+// reserved system workspace twice; workspace-backed kernels (notably suffix
+// 20/21/30/31) then access beyond the allocation and report 507053.  At this
+// direct ABI boundary the incoming pointer is already the user pointer.
+#define GetUserWorkspace(address) (address)
 #include "mat_mul_v3.cpp"
+#undef GetUserWorkspace

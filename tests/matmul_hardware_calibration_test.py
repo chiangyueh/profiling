@@ -104,6 +104,17 @@ def test_direct_resume_does_not_repeat_numeric_failures(tmp_path: Path) -> None:
     assert attempted == {("w0", "7")}
 
 
+def test_direct_kernel_does_not_offset_user_workspace_twice() -> None:
+    entry = (ROOT / "direct_matmul" / "kernel_entry.cpp").read_text(
+        encoding="utf-8"
+    )
+    include = '#include "mat_mul_v3.cpp"'
+    override = "#define GetUserWorkspace(address) (address)"
+    restore = "#undef GetUserWorkspace"
+
+    assert entry.index(override) < entry.index(include) < entry.index(restore)
+
+
 def _pool_item(family: str, rank: int, core_count: int) -> dict:
     knowledge = {field: 1 for field in candidates.old.KNOWLEDGE_FIELDS}
     knowledge.update({

@@ -362,8 +362,8 @@ void StructuredInputs(
     std::vector<uint8_t> &b,
     const Candidate &workload)
 {
-    const auto kPositive = PatternVector(workload.k, 2, 1, 1.0F, workload.dtype);
-    const auto kNegative = PatternVector(workload.k, 2, -1, 1.0F, workload.dtype);
+    auto kPositive = PatternVector(workload.k, 2, 1, 1.0F, workload.dtype);
+    auto kNegative = PatternVector(workload.k, 2, -1, 1.0F, workload.dtype);
     StoreScalar(kPositive.data(), workload.dtype, 7.0F);
     StoreScalar(kNegative.data(), workload.dtype, -7.0F);
     const auto kOnes = ConstantVector(workload.k, 1.0F, workload.dtype);

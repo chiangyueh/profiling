@@ -8,9 +8,8 @@ BUILD_COMPONENTS="${BUILD_COMPONENTS:-all}"
 
 if [[ "${BUILD_COMPONENTS}" != "all" && "${BUILD_COMPONENTS}" != "host" && \
       "${BUILD_COMPONENTS}" != "official" && \
-      "${BUILD_COMPONENTS}" != "variant" && \
-      "${BUILD_COMPONENTS}" != "cleanup" ]]; then
-    echo "fatal: BUILD_COMPONENTS must be all, host, official, variant, or cleanup" >&2
+      "${BUILD_COMPONENTS}" != "variant" ]]; then
+    echo "fatal: BUILD_COMPONENTS must be all, host, official, or variant" >&2
     exit 2
 fi
 
@@ -157,33 +156,6 @@ DIRECT_KERNEL_BUILD_SIGNATURE="$({
 } | sha256sum | cut -d' ' -f1)"
 kernel_count="${#DIRECT_KERNEL_TARGETS[@]}"
 
-cleanup_kernel_intermediates() {
-    local cleanup_target="$1"
-    case "${cleanup_target}" in
-        direct_matmul_kernel_*) ;;
-        *) echo "fatal: invalid cleanup target ${cleanup_target}" >&2; return 2 ;;
-    esac
-    local cleanup_path
-    for cleanup_path in \
-        "${NPU_BUILD}/${cleanup_target}_precompile-prefix" \
-        "${NPU_BUILD}/${cleanup_target}_preprocess-prefix" \
-        "${NPU_BUILD}/${cleanup_target}_host-prefix" \
-        "${NPU_BUILD}/${cleanup_target}_aic_device-prefix" \
-        "${NPU_BUILD}/${cleanup_target}_aiv_device-prefix" \
-        "${NPU_BUILD}/${cleanup_target}_aic_device_dir" \
-        "${NPU_BUILD}/${cleanup_target}_aiv_device_dir" \
-        "${NPU_BUILD}/${cleanup_target}_merge_obj_dir" \
-        "${NPU_BUILD}/${cleanup_target}_host_dir" \
-        "${NPU_BUILD}/${cleanup_target}_preprocess-prefix.stale-before-rebuild" \
-        "${NPU_BUILD}/auto_gen/${cleanup_target}" \
-        "${NPU_BUILD}/CMakeFiles/${cleanup_target}_host_stub_obj.dir"; do
-        if [[ -d "${cleanup_path}" ]]; then
-            cmake -E remove_directory "${cleanup_path}"
-        fi
-    done
-    return 0
-}
-
 kernel_identity() {
     local identity_target="$1"
     local identity="${identity_target#direct_matmul_kernel_}"
@@ -222,39 +194,6 @@ recover_kernel_archive() {
         "${NPU_BUILD}/elf_tool.c.o" "${NPU_BUILD}/ascendc_runtime.cpp.o"
     kernel_archive_valid "${recover_target}"
 }
-
-# A completed archive contains the packed device binary. Its ExternalProject
-# tree is no longer needed. Clean only repository-private generated trees.
-for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
-    if kernel_archive_valid "${target}"; then
-        cleanup_kernel_intermediates "${target}"
-    fi
-done
-
-# An interrupted ar step can delete the archive while leaving every object
-# needed to reconstruct it. Recover after the first cleanup pass has released
-# space. If recovery is impossible, discard only that incomplete target tree;
-# a later per-variant request will rebuild it from source.
-for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
-    if ! kernel_archive_valid "${target}"; then
-        if recover_kernel_archive "${target}"; then
-            cleanup_kernel_intermediates "${target}"
-        else
-            cleanup_kernel_intermediates "${target}"
-        fi
-    fi
-done
-
-build_free_kib="$(df -Pk "${BUILD}" | awk 'END {print $4}')"
-if [[ ! "${build_free_kib}" =~ ^[0-9]+$ || "${build_free_kib}" -lt 8388608 ]]; then
-    echo "fatal: less than 8 GiB remains after private kernel cleanup" >&2
-    exit 1
-fi
-echo "DIRECT_BUILD_STORAGE free_mib=$((build_free_kib / 1024))"
-
-if [[ "${BUILD_COMPONENTS}" == "cleanup" ]]; then
-    exit 0
-fi
 
 if [[ ! -f "${NPU_BUILD}/CMakeCache.txt" ]]; then
     run_logged "$BUILD/kernel_build.log" "configure NPU targets" \
@@ -302,6 +241,10 @@ target_symbol="aclrtlaunch_direct_matmul_${target_dtype}_k${target_suffix}"
 target_include="${NPU_BUILD}/include/${target}"
 target_header="${target_include}/${target_symbol}.h"
 
+if ! kernel_archive_valid "${target}"; then
+    recover_kernel_archive "${target}" || true
+fi
+
 kernel_cache_valid=0
 if kernel_archive_valid "${target}"; then
     if [[ "$(cat "${target_stamp}" 2>/dev/null || true)" == \
@@ -318,7 +261,6 @@ fi
 if [[ "${kernel_cache_valid}" -eq 1 ]]; then
     echo "DIRECT_KERNEL_BUILD ${target} cached"
 else
-    cleanup_kernel_intermediates "${target}"
     echo "DIRECT_KERNEL_BUILD ${target} begin"
     run_logged "$BUILD/kernel_build.log" "compile ${target}" \
         cmake --build "$NPU_BUILD" --target "${target}" \
@@ -365,5 +307,4 @@ else
     echo "DIRECT_VARIANT_RUNNER_LINK ${target_identity} passed"
 fi
 
-cleanup_kernel_intermediates "${target}"
 echo "DIRECT_VARIANT_READY target=${target} runner=${runner_path}"

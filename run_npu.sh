@@ -63,15 +63,6 @@ grep -Eq '^toolkit_running_version=.*:8\.1' "${CANN_VERSION_FILE}" || {
     exit 2
 }
 
-echo "PRIVATE_BUILD_CLEANUP begin"
-if ! BUILD_COMPONENTS=cleanup BUILD_JOBS=1 scripts/build_all.sh \
-    >"${TMPDIR:-/tmp}/matmul_direct_build_cleanup.log" 2>&1; then
-    echo "PRIVATE_BUILD_CLEANUP failed"
-    tail -20 "${TMPDIR:-/tmp}/matmul_direct_build_cleanup.log"
-    exit 1
-fi
-echo "PRIVATE_BUILD_CLEANUP passed"
-
 catalog_started_ns="$(date +%s%N)"
 CATALOG_TMP="$(mktemp "${TMPDIR:-/tmp}/matmul-hardware-calibration.XXXXXX.csv")"
 cleanup() {

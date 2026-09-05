@@ -105,6 +105,47 @@ def pairwise_order_accuracy(predicted: list[float], measured: list[float]) -> fl
     return correct / comparable if comparable else 0.0
 
 
+def paired_hardware_effects(rows: list[dict]) -> dict[str, dict]:
+    """Summarize one-factor changes against their same-run anchor."""
+
+    anchors = {
+        row["pair_id"]: row for row in rows
+        if row.get("pair_id") and row.get("design_role") == "paired_anchor"
+    }
+    effects: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        pair_id = row.get("pair_id", "")
+        if row.get("design_role") != "paired_factor" or pair_id not in anchors:
+            continue
+        anchor = anchors[pair_id]
+        delta_pct = 100.0 * (
+            row["measured_ms"] / anchor["measured_ms"] - 1.0
+        )
+        effects[row["controlled_factor"]].append({
+            "pair_id": pair_id,
+            "output_rank": row["output_rank"],
+            "anchor_output_rank": anchor["output_rank"],
+            "factor_signature": row["factor_signature"],
+            "candidate_ms": row["measured_ms"],
+            "anchor_ms": anchor["measured_ms"],
+            "delta_pct": delta_pct,
+        })
+    return {
+        factor: {
+            "pair_count": len(values),
+            "median_delta_pct": statistics.median(
+                value["delta_pct"] for value in values
+            ),
+            "minimum_delta_pct": min(value["delta_pct"] for value in values),
+            "maximum_delta_pct": max(value["delta_pct"] for value in values),
+            "measurements": sorted(
+                values, key=lambda value: (value["pair_id"], value["output_rank"])
+            ),
+        }
+        for factor, values in sorted(effects.items())
+    }
+
+
 def aggregate(rows: list[dict]) -> dict:
     if not rows:
         return {"shape_count": 0}
@@ -187,6 +228,10 @@ def main() -> int:
         raise RuntimeError(
             f"workload count {len(workloads)}, expected {args.expected_shapes}"
         )
+    formal_total = sum(
+        int(row["required_successful_tilings"]) for row in workloads
+    )
+    record_total = formal_total + len(workloads)
 
     candidates_by_id: dict[str, dict[str, dict[str, str]]] = defaultdict(dict)
     for row in candidates:
@@ -256,6 +301,9 @@ def main() -> int:
                 "used_core_num": int(candidate["used_core_num"]),
                 "controlled_factor": candidate["controlled_factor"],
                 "factor_signature": candidate["factor_signature"],
+                "pair_id": candidate.get("pair_id", ""),
+                "design_role": candidate.get("design_role", ""),
+                "hardware_stratum": candidate.get("hardware_stratum", ""),
                 "is_reserve": candidate["is_reserve"] == "1",
                 "single_core": {
                     axis: int(candidate[f"single_core_{axis}"])
@@ -334,21 +382,26 @@ def main() -> int:
             "model_top1_within_measured_best_noise": regret <= noise_pct,
             "model_top1_vs_official": model_top["versus_official"],
             "measured_best_vs_official": measured_best["versus_official"],
+            "paired_hardware_effects": paired_hardware_effects(joined),
             "candidates": sorted(joined, key=lambda row: row["output_rank"]),
         })
 
-    partitions = ("calibration", "holdout")
+    partitions = sorted({row["partition"] for row in per_shape})
     coverage_intents = sorted({row["coverage_intent"] for row in per_shape})
     result = {
-        "schema": "matmul_hardware_factor_calibration_v1",
+        "schema": "matmul_hardware_frontier_measurement_v2",
         "status": "complete",
         "method": {
-            "candidate_selection": "bounded one-factor hardware sweeps plus legal reserves",
+            "candidate_selection": (
+                "model-independent broad geometry strata plus paired hardware "
+                "factor sweeps and applicable execution-graph controls"
+            ),
             "measurement": "one warmup, three device-event launches, full validation of final timed output",
-            "candidate_latency_records": 2185,
-            "official_baselines": 70,
-            "latency_records": 2255,
+            "candidate_latency_records": formal_total,
+            "official_baselines": len(workloads),
+            "latency_records": record_total,
             "latency_history_or_cce_table_used_by_model": False,
+            "candidate_set_frozen_before_simulator_scoring": True,
             "holdout_feedback_permitted_during_calibration": False,
             "direct_tiling_buffer_execution_attested": (
                 args.require_direct_tiling_applied
@@ -368,8 +421,10 @@ def main() -> int:
         },
         "per_shape": per_shape,
     }
-    if result["aggregate"]["latency_records_including_official"] != 2255:
-        raise RuntimeError("formal latency record count is not 2255")
+    if result["aggregate"]["latency_records_including_official"] != record_total:
+        raise RuntimeError(
+            f"formal latency record count is not {record_total}"
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n",
@@ -382,7 +437,7 @@ def main() -> int:
             {"record_type": "hardware_factor_ranking", **row},
         )
     log.append_once(
-        "campaign:hardware_calibration_analysis_complete",
+        "campaign:victor_frontier_analysis_complete",
         {
             "schema": result["schema"],
             "record_type": "hardware_factor_analysis_summary",
@@ -395,8 +450,8 @@ def main() -> int:
     log.close()
     summary = result["aggregate"]
     print(
-        "MATMUL_HARDWARE_CALIBRATION_COMPLETE "
-        f"shapes={summary['shape_count']} records=2255 "
+        "MATMUL_VICTOR_FRONTIER_COMPLETE "
+        f"shapes={summary['shape_count']} records={record_total} "
         f"median_spearman={summary['median_spearman']:.6f} "
         f"median_top1_regret_pct={summary['median_top1_regret_pct']:.6f}",
         flush=True,

@@ -302,19 +302,24 @@ def main() -> int:
     ]
     candidates = [row for row in all_candidates if not truthy(row.get("is_reserve"))]
     reserves = [row for row in all_candidates if truthy(row.get("is_reserve"))]
+    workload_contract = {
+        row["workload_id"]: int(row["required_successful_tilings"])
+        for row in workloads
+    }
+    shape_count = len(workloads)
+    formal_target = sum(workload_contract.values())
+    reserve_target = len(reserves)
+    record_target = shape_count + formal_target
     if (
-        len(workloads) != 70 or len(candidates) != 2185
-        or len(reserves) != 560 or len(all_candidates) != 2745
+        not workloads or len(workload_contract) != shape_count
+        or len(candidates) != formal_target
+        or any(value <= 0 for value in workload_contract.values())
     ):
         raise RuntimeError(
             "formal input contract failed: "
             f"shapes={len(workloads)} candidates={len(candidates)} "
             f"reserves={len(reserves)}"
         )
-    workload_contract = {
-        row["workload_id"]: int(row["required_successful_tilings"])
-        for row in workloads
-    }
     grouped_candidates: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in all_candidates:
         grouped_candidates[row["workload_id"]].append(row)
@@ -323,9 +328,10 @@ def main() -> int:
     for workload_id, rows in grouped_candidates.items():
         required_count = workload_contract[workload_id]
         roles = [truthy(row.get("is_reserve")) for row in rows]
+        reserve_count = roles.count(True)
         if (
             roles.count(False) != required_count
-            or roles.count(True) != 8
+            or reserve_count <= 0
             or roles != sorted(roles)
             or [int(row["rank"]) for row in rows] != list(range(1, len(rows) + 1))
         ):
@@ -349,10 +355,10 @@ def main() -> int:
         "schema": SCHEMA,
         "record_type": "campaign_begin",
         "status": "running",
-        "shapes": 70,
-        "required_successful_candidates": 2185,
-        "available_reserves": 560,
-        "official_baselines": 70,
+        "shapes": shape_count,
+        "required_successful_candidates": formal_target,
+        "available_reserves": reserve_target,
+        "official_baselines": shape_count,
         "measurement": "one warmup plus three device-event samples",
         "candidate_execution": "compile_one_variant_then_measure_immediately",
     })
@@ -379,7 +385,7 @@ def main() -> int:
         for name in tuple(environment):
             if "RUNTIME_KB" in name or "TUNING_BANK" in name:
                 environment.pop(name, None)
-        print("OFFICIAL_BASELINE_BEGIN shapes=70", flush=True)
+        print(f"OFFICIAL_BASELINE_BEGIN shapes={shape_count}", flush=True)
         official_process = subprocess.Popen(
             command, env=environment, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, bufsize=1,
@@ -392,8 +398,8 @@ def main() -> int:
             tail_lines.append(line)
             if line.startswith("official_done "):
                 official_done += 1
-                if official_done == 1 or official_done % 20 == 0 or official_done == 70:
-                    print(f"OFFICIAL_BASELINE_PROGRESS {official_done}/70", flush=True)
+                if official_done == 1 or official_done % 20 == 0 or official_done == shape_count:
+                    print(f"OFFICIAL_BASELINE_PROGRESS {official_done}/{shape_count}", flush=True)
         official_return_code = official_process.wait()
         if official_return_code:
             raise RuntimeError(
@@ -407,9 +413,9 @@ def main() -> int:
         )
         if not validate_official(official_rows, workloads) or official_sample_map is None:
             raise RuntimeError("official baseline output contract failed")
-        print("OFFICIAL_BASELINE_DONE shapes=70", flush=True)
+        print(f"OFFICIAL_BASELINE_DONE shapes={shape_count}", flush=True)
     else:
-        print("OFFICIAL_BASELINE_RESUME shapes=70", flush=True)
+        print(f"OFFICIAL_BASELINE_RESUME shapes={shape_count}", flush=True)
     for official in official_rows:
         log.append_once(
             f"official:{official['workload_id']}",
@@ -439,7 +445,7 @@ def main() -> int:
     )
     print(
         "DIRECT_MEASUREMENT_PLAN "
-        f"success_target=2185 completed={len(completed)} "
+        f"success_target={formal_target} completed={len(completed)} "
         f"remaining_successes={remaining_successes} "
         f"available_pending_pool={len(all_candidates) - len(attempted)} "
         "reserves=only_after_numeric_failure",
@@ -587,8 +593,8 @@ def main() -> int:
             sample_map[key] = raw_samples
             attempted.add(key)
             count = len(completed)
-            if count == 1 or count % args.progress_every == 0 or count == len(candidates):
-                print(f"DIRECT_MEASUREMENT_PROGRESS {count}/2185", flush=True)
+            if count == 1 or count % args.progress_every == 0 or count == formal_target:
+                print(f"DIRECT_MEASUREMENT_PROGRESS {count}/{formal_target}", flush=True)
         return_code = process.wait()
         if direct_failure:
             raise RuntimeError(direct_failure)
@@ -607,7 +613,7 @@ def main() -> int:
             )
         print(
             f"DIRECT_VARIANT_MEASUREMENT_DONE variant={dtype}_k{suffix} "
-            f"candidates={len(variant_rows)} total_completed={len(completed)}/2185",
+            f"candidates={len(variant_rows)} total_completed={len(completed)}/{formal_target}",
             flush=True,
         )
 
@@ -662,7 +668,9 @@ def main() -> int:
         len(completed) != len(candidates)
         or any(successful_by_workload.get(key, 0) != value for key, value in required.items())
     ):
-        raise RuntimeError(f"formal direct measurements incomplete: {len(completed)}/2185")
+        raise RuntimeError(
+            f"formal direct measurements incomplete: {len(completed)}/{formal_target}"
+        )
     official_by_id = {row["workload_id"]: row for row in official_rows}
     custom_rows: list[dict[str, str]] = []
     for workload in workloads:
@@ -686,11 +694,15 @@ def main() -> int:
     write_rows(args.samples_output, sample_rows, SAMPLE_COLUMNS)
     log.append_once("campaign:complete", {
         "schema": SCHEMA, "record_type": "campaign_complete",
-        "status": "complete", "candidate_records": 2185,
-        "official_baselines": 70, "records": 2255,
+        "status": "complete", "candidate_records": formal_target,
+        "official_baselines": shape_count, "records": record_target,
     })
     log.close()
-    print("DIRECT_MEASUREMENT_COMPLETE candidates=2185 baselines=70 records=2255", flush=True)
+    print(
+        f"DIRECT_MEASUREMENT_COMPLETE candidates={formal_target} "
+        f"baselines={shape_count} records={record_target}",
+        flush=True,
+    )
     return 0
 
 

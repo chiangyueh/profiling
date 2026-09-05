@@ -172,6 +172,9 @@ std::vector<std::string> SplitCsv(const std::string &line)
             current.push_back(ch);
         }
     }
+    // Python's csv module writes CRLF records by default. std::getline removes
+    // only '\n', so discard the record terminator left on the final field.
+    if (!current.empty() && current.back() == '\r') current.pop_back();
     fields.push_back(current);
     return fields;
 }

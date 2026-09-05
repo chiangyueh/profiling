@@ -177,8 +177,11 @@ cleanup_kernel_intermediates() {
         "${NPU_BUILD}/${cleanup_target}_preprocess-prefix.stale-before-rebuild" \
         "${NPU_BUILD}/auto_gen/${cleanup_target}" \
         "${NPU_BUILD}/CMakeFiles/${cleanup_target}_host_stub_obj.dir"; do
-        [[ -d "${cleanup_path}" ]] && cmake -E remove_directory "${cleanup_path}"
+        if [[ -d "${cleanup_path}" ]]; then
+            cmake -E remove_directory "${cleanup_path}"
+        fi
     done
+    return 0
 }
 
 kernel_identity() {

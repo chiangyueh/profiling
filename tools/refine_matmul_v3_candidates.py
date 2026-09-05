@@ -720,6 +720,7 @@ def hard_legal(
             not (mk33 or nk33)
             or knowledge["singleCoreK"] != 3 * knowledge["baseK"]
             or k_chunks < 2
+            or knowledge["usedCoreNum"] < 2
             or knowledge["usedCoreNum"] > k_chunks
         ):
             return False
@@ -812,7 +813,7 @@ def hard_legal(
         k_chunks = ceil_div(workload.k, knowledge["singleCoreK"])
         if (
             knowledge["usedCoreNum"] > k_chunks
-            or knowledge["usedCoreNum"] <= 0
+            or knowledge["usedCoreNum"] < 2
         ):
             return False
     return True

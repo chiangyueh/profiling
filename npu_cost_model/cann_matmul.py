@@ -451,6 +451,14 @@ def validate_cann_tiling(
         if used > output_tasks:
             reasons.append("USED_CORES_EXCEED_OUTPUT_TASKS")
     else:
+        # Deterministic Split-K is a parallel partial-C producer graph plus
+        # an AIV workspace reduction.  CANN's source tiler reaches it only
+        # with multiple K partitions and derives usedCoreNum from those
+        # partitions.  One AIC is not the serial form of this graph.
+        if used < 2:
+            reasons.append(
+                "DETERMINISTIC_SPLIT_K_REQUIRES_MULTIPLE_CUBE_CORES"
+            )
         if single_k % base_k:
             reasons.append("PARALLEL_SPLIT_K_CHUNK_NOT_BASE_ALIGNED")
         if k_chunks < 2:

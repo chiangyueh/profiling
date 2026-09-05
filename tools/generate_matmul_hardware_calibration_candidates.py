@@ -197,7 +197,14 @@ def expanded_knowledge(
         if execution_mode_name(seed) == coverage_intent
     ][:12]
     for seed in focused_seeds:
-        for cores in range(1, hardware.core_count(Resource.CUBE) + 1):
+        minimum_cores = (
+            2
+            if execution_mode_name(seed) == "deterministic_split_k"
+            else 1
+        )
+        for cores in range(
+            minimum_cores, hardware.core_count(Resource.CUBE) + 1
+        ):
             candidate = dict(seed)
             candidate["usedCoreNum"] = cores
             add(candidate)

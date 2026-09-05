@@ -419,6 +419,26 @@ def test_deterministic_splitk_rejects_fp32_workspace_tail_overflow() -> None:
     )
 
 
+def test_deterministic_splitk_rejects_single_cube_core() -> None:
+    knowledge = dict(zip(old.KNOWLEDGE_FIELDS, (
+        1, 384, 128, 384, 128, 128, 128, 9, 6, 3, 1, 0,
+        3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 3,
+    )))
+    reasons = validate_cann_tiling(
+        128, 128, 8192, "fp16", False, False, knowledge,
+        candidates.generic_hardware(HARDWARE),
+    )
+    assert reasons == (
+        "DETERMINISTIC_SPLIT_K_REQUIRES_MULTIPLE_CUBE_CORES",
+    )
+
+    knowledge["usedCoreNum"] = 2
+    assert not validate_cann_tiling(
+        128, 128, 8192, "fp16", False, False, knowledge,
+        candidates.generic_hardware(HARDWARE),
+    )
+
+
 def test_base_l1_packets_follow_cann81_capacity_equations() -> None:
     plan = TilingPlan(
         algorithm=0,

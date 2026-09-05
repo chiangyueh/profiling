@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import generate_matmul_hardware_calibration_workloads as workloads
+import profile_direct_matmul as direct_profile
 
 
 def test_frozen_campaign_contract() -> None:
@@ -81,3 +82,22 @@ def test_jsonl_measurements_are_recoverable(tmp_path: Path) -> None:
         restored_samples = list(csv.DictReader(stream))
     assert restored_profiles[0]["model_schedule_sha256"] == "abc"
     assert [row["latency_ms"] for row in restored_samples] == ["0.4", "0.5", "0.6"]
+
+
+def test_direct_resume_does_not_repeat_numeric_failures(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    manifest = {("w0", "7"): {"workload_id": "w0", "rank": "7"}}
+    failure = {
+        "schema": direct_profile.SCHEMA,
+        "record_type": "candidate_failure",
+        "candidate": {"workload_id": "w0", "rank": "7"},
+        "runner": {"status": "failed", "error": "numeric mismatch"},
+    }
+    (logs / "1.log").write_text(json.dumps(failure) + "\n", encoding="utf-8")
+
+    completed, samples, attempted = direct_profile.load_completed(logs, manifest)
+
+    assert completed == {}
+    assert samples == {}
+    assert attempted == {("w0", "7")}

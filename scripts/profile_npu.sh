@@ -18,9 +18,10 @@ RANKED_CSV="${OUT_STEM}_candidates.csv"
 SUMMARY_CSV="${OUT_STEM}_summary.csv"
 BEST_CSV="${DETAILS_DIR}/best.csv"
 
-for executable in build/official_matmul_runner build/direct_matmul_runner; do
-    [[ -x "${executable}" ]] || { echo "fatal: ${executable} is missing" >&2; exit 2; }
-done
+[[ -x build/official_matmul_runner ]] || {
+    echo "fatal: build/official_matmul_runner is missing" >&2
+    exit 2
+}
 for name in PLATFORM_AIC_CORES PLATFORM_L2_BYTES; do
     [[ -n "${!name:-}" ]] || { echo "fatal: ${name} is missing" >&2; exit 2; }
 done
@@ -31,7 +32,8 @@ done
 mkdir -p "${DETAILS_DIR}" "${TILING_DIRECTORY}"
 
 python3 tools/profile_direct_matmul.py \
-    --direct-runner build/direct_matmul_runner \
+    --variant-builder scripts/build_all.sh \
+    --variant-runner-directory build/direct_runners \
     --official-runner build/official_matmul_runner \
     --candidates "${CANDIDATES}" \
     --workloads "${WORKLOADS}" \

@@ -19,6 +19,9 @@
 #include <utility>
 #include <vector>
 
+#ifdef DIRECT_MATMUL_SINGLE_VARIANT
+#include DIRECT_MATMUL_LAUNCH_HEADER
+#else
 #include "aclrtlaunch_direct_matmul_fp16_k0.h"
 #include "aclrtlaunch_direct_matmul_fp16_k1.h"
 #include "aclrtlaunch_direct_matmul_fp16_k20.h"
@@ -42,6 +45,7 @@
 #include "aclrtlaunch_direct_matmul_fp32_k201.h"
 #include "aclrtlaunch_direct_matmul_fp32_k10201.h"
 #include "aclrtlaunch_direct_matmul_fp32_k20201.h"
+#endif
 #include "mat_mul_v3_tiling_data.h"
 
 namespace {
@@ -54,6 +58,7 @@ struct Options {
     int warmup = 1;
     int repeat = 1;
     int samples = 3;
+    bool allowPartial = false;
 };
 
 struct Candidate {
@@ -439,6 +444,14 @@ aclError Launch(
 #define DIRECT_LAUNCH(dtype_name, suffix_value) \
     return ACLRT_LAUNCH_KERNEL(direct_matmul_##dtype_name##_k##suffix_value)( \
         candidate.usedCores, stream, a, b, nullptr, nullptr, c, workspace, tiling)
+#ifdef DIRECT_MATMUL_SINGLE_VARIANT
+    if (candidate.dtype != DIRECT_MATMUL_DTYPE_NAME ||
+        candidate.suffix != DIRECT_MATMUL_SUFFIX_VALUE) {
+        return ACL_ERROR_INVALID_PARAM;
+    }
+    return DIRECT_MATMUL_LAUNCH_FUNCTION(
+        candidate.usedCores, stream, a, b, nullptr, nullptr, c, workspace, tiling);
+#else
     if (candidate.dtype == "fp16") {
         switch (candidate.suffix) {
             case 0: DIRECT_LAUNCH(fp16, 0);
@@ -472,6 +485,7 @@ aclError Launch(
             case 20201: DIRECT_LAUNCH(fp32, 20201);
         }
     }
+#endif
 #undef DIRECT_LAUNCH
     return ACL_ERROR_INVALID_PARAM;
 }
@@ -658,7 +672,8 @@ std::unordered_map<std::string, std::string> ParseArgs(int argc, char **argv)
     std::unordered_map<std::string, std::string> result;
     for (int index = 1; index < argc; ++index) {
         const std::string key = argv[index];
-        if (key == "--help" || key == "--validate-input") {
+        if (key == "--help" || key == "--validate-input" ||
+            key == "--allow-partial") {
             result[key] = "1";
             continue;
         }
@@ -696,6 +711,7 @@ int main(int argc, char **argv)
         options.warmup = std::stoi(Get(args, "--warmup", "1"));
         options.repeat = std::stoi(Get(args, "--repeat", "1"));
         options.samples = std::stoi(Get(args, "--samples", "3"));
+        options.allowPartial = args.count("--allow-partial") != 0;
         if (options.manifest.empty() || options.warmup < 0 ||
             options.repeat != 1 || options.samples <= 0) {
             throw std::runtime_error("invalid direct runner options");
@@ -780,7 +796,8 @@ int main(int argc, char **argv)
                         }
                     }
                 }
-                if (successful != workload.requiredSuccessfulTilings) {
+                if (!options.allowPartial &&
+                    successful != workload.requiredSuccessfulTilings) {
                     throw std::runtime_error(
                         "workload exhausted legal reserves before reaching success target");
                 }

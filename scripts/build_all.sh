@@ -7,8 +7,10 @@ mkdir -p "$BUILD"
 BUILD_COMPONENTS="${BUILD_COMPONENTS:-all}"
 
 if [[ "${BUILD_COMPONENTS}" != "all" && "${BUILD_COMPONENTS}" != "host" && \
-      "${BUILD_COMPONENTS}" != "runner" ]]; then
-    echo "fatal: BUILD_COMPONENTS must be 'all', 'host', or 'runner'" >&2
+      "${BUILD_COMPONENTS}" != "official" && \
+      "${BUILD_COMPONENTS}" != "variant" && \
+      "${BUILD_COMPONENTS}" != "cleanup" ]]; then
+    echo "fatal: BUILD_COMPONENTS must be all, host, official, variant, or cleanup" >&2
     exit 2
 fi
 
@@ -111,8 +113,8 @@ if [[ "${BUILD_COMPONENTS}" == "all" || "${BUILD_COMPONENTS}" == "host" ]]; then
         "$HOST_OBJ_DIR/hardware_path_builders.o" \
         "$HOST_OBJ_DIR/indexed_read_path.o" \
         -o "$BUILD/indexed_read_cost"
-elif [[ "${BUILD_COMPONENTS}" == "runner" ]]; then
-    echo "[1/2] Skipping tiling search host (runner-only build)"
+else
+    echo "[1/2] Skipping tiling search host"
 fi
 
 if [[ "${BUILD_COMPONENTS}" == "host" ]]; then
@@ -121,7 +123,7 @@ if [[ "${BUILD_COMPONENTS}" == "host" ]]; then
     exit 0
 fi
 
-echo "[2/2] Building official baseline and direct MatMulV3 kernels (jobs=${BUILD_JOBS:-1})"
+echo "[2/2] Building ${BUILD_COMPONENTS} NPU component (jobs=${BUILD_JOBS:-1})"
 SOC_BUILD_NAME="$(printf '%s' "$ASCENDC_SOC_VERSION" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' '_')"
 NPU_BUILD="$BUILD/npu_cmake_${SOC_BUILD_NAME}"
 mkdir -p "$NPU_BUILD"
@@ -172,6 +174,7 @@ cleanup_kernel_intermediates() {
         "${NPU_BUILD}/${cleanup_target}_aiv_device_dir" \
         "${NPU_BUILD}/${cleanup_target}_merge_obj_dir" \
         "${NPU_BUILD}/${cleanup_target}_host_dir" \
+        "${NPU_BUILD}/${cleanup_target}_preprocess-prefix.stale-before-rebuild" \
         "${NPU_BUILD}/auto_gen/${cleanup_target}" \
         "${NPU_BUILD}/CMakeFiles/${cleanup_target}_host_stub_obj.dir"; do
         [[ -d "${cleanup_path}" ]] && cmake -E remove_directory "${cleanup_path}"
@@ -217,75 +220,103 @@ recover_kernel_archive() {
     kernel_archive_valid "${recover_target}"
 }
 
-# A completed archive contains the packed device binary.  Its ExternalProject
-# trees are no longer needed and can consume many GiB across 23 variants.
-# Remove only those private generated trees before recovering/building any
-# missing archive; libraries, launch headers and stamps remain intact.
+# A completed archive contains the packed device binary. Its ExternalProject
+# tree is no longer needed. Clean only repository-private generated trees.
 for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
     if kernel_archive_valid "${target}"; then
         cleanup_kernel_intermediates "${target}"
     fi
 done
 
+# An interrupted ar step can delete the archive while leaving every object
+# needed to reconstruct it. Recover after the first cleanup pass has released
+# space. If recovery is impossible, discard only that incomplete target tree;
+# a later per-variant request will rebuild it from source.
+for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
+    if ! kernel_archive_valid "${target}"; then
+        if recover_kernel_archive "${target}"; then
+            cleanup_kernel_intermediates "${target}"
+        else
+            cleanup_kernel_intermediates "${target}"
+        fi
+    fi
+done
+
 build_free_kib="$(df -Pk "${BUILD}" | awk 'END {print $4}')"
-if [[ ! "${build_free_kib}" =~ ^[0-9]+$ || "${build_free_kib}" -lt 524288 ]]; then
-    echo "fatal: less than 512 MiB remains after private kernel cleanup" >&2
+if [[ ! "${build_free_kib}" =~ ^[0-9]+$ || "${build_free_kib}" -lt 8388608 ]]; then
+    echo "fatal: less than 8 GiB remains after private kernel cleanup" >&2
     exit 1
 fi
 echo "DIRECT_BUILD_STORAGE free_mib=$((build_free_kib / 1024))"
 
-run_logged "$BUILD/kernel_build.log" "configure official runner" \
-    cmake -S "$ROOT/cmake_npu" -B "$NPU_BUILD" \
-        -DASCEND_CANN_PACKAGE_PATH="$CANN_ROOT" \
-        -DCMAKE_BUILD_TYPE=Release
+if [[ "${BUILD_COMPONENTS}" == "cleanup" ]]; then
+    exit 0
+fi
 
-kernel_index=0
-for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
-    kernel_index=$((kernel_index + 1))
-    target_stamp="${NPU_BUILD}/.${target}.sha256"
-    target_library="${NPU_BUILD}/lib/lib${target}.a"
-    target_include="${NPU_BUILD}/include/${target}"
-    target_identity="${target#direct_matmul_kernel_}"
-    target_dtype="${target_identity%%_*}"
-    target_suffix="${target_identity#*_}"
-    target_symbol="aclrtlaunch_direct_matmul_${target_dtype}_k${target_suffix}"
-    target_header="${target_include}/${target_symbol}.h"
-    if [[ ! -s "${target_library}" ]]; then
-        recover_kernel_archive "${target}" || true
+if [[ ! -f "${NPU_BUILD}/CMakeCache.txt" ]]; then
+    run_logged "$BUILD/kernel_build.log" "configure NPU targets" \
+        cmake -S "$ROOT/cmake_npu" -B "$NPU_BUILD" \
+            -DASCEND_CANN_PACKAGE_PATH="$CANN_ROOT" \
+            -DCMAKE_BUILD_TYPE=Release
+fi
+
+if [[ "${BUILD_COMPONENTS}" == "all" || \
+      "${BUILD_COMPONENTS}" == "official" ]]; then
+    echo "OFFICIAL_RUNNER_BUILD begin"
+    run_logged "$BUILD/kernel_build.log" "compile official runner" \
+        cmake --build "$NPU_BUILD" --target official_matmul_runner \
+        --parallel "${BUILD_JOBS:-1}"
+    cp "$NPU_BUILD/official_matmul_runner" "$BUILD/official_matmul_runner"
+    echo "OFFICIAL_RUNNER_BUILD passed"
+fi
+
+if [[ "${BUILD_COMPONENTS}" == "all" || \
+      "${BUILD_COMPONENTS}" == "official" ]]; then
+    file "$BUILD/official_matmul_runner"
+    echo "Build completed: $BUILD"
+    exit 0
+fi
+
+target="${DIRECT_KERNEL_TARGET:-}"
+target_allowed=0
+for allowed_target in "${DIRECT_KERNEL_TARGETS[@]}"; do
+    if [[ "${target}" == "${allowed_target}" ]]; then
+        target_allowed=1
+        break
     fi
-    kernel_cache_valid=0
-    if [[ -s "${target_library}" && -f "${target_header}" && \
-          -f "${target_stamp}" ]] && \
-       ar t "${target_library}" >/dev/null 2>&1 && \
-       nm -g --defined-only "${target_library}" 2>/dev/null | \
-           grep -Eq "[[:space:]]${target_symbol}$"; then
-        if [[ "$(cat "${target_stamp}" 2>/dev/null || true)" == \
-              "${DIRECT_KERNEL_BUILD_SIGNATURE}" ]]; then
-            kernel_cache_valid=1
-        elif [[ ! "${ROOT}/direct_matmul/kernel_entry.cpp" -nt "${target_library}" && \
-                ! "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h" -nt "${target_library}" ]] && \
-             [[ -z "$(find "${MATMUL_V3_KERNEL_DIR}" -type f \
-                 -newer "${target_library}" -print -quit)" ]]; then
-            # One-time migration from the former stamp, whose hash included
-            # link-only CMake text.  The archive symbol and every actual
-            # kernel input are checked before retaining the expensive build.
-            printf '%s\n' "${DIRECT_KERNEL_BUILD_SIGNATURE}" >"${target_stamp}"
-            kernel_cache_valid=1
-        fi
+done
+if [[ "${target_allowed}" -ne 1 ]]; then
+    echo "fatal: DIRECT_KERNEL_TARGET is not a registered campaign variant" >&2
+    exit 2
+fi
+
+target_stamp="${NPU_BUILD}/.${target}.sha256"
+target_library="${NPU_BUILD}/lib/lib${target}.a"
+target_identity="${target#direct_matmul_kernel_}"
+target_dtype="${target_identity%%_*}"
+target_suffix="${target_identity#*_}"
+target_symbol="aclrtlaunch_direct_matmul_${target_dtype}_k${target_suffix}"
+target_include="${NPU_BUILD}/include/${target}"
+target_header="${target_include}/${target_symbol}.h"
+
+kernel_cache_valid=0
+if kernel_archive_valid "${target}"; then
+    if [[ "$(cat "${target_stamp}" 2>/dev/null || true)" == \
+          "${DIRECT_KERNEL_BUILD_SIGNATURE}" ]]; then
+        kernel_cache_valid=1
+    elif [[ ! "${ROOT}/direct_matmul/kernel_entry.cpp" -nt "${target_library}" && \
+            ! "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h" -nt "${target_library}" ]] && \
+         [[ -z "$(find "${MATMUL_V3_KERNEL_DIR}" -type f \
+             -newer "${target_library}" -print -quit)" ]]; then
+        printf '%s\n' "${DIRECT_KERNEL_BUILD_SIGNATURE}" >"${target_stamp}"
+        kernel_cache_valid=1
     fi
-    if [[ "${kernel_cache_valid}" -eq 1 ]]; then
-        cleanup_kernel_intermediates "${target}"
-        echo "DIRECT_KERNEL_BUILD ${kernel_index}/${kernel_count} ${target} cached"
-        continue
-    fi
-    # CANN 8.1's merge_obj_text.sh rewrites its input in place and cannot be
-    # invoked twice.  An interrupted ExternalProject therefore has to replay
-    # only this target's private preprocess directory from source.
-    target_preprocess="${NPU_BUILD}/${target}_preprocess-prefix"
-    if [[ -d "${target_preprocess}" ]]; then
-        cmake -E remove_directory "${target_preprocess}"
-    fi
-    echo "DIRECT_KERNEL_BUILD ${kernel_index}/${kernel_count} ${target} begin"
+fi
+if [[ "${kernel_cache_valid}" -eq 1 ]]; then
+    echo "DIRECT_KERNEL_BUILD ${target} cached"
+else
+    cleanup_kernel_intermediates "${target}"
+    echo "DIRECT_KERNEL_BUILD ${target} begin"
     run_logged "$BUILD/kernel_build.log" "compile ${target}" \
         cmake --build "$NPU_BUILD" --target "${target}" \
         --parallel "${BUILD_JOBS:-1}"
@@ -294,42 +325,42 @@ for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
         exit 1
     }
     printf '%s\n' "${DIRECT_KERNEL_BUILD_SIGNATURE}" >"${target_stamp}"
-    cleanup_kernel_intermediates "${target}"
-    echo "DIRECT_KERNEL_BUILD ${kernel_index}/${kernel_count} ${target} passed"
-done
-echo "DIRECT_RUNNER_LINK begin"
-run_logged "$BUILD/kernel_build.log" "compile official runner" \
-    cmake --build "$NPU_BUILD" --target official_matmul_runner \
-    --parallel "${BUILD_JOBS:-1}"
-
-DIRECT_RUNNER_COMMAND=(
-    g++ -std=c++17 -O3 -DNDEBUG
-    "-I${ROOT}/direct_matmul" "-I${CANN_INCLUDE}"
-)
-for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
-    DIRECT_RUNNER_COMMAND+=("-I${NPU_BUILD}/include/${target}")
-done
-DIRECT_RUNNER_COMMAND+=("${ROOT}/direct_matmul/runner.cpp")
-for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
-    DIRECT_RUNNER_COMMAND+=("${NPU_BUILD}/lib/lib${target}.a")
-done
-DIRECT_RUNNER_COMMAND+=(
-    "-L${CANN_LIB}" "-L${CANN_ROOT_LIB}"
-    "-L${CANN_ROOT}/tools/simulator/${ASCENDC_SOC_VERSION}/lib"
-    "-Wl,-rpath-link,${CANN_LIB}" "-Wl,-rpath-link,${CANN_DEVLIB}"
-    -lascendcl -lruntime -lregister -lerror_manager -lprofapi
-    -lge_common_base -lascendalog -lmmpa -lascend_dump -lc_sec
-    -ldl -lpthread -o "${BUILD}/direct_matmul_runner"
-)
-run_logged "$BUILD/kernel_build.log" "link direct runner without kernel rebuild" \
-    "${DIRECT_RUNNER_COMMAND[@]}"
-echo "DIRECT_RUNNER_LINK passed"
-cp "$NPU_BUILD/official_matmul_runner" "$BUILD/official_matmul_runner"
-: >"$BUILD/runner_build.log"
-
-if [[ "${BUILD_COMPONENTS}" == "all" ]]; then
-    file "$BUILD/matmul_tiling_search" "$BUILD/official_matmul_runner" "$BUILD/direct_matmul_runner"
-else
-    file "$BUILD/official_matmul_runner" "$BUILD/direct_matmul_runner"
+    echo "DIRECT_KERNEL_BUILD ${target} passed"
 fi
-echo "Build completed: $BUILD"
+
+runner_directory="${BUILD}/direct_runners"
+runner_path="${runner_directory}/direct_matmul_${target_dtype}_k${target_suffix}"
+runner_stamp="${runner_path}.sha256"
+mkdir -p "${runner_directory}"
+runner_signature="$({
+    sha256sum "${ROOT}/direct_matmul/runner.cpp" \
+        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h" \
+        "${target_library}" "${target_header}"
+    printf '%s\n' "single-variant-runner-v1:${target_dtype}:${target_suffix}:${ASCENDC_SOC_VERSION}"
+} | sha256sum | cut -d' ' -f1)"
+if [[ -x "${runner_path}" && \
+      "$(cat "${runner_stamp}" 2>/dev/null || true)" == "${runner_signature}" ]]; then
+    echo "DIRECT_VARIANT_RUNNER_LINK ${target_identity} cached"
+else
+    echo "DIRECT_VARIANT_RUNNER_LINK ${target_identity} begin"
+    run_logged "$BUILD/kernel_build.log" "link runner ${target_identity}" \
+        g++ -std=c++17 -O3 -DNDEBUG \
+        -DDIRECT_MATMUL_SINGLE_VARIANT=1 \
+        "-DDIRECT_MATMUL_LAUNCH_HEADER=\"${target_symbol}.h\"" \
+        "-DDIRECT_MATMUL_DTYPE_NAME=\"${target_dtype}\"" \
+        "-DDIRECT_MATMUL_SUFFIX_VALUE=${target_suffix}U" \
+        "-DDIRECT_MATMUL_LAUNCH_FUNCTION=${target_symbol}" \
+        "-I${ROOT}/direct_matmul" "-I${CANN_INCLUDE}" "-I${target_include}" \
+        "${ROOT}/direct_matmul/runner.cpp" "${target_library}" \
+        "-L${CANN_LIB}" "-L${CANN_ROOT_LIB}" \
+        "-L${CANN_ROOT}/tools/simulator/${ASCENDC_SOC_VERSION}/lib" \
+        "-Wl,-rpath-link,${CANN_LIB}" "-Wl,-rpath-link,${CANN_DEVLIB}" \
+        -lascendcl -lruntime -lregister -lerror_manager -lprofapi \
+        -lge_common_base -lascendalog -lmmpa -lascend_dump -lc_sec \
+        -ldl -lpthread -o "${runner_path}"
+    printf '%s\n' "${runner_signature}" >"${runner_stamp}"
+    echo "DIRECT_VARIANT_RUNNER_LINK ${target_identity} passed"
+fi
+
+cleanup_kernel_intermediates "${target}"
+echo "DIRECT_VARIANT_READY target=${target} runner=${runner_path}"

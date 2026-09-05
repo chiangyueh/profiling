@@ -118,9 +118,14 @@ class JsonlLog:
 def load_completed(
     log_directory: Path,
     manifest: dict[tuple[str, str], dict[str, str]],
-) -> tuple[dict[tuple[str, str], dict[str, str]], dict[tuple[str, str], list[float]]]:
+) -> tuple[
+    dict[tuple[str, str], dict[str, str]],
+    dict[tuple[str, str], list[float]],
+    set[tuple[str, str]],
+]:
     completed: dict[tuple[str, str], dict[str, str]] = {}
     samples: dict[tuple[str, str], list[float]] = {}
+    attempted: set[tuple[str, str]] = set()
     paths = sorted(
         (path for path in log_directory.glob("[0-9]*.log") if path.stem.isdigit()),
         key=lambda path: int(path.stem),
@@ -132,7 +137,18 @@ def load_completed(
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if record.get("schema") != SCHEMA or record.get("record_type") != "candidate":
+                if record.get("schema") != SCHEMA:
+                    continue
+                if record.get("record_type") == "candidate_failure":
+                    candidate = record.get("candidate") or {}
+                    key = (
+                        str(candidate.get("workload_id", "")),
+                        str(candidate.get("rank", "")),
+                    )
+                    if key in manifest:
+                        attempted.add(key)
+                    continue
+                if record.get("record_type") != "candidate":
                     continue
                 profile = record.get("measurement") or {}
                 key = (str(profile.get("workload_id", "")), str(profile.get("rank", "")))
@@ -159,7 +175,8 @@ def load_completed(
                     continue
                 completed[key] = {field: str(profile.get(field, "")) for field in PROFILE_COLUMNS}
                 samples[key] = numeric_samples
-    return completed, samples
+                attempted.add(key)
+    return completed, samples, attempted
 
 
 def candidate_profile(
@@ -256,7 +273,8 @@ def official_samples(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--direct-runner", type=Path, required=True)
+    parser.add_argument("--variant-builder", type=Path, required=True)
+    parser.add_argument("--variant-runner-directory", type=Path, required=True)
     parser.add_argument("--official-runner", type=Path, required=True)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--workloads", type=Path, required=True)
@@ -326,21 +344,6 @@ def main() -> int:
     candidate_map = {
         (row["workload_id"], row["rank"]): row for row in all_candidates
     }
-    preflight = subprocess.run(
-        [str(args.direct_runner), "--manifest", str(args.manifest), "--validate-input"],
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        env={
-            name: value for name, value in os.environ.items()
-            if "RUNTIME_KB" not in name and "TUNING_BANK" not in name
-        },
-        check=False,
-    )
-    if preflight.returncode or "DIRECT_MATMUL_INPUT status=passed" not in preflight.stdout:
-        raise RuntimeError(
-            f"direct manifest preflight failed rc={preflight.returncode}: "
-            + preflight.stdout[-2000:]
-        )
-    print("DIRECT_INPUT_PREFLIGHT passed candidates=2745", flush=True)
     log = JsonlLog(args.log_directory, args.log_max_bytes)
     log.append_once("campaign:begin", {
         "schema": SCHEMA,
@@ -351,7 +354,7 @@ def main() -> int:
         "available_reserves": 560,
         "official_baselines": 70,
         "measurement": "one warmup plus three device-event samples",
-        "candidate_execution": "exact_direct_cann81_tiling_buffer",
+        "candidate_execution": "compile_one_variant_then_measure_immediately",
     })
 
     official_rows = read_rows(args.official_output) if args.official_output.is_file() else []
@@ -415,25 +418,21 @@ def main() -> int:
              "samples_ms": official_sample_map[official["workload_id"]]},
         )
 
-    completed, sample_map = load_completed(args.log_directory, manifest)
+    completed, sample_map, attempted = load_completed(args.log_directory, manifest)
     required = {
         row["workload_id"]: int(row["required_successful_tilings"])
         for row in workloads
     }
-    completed_by_workload: dict[str, int] = {}
-    for workload_id, _ in completed:
-        completed_by_workload[workload_id] = completed_by_workload.get(workload_id, 0) + 1
+
+    def completion_counts() -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for workload_id, _ in completed:
+            counts[workload_id] = counts.get(workload_id, 0) + 1
+        return counts
+
+    completed_by_workload = completion_counts()
     if any(completed_by_workload.get(key, 0) > value for key, value in required.items()):
         raise RuntimeError("resume log contains more accepted candidates than requested")
-    pending = []
-    for row in manifest_rows:
-        workload_id = row["workload_id"]
-        remaining = required[workload_id] - completed_by_workload.get(workload_id, 0)
-        if remaining <= 0 or (workload_id, row["rank"]) in completed:
-            continue
-        pending_row = dict(row)
-        pending_row["required_successful_tilings"] = str(remaining)
-        pending.append(pending_row)
     remaining_successes = sum(
         value - completed_by_workload.get(key, 0)
         for key, value in required.items()
@@ -442,22 +441,92 @@ def main() -> int:
         "DIRECT_MEASUREMENT_PLAN "
         f"success_target=2185 completed={len(completed)} "
         f"remaining_successes={remaining_successes} "
-        f"available_pending_pool={len(pending)} "
+        f"available_pending_pool={len(all_candidates) - len(attempted)} "
         "reserves=only_after_numeric_failure",
         flush=True,
     )
-    if pending:
-        pending_manifest = args.manifest.with_name("pending_direct_manifest.csv")
-        write_rows(pending_manifest, pending, list(pending[0]))
+
+    direct_environment = dict(os.environ)
+    for name in tuple(direct_environment):
+        if "RUNTIME_KB" in name or "TUNING_BANK" in name:
+            direct_environment.pop(name, None)
+    built_variants: set[tuple[str, str]] = set()
+
+    def run_variant(dtype: str, suffix: str, rows: list[dict[str, str]], phase: str) -> None:
+        if not rows:
+            return
+        target = f"direct_matmul_kernel_{dtype}_{suffix}"
+        runner = args.variant_runner_directory / f"direct_matmul_{dtype}_k{suffix}"
+        if (dtype, suffix) not in built_variants:
+            build_environment = dict(direct_environment)
+            build_environment.update({
+                "BUILD_COMPONENTS": "variant",
+                "BUILD_JOBS": "1",
+                "DIRECT_KERNEL_TARGET": target,
+            })
+            print(
+                f"DIRECT_VARIANT_BUILD_BEGIN variant={dtype}_k{suffix} "
+                f"candidate_count={len(rows)}",
+                flush=True,
+            )
+            build_process = subprocess.Popen(
+                [str(args.variant_builder)], env=build_environment, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1,
+            )
+            assert build_process.stdout is not None
+            build_tail: deque[str] = deque(maxlen=30)
+            for line in build_process.stdout:
+                line = line.rstrip("\n")
+                build_tail.append(line)
+                if line.startswith(("DIRECT_KERNEL_BUILD ",
+                                    "DIRECT_VARIANT_RUNNER_LINK ",
+                                    "DIRECT_VARIANT_READY ", "fatal:",
+                                    "build_error:")):
+                    print(line, flush=True)
+            build_return_code = build_process.wait()
+            if build_return_code or not runner.is_file() or not os.access(runner, os.X_OK):
+                raise RuntimeError(
+                    f"variant build failed for {dtype}_k{suffix} "
+                    f"rc={build_return_code}: " + "\n".join(build_tail)
+                )
+            built_variants.add((dtype, suffix))
+            print(f"DIRECT_VARIANT_BUILD_DONE variant={dtype}_k{suffix}", flush=True)
+
+        group_sizes: dict[str, int] = {}
+        for row in rows:
+            group_sizes[row["workload_id"]] = group_sizes.get(row["workload_id"], 0) + 1
+        variant_rows: list[dict[str, str]] = []
+        for row in rows:
+            variant_row = dict(row)
+            variant_row["required_successful_tilings"] = str(
+                group_sizes[row["workload_id"]]
+            )
+            variant_rows.append(variant_row)
+        manifest_directory = args.manifest.with_name("variant_manifests")
+        variant_manifest = manifest_directory / f"{dtype}_k{suffix}_{phase}.csv"
+        write_rows(variant_manifest, variant_rows, list(variant_rows[0]))
+
+        preflight = subprocess.run(
+            [str(runner), "--manifest", str(variant_manifest), "--validate-input"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=direct_environment, check=False,
+        )
+        if preflight.returncode or "DIRECT_MATMUL_INPUT status=passed" not in preflight.stdout:
+            raise RuntimeError(
+                f"variant input preflight failed for {dtype}_k{suffix} "
+                f"rc={preflight.returncode}: " + preflight.stdout[-2000:]
+            )
+        print(
+            f"DIRECT_VARIANT_MEASUREMENT_BEGIN variant={dtype}_k{suffix} "
+            f"candidates={len(variant_rows)} phase={phase}",
+            flush=True,
+        )
         command = [
-            str(args.direct_runner), "--manifest", str(pending_manifest),
+            str(runner), "--manifest", str(variant_manifest),
             "--device", str(args.device), "--warmup", str(args.warmup),
             "--repeat", str(args.repeat), "--samples", str(args.samples),
+            "--allow-partial",
         ]
-        direct_environment = dict(os.environ)
-        for name in tuple(direct_environment):
-            if "RUNTIME_KB" in name or "TUNING_BANK" in name:
-                direct_environment.pop(name, None)
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, env=direct_environment,
@@ -465,6 +534,7 @@ def main() -> int:
         assert process.stdout is not None
         direct_tail: deque[str] = deque(maxlen=20)
         direct_failure = ""
+        returned: set[tuple[str, str]] = set()
         for line in process.stdout:
             line = line.rstrip("\n")
             direct_tail.append(line)
@@ -474,6 +544,7 @@ def main() -> int:
                 continue
             result = json.loads(line.split(" ", 1)[1])
             key = (str(result.get("workload_id", "")), str(result.get("rank", "")))
+            returned.add(key)
             candidate = candidate_map.get(key)
             expected_manifest = manifest.get(key)
             if candidate is None or expected_manifest is None:
@@ -484,6 +555,7 @@ def main() -> int:
                     "schema": SCHEMA, "record_type": "candidate_failure",
                     "candidate": candidate, "runner": result,
                 })
+                attempted.add(key)
                 continue
             profile = candidate_profile(
                 candidate, result, args.warmup, args.repeat, args.samples
@@ -513,6 +585,7 @@ def main() -> int:
             })
             completed[key] = profile
             sample_map[key] = raw_samples
+            attempted.add(key)
             count = len(completed)
             if count == 1 or count % args.progress_every == 0 or count == len(candidates):
                 print(f"DIRECT_MEASUREMENT_PROGRESS {count}/2185", flush=True)
@@ -524,6 +597,63 @@ def main() -> int:
                 f"direct MatMul runner failed rc={return_code}: "
                 + "\n".join(direct_tail)
             )
+        expected_returned = {
+            (row["workload_id"], row["rank"]) for row in variant_rows
+        }
+        if returned != expected_returned:
+            raise RuntimeError(
+                f"variant runner omitted results for {dtype}_k{suffix}: "
+                f"returned={len(returned)} expected={len(expected_returned)}"
+            )
+        print(
+            f"DIRECT_VARIANT_MEASUREMENT_DONE variant={dtype}_k{suffix} "
+            f"candidates={len(variant_rows)} total_completed={len(completed)}/2185",
+            flush=True,
+        )
+
+    def run_grouped(rows: list[dict[str, str]], phase: str) -> None:
+        grouped: dict[tuple[str, str], list[dict[str, str]]] = {}
+        for row in rows:
+            key = (row["dtype"], row["kernel_suffix"])
+            grouped.setdefault(key, []).append(row)
+        for (dtype, suffix), variant_rows in grouped.items():
+            run_variant(dtype, suffix, variant_rows, phase)
+
+    completed_by_workload = completion_counts()
+    formal_pending = [
+        row for row in manifest_rows
+        if not truthy(row.get("is_reserve"))
+        and (row["workload_id"], row["rank"]) not in attempted
+        and completed_by_workload.get(row["workload_id"], 0)
+            < required[row["workload_id"]]
+    ]
+    run_grouped(formal_pending, "formal")
+
+    reserve_round = 0
+    while True:
+        completed_by_workload = completion_counts()
+        deficits = {
+            workload_id: target - completed_by_workload.get(workload_id, 0)
+            for workload_id, target in required.items()
+            if completed_by_workload.get(workload_id, 0) < target
+        }
+        if not deficits:
+            break
+        reserve_round += 1
+        reserve_pending: list[dict[str, str]] = []
+        for workload_id, deficit in deficits.items():
+            available = [
+                row for row in manifest_rows
+                if row["workload_id"] == workload_id
+                and truthy(row.get("is_reserve"))
+                and (row["workload_id"], row["rank"]) not in attempted
+            ]
+            reserve_pending.extend(available[:deficit])
+        if not reserve_pending:
+            raise RuntimeError(
+                "legal reserve pool exhausted before every workload reached its target"
+            )
+        run_grouped(reserve_pending, f"reserve_{reserve_round}")
 
     successful_by_workload: dict[str, int] = {}
     for workload_id, _ in completed:

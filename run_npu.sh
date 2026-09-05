@@ -63,6 +63,15 @@ grep -Eq '^toolkit_running_version=.*:8\.1' "${CANN_VERSION_FILE}" || {
     exit 2
 }
 
+echo "PRIVATE_BUILD_CLEANUP begin"
+if ! BUILD_COMPONENTS=cleanup BUILD_JOBS=1 scripts/build_all.sh \
+    >"${TMPDIR:-/tmp}/matmul_direct_build_cleanup.log" 2>&1; then
+    echo "PRIVATE_BUILD_CLEANUP failed"
+    tail -20 "${TMPDIR:-/tmp}/matmul_direct_build_cleanup.log"
+    exit 1
+fi
+echo "PRIVATE_BUILD_CLEANUP passed"
+
 catalog_started_ns="$(date +%s%N)"
 CATALOG_TMP="$(mktemp "${TMPDIR:-/tmp}/matmul-hardware-calibration.XXXXXX.csv")"
 cleanup() {
@@ -265,33 +274,29 @@ direct_preflight_wall_ms=$(( ($(date +%s%N) - direct_preflight_started_ns) / 100
 echo "DIRECT_TILING_PREFLIGHT passed candidates=2745 wall_ms=${direct_preflight_wall_ms}"
 
 RUNNER_BUILD_HASH="$({
-    find runner direct_matmul cmake_npu -type f -print0
-    printf '%s\0' scripts/build_all.sh "${CANN_VERSION_FILE}"
-    find "${MATMUL_V3_SOURCE_DIR}" -type f -print0
+    printf '%s\0' runner/official_matmul_runner.cpp \
+        cmake_npu/CMakeLists.txt scripts/build_all.sh "${CANN_VERSION_FILE}"
 } | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
-RUNNER_BUILD_STAMP="${ROOT}/build/.matmul_direct_runner.sha256"
+RUNNER_BUILD_STAMP="${ROOT}/build/.matmul_official_runner.sha256"
 runner_build_started_ns="$(date +%s%N)"
-if [[ ! -x build/official_matmul_runner || ! -x build/direct_matmul_runner || \
-      ! -f "${RUNNER_BUILD_STAMP}" || \
+if [[ ! -x build/official_matmul_runner || ! -f "${RUNNER_BUILD_STAMP}" || \
       "$(cat "${RUNNER_BUILD_STAMP}" 2>/dev/null || true)" != "${RUNNER_BUILD_HASH}" ]]; then
-    echo "RUNNER_BUILD begin jobs=1"
-    if ! BUILD_COMPONENTS=runner BUILD_JOBS=1 scripts/build_all.sh \
-        > >(tee "${CAMPAIGN_DIR}/build.log" | awk '
-            /DIRECT_KERNEL_BUILD|DIRECT_RUNNER_LINK|fatal:/ {print; fflush()}
-        ') 2>&1; then
-        echo "RUNNER_BUILD failed log=${CAMPAIGN_DIR}/build.log"
-        tail -20 "${CAMPAIGN_DIR}/build.log"
+    echo "OFFICIAL_RUNNER_BUILD begin jobs=1"
+    if ! BUILD_COMPONENTS=official BUILD_JOBS=1 scripts/build_all.sh \
+        >"${CAMPAIGN_DIR}/official_runner_build.log" 2>&1; then
+        echo "OFFICIAL_RUNNER_BUILD failed log=${CAMPAIGN_DIR}/official_runner_build.log"
+        tail -20 "${CAMPAIGN_DIR}/official_runner_build.log"
         exit 1
     fi
     printf '%s\n' "${RUNNER_BUILD_HASH}" >"${RUNNER_BUILD_STAMP}"
-    echo "RUNNER_BUILD passed"
+    echo "OFFICIAL_RUNNER_BUILD passed"
     runner_build_cached=0
 else
-    echo "RUNNER_BUILD cached"
+    echo "OFFICIAL_RUNNER_BUILD cached"
     runner_build_cached=1
 fi
 runner_build_wall_ms=$(( ($(date +%s%N) - runner_build_started_ns) / 1000000 ))
-echo "CAMPAIGN_STAGE_TIMING stage=runner_build wall_ms=${runner_build_wall_ms} cached=${runner_build_cached}"
+echo "CAMPAIGN_STAGE_TIMING stage=official_runner_build wall_ms=${runner_build_wall_ms} cached=${runner_build_cached}"
 
 echo "NPU_MEASUREMENT_BEGIN shapes=70 candidate_records=2185 official_baselines=70 records=2255"
 export KEEP_DETAILS=1
@@ -306,7 +311,7 @@ set +e
 "${ROOT}/scripts/profile_npu.sh" \
     "${CANDIDATES}" "${OUT_STEM}" "${WORKLOADS}" \
     > >(awk '
-        /OFFICIAL_BASELINE_|DIRECT_INPUT_|DIRECT_MEASUREMENT_|NPU_RESULTS_READY|fatal:|Traceback/ {
+        /OFFICIAL_BASELINE_|DIRECT_VARIANT_|DIRECT_MEASUREMENT_|NPU_RESULTS_READY|fatal:|Traceback/ {
             print; fflush();
         }
     ' | tee "${PROFILE_LOG}") 2>&1

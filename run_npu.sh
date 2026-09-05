@@ -205,7 +205,6 @@ if (
     or len(hashes) != 70
     or any(len(hashes[row["workload_id"]]) != searched[row["workload_id"]] for row in workloads)
     or len(families) != 70
-    or any(len(value) < 2 for value in families.values())
     or set().union(*families.values()) != {
         "BASE", "SINGLE_CORE_SPLIT_K", "DETERMINISTIC_SPLIT_K",
         "AL1_FULL_LOAD", "BL1_FULL_LOAD", "BL1_FULL_LOAD_FIXPIPE",

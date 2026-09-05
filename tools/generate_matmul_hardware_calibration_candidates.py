@@ -66,7 +66,6 @@ OBSOLETE_EXECUTION_COLUMNS = {
     "tiling_solver_callback_count",
 }
 FACTOR_FIELDS = {
-    "execution_graph": ("tilingEnable",),
     "core_parallelism": ("usedCoreNum",),
     "mn_geometry": (
         "singleCoreM", "singleCoreN", "baseM", "baseN", "stepM", "stepN",
@@ -359,18 +358,16 @@ def select_controlled(
 
     selected: list[tuple[dict, str]] = [(pool[0], "model_optimum_anchor")]
     seen = {signature(pool[0]["knowledge"])}
-    # Measure the model-best point from every legal execution graph before
-    # local factor sweeps.  No workload-provided family label participates
-    # in selection, so measured ranks test the graph choice itself.
-    best_by_family: dict[str, dict] = {}
-    for item in pool:
-        best_by_family.setdefault(item["family"], item)
-    for family in sorted(best_by_family):
-        item = best_by_family[family]
-        key = signature(item["knowledge"])
-        if key not in seen and len(selected) < count:
-            seen.add(key)
-            selected.append((item, "execution_graph"))
+    # pool[0] is the unrestricted hardware-model optimum, so graph selection
+    # is tested once without a workload label.  The remaining rows are the
+    # controlled factor sweep for this coverage stratum.  Forcing one row
+    # from every graph here would promote a low-ranked graph merely because
+    # it exists, which is neither model ranking nor controlled calibration.
+    coverage_anchor = coverage_items[0]
+    coverage_anchor_key = signature(coverage_anchor["knowledge"])
+    if coverage_anchor_key not in seen and len(selected) < count:
+        seen.add(coverage_anchor_key)
+        selected.append((coverage_anchor, "coverage_anchor"))
     factor_order = tuple(FACTOR_FIELDS)
     progress = True
     while len(selected) < count and progress:

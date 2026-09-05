@@ -42,6 +42,8 @@ ARCH="$(uname -m)"
 PLATFORM_ROOT="$CANN_ROOT/${ARCH}-linux"
 CANN_INCLUDE="$PLATFORM_ROOT/include"
 CANN_LIB="$PLATFORM_ROOT/lib64"
+CANN_DEVLIB="$PLATFORM_ROOT/devlib"
+CANN_ROOT_LIB="$CANN_ROOT/lib64"
 HOST_TILING_INCLUDE="$CANN_INCLUDE/ascendc/host_api/tiling"
 HOST_HIGHLEVEL_INCLUDE="$CANN_INCLUDE/ascendc/highlevel_api"
 
@@ -124,10 +126,6 @@ SOC_BUILD_NAME="$(printf '%s' "$ASCENDC_SOC_VERSION" | tr '[:upper:]' '[:lower:]
 NPU_BUILD="$BUILD/npu_cmake_${SOC_BUILD_NAME}"
 mkdir -p "$NPU_BUILD"
 : >"$BUILD/kernel_build.log"
-run_logged "$BUILD/kernel_build.log" "configure official runner" \
-    cmake -S "$ROOT/cmake_npu" -B "$NPU_BUILD" \
-        -DASCEND_CANN_PACKAGE_PATH="$CANN_ROOT" \
-        -DCMAKE_BUILD_TYPE=Release
 
 DIRECT_KERNEL_TARGETS=(
     direct_matmul_kernel_fp16_0 direct_matmul_kernel_fp16_1
@@ -156,6 +154,91 @@ DIRECT_KERNEL_BUILD_SIGNATURE="$({
         "cann81-direct-kernel-v2:${ASCENDC_SOC_VERSION}:${DIRECT_KERNEL_TARGETS[*]}"
 } | sha256sum | cut -d' ' -f1)"
 kernel_count="${#DIRECT_KERNEL_TARGETS[@]}"
+
+cleanup_kernel_intermediates() {
+    local cleanup_target="$1"
+    case "${cleanup_target}" in
+        direct_matmul_kernel_*) ;;
+        *) echo "fatal: invalid cleanup target ${cleanup_target}" >&2; return 2 ;;
+    esac
+    local cleanup_path
+    for cleanup_path in \
+        "${NPU_BUILD}/${cleanup_target}_precompile-prefix" \
+        "${NPU_BUILD}/${cleanup_target}_preprocess-prefix" \
+        "${NPU_BUILD}/${cleanup_target}_host-prefix" \
+        "${NPU_BUILD}/${cleanup_target}_aic_device-prefix" \
+        "${NPU_BUILD}/${cleanup_target}_aiv_device-prefix" \
+        "${NPU_BUILD}/${cleanup_target}_aic_device_dir" \
+        "${NPU_BUILD}/${cleanup_target}_aiv_device_dir" \
+        "${NPU_BUILD}/${cleanup_target}_merge_obj_dir" \
+        "${NPU_BUILD}/${cleanup_target}_host_dir" \
+        "${NPU_BUILD}/auto_gen/${cleanup_target}" \
+        "${NPU_BUILD}/CMakeFiles/${cleanup_target}_host_stub_obj.dir"; do
+        [[ -d "${cleanup_path}" ]] && cmake -E remove_directory "${cleanup_path}"
+    done
+}
+
+kernel_identity() {
+    local identity_target="$1"
+    local identity="${identity_target#direct_matmul_kernel_}"
+    local dtype="${identity%%_*}"
+    local suffix="${identity#*_}"
+    printf 'aclrtlaunch_direct_matmul_%s_k%s\n' "${dtype}" "${suffix}"
+}
+
+kernel_archive_valid() {
+    local valid_target="$1"
+    local valid_library="${NPU_BUILD}/lib/lib${valid_target}.a"
+    local valid_symbol
+    valid_symbol="$(kernel_identity "${valid_target}")"
+    local valid_header="${NPU_BUILD}/include/${valid_target}/${valid_symbol}.h"
+    [[ -s "${valid_library}" && -f "${valid_header}" ]] || return 1
+    ar t "${valid_library}" >/dev/null 2>&1 || return 1
+    nm -g --defined-only "${valid_library}" 2>/dev/null | \
+        grep -E "[[:space:]]${valid_symbol}$" >/dev/null
+}
+
+recover_kernel_archive() {
+    local recover_target="$1"
+    local recover_library="${NPU_BUILD}/lib/lib${recover_target}.a"
+    local recover_stub recover_host
+    recover_stub="$(find \
+        "${NPU_BUILD}/CMakeFiles/${recover_target}_host_stub_obj.dir" \
+        -type f -name 'host_stub.cpp.o' -print -quit 2>/dev/null || true)"
+    recover_host="$(find "${NPU_BUILD}/${recover_target}_host_dir" \
+        -type f -name 'kernel_entry.cpp.o' -print -quit 2>/dev/null || true)"
+    [[ -n "${recover_stub}" && -n "${recover_host}" && \
+       -f "${NPU_BUILD}/elf_tool.c.o" && \
+       -f "${NPU_BUILD}/ascendc_runtime.cpp.o" ]] || return 1
+    mkdir -p "${NPU_BUILD}/lib"
+    ar rcs "${recover_library}" \
+        "${recover_stub}" "${recover_host}" \
+        "${NPU_BUILD}/elf_tool.c.o" "${NPU_BUILD}/ascendc_runtime.cpp.o"
+    kernel_archive_valid "${recover_target}"
+}
+
+# A completed archive contains the packed device binary.  Its ExternalProject
+# trees are no longer needed and can consume many GiB across 23 variants.
+# Remove only those private generated trees before recovering/building any
+# missing archive; libraries, launch headers and stamps remain intact.
+for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
+    if kernel_archive_valid "${target}"; then
+        cleanup_kernel_intermediates "${target}"
+    fi
+done
+
+build_free_kib="$(df -Pk "${BUILD}" | awk 'END {print $4}')"
+if [[ ! "${build_free_kib}" =~ ^[0-9]+$ || "${build_free_kib}" -lt 524288 ]]; then
+    echo "fatal: less than 512 MiB remains after private kernel cleanup" >&2
+    exit 1
+fi
+echo "DIRECT_BUILD_STORAGE free_mib=$((build_free_kib / 1024))"
+
+run_logged "$BUILD/kernel_build.log" "configure official runner" \
+    cmake -S "$ROOT/cmake_npu" -B "$NPU_BUILD" \
+        -DASCEND_CANN_PACKAGE_PATH="$CANN_ROOT" \
+        -DCMAKE_BUILD_TYPE=Release
+
 kernel_index=0
 for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
     kernel_index=$((kernel_index + 1))
@@ -167,6 +250,9 @@ for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
     target_suffix="${target_identity#*_}"
     target_symbol="aclrtlaunch_direct_matmul_${target_dtype}_k${target_suffix}"
     target_header="${target_include}/${target_symbol}.h"
+    if [[ ! -s "${target_library}" ]]; then
+        recover_kernel_archive "${target}" || true
+    fi
     kernel_cache_valid=0
     if [[ -s "${target_library}" && -f "${target_header}" && \
           -f "${target_stamp}" ]] && \
@@ -188,6 +274,7 @@ for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
         fi
     fi
     if [[ "${kernel_cache_valid}" -eq 1 ]]; then
+        cleanup_kernel_intermediates "${target}"
         echo "DIRECT_KERNEL_BUILD ${kernel_index}/${kernel_count} ${target} cached"
         continue
     fi
@@ -202,19 +289,42 @@ for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
     run_logged "$BUILD/kernel_build.log" "compile ${target}" \
         cmake --build "$NPU_BUILD" --target "${target}" \
         --parallel "${BUILD_JOBS:-1}"
+    kernel_archive_valid "${target}" || {
+        echo "fatal: ${target} archive/header/symbol validation failed" >&2
+        exit 1
+    }
     printf '%s\n' "${DIRECT_KERNEL_BUILD_SIGNATURE}" >"${target_stamp}"
+    cleanup_kernel_intermediates "${target}"
     echo "DIRECT_KERNEL_BUILD ${kernel_index}/${kernel_count} ${target} passed"
 done
 echo "DIRECT_RUNNER_LINK begin"
 run_logged "$BUILD/kernel_build.log" "compile official runner" \
     cmake --build "$NPU_BUILD" --target official_matmul_runner \
     --parallel "${BUILD_JOBS:-1}"
-run_logged "$BUILD/kernel_build.log" "link direct runner" \
-    cmake --build "$NPU_BUILD" --target direct_matmul_runner \
-    --parallel "${BUILD_JOBS:-1}"
+
+DIRECT_RUNNER_COMMAND=(
+    g++ -std=c++17 -O3 -DNDEBUG
+    "-I${ROOT}/direct_matmul" "-I${CANN_INCLUDE}"
+)
+for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
+    DIRECT_RUNNER_COMMAND+=("-I${NPU_BUILD}/include/${target}")
+done
+DIRECT_RUNNER_COMMAND+=("${ROOT}/direct_matmul/runner.cpp")
+for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
+    DIRECT_RUNNER_COMMAND+=("${NPU_BUILD}/lib/lib${target}.a")
+done
+DIRECT_RUNNER_COMMAND+=(
+    "-L${CANN_LIB}" "-L${CANN_ROOT_LIB}"
+    "-L${CANN_ROOT}/tools/simulator/${ASCENDC_SOC_VERSION}/lib"
+    "-Wl,-rpath-link,${CANN_LIB}" "-Wl,-rpath-link,${CANN_DEVLIB}"
+    -lascendcl -lruntime -lregister -lerror_manager -lprofapi
+    -lge_common_base -lascendalog -lmmpa -lascend_dump -lc_sec
+    -ldl -lpthread -o "${BUILD}/direct_matmul_runner"
+)
+run_logged "$BUILD/kernel_build.log" "link direct runner without kernel rebuild" \
+    "${DIRECT_RUNNER_COMMAND[@]}"
 echo "DIRECT_RUNNER_LINK passed"
 cp "$NPU_BUILD/official_matmul_runner" "$BUILD/official_matmul_runner"
-cp "$NPU_BUILD/direct_matmul_runner" "$BUILD/direct_matmul_runner"
 : >"$BUILD/runner_build.log"
 
 if [[ "${BUILD_COMPONENTS}" == "all" ]]; then

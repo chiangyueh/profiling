@@ -116,44 +116,9 @@ register_direct_matmul(fp32 float 201 00201)
 register_direct_matmul(fp32 float 10201 10201)
 register_direct_matmul(fp32 float 20201 20201)
 
-# The kernel archives are built explicitly and serially by build_all.sh.
-# Linking against the CMake targets here would traverse every AscendC
-# ExternalProject again; CANN 8.1 marks those projects BUILD_ALWAYS and its
-# preprocess objects are not safe to rewrite a second time.  Use the already
-# materialized archives and generated launch headers for this host-only step.
-set(DIRECT_MATMUL_PREBUILT_ARCHIVES "")
-set(DIRECT_MATMUL_GENERATED_INCLUDES "")
-foreach(kernel_target IN LISTS DIRECT_MATMUL_KERNEL_TARGETS)
-    list(APPEND DIRECT_MATMUL_PREBUILT_ARCHIVES
-        "${CMAKE_BINARY_DIR}/lib/lib${kernel_target}.a"
-    )
-    list(APPEND DIRECT_MATMUL_GENERATED_INCLUDES
-        "${CMAKE_BINARY_DIR}/include/${kernel_target}"
-    )
-endforeach()
-
-add_executable(direct_matmul_runner
-    "${PROJECT_ROOT}/direct_matmul/runner.cpp"
-)
-target_link_libraries(direct_matmul_runner PRIVATE
-    ${DIRECT_MATMUL_PREBUILT_ARCHIVES}
-    ascendcl runtime register error_manager profapi ge_common_base
-    ascendalog mmpa ascend_dump c_sec dl pthread
-)
-target_include_directories(direct_matmul_runner PRIVATE
-    "${PROJECT_ROOT}/direct_matmul"
-    "${CANN_INCLUDE}"
-    ${DIRECT_MATMUL_GENERATED_INCLUDES}
-)
-target_link_directories(direct_matmul_runner PRIVATE
-    "${CANN_LIB}"
-    "${CANN_ROOT_LIB}"
-    "${ASCEND_CANN_PACKAGE_PATH}/tools/simulator/${SOC_VERSION}/lib"
-)
-target_link_options(direct_matmul_runner PRIVATE
-    "-Wl,-rpath-link,${CANN_LIB}"
-    "-Wl,-rpath-link,${CANN_DEVLIB}"
-)
+# direct_matmul_runner is intentionally linked outside this CMake graph by
+# build_all.sh.  Depending on any ascendc_library target here would retraverse
+# CANN 8.1 BUILD_ALWAYS ExternalProjects after their archives already exist.
 
 target_include_directories(official_matmul_runner PRIVATE
     "${CANN_INCLUDE}"

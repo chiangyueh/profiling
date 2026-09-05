@@ -55,6 +55,62 @@ endif()
 if(NOT EXISTS "${MATMUL_V3_KERNEL_DIR}/mat_mul_v3.cpp")
     message(FATAL_ERROR "installed CANN 8.1 MatMulV3 kernel source was not found")
 endif()
+
+# CANN 8.1's device sub-project assigns the real ld.lld path internally, so an
+# outer BUILD_JOBS=1 does not disable the linker's own LLVM worker pool.  Keep a
+# private copy of the small CMake support package and redirect only its linker
+# entries through our process-local single-thread wrapper.  The installed CANN
+# package and the calling shell environment remain untouched.
+get_filename_component(ASCENDC_CMAKE_REAL "${ASCENDC_CMAKE}" REALPATH)
+get_filename_component(ASCENDC_CMAKE_SOURCE_DIR "${ASCENDC_CMAKE_REAL}" DIRECTORY)
+set(ASCENDC_CMAKE_PRIVATE_DIR
+    "${CMAKE_BINARY_DIR}/ascendc_kernel_cmake_single_thread"
+)
+if(NOT EXISTS "${ASCENDC_CMAKE_PRIVATE_DIR}/ascendc.cmake")
+    file(COPY "${ASCENDC_CMAKE_SOURCE_DIR}/"
+         DESTINATION "${ASCENDC_CMAKE_PRIVATE_DIR}")
+endif()
+set(ASCENDC_LINKER_WRAPPER
+    "${PROJECT_ROOT}/scripts/ccec_ld_single_thread.sh"
+)
+if(NOT EXISTS "${ASCENDC_LINKER_WRAPPER}")
+    message(FATAL_ERROR "private CCEC linker wrapper was not found")
+endif()
+foreach(config_name IN ITEMS host_config.cmake bisheng_config.cmake)
+    set(config_path "${ASCENDC_CMAKE_PRIVATE_DIR}/${config_name}")
+    file(READ "${config_path}" config_text)
+    if(config_name STREQUAL "host_config.cmake")
+        set(expected_linker_line
+            "set(CCEC_LINKER \"${ASCENDC_LINKER_WRAPPER}\")"
+        )
+        string(REGEX REPLACE
+            "set\\(CCEC_LINKER[^\n]*\\)"
+            "${expected_linker_line}"
+            patched_config_text "${config_text}"
+        )
+    else()
+        set(expected_linker_line
+            "set(CMAKE_LINKER \"${ASCENDC_LINKER_WRAPPER}\")"
+        )
+        string(REGEX REPLACE
+            "set\\(CMAKE_LINKER[^\n]*\\)"
+            "${expected_linker_line}"
+            patched_config_text "${config_text}"
+        )
+    endif()
+    string(FIND "${patched_config_text}" "${expected_linker_line}"
+        expected_linker_position)
+    if(expected_linker_position EQUAL -1)
+        message(FATAL_ERROR "failed to redirect ${config_name} linker")
+    endif()
+    if(NOT config_text STREQUAL patched_config_text)
+        file(WRITE "${config_path}" "${patched_config_text}")
+    endif()
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${ASCENDC_LINKER_WRAPPER}"
+)
+set(ASCENDC_CMAKE "${ASCENDC_CMAKE_PRIVATE_DIR}/ascendc.cmake")
 include("${ASCENDC_CMAKE}")
 
 function(add_direct_matmul_kernel target kernel dtype suffix)

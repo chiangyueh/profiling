@@ -115,6 +115,21 @@ def test_direct_kernel_does_not_offset_user_workspace_twice() -> None:
     assert entry.index(override) < entry.index(include) < entry.index(restore)
 
 
+def test_ccec_linker_is_limited_inside_the_private_cmake_copy() -> None:
+    cmake = (ROOT / "cmake_npu" / "CMakeLists.txt").read_text(
+        encoding="utf-8"
+    )
+    wrapper = (ROOT / "scripts" / "ccec_ld_single_thread.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ascendc_kernel_cmake_single_thread" in cmake
+    assert "host_config.cmake bisheng_config.cmake" in cmake
+    assert "ASCENDC_LINKER_WRAPPER" in cmake
+    assert "--threads=1" in wrapper
+    assert 'exec "${real_linker}"' in wrapper
+
+
 def _pool_item(family: str, rank: int, core_count: int) -> dict:
     knowledge = {field: 1 for field in candidates.old.KNOWLEDGE_FIELDS}
     knowledge.update({

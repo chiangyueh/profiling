@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Create a preregistered, model-independent MatMul hardware frontier.
+"""Create a source-anchored, model-independent MatMul hardware frontier.
 
-Candidate identities are selected from CANN-legal parameter space using only
-hardware capacities and structural strata.  The cost simulator is invoked
-only after the measured set has been frozen, so its score cannot influence
-which tilings are sent to the NPU.
+Every applicable original CANN route/core cap is retained before a bounded
+hardware-factor neighborhood is expanded around those observed basins.  The
+cost simulator is invoked only after the measured set has been frozen, so its
+score cannot influence which tilings are sent to the NPU.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import csv
 import hashlib
 import json
 import math
+import struct
 import sys
 import time
 from collections import Counter, defaultdict, deque
@@ -41,18 +42,6 @@ from npu_cost_model.operators import matmul
 
 
 RESERVES_PER_SHAPE = 32
-FORMAL_GEOMETRY = 300
-FORMAL_PAIRED = 300
-FORMAL_INTERACTION = 60
-FORMAL_SERIAL_SPLIT_K = 40
-FORMAL_DETERMINISTIC_SPLIT_K = 20
-PAIRED_FACTOR_QUOTAS = {
-    "core_parallelism": 100,
-    "k_pipeline": 95,
-    "l0_buffering": 37,
-    "l2_partition": 56,
-    "cube_traversal": 12,
-}
 CUSTOM_COLUMNS = (
     "hardware_aic_cores", "new_model_cycles", "new_model_rank",
     "global_model_rank", "new_model_bottleneck", "new_model_breakdown",
@@ -65,6 +54,10 @@ CUSTOM_COLUMNS = (
     "legal_candidate_count", "candidate_generation_ms",
     "static_legality_ms", "simulator_scoring_ms", "tiling_solver_select_ms",
     "tiling_solver_extra_ms", "tiling_solver_total_ms",
+    "source_anchor", "source_route", "source_core_cap",
+    "source_tiling_key", "source_block_dim", "source_workspace_bytes",
+    "source_raw_tiling_hex", "source_route_provenance",
+    "source_validator_violations",
 )
 MANDATORY_COLUMNS = (
     "workload_id", "m", "n", "k", "dtype", "trans_a", "trans_b",
@@ -206,6 +199,254 @@ def execution_identity(
         workload.trans_a, workload.trans_b, knowledge,
     )
     return hashlib.sha256(payload).hexdigest(), suffix
+
+
+def item_identity(item: dict) -> tuple:
+    raw = item.get("source_raw_tiling_hex", "")
+    return ("source", raw) if raw else ("parameters", *signature(item["knowledge"]))
+
+
+def source_suffix(tiling_key: int) -> int:
+    offset = 10_000_000_000_000_000_000
+    if tiling_key < offset:
+        raise old.SearchError(f"source tiling key is below MatMulV3 offset: {tiling_key}")
+    return tiling_key - offset
+
+
+def knowledge_from_source(raw_hex: str, tiling_key: int) -> dict[str, int]:
+    try:
+        raw = bytes.fromhex(raw_hex)
+    except ValueError as error:
+        raise old.SearchError(f"invalid source raw tiling: {error}") from error
+    if len(raw) != 272:
+        raise old.SearchError(f"source raw tiling has {len(raw)} bytes, expected 272")
+    words = struct.unpack("<68I", raw)
+    suffix = source_suffix(tiling_key)
+    split = (suffix // 10) % 10
+    full = (suffix // 100) % 10
+    fix = (suffix // 10_000) % 10
+    return {
+        "usedCoreNum": words[0],
+        "singleCoreM": words[5], "singleCoreN": words[6],
+        "singleCoreK": words[7], "baseM": words[8], "baseN": words[9],
+        "baseK": words[10], "depthA1": words[11], "depthB1": words[12],
+        "stepM": words[13], "stepN": words[14],
+        "iterateOrder": words[17], "stepKa": words[26], "stepKb": words[27],
+        "dbL0A": words[30], "dbL0B": words[31], "dbL0C": words[32],
+        "l2MTileCnt": words[50], "l2NTileCnt": words[51],
+        "l2MTileBlock": words[52], "l2NTileBlock": words[53],
+        "l2IterateOrder": words[54],
+        "tilingEnable": split + 10 * full + 1000 * fix,
+    }
+
+
+def read_source_anchors(
+    path: Path, workload: old.Workload, platform: old.Hardware, hardware,
+) -> list[dict]:
+    observations: list[dict] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise old.SearchError(f"invalid source audit line {line_number}: {error}")
+        if (
+            row.get("schema") == "matmul_v3_source_route_observation_v1"
+            and row.get("workload_id") == workload.workload_id
+            and row.get("status") == "success"
+            and row.get("route_matched") is True
+        ):
+            observations.append(row)
+    if not any(
+        row.get("route") == "ALL"
+        and int(row.get("core_cap", 0)) == platform.aic_cores
+        for row in observations
+    ):
+        raise old.SearchError(
+            f"{workload.workload_id}: source audit lacks ALL@{platform.aic_cores}"
+        )
+    grouped: dict[tuple, list[dict]] = defaultdict(list)
+    for row in observations:
+        grouped[(
+            int(row["tiling_key"]), int(row["block_dim"]),
+            int(row["workspace_bytes"]), str(row["raw_tiling_hex"]),
+        )].append(row)
+    anchors: list[dict] = []
+    for (tiling_key, block_dim, workspace, raw_hex), provenance in grouped.items():
+        knowledge = knowledge_from_source(raw_hex, tiling_key)
+        words = struct.unpack("<68I", bytes.fromhex(raw_hex))
+        if (words[1], words[2], words[3], words[4]) != (
+            workload.m, workload.n, workload.k, workload.k
+        ) or words[0] != block_dim:
+            raise old.SearchError(f"{workload.workload_id}: source anchor shape/block mismatch")
+        source_violations = validate_cann_tiling(
+            workload.m, workload.n, workload.k, workload.dtype,
+            workload.trans_a, workload.trans_b, knowledge, hardware,
+            aoe_injection=True,
+        )
+        try:
+            plan_from_cann(
+                workload.m, workload.n, workload.k, knowledge,
+                dtype=workload.dtype, trans_a=workload.trans_a,
+                trans_b=workload.trans_b,
+            )
+        except (KeyError, ValueError) as error:
+            raise old.SearchError(
+                f"{workload.workload_id}: simulator cannot represent original-source "
+                f"key={tiling_key} block={block_dim}: {error}"
+            ) from error
+        suffix = source_suffix(tiling_key)
+        if suffix not in {0, 1, 20, 21, 30, 31, 101, 201, 10201, 20201}:
+            continue
+        routes = sorted({str(row["route"]) for row in provenance})
+        caps = sorted({int(row["core_cap"]) for row in provenance})
+        anchors.append({
+            "knowledge": knowledge,
+            "design_role": "official_source_anchor",
+            "controlled_factor": "official_source_route",
+            "pair_id": f"source_{len(anchors):03d}",
+            "factor_signature": f"routes={'+'.join(routes)}:caps={','.join(map(str, caps))}",
+            "hardware_stratum": hardware_stratum(workload, knowledge, hardware),
+            "source_raw_tiling_hex": raw_hex,
+            "source_route": "+".join(routes),
+            "source_core_cap": ",".join(map(str, caps)),
+            "source_tiling_key": tiling_key,
+            "source_block_dim": block_dim,
+            "source_workspace_bytes": workspace,
+            "source_route_provenance": json.dumps(
+                [{"route": row["route"], "core_cap": row["core_cap"]} for row in provenance],
+                separators=(",", ":"), sort_keys=True,
+            ),
+            "source_validator_violations": "+".join(source_violations),
+        })
+    if not anchors:
+        raise old.SearchError(f"{workload.workload_id}: no executable source anchors")
+    return anchors
+
+
+def source_frontier_candidates(
+    workload: old.Workload, source_anchors: list[dict],
+    platform: old.Hardware, hardware,
+) -> tuple[list[dict], int]:
+    """Expand hardware factors around every observed source basin.
+
+    Exact source anchors cover every applicable original route/core cap.  The
+    local set crosses M/N geometry, K pipeline, core waves, buffering, L2
+    partition and traversal around those anchors; it never starts from the old
+    hand-picked global geometry targets.
+    """
+    items: dict[tuple, dict] = {item_identity(item): item for item in source_anchors}
+    source_signatures = {signature(item["knowledge"]) for item in source_anchors}
+    legality_ns = 0
+
+    def add(knowledge: dict[str, int], factor: str, pair_id: str, value: str) -> bool:
+        nonlocal legality_ns
+        key = ("parameters", *signature(knowledge))
+        if key in items or signature(knowledge) in source_signatures:
+            return signature(knowledge) in source_signatures
+        started = time.perf_counter_ns()
+        accepted = legal(workload, knowledge, platform, hardware)
+        legality_ns += time.perf_counter_ns() - started
+        if not accepted:
+            return False
+        items[key] = {
+            "knowledge": dict(knowledge), "design_role": "source_local_frontier",
+            "controlled_factor": factor, "pair_id": pair_id,
+            "factor_signature": value,
+            "hardware_stratum": hardware_stratum(workload, knowledge, hardware),
+        }
+        return True
+
+    base_seeds: dict[tuple[int, ...], dict[str, int]] = {}
+    for item in source_anchors:
+        seed = item["knowledge"]
+        if execution_mode_name(seed) == "base":
+            base_seeds.setdefault(signature(seed), seed)
+    if not base_seeds:
+        raise old.SearchError(f"{workload.workload_id}: original source exposed no BASE basin")
+
+    step_pairs = (
+        (1, 1), (1, 2), (2, 1), (2, 2), (2, 4), (4, 2),
+        (4, 4), (4, 8), (8, 4), (8, 8), (8, 16), (16, 8),
+        (16, 16), (16, 32), (32, 16), (32, 32),
+    )
+    expanded_geometries: dict[tuple[int, ...], dict[str, int]] = {}
+    for seed_index, seed in enumerate(base_seeds.values()):
+        pair_id = f"base_source_{seed_index:03d}"
+        m_blocks = max(1, old.ceil_div(seed["singleCoreM"], seed["baseM"]))
+        n_blocks = max(1, old.ceil_div(seed["singleCoreN"], seed["baseN"]))
+        base_ms = sorted({
+            old.align_up(max(16, seed["baseM"] * numerator // denominator), 16)
+            for numerator, denominator in ((1, 2), (3, 4), (1, 1), (5, 4), (3, 2), (2, 1))
+            if seed["baseM"] * numerator // denominator <= 512
+        })
+        base_ns = sorted({
+            old.align_up(max(16, seed["baseN"] * numerator // denominator), 16)
+            for numerator, denominator in ((1, 2), (3, 4), (1, 1), (5, 4), (3, 2), (2, 1))
+            if seed["baseN"] * numerator // denominator <= 512
+        })
+        base_ks = sorted({
+            value for value in BK_VALUES
+            if max(16, seed["baseK"] // 2) <= value <= min(256, seed["baseK"] * 2)
+        } | {seed["baseK"]})
+        for base_m, base_n, base_k in product(base_ms, base_ns, base_ks):
+            geometry = dict(seed)
+            geometry.update(
+                baseM=base_m, baseN=base_n, baseK=base_k,
+                singleCoreM=base_m * m_blocks,
+                singleCoreN=base_n * n_blocks,
+            )
+            tasks = old.ceil_div(workload.m, geometry["singleCoreM"]) * old.ceil_div(
+                workload.n, geometry["singleCoreN"]
+            )
+            geometry["usedCoreNum"] = min(platform.aic_cores, tasks)
+            if add(geometry, "source_mnk_geometry", pair_id,
+                   f"baseM={base_m}:baseN={base_n}:baseK={base_k}"):
+                expanded_geometries.setdefault(signature(geometry), geometry)
+
+    for geometry_index, geometry in enumerate(expanded_geometries.values()):
+        pair_id = f"geometry_{geometry_index:04d}"
+        tasks = old.ceil_div(workload.m, geometry["singleCoreM"]) * old.ceil_div(
+            workload.n, geometry["singleCoreN"]
+        )
+        for cores in range(1, min(platform.aic_cores, tasks) + 1):
+            candidate = dict(geometry); candidate["usedCoreNum"] = cores
+            add(candidate, "core_parallelism", pair_id, f"usedCoreNum={cores}")
+        for step_ka, step_kb in step_pairs:
+            for packets in (1, 2):
+                candidate = dict(geometry)
+                candidate.update(
+                    stepKa=step_ka, stepKb=step_kb,
+                    depthA1=step_ka * packets, depthB1=step_kb * packets,
+                )
+                add(candidate, "k_pipeline", pair_id,
+                    f"stepKa={step_ka}:stepKb={step_kb}:packets={packets}")
+        for db_a, db_b, db_c in product((1, 2), repeat=3):
+            candidate = dict(geometry)
+            candidate.update(dbL0A=db_a, dbL0B=db_b, dbL0C=db_c)
+            add(candidate, "l0_buffering", pair_id,
+                f"dbL0A={db_a}:dbL0B={db_b}:dbL0C={db_c}")
+        for order in (0, 1):
+            candidate = dict(geometry); candidate["iterateOrder"] = order
+            add(candidate, "cube_traversal", pair_id, f"iterateOrder={order}")
+        m_total = old.ceil_div(workload.m, geometry["singleCoreM"])
+        n_total = old.ceil_div(workload.n, geometry["singleCoreN"])
+        for m_block, n_block in (
+            *((value, n_total) for value in partition_values(m_total)),
+            *((m_total, value) for value in partition_values(n_total)),
+        ):
+            for order in (1, 2):
+                candidate = l2_schedule(workload, geometry, m_block, n_block, order)
+                add(candidate, "l2_partition", pair_id,
+                    f"mBlock={m_block}:nBlock={n_block}:order={order}")
+
+    proposed = list(items.values())
+    if len(proposed) < 752:
+        raise old.SearchError(
+            f"{workload.workload_id}: source frontier has only {len(proposed)} legal candidates"
+        )
+    return proposed, legality_ns
 
 
 def legal(
@@ -482,87 +723,62 @@ def select_fixed_design(
     proposed: list[dict], anchors: list[dict], required: int,
 ) -> tuple[list[dict], list[dict]]:
     selected: list[dict] = []
-    seen: set[tuple[int, ...]] = set()
+    seen: set[tuple] = set()
 
+    # Every distinct original-source anchor is a formal measurement.  This is
+    # the guard against repeatedly refining a locally coherent but globally
+    # wrong basin.
     for item in anchors:
-        key = signature(item["knowledge"])
+        key = item_identity(item)
         if key not in seen:
             selected.append(item)
             seen.add(key)
-
-    geometry = [item for item in proposed if item["design_role"] in {"broad_geometry", "paired_anchor"}]
-    geometry_pick = round_robin_strata(
-        geometry, FORMAL_GEOMETRY,
-        lambda item: item["hardware_stratum"],
-    )
-    for item in geometry_pick:
-        if len([value for value in selected if value["design_role"] in {"broad_geometry", "paired_anchor"}]) >= FORMAL_GEOMETRY:
-            break
-        key = signature(item["knowledge"])
+    if len(selected) > required:
+        raise old.SearchError(
+            f"original source emitted {len(selected)} distinct anchors, exceeding {required}"
+        )
+    # Cover every value of every independently controlled hardware dimension
+    # once before filling the remaining stratified design.  This avoids a
+    # lexicographic accident silently dropping an entire factor.
+    for factor in (
+        "source_mnk_geometry", "core_parallelism", "k_pipeline",
+        "l0_buffering", "l2_partition", "cube_traversal",
+    ):
+        factor_pool = [
+            item for item in proposed if item["controlled_factor"] == factor
+            and item_identity(item) not in seen
+        ]
+        for item in round_robin_strata(
+            factor_pool, len({value["factor_signature"] for value in factor_pool}),
+            lambda value: value["factor_signature"],
+        ):
+            key = item_identity(item)
+            if key not in seen and len(selected) < required:
+                selected.append(item); seen.add(key)
+    remaining = [item for item in proposed if item_identity(item) not in seen]
+    for item in round_robin_strata(
+        remaining, required - len(selected),
+        lambda value: (
+            value["controlled_factor"], value["factor_signature"],
+            value["hardware_stratum"]
+        ),
+    ):
+        key = item_identity(item)
         if key not in seen:
             selected.append(item); seen.add(key)
-
-    paired_added = 0
-    for factor, quota in PAIRED_FACTOR_QUOTAS.items():
-        pool = [
-            item for item in proposed
-            if item["design_role"] == "paired_factor"
-            and item["controlled_factor"] == factor
-        ]
-        added = 0
-        for item in round_robin_strata(
-            pool, len(pool), lambda value: value["factor_signature"]
-        ):
-            key = signature(item["knowledge"])
-            if key in seen:
-                continue
-            selected.append(item); seen.add(key); added += 1; paired_added += 1
-            if added == quota:
-                break
-    if paired_added != FORMAL_PAIRED:
-        raise old.SearchError(
-            f"paired hardware design has {paired_added} candidates; "
-            f"required {FORMAL_PAIRED}"
-        )
-
-    categories = (
-        ("factor_interaction", FORMAL_INTERACTION, lambda item: item["pair_id"]),
-        ("serial_split_k", FORMAL_SERIAL_SPLIT_K, lambda item: item["pair_id"]),
-        ("deterministic_split_k", FORMAL_DETERMINISTIC_SPLIT_K, lambda item: item["pair_id"]),
-    )
-    for category, count, key_function in categories:
-        if category in {"serial_split_k", "deterministic_split_k"}:
-            pool = [item for item in proposed if item["controlled_factor"] == category]
-        else:
-            pool = [item for item in proposed if item["design_role"] == category]
-        added = 0
-        for item in round_robin_strata(pool, len(pool), key_function):
-            key = signature(item["knowledge"])
-            if key in seen:
-                continue
-            selected.append(item); seen.add(key); added += 1
-            if added == count:
-                break
-
-    if len(selected) < required:
-        remaining = [item for item in proposed if signature(item["knowledge"]) not in seen]
-        for item in round_robin_strata(
-            remaining, required - len(selected),
-            lambda value: (value["design_role"], value["hardware_stratum"]),
-        ):
-            key = signature(item["knowledge"])
-            if key not in seen:
-                selected.append(item); seen.add(key)
-            if len(selected) == required:
-                break
+        if len(selected) == required:
+            break
     if len(selected) != required:
         raise old.SearchError(
-            f"fixed design has {len(selected)} legal candidates; required {required}"
+            f"source frontier has {len(selected)} legal candidates; required {required}"
         )
-    remaining = [item for item in proposed if signature(item["knowledge"]) not in seen]
+    remaining = [item for item in proposed if item_identity(item) not in seen]
     reserves = round_robin_strata(
         remaining, RESERVES_PER_SHAPE,
-        lambda value: (value["design_role"], value["hardware_stratum"]),
+        lambda value: (
+            value["controlled_factor"], value["factor_signature"],
+            value["hardware_stratum"]
+        ),
     )
     if len(reserves) != RESERVES_PER_SHAPE:
         raise old.SearchError("fixed design lacks legal numeric-failure reserves")
@@ -617,6 +833,7 @@ def main() -> int:
     parser.add_argument("--workloads", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--all-output", type=Path, required=True)
+    parser.add_argument("--source-audit", type=Path, required=True)
     parser.add_argument("--soc", required=True)
     parser.add_argument("--aic-cores", type=int, required=True)
     parser.add_argument("--l0a-bytes", type=int, required=True)
@@ -654,8 +871,11 @@ def main() -> int:
         )
         required = int(metadata["required_successful_tilings"])
         generation_started = time.perf_counter_ns()
-        proposed, anchors, legality_ns = proposed_candidates(
-            workload, platform, hardware
+        anchors = read_source_anchors(
+            args.source_audit, workload, platform, hardware
+        )
+        proposed, legality_ns = source_frontier_candidates(
+            workload, anchors, platform, hardware
         )
         generation_ns = time.perf_counter_ns() - generation_started
         formal, reserves = select_fixed_design(proposed, anchors, required)
@@ -671,15 +891,20 @@ def main() -> int:
             simulation = item["simulation"]
             family = execution_mode_name(knowledge)
             schedule_sha, suffix = execution_identity(workload, knowledge)
+            if item.get("source_raw_tiling_hex"):
+                schedule_sha = hashlib.sha256(
+                    bytes.fromhex(item["source_raw_tiling_hex"])
+                ).hexdigest()
+                suffix = source_suffix(int(item["source_tiling_key"]))
             row = old.row_from_state(
                 fields, None, workload, knowledge,
-                "hardware_stratified_frontier_v1", family.upper(),
+                "official_source_route_frontier_v1", family.upper(),
                 simulation.total_cycles,
                 simulation.gm_read_bytes + simulation.gm_write_bytes,
                 simulation.l2_bytes, 10_000_000_000_000_000_000 + suffix,
                 guidance=item["controlled_factor"],
                 bottleneck=simulation.bottleneck,
-                rationale="fixed structural hardware design; model scored only after freeze",
+                rationale="original source route anchor or hardware-local expansion; model scored only after freeze",
                 resume_policy="allow_new",
             )
             row.update({
@@ -694,13 +919,13 @@ def main() -> int:
                 "model_kernel_suffix": str(suffix),
                 "model_kernel_variant": family.upper(),
                 "model_kernel_family": family.upper(),
-                "model_input_source": "parameters_only_after_preregistered_candidate_freeze",
+                "model_input_source": "source_route_or_parameters_after_preregistered_candidate_freeze",
                 "controlled_factor": item["controlled_factor"],
                 "factor_signature": item["factor_signature"],
                 "pair_id": item["pair_id"],
                 "design_role": item["design_role"],
                 "hardware_stratum": item["hardware_stratum"],
-                "selection_basis": "hardware_capacity_and_structural_strata_no_cost_score",
+                "selection_basis": "official_source_routes_and_hardware_local_strata_no_latency_no_cost_score",
                 "candidate_set_frozen_before_model_scoring": "1",
                 "is_reserve": str(int(reserve)),
                 "coverage_intent": metadata["coverage_intent"],
@@ -714,6 +939,15 @@ def main() -> int:
                 "tiling_solver_select_ms": f"{scoring_ns / 1e6:.9g}",
                 "tiling_solver_extra_ms": f"{generation_ns / 1e6:.9g}",
                 "tiling_solver_total_ms": f"{(time.perf_counter_ns() - shape_started) / 1e6:.9g}",
+                "source_anchor": str(int(bool(item.get("source_raw_tiling_hex")))),
+                "source_route": item.get("source_route", ""),
+                "source_core_cap": item.get("source_core_cap", ""),
+                "source_tiling_key": str(item.get("source_tiling_key", "")),
+                "source_block_dim": str(item.get("source_block_dim", "")),
+                "source_workspace_bytes": str(item.get("source_workspace_bytes", "")),
+                "source_raw_tiling_hex": item.get("source_raw_tiling_hex", ""),
+                "source_route_provenance": item.get("source_route_provenance", ""),
+                "source_validator_violations": item.get("source_validator_violations", ""),
             })
             shape_rows.append(row)
             if not reserve:
@@ -724,7 +958,7 @@ def main() -> int:
         print(
             f"VICTOR_FRONTIER_CANDIDATES [{workload_index}/{len(catalog)}] "
             f"{workload.workload_id} formal={len(formal)} reserves={len(reserves)} "
-            f"legal_pool={len(proposed)} families="
+            f"source_anchors={len(anchors)} legal_pool={len(proposed)} families="
             f"{','.join(sorted({execution_mode_name(item['knowledge']) for item in formal}))} "
             f"host_ms={(time.perf_counter_ns() - shape_started) / 1e6:.3f}",
             flush=True,
@@ -745,7 +979,7 @@ def main() -> int:
     print(
         "MATMUL_VICTOR_FRONTIER_CANDIDATES "
         f"shapes=3 scheduled={len(selected_rows)} formal=2160 reserves=96 "
-        f"baselines=3 records=2163 by_family={dict(family_counts)}",
+        f"baselines=3 records=2163 source_anchored=1 by_family={dict(family_counts)}",
         flush=True,
     )
     return 0

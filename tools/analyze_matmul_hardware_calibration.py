@@ -187,6 +187,21 @@ def aggregate(rows: list[dict]) -> dict:
             == row["measured_best_kernel_family"]
             for row in rows
         ) / len(rows),
+        "production_source_anchor_delta_pct": {
+            "median": statistics.median(
+                row["production_source_anchor_vs_official"]["delta_pct"]
+                for row in rows
+            ),
+            "maximum_absolute": max(
+                abs(row["production_source_anchor_vs_official"]["delta_pct"])
+                for row in rows
+            ),
+        },
+        "source_anchor_validator_disagreement_count": sum(
+            bool(candidate.get("source_validator_violations"))
+            for row in rows for candidate in row["candidates"]
+            if candidate.get("source_anchor")
+        ),
         "measured_best_model_rank_capture": {
             f"top{limit}": sum(
                 row["measured_best_model_rank"] <= limit for row in rows
@@ -305,6 +320,12 @@ def main() -> int:
                 "design_role": candidate.get("design_role", ""),
                 "hardware_stratum": candidate.get("hardware_stratum", ""),
                 "is_reserve": candidate["is_reserve"] == "1",
+                "source_anchor": candidate.get("source_anchor") == "1",
+                "source_route": candidate.get("source_route", ""),
+                "source_core_cap": candidate.get("source_core_cap", ""),
+                "source_validator_violations": candidate.get(
+                    "source_validator_violations", ""
+                ),
                 "single_core": {
                     axis: int(candidate[f"single_core_{axis}"])
                     for axis in ("m", "n", "k")
@@ -342,6 +363,19 @@ def main() -> int:
             row["model_rank_within_measured"] = model_rank[row["output_rank"]]
         model_top = predicted_order[0]
         measured_best = measured_order[0]
+        production_source_anchors = [
+            row for row in joined
+            if row["source_anchor"]
+            and "ALL" in row["source_route"].split("+")
+            and "20" in row["source_core_cap"].split(",")
+        ]
+        if not production_source_anchors:
+            raise RuntimeError(
+                f"{workload_id}: measured candidates lack the original ALL@20 source anchor"
+            )
+        production_source_anchor = min(
+            production_source_anchors, key=lambda row: row["measured_ms"]
+        )
         model_top_profile = profile_map[str(model_top["output_rank"])]
         measured_best_profile = profile_map[str(measured_best["output_rank"])]
         noise_pct = max(
@@ -382,6 +416,8 @@ def main() -> int:
             "model_top1_within_measured_best_noise": regret <= noise_pct,
             "model_top1_vs_official": model_top["versus_official"],
             "measured_best_vs_official": measured_best["versus_official"],
+            "production_source_anchor_output_rank": production_source_anchor["output_rank"],
+            "production_source_anchor_vs_official": production_source_anchor["versus_official"],
             "paired_hardware_effects": paired_hardware_effects(joined),
             "candidates": sorted(joined, key=lambda row: row["output_rank"]),
         })
@@ -393,8 +429,8 @@ def main() -> int:
         "status": "complete",
         "method": {
             "candidate_selection": (
-                "model-independent broad geometry strata plus paired hardware "
-                "factor sweeps and applicable execution-graph controls"
+                "every applicable original source route/core-cap anchor plus "
+                "hardware-local factor strata; model scored only after freeze"
             ),
             "measurement": "one warmup, three device-event launches, full validation of final timed output",
             "candidate_latency_records": formal_total,

@@ -25,13 +25,13 @@ def build_workloads() -> list[dict[str, str]]:
             "m": str(m), "n": str(n), "k": str(k),
             "dtype": "fp16", "trans_a": "0", "trans_b": "0",
             "max_cores": "20",
-            "search_family": "hardware_stratified_frontier",
+            "search_family": "source_route_frontier",
             "coverage_intent": "all_applicable_execution_graphs",
             "calibration_partition": "frontier_discovery",
             "required_successful_tilings": str(FORMAL_PER_SHAPE),
             "coverage": (
                 f"preregistered_victor_shape;fp16;nn;m{m};n{n};k{k};"
-                "broad_geometry;paired_hardware_factors"
+                "original_source_routes;all_core_caps;hardware_local_frontier"
             ),
         })
     return rows

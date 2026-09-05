@@ -326,15 +326,23 @@ def materialize(row: dict[str, str], *, l2_bytes: int, aic_cores: int) -> Materi
     )
     from dataclasses import replace
     hardware = replace(hardware, core_counts=core_counts, capacities=capacities)
+    source_hex = row.get("source_raw_tiling_hex", "").strip()
     violations = validate_cann_tiling(
         m, n, k, dtype, trans_a, trans_b, knowledge, hardware
     )
-    if violations:
+    if violations and not source_hex:
         raise ValueError("validator rejected candidate: " + ",".join(violations))
 
-    suffix = source_kernel_suffix(
+    derived_suffix = source_kernel_suffix(
         m, n, k, dtype, trans_a, trans_b, knowledge
     )
+    if source_hex:
+        source_key = int(row.get("source_tiling_key") or 0)
+        suffix = source_key - 10_000_000_000_000_000_000
+        if suffix < 0:
+            raise ValueError("source raw tiling key is below the MatMulV3 offset")
+    else:
+        suffix = derived_suffix
     declared_suffix = int(row.get("model_kernel_suffix") or suffix)
     if declared_suffix != suffix:
         raise ValueError(
@@ -342,6 +350,59 @@ def materialize(row: dict[str, str], *, l2_bytes: int, aic_cores: int) -> Materi
         )
     if suffix not in SUPPORTED_KERNELS.get(dtype, set()):
         raise ValueError(f"direct kernel was not built for {dtype}/suffix={suffix}")
+
+    # An original-source anchor is copied byte-for-byte.  This preserves every
+    # TCubeTiling field that is not represented in the generic model IR; the
+    # checks below prevent a raw blob from being paired with different visible
+    # parameters, shape, graph, or block count.
+    if source_hex:
+        try:
+            blob = bytes.fromhex(source_hex)
+        except ValueError as error:
+            raise ValueError(f"invalid source raw tiling hex: {error}") from error
+        if len(blob) != ABI_BYTES:
+            raise ValueError(
+                f"source raw tiling has {len(blob)} bytes; expected {ABI_BYTES}"
+            )
+        words = struct.unpack("<68I", blob)
+        expected = {
+            0: knowledge["usedCoreNum"], 1: m, 2: n, 3: k, 4: k,
+            5: knowledge["singleCoreM"], 6: knowledge["singleCoreN"],
+            7: knowledge["singleCoreK"], 8: knowledge["baseM"],
+            9: knowledge["baseN"], 10: knowledge["baseK"],
+            11: knowledge["depthA1"], 12: knowledge["depthB1"],
+            13: knowledge["stepM"], 14: knowledge["stepN"],
+            17: knowledge["iterateOrder"], 26: knowledge["stepKa"],
+            27: knowledge["stepKb"], 30: knowledge["dbL0A"],
+            31: knowledge["dbL0B"], 32: knowledge["dbL0C"],
+            50: knowledge["l2MTileCnt"], 51: knowledge["l2NTileCnt"],
+            52: knowledge["l2MTileBlock"], 53: knowledge["l2NTileBlock"],
+            54: knowledge["l2IterateOrder"], 56: int(trans_a), 57: int(trans_b),
+        }
+        mismatches = [
+            f"word[{index}]={words[index]} expected={value}"
+            for index, value in expected.items() if words[index] != value
+        ]
+        if mismatches:
+            raise ValueError(
+                "source raw tiling/visible parameter mismatch: " + ";".join(mismatches)
+            )
+        if int(row.get("source_tiling_key") or 0) != 10_000_000_000_000_000_000 + suffix:
+            raise ValueError("source raw tiling key does not match the selected kernel suffix")
+        if int(row.get("used_core_num") or 0) != int(row.get("source_block_dim") or 0):
+            raise ValueError("source raw tiling usedCoreNum does not match source blockDim")
+        workspace = int(row.get("source_workspace_bytes") or 0)
+        if workspace <= 0:
+            raise ValueError("source raw tiling lacks a positive source workspace size")
+        digest = hashlib.sha256(blob).hexdigest()
+        fnv = 0xCBF29CE484222325
+        for value in blob:
+            fnv = ((fnv ^ value) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+        return MaterializedTiling(
+            blob=blob, sha256=digest, fnv1a64=f"{fnv:016x}",
+            suffix=suffix, workspace_bytes=workspace,
+            l2_cache_flag=words[62], nd2nz_a=words[58], nd2nz_b=words[59],
+        )
 
     graph_name = row.get("execution_mode") or "base"
     if graph_name == "base_iterate_all":

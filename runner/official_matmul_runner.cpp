@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -38,6 +39,7 @@ struct Options {
     int32_t samples = 15;
     int32_t numericPreflightMaxMiB = 4;
     bool preflightOnly = false;
+    bool planningOnly = false;
     bool structuredFullPreflight = false;
     bool validateAfterMeasurement = false;
 };
@@ -165,6 +167,17 @@ struct ExecutorHandle {
     ~ExecutorHandle()
     {
         if (ptr != nullptr) aclDestroyAclOpExecutor(ptr);
+    }
+};
+
+struct SharedLibrary {
+    void *ptr = nullptr;
+    SharedLibrary() = default;
+    SharedLibrary(const SharedLibrary &) = delete;
+    SharedLibrary &operator=(const SharedLibrary &) = delete;
+    ~SharedLibrary()
+    {
+        if (ptr != nullptr) dlclose(ptr);
     }
 };
 
@@ -683,20 +696,63 @@ ProfileSummary ProfileOfficial(
 
         const auto executorSetupStarted = SteadyClock::now();
         uint64_t workspaceBytes = 0;
+        SharedLibrary privateTiling;
+        SharedLibrary privateOpApi;
         ExecutorHandle executor;
         LogStage(workload, "get_workspace");
-        CheckAclnn(aclnnMatmulGetWorkspaceSize(
+        if (const char *library = std::getenv("MATMUL_SOURCE_TILING_LIBRARY")) {
+            if (*library != '\0') {
+                privateTiling.ptr = dlopen(library, RTLD_NOW | RTLD_GLOBAL);
+                if (privateTiling.ptr == nullptr) {
+                    const char *openError = dlerror();
+                    throw std::runtime_error(
+                        "dlopen private MatMul tiling library failed: " +
+                        std::string(openError == nullptr ? "unknown" : openError));
+                }
+            }
+        }
+        using GetWorkspaceFunction = decltype(&aclnnMatmulGetWorkspaceSize);
+        GetWorkspaceFunction getWorkspace = &aclnnMatmulGetWorkspaceSize;
+        if (const char *library = std::getenv("MATMUL_SOURCE_OPAPI_LIBRARY")) {
+            if (*library != '\0') {
+                privateOpApi.ptr = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+                if (privateOpApi.ptr == nullptr) {
+                    const char *openError = dlerror();
+                    throw std::runtime_error(
+                        "dlopen private MatMul opapi failed: " +
+                        std::string(openError == nullptr ? "unknown" : openError));
+                }
+                dlerror();
+                void *symbol = dlsym(privateOpApi.ptr, "aclnnMatmulGetWorkspaceSize");
+                const char *symbolError = dlerror();
+                if (symbolError != nullptr || symbol == nullptr) {
+                    throw std::runtime_error(
+                        "private MatMul opapi lacks aclnnMatmulGetWorkspaceSize: " +
+                        std::string(symbolError == nullptr ? "unknown" : symbolError));
+                }
+                getWorkspace = reinterpret_cast<GetWorkspaceFunction>(symbol);
+            }
+        }
+        CheckAclnn(getWorkspace(
             aTensor.ptr, bTensor.ptr, cTensor.ptr, 0, &workspaceBytes, &executor.ptr),
             "aclnnMatmulGetWorkspaceSize");
         summary.workspaceBytes = workspaceBytes;
         if (executor.ptr == nullptr) {
             throw std::runtime_error("aclnnMatmulGetWorkspaceSize returned null executor");
         }
+        summary.executorSetupMs = ElapsedMs(executorSetupStarted);
+        if (options.planningOnly) {
+            summary.preflightMode = "private_source_tiling_planning";
+            summary.preflightPassed = true;
+            summary.success = true;
+            summary.runnerTotalMs = ElapsedMs(runnerStarted);
+            LogStage(workload, "planning_complete");
+            return summary;
+        }
         CheckAclnn(
             aclSetAclOpExecutorRepeatable(executor.ptr),
             "aclSetAclOpExecutorRepeatable");
         DeviceBuffer workspace(static_cast<size_t>(workspaceBytes));
-        summary.executorSetupMs = ElapsedMs(executorSetupStarted);
 
         auto launch = [&]() {
             CheckAclnn(
@@ -942,6 +998,7 @@ std::unordered_map<std::string, std::string> ParseArgs(int argc, char **argv)
         const std::string key = argv[i];
         if (key == "--help" || key == "-h" || key == "--validate-input" ||
             key == "--acl-only" || key == "--preflight-only" ||
+            key == "--planning-only" ||
             key == "--structured-full-preflight" ||
             key == "--validate-after-measurement") {
             args[key] = "1";
@@ -990,6 +1047,7 @@ void PrintUsage()
         << "  --structured-full-preflight  signed-axis inputs and full C comparison\n"
         << "  --validate-after-measurement validate the final timed output; no extra launch\n"
         << "  --preflight-only     launch once, synchronize, and validate output; no timing\n"
+        << "  --planning-only      create an executor and stop before any kernel launch\n"
         << "  --acl-only            initialize the linked ACL runtime without profiling\n"
         << "  --validate-input       validate input and CSV schema without ACL/NPU\n";
 }
@@ -1017,6 +1075,7 @@ int main(int argc, char **argv)
         options.numericPreflightMaxMiB =
             GetInt(args, "--numeric-preflight-max-mib", options.numericPreflightMaxMiB);
         options.preflightOnly = args.count("--preflight-only") != 0;
+        options.planningOnly = args.count("--planning-only") != 0;
         options.structuredFullPreflight =
             args.count("--structured-full-preflight") != 0;
         options.validateAfterMeasurement =
@@ -1102,14 +1161,16 @@ int main(int argc, char **argv)
                 aclrtDestroyContext(context);
                 context = nullptr;
             }
-            aclrtResetDevice(options.deviceId);
+            if (!options.planningOnly) {
+                aclrtResetDevice(options.deviceId);
+            }
             deviceSet = false;
             aclFinalize();
             aclInitialized = false;
         } catch (...) {
             if (stream != nullptr) aclrtDestroyStream(stream);
             if (context != nullptr) aclrtDestroyContext(context);
-            if (deviceSet) aclrtResetDevice(options.deviceId);
+            if (deviceSet && !options.planningOnly) aclrtResetDevice(options.deviceId);
             if (aclInitialized) aclFinalize();
             throw;
         }

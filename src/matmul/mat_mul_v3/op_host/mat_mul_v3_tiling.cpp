@@ -20,6 +20,14 @@
 #include "cube_tiling_runtime.h"
 #include "cache_tiling.h"
 
+#include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <vector>
+
 #define OP_LOGI(nodeName, fmt, ...) do {std::printf(fmt, ##__VA_ARGS__); std::printf("\n"); } while(0)
 
 #define OP_LOGD(nodeName, fmt, ...) do {std::printf(fmt, ##__VA_ARGS__); std::printf("\n"); } while(0)
@@ -57,11 +65,161 @@ namespace optiling {
 
 REGISTER_TILING_TEMPLATE("MatMulV3", MatmulV3BaseTiling, 0);
 
+namespace {
+constexpr uint64_t MATMUL_TILING_KEY_OFFSET = 10000000000000000000UL;
+
+struct SourceRoute {
+    const char *name;
+    TilingCalcSelect selector;
+};
+
+const std::array<SourceRoute, 7> SOURCE_ROUTES{{
+    {"ALL", TilingCalcSelect::ALL},
+    {"BASE", TilingCalcSelect::BASE},
+    {"SINGLE_CORE_SPLIT_K", TilingCalcSelect::SINGLE_CORE_SPLIT_K},
+    {"DETERMINISTIC_SPLIT_K", TilingCalcSelect::DETERMINISTIC_SPLIT_K},
+    {"AL1_FULL_LOAD", TilingCalcSelect::AL1_FULL_LOAD},
+    {"BL1_FULL_LOAD", TilingCalcSelect::BL1_FULL_LOAD},
+    {"BL1_FULL_LOAD_FIXPIPE", TilingCalcSelect::BL1_FULL_LOAD_FIXPIPE},
+}};
+
+class MatmulV3SourceRouteTiling final : public MatmulV3BaseTiling {
+public:
+    MatmulV3SourceRouteTiling(gert::TilingContext *context, MatmulTilingData *data,
+                             TilingCalcSelect selector, uint64_t coreCap)
+        : MatmulV3BaseTiling(context, data, selector), coreCap_(coreCap) {}
+
+protected:
+    ge::graphStatus GetPlatformInfo() override
+    {
+        const ge::graphStatus status = MatmulV3BaseTiling::GetPlatformInfo();
+        if (status == ge::GRAPH_SUCCESS) {
+            compileInfo_.aicNum = std::max<uint64_t>(1, std::min(compileInfo_.aicNum, coreCap_));
+        }
+        return status;
+    }
+
+private:
+    uint64_t coreCap_;
+};
+
+std::string JsonEscape(const char *value)
+{
+    std::ostringstream output;
+    for (const unsigned char ch : std::string(value == nullptr ? "" : value)) {
+        switch (ch) {
+            case '\\': output << "\\\\"; break;
+            case '"': output << "\\\""; break;
+            case '\n': output << "\\n"; break;
+            case '\r': output << "\\r"; break;
+            case '\t': output << "\\t"; break;
+            default:
+                if (ch < 0x20) {
+                    output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                           << static_cast<uint32_t>(ch) << std::dec;
+                } else {
+                    output << ch;
+                }
+        }
+    }
+    return output.str();
+}
+
+bool RouteMatches(const TilingCalcSelect selector, const uint64_t tilingKey)
+{
+    if (tilingKey < MATMUL_TILING_KEY_OFFSET) {
+        return false;
+    }
+    if (selector == TilingCalcSelect::ALL) {
+        return true;
+    }
+    const uint64_t suffix = tilingKey - MATMUL_TILING_KEY_OFFSET;
+    const uint64_t split = (suffix / 10) % 10;
+    const uint64_t fullLoad = (suffix / 100) % 10;
+    const uint64_t fix = (suffix / 10000) % 10;
+    switch (selector) {
+        case TilingCalcSelect::BASE:
+            return split == 0 && fullLoad == 0 && fix == 0;
+        case TilingCalcSelect::SINGLE_CORE_SPLIT_K:
+            return split == 2;
+        case TilingCalcSelect::DETERMINISTIC_SPLIT_K:
+            return split == 3;
+        case TilingCalcSelect::AL1_FULL_LOAD:
+            return split == 0 && fullLoad == 1;
+        case TilingCalcSelect::BL1_FULL_LOAD:
+            return split == 0 && fullLoad == 2 && fix == 0;
+        case TilingCalcSelect::BL1_FULL_LOAD_FIXPIPE:
+            return split == 0 && fullLoad == 2 && (fix == 1 || fix == 2);
+        default:
+            return false;
+    }
+}
+
+void AppendSourceRouteAudit(gert::TilingContext *context)
+{
+    const char *path = std::getenv("MATMUL_SOURCE_ROUTE_AUDIT_PATH");
+    if (path == nullptr || *path == '\0') {
+        return;
+    }
+    const auto *compileInfo = reinterpret_cast<const MatmulV3CompileInfo *>(context->GetCompileInfo());
+    if (compileInfo == nullptr || compileInfo->aicNum == 0) {
+        return;
+    }
+    uint64_t maxCoreCap = compileInfo->aicNum;
+    if (const char *requested = std::getenv("MATMUL_SOURCE_ROUTE_MAX_CORES")) {
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(requested, &end, 10);
+        if (end != requested && *end == '\0' && parsed > 0) {
+            maxCoreCap = std::min<uint64_t>(maxCoreCap, parsed);
+        }
+    }
+    const char *workloadId = std::getenv("MATMUL_SOURCE_ROUTE_WORKLOAD_ID");
+    std::ofstream audit(path, std::ios::app);
+    if (!audit) {
+        return;
+    }
+    for (uint64_t coreCap = 1; coreCap <= maxCoreCap; ++coreCap) {
+        for (const SourceRoute &route : SOURCE_ROUTES) {
+            MatmulTilingData routeData;
+            MatmulV3SourceRouteTiling tiler(context, &routeData, route.selector, coreCap);
+            const ge::graphStatus status = tiler.DoTiling();
+            const uint64_t tilingKey = context->GetTilingKey();
+            const bool matched = status == ge::GRAPH_SUCCESS && RouteMatches(route.selector, tilingKey);
+            audit << "{\"schema\":\"matmul_v3_source_route_observation_v1\""
+                  << ",\"workload_id\":\"" << JsonEscape(workloadId) << "\""
+                  << ",\"route\":\"" << route.name << "\""
+                  << ",\"core_cap\":" << coreCap
+                  << ",\"status\":\"" << (status == ge::GRAPH_SUCCESS ? "success" : "failed") << "\""
+                  << ",\"route_matched\":" << (matched ? "true" : "false");
+            if (status == ge::GRAPH_SUCCESS) {
+                std::vector<uint8_t> bytes(routeData.GetDataSize());
+                routeData.SaveToBuffer(bytes.data(), bytes.size());
+                audit << ",\"tiling_key\":" << tilingKey
+                      << ",\"block_dim\":" << context->GetBlockDim()
+                      << ",\"workspace_bytes\":" << context->GetWorkspaceSizes(1)[0]
+                      << ",\"raw_tiling_hex\":\"";
+                for (const uint8_t byte : bytes) {
+                    audit << std::hex << std::setw(2) << std::setfill('0')
+                          << static_cast<uint32_t>(byte);
+                }
+                audit << std::dec << "\"";
+            }
+            audit << "}\n";
+            audit.flush();
+        }
+    }
+}
+} // namespace
+
 static ge::graphStatus MatmulV3TilingFunc(gert::TilingContext* context)
 {
     OP_TILING_CHECK(context == nullptr,
             CUBE_INNER_ERR_REPORT("MatMulV3", "context is null"),
             return ge::GRAPH_FAILED);
+    // Calibration only: enumerate each original route and core budget, then
+    // run the untouched production ALL dispatcher last so the real executor
+    // receives exactly the normal official result.
+    AppendSourceRouteAudit(context);
     return TilingRegistry::GetInstance().DoTilingImpl(context);
 }
 

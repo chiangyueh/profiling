@@ -30,27 +30,51 @@ def test_frontier_is_frozen_by_structure_before_model_scoring() -> None:
         192 * 1024 * 1024, 16.0, 8.0,
     )
     hardware = candidates.generic_hardware(platform)
-    for metadata in workloads.build_workloads():
-        workload = candidates.old.Workload(
-            metadata["workload_id"], int(metadata["m"]), int(metadata["n"]),
-            int(metadata["k"]), metadata["dtype"], False, False, 20,
-        )
-        proposed, anchors, _ = candidates.proposed_candidates(
-            workload, platform, hardware
-        )
-        formal, reserves = candidates.select_fixed_design(
-            proposed, anchors, 720
-        )
-        assert len(formal) == 720
-        assert len(reserves) == 32
-        assert len({candidates.signature(row["knowledge"]) for row in (*formal, *reserves)}) == 752
-        assert not any("simulation" in row or "model_rank" in row for row in formal)
-        assert {
-            candidates.execution_mode_name(row["knowledge"]) for row in formal
-        } == {"base", "single_core_split_k", "deterministic_split_k"}
-        assert {
-            row["knowledge"]["usedCoreNum"] for row in formal
-        } == set(range(1, 21))
-        assert {
-            row["knowledge"]["baseK"] for row in formal
-        } == {16, 32, 64, 96, 128, 192, 256}
+    metadata = workloads.build_workloads()[0]
+    workload = candidates.old.Workload(
+        metadata["workload_id"], int(metadata["m"]), int(metadata["n"]),
+        int(metadata["k"]), metadata["dtype"], False, False, 20,
+    )
+    knowledge = candidates.base_knowledge(workload, 32, 192, 32, 20)
+    anchor = {
+        "knowledge": knowledge,
+        "design_role": "official_source_anchor",
+        "controlled_factor": "official_source_route",
+        "pair_id": "source_000", "factor_signature": "ALL@20",
+        "hardware_stratum": candidates.hardware_stratum(
+            workload, knowledge, hardware
+        ),
+        "source_raw_tiling_hex": "00" * 272,
+        "source_route": "ALL+BASE", "source_core_cap": "20",
+    }
+    proposed, _ = candidates.source_frontier_candidates(
+        workload, [anchor], platform, hardware
+    )
+    formal, reserves = candidates.select_fixed_design(
+        proposed, [anchor], 720
+    )
+    assert len(formal) == 720
+    assert len(reserves) == 32
+    assert formal[0] is anchor
+    assert not any("simulation" in row or "model_rank" in row for row in formal)
+    assert {row["knowledge"]["usedCoreNum"] for row in formal} == set(range(1, 21))
+    assert {row["controlled_factor"] for row in formal} >= {
+        "official_source_route", "source_mnk_geometry", "core_parallelism",
+        "k_pipeline", "l0_buffering", "l2_partition", "cube_traversal",
+    }
+
+
+def test_source_key_decodes_all_execution_graph_digits() -> None:
+    words = [0] * 68
+    words[0:15] = [20, 128, 128, 32768, 32768, 128, 128, 128,
+                   128, 128, 128, 2, 2, 1, 1]
+    words[17] = 0
+    words[26:28] = [1, 1]
+    words[30:33] = [2, 2, 2]
+    words[50:55] = [1, 1, 1, 1, 0]
+    import struct
+    knowledge = candidates.knowledge_from_source(
+        struct.pack("<68I", *words).hex(),
+        10_000_000_000_000_000_000 + 10201,
+    )
+    assert knowledge["tilingEnable"] == 1020

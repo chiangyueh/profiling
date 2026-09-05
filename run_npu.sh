@@ -9,9 +9,9 @@ usage() {
     cat <<'USAGE'
 Usage: profiling/run_npu.sh --mode full [-d PHYSICAL_NPU_ID]
 
-MatMulV3 broad frontier mapping for the three preregistered Victor shapes.
-The formal output contains 2,160 validated candidate latencies plus three
-separate official baselines.
+MatMulV3 original-source-route frontier mapping for the three preregistered
+Victor shapes.  The formal output contains 2,160 validated candidate
+latencies plus three separate official baselines.
 USAGE
 }
 
@@ -78,6 +78,7 @@ CAMPAIGN_ID="$({
         "${CATALOG_TMP}" \
         tools/generate_matmul_victor_frontier_workloads.py \
         tools/generate_matmul_victor_frontier_candidates.py \
+        tools/collect_matmul_source_routes.py \
         tools/analyze_matmul_hardware_calibration.py \
         tools/direct_matmul_tiling.py \
         tools/profile_direct_matmul.py \
@@ -91,9 +92,10 @@ CAMPAIGN_ID="$({
         direct_matmul/runner.cpp \
         npu_cost_model/*.py \
         "${CANN_VERSION_FILE}"
+    find src/matmul/mat_mul_v3 cmake -type f -print0 | sort -z | xargs -0 sha256sum
     find "${MATMUL_V3_SOURCE_DIR}" -type f -print0 | sort -z | xargs -0 sha256sum
 } | sha256sum | cut -c1-20)"
-CAMPAIGN_DIR="${ROOT}/results/matmul_victor_frontier_direct_v1/${CAMPAIGN_ID}"
+CAMPAIGN_DIR="${ROOT}/results/matmul_source_route_frontier_direct_v1/${CAMPAIGN_ID}"
 CATALOG="${CAMPAIGN_DIR}/catalog.csv"
 WORKLOADS="${CAMPAIGN_DIR}/workloads.csv"
 CANDIDATES="${CAMPAIGN_DIR}/candidates.csv"
@@ -103,6 +105,7 @@ OUT_STEM="${CAMPAIGN_DIR}/measurement"
 DETAILS_DIR="${OUT_STEM}_details"
 LOG_DIR="${CAMPAIGN_DIR}/logs"
 ANALYSIS="${CAMPAIGN_DIR}/analysis.json"
+SOURCE_AUDIT="${CAMPAIGN_DIR}/source_routes.jsonl"
 mkdir -p "${CAMPAIGN_DIR}" "${TILING_DIR}" "${LOG_DIR}"
 cp "${CATALOG_TMP}" "${CATALOG}"
 
@@ -115,8 +118,8 @@ fi
 
 echo "CAMPAIGN_READY operator=matmul shapes=3 candidate_records=2160 official_baselines=3 records=2163 device=${PHYSICAL_DEVICE}"
 echo "measurement=1_warmup+3_device_event_samples+validate_last_timed_output"
-echo "design=broad_geometry_300,paired_factors_300,interactions_60,split_k_controls_60 per_shape"
-echo "candidate_selection=no_cost_model_no_runtimekb_no_official_tiler"
+echo "design=every_applicable_original_source_route_and_core_cap_plus_hardware_local_frontier"
+echo "candidate_selection=source_routes_no_runtimekb_no_latency_no_cost_score"
 echo "logs=${LOG_DIR}"
 echo "CAMPAIGN_STAGE_TIMING stage=workload_catalog wall_ms=${catalog_wall_ms}"
 
@@ -145,6 +148,95 @@ fi
 host_build_wall_ms=$(( ($(date +%s%N) - host_build_started_ns) / 1000000 ))
 echo "CAMPAIGN_STAGE_TIMING stage=platform_host_build wall_ms=${host_build_wall_ms} cached=${host_build_cached}"
 
+RUNNER_BUILD_HASH="$({
+    printf '%s\0' runner/official_matmul_runner.cpp \
+        cmake_npu/CMakeLists.txt scripts/build_all.sh "${CANN_VERSION_FILE}"
+} | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+RUNNER_BUILD_STAMP="${ROOT}/build/.matmul_official_runner.sha256"
+runner_build_started_ns="$(date +%s%N)"
+if [[ ! -x build/official_matmul_runner || ! -f "${RUNNER_BUILD_STAMP}" || \
+      "$(cat "${RUNNER_BUILD_STAMP}" 2>/dev/null || true)" != "${RUNNER_BUILD_HASH}" ]]; then
+    echo "OFFICIAL_RUNNER_BUILD begin jobs=1"
+    if ! BUILD_COMPONENTS=official BUILD_JOBS=1 scripts/build_all.sh \
+        >"${CAMPAIGN_DIR}/official_runner_build.log" 2>&1; then
+        echo "OFFICIAL_RUNNER_BUILD failed log=${CAMPAIGN_DIR}/official_runner_build.log"
+        tail -20 "${CAMPAIGN_DIR}/official_runner_build.log"
+        exit 1
+    fi
+    printf '%s\n' "${RUNNER_BUILD_HASH}" >"${RUNNER_BUILD_STAMP}"
+    echo "OFFICIAL_RUNNER_BUILD passed"
+    runner_build_cached=0
+else
+    echo "OFFICIAL_RUNNER_BUILD cached"
+    runner_build_cached=1
+fi
+runner_build_wall_ms=$(( ($(date +%s%N) - runner_build_started_ns) / 1000000 ))
+echo "CAMPAIGN_STAGE_TIMING stage=official_runner_build wall_ms=${runner_build_wall_ms} cached=${runner_build_cached}"
+
+SOURCE_HOST_HASH="$({
+    find src/matmul/mat_mul_v3 cmake -type f -print0 | sort -z | xargs -0 sha256sum
+    sha256sum CMakeLists.txt "${CANN_VERSION_FILE}"
+} | sha256sum | cut -c1-20)"
+SOURCE_STATE="${ROOT}/.benchmark_state/matmul_source_route_host/${SOURCE_HOST_HASH}"
+SOURCE_BUILD="${SOURCE_STATE}/build"
+SOURCE_INSTALL="${SOURCE_STATE}/install"
+SOURCE_PACKAGE_ROOT="${SOURCE_INSTALL}/packages/vendors/matmul_source_routes"
+SOURCE_OPAPI="${SOURCE_PACKAGE_ROOT}/op_api/lib/libcust_opapi.so"
+SOURCE_TILING_LIB_GLOB="${SOURCE_PACKAGE_ROOT}/op_impl/ai_core/tbe/op_tiling/lib/linux"/*/libcust_opmaster_rt2.0.so
+source_host_started_ns="$(date +%s%N)"
+if [[ ! -f "${SOURCE_OPAPI}" ]] || ! compgen -G "${SOURCE_TILING_LIB_GLOB}" >/dev/null; then
+    mkdir -p "${SOURCE_BUILD}" "${SOURCE_INSTALL}"
+    echo "SOURCE_HOST_PACKAGE_BUILD begin jobs=1"
+    SOURCE_BUILD_LOG="${SOURCE_STATE}/build.log"
+    if ! cmake -S "${ROOT}" -B "${SOURCE_BUILD}" -G "Unix Makefiles" \
+        -DBUILD_OPEN_PROJECT=ON \
+        -DASCEND_COMPUTE_UNIT=ascend910b \
+        -DASCEND_OP_NAME=mat_mul_v3 \
+        -DVENDOR_NAME=matmul_source_routes \
+        -DCUSTOM_ASCEND_CANN_PACKAGE_PATH="${CANN_ROOT}" \
+        -DASCEND_THIRD_LIB_PATH="${ROOT}/third_party" \
+        -DENABLE_OPS_KERNEL=OFF \
+        -DENABLE_TEST=OFF \
+        -DENABLE_EXAMPLE=OFF \
+        -DENABLE_CCACHE=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${SOURCE_INSTALL}" \
+        >"${SOURCE_BUILD_LOG}" 2>&1 || \
+       ! cmake --build "${SOURCE_BUILD}" --target package -- -j1 \
+        >>"${SOURCE_BUILD_LOG}" 2>&1 || \
+       ! cmake --install "${SOURCE_BUILD}" >>"${SOURCE_BUILD_LOG}" 2>&1; then
+        echo "SOURCE_HOST_PACKAGE_BUILD failed log=${SOURCE_BUILD_LOG}"
+        tail -20 "${SOURCE_BUILD_LOG}"
+        exit 1
+    fi
+    echo "SOURCE_HOST_PACKAGE_BUILD passed"
+    source_host_cached=0
+else
+    echo "SOURCE_HOST_PACKAGE_BUILD cached"
+    source_host_cached=1
+fi
+if [[ ! -f "${SOURCE_OPAPI}" ]] || ! compgen -G "${SOURCE_TILING_LIB_GLOB}" >/dev/null; then
+    echo "fatal: private MatMul source host package is incomplete" >&2
+    exit 1
+fi
+SOURCE_TILING_LIBRARY="$(compgen -G "${SOURCE_TILING_LIB_GLOB}" | head -1)"
+source_host_wall_ms=$(( ($(date +%s%N) - source_host_started_ns) / 1000000 ))
+echo "CAMPAIGN_STAGE_TIMING stage=source_host_package wall_ms=${source_host_wall_ms} cached=${source_host_cached}"
+
+source_route_started_ns="$(date +%s%N)"
+python3 tools/collect_matmul_source_routes.py \
+    --runner "${ROOT}/build/official_matmul_runner" \
+    --workloads "${CATALOG}" \
+    --audit "${SOURCE_AUDIT}" \
+    --state-dir "${CAMPAIGN_DIR}/source_route_state" \
+    --package-root "${SOURCE_PACKAGE_ROOT}" \
+    --opapi "${SOURCE_OPAPI}" \
+    --tiling-library "${SOURCE_TILING_LIBRARY}" \
+    --device 0 \
+    --max-cores 20
+source_route_wall_ms=$(( ($(date +%s%N) - source_route_started_ns) / 1000000 ))
+echo "CAMPAIGN_STAGE_TIMING stage=source_route_discovery wall_ms=${source_route_wall_ms}"
+
 export DISABLE_MEASUREMENT_HISTORY=1
 export SEARCH_SCOPE=matmul_victor_frontier_v1
 export SEARCH_OUTPUT="${CANDIDATES}"
@@ -153,9 +245,10 @@ export SEARCH_TILING_DIR="${TILING_DIR}"
 export FRONTIER_WORKLOADS_OUTPUT="${WORKLOADS}"
 export MEASUREMENT_JSONL_LOG_DIRECTORY="${LOG_DIR}"
 export MEASUREMENT_JSONL_LOG_MAX_BYTES=52428800
+export SOURCE_ROUTE_AUDIT
 
 candidate_contract() {
-python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" <<'PY'
+python3 - "${WORKLOADS}" "${CANDIDATES}" "${ALL_CANDIDATES}" "${SOURCE_AUDIT}" <<'PY'
 import csv
 import sys
 from collections import Counter
@@ -176,15 +269,19 @@ searched = Counter(
     if row.get("candidate_role") == "searched"
 )
 hashes = {}
-families = {}
+source_all = set()
 for row in candidates:
     hashes.setdefault(row["workload_id"], set()).add(
         row.get("model_schedule_sha256", "")
     )
-    if row.get("candidate_role") == "searched" and row.get("is_reserve") != "1":
-        families.setdefault(row["workload_id"], set()).add(
-            row.get("model_kernel_family", "")
-        )
+    if (
+        row.get("candidate_role") == "searched"
+        and row.get("source_anchor") == "1"
+        and "ALL" in row.get("source_route", "").split("+")
+        and "20" in row.get("source_core_cap", "").split(",")
+        and len(row.get("source_raw_tiling_hex", "")) == 544
+    ):
+        source_all.add(row["workload_id"])
 if (
     len(workloads) != 3
     or len(set(workload_ids)) != 3
@@ -193,7 +290,7 @@ if (
          row["trans_a"], row["trans_b"])
         for row in workloads
     }) != 3
-    or {row.get("search_family") for row in workloads} != {"hardware_stratified_frontier"}
+    or {row.get("search_family") for row in workloads} != {"source_route_frontier"}
     or any("target_kernel_family" in row for row in workloads)
     or len(candidates) != 2256
     or set(candidate_ids) != set(workload_ids)
@@ -205,10 +302,7 @@ if (
     )
     or len(hashes) != 3
     or any(len(hashes[row["workload_id"]]) != searched[row["workload_id"]] for row in workloads)
-    or len(families) != 3
-    or set().union(*families.values()) != {
-        "BASE", "SINGLE_CORE_SPLIT_K", "DETERMINISTIC_SPLIT_K",
-    }
+    or source_all != set(workload_ids)
     or not all_candidates
     or not all(row.get("global_model_rank", "").isdigit() for row in candidates)
     or not all(row.get("controlled_factor", "") for row in candidates)
@@ -262,31 +356,6 @@ python3 tools/direct_matmul_tiling.py \
     --include-reserves >/dev/null
 direct_preflight_wall_ms=$(( ($(date +%s%N) - direct_preflight_started_ns) / 1000000 ))
 echo "DIRECT_TILING_PREFLIGHT passed candidates=2256 wall_ms=${direct_preflight_wall_ms}"
-
-RUNNER_BUILD_HASH="$({
-    printf '%s\0' runner/official_matmul_runner.cpp \
-        cmake_npu/CMakeLists.txt scripts/build_all.sh "${CANN_VERSION_FILE}"
-} | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
-RUNNER_BUILD_STAMP="${ROOT}/build/.matmul_official_runner.sha256"
-runner_build_started_ns="$(date +%s%N)"
-if [[ ! -x build/official_matmul_runner || ! -f "${RUNNER_BUILD_STAMP}" || \
-      "$(cat "${RUNNER_BUILD_STAMP}" 2>/dev/null || true)" != "${RUNNER_BUILD_HASH}" ]]; then
-    echo "OFFICIAL_RUNNER_BUILD begin jobs=1"
-    if ! BUILD_COMPONENTS=official BUILD_JOBS=1 scripts/build_all.sh \
-        >"${CAMPAIGN_DIR}/official_runner_build.log" 2>&1; then
-        echo "OFFICIAL_RUNNER_BUILD failed log=${CAMPAIGN_DIR}/official_runner_build.log"
-        tail -20 "${CAMPAIGN_DIR}/official_runner_build.log"
-        exit 1
-    fi
-    printf '%s\n' "${RUNNER_BUILD_HASH}" >"${RUNNER_BUILD_STAMP}"
-    echo "OFFICIAL_RUNNER_BUILD passed"
-    runner_build_cached=0
-else
-    echo "OFFICIAL_RUNNER_BUILD cached"
-    runner_build_cached=1
-fi
-runner_build_wall_ms=$(( ($(date +%s%N) - runner_build_started_ns) / 1000000 ))
-echo "CAMPAIGN_STAGE_TIMING stage=official_runner_build wall_ms=${runner_build_wall_ms} cached=${runner_build_cached}"
 
 echo "NPU_MEASUREMENT_BEGIN shapes=3 candidate_records=2160 official_baselines=3 records=2163"
 export KEEP_DETAILS=1

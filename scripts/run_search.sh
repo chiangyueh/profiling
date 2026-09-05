@@ -91,6 +91,7 @@ if [[ "${SEARCH_SCOPE}" == "matmul_victor_frontier_v1" ]]; then
             --workloads "${FRONTIER_WORKLOADS_OUTPUT:?}" \
             --output "${SEARCH_OUTPUT}" \
             --all-output "${SEARCH_ALL_OUTPUT}" \
+            --source-audit "${SOURCE_ROUTE_AUDIT:?}" \
             --soc "${ASCENDC_SOC_VERSION:-${SOC_VERSION:-Ascend910B}}" \
             --aic-cores "${PLATFORM_AIC_CORES}" \
             --l0a-bytes "${PLATFORM_L0A_BYTES}" \

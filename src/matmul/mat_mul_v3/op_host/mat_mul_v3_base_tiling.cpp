@@ -933,6 +933,15 @@ void MatmulV3BaseTiling::DoSelectTiling()
         case TilingCalcSelect::DETERMINISTIC_SPLIT_K:
             DO_CACL_TILING_ENABLE(DoDeterministicMultiCoreSplitKTiling())
             break;
+        case TilingCalcSelect::AL1_FULL_LOAD:
+            DO_CACL_TILING_ENABLE(DoAL1FullLoadTiling())
+            break;
+        case TilingCalcSelect::BL1_FULL_LOAD:
+            DO_CACL_TILING_ENABLE(DoBL1FullLoadTiling())
+            break;
+        case TilingCalcSelect::BL1_FULL_LOAD_FIXPIPE:
+            DO_CACL_TILING_ENABLE(DoBL1FullloadWithFixpipeTiling())
+            break;
         default:
             break;
     }
@@ -2214,4 +2223,3 @@ ge::graphStatus MatmulV3BaseTiling::PostTiling()
 }
 }
 }
-

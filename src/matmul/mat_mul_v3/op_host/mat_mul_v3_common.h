@@ -129,7 +129,12 @@ enum class TilingCalcSelect  //选择不同的计算Tiling的方法
     ALL = 0,
     BASE = 1,
     SINGLE_CORE_SPLIT_K = 2,
-    DETERMINISTIC_SPLIT_K = 3
+    DETERMINISTIC_SPLIT_K = 3,
+    // Audit-only selectors.  They invoke the original route predicates and
+    // implementations independently; the production ALL order is unchanged.
+    AL1_FULL_LOAD = 4,
+    BL1_FULL_LOAD = 5,
+    BL1_FULL_LOAD_FIXPIPE = 6
 };
 
 enum class TilingEnableSplitCore // 互斥flag, 对应不同切K模板选择

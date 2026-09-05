@@ -147,12 +147,14 @@ DIRECT_KERNEL_TARGETS=(
 )
 MATMUL_V3_KERNEL_DIR="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe/impl/ascendc/mat_mul_v3"
 DIRECT_KERNEL_BUILD_SIGNATURE="$({
-    printf '%s\0' \
+    sha256sum \
         "${ROOT}/direct_matmul/kernel_entry.cpp" \
-        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h" \
-        "${ROOT}/cmake_npu/CMakeLists.txt"
-    find "${MATMUL_V3_KERNEL_DIR}" -type f -print0
-} | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+        "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h"
+    find "${MATMUL_V3_KERNEL_DIR}" -type f -print0 | \
+        sort -z | xargs -0 sha256sum
+    printf '%s\n' \
+        "cann81-direct-kernel-v2:${ASCENDC_SOC_VERSION}:${DIRECT_KERNEL_TARGETS[*]}"
+} | sha256sum | cut -d' ' -f1)"
 kernel_count="${#DIRECT_KERNEL_TARGETS[@]}"
 kernel_index=0
 for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
@@ -160,11 +162,32 @@ for target in "${DIRECT_KERNEL_TARGETS[@]}"; do
     target_stamp="${NPU_BUILD}/.${target}.sha256"
     target_library="${NPU_BUILD}/lib/lib${target}.a"
     target_include="${NPU_BUILD}/include/${target}"
-    if [[ -s "${target_library}" && -d "${target_include}" && \
-          -f "${target_stamp}" && \
-          "$(cat "${target_stamp}" 2>/dev/null || true)" == \
-              "${DIRECT_KERNEL_BUILD_SIGNATURE}" ]] && \
-       ar t "${target_library}" >/dev/null 2>&1; then
+    target_identity="${target#direct_matmul_kernel_}"
+    target_dtype="${target_identity%%_*}"
+    target_suffix="${target_identity#*_}"
+    target_symbol="aclrtlaunch_direct_matmul_${target_dtype}_k${target_suffix}"
+    target_header="${target_include}/${target_symbol}.h"
+    kernel_cache_valid=0
+    if [[ -s "${target_library}" && -f "${target_header}" && \
+          -f "${target_stamp}" ]] && \
+       ar t "${target_library}" >/dev/null 2>&1 && \
+       nm -g --defined-only "${target_library}" 2>/dev/null | \
+           grep -Eq "[[:space:]]${target_symbol}$"; then
+        if [[ "$(cat "${target_stamp}" 2>/dev/null || true)" == \
+              "${DIRECT_KERNEL_BUILD_SIGNATURE}" ]]; then
+            kernel_cache_valid=1
+        elif [[ ! "${ROOT}/direct_matmul/kernel_entry.cpp" -nt "${target_library}" && \
+                ! "${ROOT}/direct_matmul/mat_mul_v3_tiling_data.h" -nt "${target_library}" ]] && \
+             [[ -z "$(find "${MATMUL_V3_KERNEL_DIR}" -type f \
+                 -newer "${target_library}" -print -quit)" ]]; then
+            # One-time migration from the former stamp, whose hash included
+            # link-only CMake text.  The archive symbol and every actual
+            # kernel input are checked before retaining the expensive build.
+            printf '%s\n' "${DIRECT_KERNEL_BUILD_SIGNATURE}" >"${target_stamp}"
+            kernel_cache_valid=1
+        fi
+    fi
+    if [[ "${kernel_cache_valid}" -eq 1 ]]; then
         echo "DIRECT_KERNEL_BUILD ${kernel_index}/${kernel_count} ${target} cached"
         continue
     fi

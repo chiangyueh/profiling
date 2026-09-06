@@ -124,7 +124,36 @@ fi
 
 echo "[2/2] Building ${BUILD_COMPONENTS} NPU component (jobs=${BUILD_JOBS:-1})"
 SOC_BUILD_NAME="$(printf '%s' "$ASCENDC_SOC_VERSION" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' '_')"
-NPU_BUILD="$BUILD/npu_cmake_${SOC_BUILD_NAME}"
+ASCENDC_CMAKE_SOURCE="${CANN_ROOT}/tools/tikcpp/ascendc_kernel_cmake/ascendc.cmake"
+if [[ ! -f "${ASCENDC_CMAKE_SOURCE}" ]]; then
+    ASCENDC_CMAKE_SOURCE="${CANN_ROOT}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake"
+fi
+if [[ ! -f "${ASCENDC_CMAKE_SOURCE}" ]]; then
+    ASCENDC_CMAKE_SOURCE="${PLATFORM_ROOT}/tikcpp/ascendc_kernel_cmake/ascendc.cmake"
+fi
+[[ -f "${ASCENDC_CMAKE_SOURCE}" ]] || {
+    echo "fatal: CANN AscendC CMake module was not found" >&2
+    exit 2
+}
+
+# CMake records the absolute source directory of AscendC's nested
+# device_precompile_project.  Reusing a build tree after this repository moved
+# from the installed support package to its private, linker-limited copy makes
+# CMake reject later kernel families with a source-directory mismatch.  Key the
+# build tree by the configure inputs instead of reusing the old untracked
+# build/npu_cmake_<soc> directory.  This is additive: no existing build tree is
+# removed or modified.
+NPU_CONFIGURE_ID="$({
+    sha256sum \
+        "${ROOT}/cmake_npu/CMakeLists.txt" \
+        "${ROOT}/scripts/ccec_ld_single_thread.sh" \
+        "${ASCENDC_CMAKE_SOURCE}"
+    printf '%s\n' \
+        "$(readlink -f "${CANN_ROOT}")" \
+        "$(readlink -f "${ASCENDC_CMAKE_SOURCE}")" \
+        "${ASCENDC_SOC_VERSION}"
+} | sha256sum | cut -c1-12)"
+NPU_BUILD="$BUILD/npu_cmake_${SOC_BUILD_NAME}_${NPU_CONFIGURE_ID}"
 mkdir -p "$NPU_BUILD"
 : >"$BUILD/kernel_build.log"
 
